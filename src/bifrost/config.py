@@ -307,19 +307,6 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_thinking=True,
         ),
         ManagedModelConfig(
-            id="grok-build",
-            name="Grok Build",
-            vendor="xai",
-            provider=ManagedModelProvider.CLOUD,
-            tier=ManagedModelTier.FRONTIER,
-            color="#1DA1F2",
-            description="xAI Grok Build agentic coding model (ACP over stdio).",
-            cost_per_million_tokens=None,  # Provider does not publish a stable blended rate
-            session_definition="skuldGrok",
-            supports_tools=True,
-            supports_thinking=True,
-        ),
-        ManagedModelConfig(
             id="deepseek-v4-flash",
             name="DeepSeek V4 Flash",
             vendor="deepseek",

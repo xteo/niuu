@@ -1,16 +1,25 @@
 """Capture build identity once when the platform starts, never from later edits."""
 
 import hashlib
-import os
 import subprocess
 from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class BuildIdentitySettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="NIUU_BUILD_")
+    revision: str = ""
+    version: str = "development"
+
 
 GIT_IDENTITY_TIMEOUT_SECONDS = 5
 
 
 def build_identity() -> dict[str, str | bool]:
     root = Path(__file__).resolve().parents[2]
-    revision = os.environ.get("NIUU_BUILD_REVISION", "")
+    settings = BuildIdentitySettings()
+    revision = settings.revision
     dirty = False
     try:
         if not revision:
@@ -39,7 +48,7 @@ def build_identity() -> dict[str, str | bool]:
         digest.update(b"\0")
     return {
         "revision": revision,
-        "build": os.environ.get("NIUU_BUILD_VERSION", "development"),
+        "build": settings.version,
         "source_sha256": digest.hexdigest(),
         "dirty": dirty,
     }

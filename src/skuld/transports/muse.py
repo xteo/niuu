@@ -612,9 +612,7 @@ class MuseMSPTransport(CLITransport):
     # ------------------------------------------------------------------
 
     def _resolve_muse_bin(self) -> str:
-        return (
-            self._muse_bin_override or os.environ.get("MUSE_BIN") or shutil.which("muse") or "muse"
-        )
+        return self._muse_bin_override or shutil.which("muse") or "muse"
 
     def _serve_command(self, muse_bin: str) -> list[str]:
         """``muse serve`` with the host-lifetime sandbox posture (flags go AFTER the verb)."""

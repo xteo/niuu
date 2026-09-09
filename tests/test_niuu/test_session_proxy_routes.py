@@ -84,17 +84,17 @@ class TestStandaloneSessionProxyRoutes:
         )
         assert request.kwargs["headers"]["Host"] == "forge-123--skuld.openshell.localhost:8080"
 
-    def test_ws_route_closes_4410_without_port_or_target(self, tmp_path) -> None:
+    def test_ws_route_closes_4411_when_target_is_not_yet_known(self, tmp_path) -> None:
         from starlette.websockets import WebSocketDisconnect
 
         app, _reg = _bare_app(tmp_path)
         client = TestClient(app)
 
         with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect("/s/unknown/session"):
-                pass
+            with client.websocket_connect("/s/unknown/session") as ws:
+                ws.receive_text()
 
-        assert exc.value.code == 4410
+        assert exc.value.code == 4411
 
     def test_ws_route_dials_gateway_for_external_target(self, tmp_path) -> None:
         from starlette.websockets import WebSocketDisconnect
@@ -123,7 +123,7 @@ class TestStandaloneSessionProxyRoutes:
         # The broker leg failed, so the browser leg closes deterministically —
         # what matters here is the dial: the sandbox route stays in the URL
         # (its Host), while the TCP connection goes to the gateway address.
-        assert exc.value.code == 4410
+        assert exc.value.code == 4411
         assert captured["url"] == "ws://forge-123--skuld.openshell.localhost:8080/session"
         assert captured["kwargs"]["host"] == "openshell.openshell.svc.cluster.local"
         assert captured["kwargs"]["port"] == 8080

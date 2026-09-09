@@ -104,7 +104,8 @@ async def running_shim(
     if tick_seconds is not None:
         mod.TICK_EMIT_SECONDS = tick_seconds
 
-    gw = OpenClawGateway(Cfg(), stub, store=OpenClawStore(Cfg.store_path))
+    store = OpenClawStore(Cfg.store_path)
+    gw = OpenClawGateway(Cfg(), stub, store=store)
     config = uvicorn.Config(
         gw._app,
         host="127.0.0.1",
@@ -127,6 +128,7 @@ async def running_shim(
         server.should_exit = True
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await asyncio.wait_for(task, timeout=5)
+        store.close()
 
 
 class TestHandshake:

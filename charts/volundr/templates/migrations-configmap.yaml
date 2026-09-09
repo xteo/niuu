@@ -2,6 +2,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: {{ include "volundr.fullname" . }}-migrations
+  labels:
+    {{- include "volundr.labels" . | nindent 4 }}
+data:
   000001_initial_schema.down.sql: |
     -- Rollback initial schema
 

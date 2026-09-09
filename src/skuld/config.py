@@ -736,6 +736,21 @@ class SkuldSettings(BaseSettings):
     conversation_snapshot_max_bytes: int = Field(default=900 * 1024, gt=0)
     live_frame_max_bytes: int = Field(default=900 * 1024, ge=1024)
     # Native results are retained whole before the browser projection elides them.
+    muse_bin: str = Field(
+        default="",
+        validation_alias=AliasChoices("muse_bin", "SKULD__MUSE_BIN", "MUSE_BIN"),
+        description="Muse executable override; empty resolves muse on PATH.",
+    )
+    tmux_question_transcript_max_bytes: int = Field(
+        default=1048576,
+        ge=1,
+        description="Maximum native transcript bytes inspected to confirm a Claude answer.",
+    )
+    tmux_question_result_history_limit: int = Field(
+        default=128,
+        ge=1,
+        description="Maximum retained native question receipt identities for deduplication.",
+    )
     codex_receive_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     # Unified internal-visibility default for a freshly-connected live channel
     # (SRD FR-7 / INV-10). The read paths thread the SAME configured default

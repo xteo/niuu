@@ -221,27 +221,6 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 },
             },
         ),
-        "skuldCodexRemote": SessionDefinitionConfig(
-            enabled=True,
-            display_name="Codex Remote Control",
-            description=(
-                "Codex Remote Control — requires the standalone Codex install; "
-                "fails fast with guidance until it exists"
-            ),
-            labels=["session", "codex", "remote-control"],
-            # Astra is the default Codex model (Damien, 2026-09-05).
-            default_model="gpt-6-astra",
-            compatible_providers=["openai"],
-            defaults={
-                "broker": {
-                    "cliType": "codex",
-                    "transportAdapter": (
-                        "skuld.transports.remote_control.CodexRemoteControlTransport"
-                    ),
-                    "agentTeams": False,
-                },
-            },
-        ),
     }
 
 

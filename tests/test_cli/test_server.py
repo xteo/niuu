@@ -2020,6 +2020,8 @@ class TestRootServerRunMigrations:
             raise FileNotFoundError
 
         mock_conn = AsyncMock()
+        mock_conn.transaction = MagicMock(return_value=AsyncMock())
+        mock_conn.fetchval.return_value = None
 
         with (
             patch("asyncpg.connect", new_callable=AsyncMock, return_value=mock_conn),
@@ -2028,8 +2030,11 @@ class TestRootServerRunMigrations:
         ):
             await server._run_migrations()
 
-        assert mock_conn.execute.await_count == 3
-        executed_sql = [call.args[0] for call in mock_conn.execute.await_args_list]
+        executed_sql = [
+            call.args[0]
+            for call in mock_conn.execute.await_args_list
+            if call.args[0].startswith("CREATE TABLE IF NOT EXISTS t")
+        ]
         assert executed_sql == [
             "CREATE TABLE IF NOT EXISTS t1 (id INT);",
             "CREATE TABLE IF NOT EXISTS t0 (id INT);",
@@ -2038,7 +2043,7 @@ class TestRootServerRunMigrations:
         mock_conn.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_handles_migration_errors_gracefully(self, tmp_path: Path) -> None:
+    async def test_migration_errors_prevent_startup(self, tmp_path: Path) -> None:
         registry = PluginRegistry()
         server = RootServer(registry=registry)
 
@@ -2053,6 +2058,8 @@ class TestRootServerRunMigrations:
         (vol_dir / "000001_init.up.sql").write_text("INVALID SQL;")
 
         mock_conn = AsyncMock()
+        mock_conn.transaction = MagicMock(return_value=AsyncMock())
+        mock_conn.fetchval.return_value = None
         mock_conn.execute = AsyncMock(side_effect=Exception("syntax error"))
 
         with (
@@ -2060,11 +2067,11 @@ class TestRootServerRunMigrations:
             patch("cli.resources.migration_dir", side_effect=[vol_dir, FileNotFoundError]),
             patch("niuu.app.bootstrap_sql_for_service", return_value=()),
         ):
-            # Should not raise
-            await server._run_migrations()
+            with pytest.raises(Exception, match="syntax error"):
+                await server._run_migrations()
 
     @pytest.mark.asyncio
-    async def test_handles_connect_failure_gracefully(self) -> None:
+    async def test_connect_failure_prevents_startup(self) -> None:
         registry = PluginRegistry()
         server = RootServer(registry=registry)
 
@@ -2075,8 +2082,8 @@ class TestRootServerRunMigrations:
         server._embedded_db = mock_db
 
         with patch("asyncpg.connect", new_callable=AsyncMock, side_effect=Exception("fail")):
-            # Should not raise
-            await server._run_migrations()
+            with pytest.raises(Exception, match="fail"):
+                await server._run_migrations()
 
 
 class TestRootServerStartEmbeddedDb:

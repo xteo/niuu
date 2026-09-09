@@ -223,6 +223,10 @@ git:
 
 # Broker configuration (Skuld application settings)
 broker:
+  # Native question proof bounds and optional Muse executable override.
+  tmuxQuestionTranscriptMaxBytes: 1048576
+  tmuxQuestionResultHistoryLimit: 128
+  museBin: ""
   # -- (DEPRECATED) AI CLI backend: "claude" (Claude Code, default) or "codex" (OpenAI Codex).
   # Use broker.transportAdapter instead. Kept for backward compatibility during rollout.
   cliType: claude

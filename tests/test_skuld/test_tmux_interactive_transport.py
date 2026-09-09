@@ -1125,6 +1125,117 @@ async def test_hook_enabled_turn_completes_on_stop_not_terminal_idle(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_queued_prompt_after_teammate_stop_recovers_native_idle(tmp_path: Path) -> None:
+    """Recorded live: a worker's late Stop precedes a follow-up with no Stop."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    transport._claude_native_session_id = "main-native-session"
+    fixture = Path(__file__).parents[1] / "fixtures/forge-live/claude-queued-idle.json"
+    hooks = json.loads(fixture.read_text())
+    try:
+        for hook in hooks:
+            await transport.handle_claude_hook(hook)
+        results = [e for e in events if e["type"] == "result"]
+        assert len(results) == 2  # Old worker notification, then the actual follow-up.
+        assert results[-1]["stop_reason"] == "native_idle"
+        assert "FORGE_RECOVERED" in results[-1]["result"]
+        assert "FORGE_DONE:" in results[-1]["result"]
+        assert not transport.is_turn_active
+        # A retried notification or a delayed Stop cannot commit the answer twice.
+        await transport.handle_claude_hook(hooks[-1])
+        await transport.handle_claude_hook(
+            {
+                **hooks[-1],
+                "hook_event_name": "Stop",
+                "last_assistant_message": results[-1]["result"],
+            }
+        )
+        assert len([e for e in events if e["type"] == "result"]) == 2
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "obstacle", ["foreign_prompt", "no_prompt", "child", "partial", "tool", "question", "queued"]
+)
+async def test_native_idle_requires_matching_finished_main_display(
+    tmp_path: Path, obstacle: str
+) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    transport._claude_native_session_id = "main"
+    try:
+        await transport.handle_claude_hook(
+            {
+                "hook_event_name": "MessageDisplay",
+                "session_id": "main",
+                "prompt_id": "p",
+                "message_id": "m",
+                "delta": "Public answer",
+                "final": True,
+            }
+        )
+        idle = {
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "session_id": "main",
+            "prompt_id": "p",
+        }
+        if obstacle == "foreign_prompt":
+            idle["prompt_id"] = "old"
+        elif obstacle == "no_prompt":
+            idle.pop("prompt_id")
+        elif obstacle == "child":
+            idle["session_id"] = "worker"
+        elif obstacle == "partial":
+            await transport.handle_claude_hook(
+                {
+                    "hook_event_name": "MessageDisplay",
+                    "message_id": "new",
+                    "delta": "still writing",
+                    "final": False,
+                }
+            )
+        elif obstacle == "tool":
+            await transport.handle_claude_hook(
+                {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tool"}
+            )
+        elif obstacle == "question":
+            transport._pending_tty_prompts["question"] = {"answer_in_flight": True}
+        elif obstacle == "queued":
+            transport._pending_prompt_correlations.append(("next", None, "next request"))
+        await transport.handle_claude_hook(idle)
+        assert not any(e["type"] == "result" for e in events)
+        assert transport.is_turn_active
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_work_after_stop_rearms_completion_watchdog(tmp_path: Path) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    try:
+        await transport.handle_claude_hook(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "first"}
+        )
+        previous = transport._turn_done
+        await transport.handle_claude_hook(
+            {"hook_event_name": "Stop", "last_assistant_message": "first done"}
+        )
+        transport._turn_max_seconds = 0.01
+        await transport.handle_claude_hook(
+            {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_use_id": "next"}
+        )
+        assert transport._turn_done is not previous
+        await _wait_until(lambda: any(e.get("stop_reason") == "timeout" for e in events))
+        assert not transport.is_turn_active
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
 async def test_capabilities_advertise_native_steering(tmp_path: Path) -> None:
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
     caps = transport.capabilities

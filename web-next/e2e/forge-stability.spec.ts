@@ -51,6 +51,6 @@ test('history filters survive repeated changes without losing rows', async ({ pa
 
 test('launch catalog exposes the standard Claude and Codex definitions', async ({ page }) => {
   await page.goto('/volundr/catalog');
-  await expect(page.getByText('standard-claude')).toBeVisible();
-  await expect(page.getByText('standard-codex')).toBeVisible();
+  await expect(page.getByRole('button', { name: /standard-claude/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /standard-codex/ })).toBeVisible();
 });

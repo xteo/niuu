@@ -126,7 +126,7 @@ def test_aliases_are_identical_sql_in_source_package_and_chart():
     packaged = root / "src/cli/migrations/volundr"
     template = (root / "charts/volundr/templates/migrations-configmap.yaml").read_text()
     # Only inspect literal data; Helm metadata is rendered by the separate chart gate.
-    literal = template[template.index("data:\n") : template.rindex("{{- end")]
+    literal = template[template.index("\ndata:\n") + 1 : template.rindex("{{- end")]
     data = yaml.safe_load(literal)["data"]
     for path in [*MIGRATIONS.glob("*.sql"), MIGRATIONS / "lineage-aliases.json"]:
         assert (packaged / path.name).read_bytes() == path.read_bytes(), path.name

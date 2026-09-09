@@ -209,6 +209,8 @@ class TmuxInteractiveTransport(CLITransport):
         turn_max_seconds: float | None = None,
         pane_poll_interval_s: float | None = None,
         frame_interval_s: float | None = None,
+        question_transcript_max_bytes: int = 1048576,
+        question_result_history_limit: int = 128,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
@@ -275,10 +277,9 @@ class TmuxInteractiveTransport(CLITransport):
         self._question_result_wait_s = self._float_env(
             "SKULD__TMUX_QUESTION_RESULT_WAIT_SECONDS", None, 5.0
         )
-        self._question_transcript_max_bytes = max(
-            1,
-            self._coerce_int(os.environ.get("SKULD__TMUX_QUESTION_TRANSCRIPT_MAX_BYTES"), 1048576),
-        )
+        if question_transcript_max_bytes < 1 or question_result_history_limit < 1:
+            raise ValueError("Native question transcript and receipt bounds must be positive")
+        self._question_transcript_max_bytes = question_transcript_max_bytes
         # Initial-prompt fix: the REPL isn't ready to accept input the instant the
         # CLI is spawned — pasting the seed prompt into a still-booting Claude makes
         # it land mid-startup (it was being parsed as a slash command). Wait for a
@@ -367,6 +368,11 @@ class TmuxInteractiveTransport(CLITransport):
         self._native_pretool_text_ids: set[tuple[str, int]] = set()
         self._pending_native_display_texts: list[str] = []
         self._unmatched_display_texts: list[str] = []
+        # A native idle notification can follow a completed MessageDisplay without
+        # a Stop callback when queued input overlaps a teammate's final turn.
+        self._idle_display: tuple[str, str] | None = None
+        self._idle_completed_prompt = ""
+        self._main_hook_tools: set[str] = set()
         # Correlation FIFO of (msg_id, request_id, normalized_text) for each user
         # message pasted into the pane but not yet seen consumed by Claude. A steered
         # message lands in the CLI's own input queue and is inserted "at the right
@@ -408,12 +414,7 @@ class TmuxInteractiveTransport(CLITransport):
         self._pending_tty_prompts: dict[str, dict[str, Any]] = {}
         self._answer_lock = asyncio.Lock()
         self._question_result_emit_lock = asyncio.Lock()
-        self._question_result_ids: deque[str] = deque(
-            maxlen=max(
-                1,
-                self._coerce_int(os.environ.get("SKULD__TMUX_QUESTION_RESULT_HISTORY_LIMIT"), 128),
-            )
-        )
+        self._question_result_ids: deque[str] = deque(maxlen=question_result_history_limit)
         self._tty_question_seq = 0
         self._last_result: dict | None = None
         self._slash_commands_cache = self._normalize_slash_command_items(
@@ -858,6 +859,9 @@ class TmuxInteractiveTransport(CLITransport):
         self._turn_displayed_texts = []
         self._display_msg_buffers = {}
         self._reset_text_identity_tracking()
+        self._idle_display = None
+        self._idle_completed_prompt = ""
+        self._main_hook_tools.clear()
         self._turn_prompt_text = ""
         # The watchdog captures the `_turn_done` Event it was started with. A fresh
         # turn always gets a freshly-created Event (above), so we MUST bind a live
@@ -1010,6 +1014,9 @@ class TmuxInteractiveTransport(CLITransport):
         )
 
         if event_name == "UserPromptSubmit":
+            if not self._is_child_hook(payload):
+                self._idle_display = None
+                self._idle_completed_prompt = ""
             self._mark_semantic_turn_started()
             prompt = payload.get("prompt")
             prompt_str = prompt if isinstance(prompt, str) else ""
@@ -1042,6 +1049,11 @@ class TmuxInteractiveTransport(CLITransport):
         if event_name == "PreToolUse":
             async with self._text_hook_lock:
                 self._mark_semantic_turn_started()
+                if not self._is_child_hook(payload):
+                    self._idle_display = None
+                    self._idle_completed_prompt = ""
+                    if tool_id := self._coerce_str(payload.get("tool_use_id")):
+                        self._main_hook_tools.add(tool_id)
                 await self._emit_native_text_before_tool(payload)
                 await self._emit_tool_use_from_hook(payload)
             return True
@@ -1051,6 +1063,8 @@ class TmuxInteractiveTransport(CLITransport):
                 payload,
                 is_error=event_name == "PostToolUseFailure",
             )
+            if not self._is_child_hook(payload):
+                self._main_hook_tools.discard(self._coerce_str(payload.get("tool_use_id")))
             return True
 
         if event_name == "PermissionRequest":
@@ -1060,6 +1074,11 @@ class TmuxInteractiveTransport(CLITransport):
         if event_name == "MessageDisplay":
             async with self._text_hook_lock:
                 await self._emit_message_display_from_hook(payload)
+            return True
+
+        if event_name == "Notification" and payload.get("notification_type") == "idle_prompt":
+            async with self._text_hook_lock:
+                await self._finish_native_idle_turn(payload)
             return True
 
         if event_name == "SubagentStart":
@@ -1081,6 +1100,14 @@ class TmuxInteractiveTransport(CLITransport):
 
         if event_name == "Stop":
             if self._is_child_hook(payload):
+                return True
+            if (
+                not self._turn_active
+                and self._idle_completed_prompt
+                and payload.get("prompt_id") == self._idle_completed_prompt
+                and self._coerce_str(payload.get("last_assistant_message")).strip()
+                == (self._last_result or {}).get("result")
+            ):
                 return True
             await self._finish_hook_turn(
                 content=self._coerce_str(payload.get("last_assistant_message")),
@@ -1127,15 +1154,28 @@ class TmuxInteractiveTransport(CLITransport):
     def _mark_semantic_turn_started(self) -> None:
         if self._turn_active:
             return
-        self._turn_active = True
-        self._turn_started_at = time.monotonic()
+        # Native work can start without another paste (teammates, queued input,
+        # terminal input). Every new turn needs its own completion event/watchdog.
+        self._begin_turn()
         self._turn_last_output_at = self._turn_started_at
-        self._turn_stream_started = False
-        self._turn_buffer = []
-        self._turn_last_clean_text = ""
-        self._turn_displayed_texts = []
-        self._display_msg_buffers = {}
-        self._reset_text_identity_tracking()
+
+    async def _finish_native_idle_turn(self, payload: dict[str, Any]) -> None:
+        """Recover a missing Stop only from matching native completion evidence."""
+        prompt_id = self._coerce_str(payload.get("prompt_id"))
+        if (
+            self._is_child_hook(payload)
+            or not self._turn_active
+            or not prompt_id
+            or not self._idle_display
+            or self._idle_display[0] != prompt_id
+            or self._display_msg_buffers
+            or self._main_hook_tools
+            or self._pending_tty_prompts
+            or self._pending_prompt_correlations
+        ):
+            return
+        await self._finish_hook_turn(content=self._idle_display[1], reason="native_idle")
+        self._idle_completed_prompt = prompt_id
 
     def _reset_text_identity_tracking(self) -> None:
         self._displayed_message_ids.clear()
@@ -1244,6 +1284,10 @@ class TmuxInteractiveTransport(CLITransport):
             if self._normalize_prompt(text) == self._normalize_prompt(last_result_text):
                 return
         self._mark_semantic_turn_started()
+        prompt_id = self._coerce_str(payload.get("prompt_id"))
+        if prompt_id:
+            self._idle_display = (prompt_id, text)
+            self._idle_completed_prompt = ""
         # Native and display IDs differ. Consume only ONE exact delayed display
         # occurrence per pre-tool native item; identical later messages survive.
         if message_id != "current" and message_id in self._displayed_message_ids:

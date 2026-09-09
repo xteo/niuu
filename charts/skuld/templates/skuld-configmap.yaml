@@ -31,6 +31,9 @@ data:
     transport: {{ .Values.broker.transport | default "sdk" | quote }}
     transport_adapter: {{ .Values.broker.transportAdapter | default "skuld.transports.sdk.SDKTransport" | quote }}
     cli_binary: {{ .Values.broker.cliBinary | default "claude" | quote }}
+    muse_bin: {{ .Values.broker.museBin | default "" | quote }}
+    tmux_question_transcript_max_bytes: {{ .Values.broker.tmuxQuestionTranscriptMaxBytes | default 1048576 }}
+    tmux_question_result_history_limit: {{ .Values.broker.tmuxQuestionResultHistoryLimit | default 128 }}
     remote_control_permission_mode: {{ .Values.broker.remoteControlPermissionMode | default "" | quote }}
     skip_permissions: {{ .Values.broker.skipPermissions }}
     agent_teams: {{ .Values.broker.agentTeams | default false }}
