@@ -505,7 +505,7 @@ class Session(BaseModel):
         default=None,
         max_length=255,
         description=(
-            "Session definition (runtime type, e.g. skuldClaude / skuldGrok) the "
+            "Session definition (runtime type, e.g. skuldClaude / skuldGrok / skuldMuse) the "
             "session was launched with, persisted so restarts re-apply the same "
             "transport instead of falling back to the platform default."
         ),

@@ -436,7 +436,9 @@ class EventLogMixin:
         self._enqueue_event_log(frame)
         return await self._safe_browser_send_json(websocket, frame)
 
-    def _enqueue_human_turn_event(self, content: str, turn_id: str) -> None:
+    def _enqueue_human_turn_event(
+        self, content: str, turn_id: str, *, request_id: str | None = None
+    ) -> None:
         """Persist a HUMAN message to the durable event log as a user frame.
 
         The CLI never echoes the operator's own prompt as a text frame — only
@@ -455,6 +457,7 @@ class EventLogMixin:
                 "role": "user",
                 "uuid": turn_id,
                 "message": {"role": "user", "content": content},
+                **({"request_id": request_id} if request_id else {}),
             }
         )
 
@@ -502,32 +505,51 @@ class EventLogMixin:
                 logger.debug("event log flush iteration failed", exc_info=True)
 
     async def _flush_event_log(self) -> None:
-        """Send one batch from the front of the buffer. Removes only on success."""
+        """Serialize flushes and acknowledge only the sequence range actually sent."""
         if not self.volundr_api_url:
             return
         async with self._event_log_lock:
             batch = self._event_log_buffer[: self._settings.event_log_batch_size]
-        if not batch:
-            return
+            if not batch:
+                return
 
-        client = await self._get_http_client()
-        path = self.FORGE_LOG_PATH_TEMPLATE.format(sid=self.session_id)
-        try:
-            response = await client.post(path, json={"entries": batch})
-        except Exception:
-            logger.debug("event log POST failed — will retry", exc_info=True)
-            return
-        if response.status_code >= 300:
-            logger.debug(
-                "event log POST rejected (%d): %s — will retry",
-                response.status_code,
-                response.text[:200],
+            client = await self._get_http_client()
+            path = self.FORGE_LOG_PATH_TEMPLATE.format(sid=self.session_id)
+            try:
+                response = await client.post(path, json={"entries": batch})
+            except Exception:
+                logger.debug("event log POST failed — will retry", exc_info=True)
+                return
+            if response.status_code >= 300:
+                logger.debug(
+                    "event log POST rejected (%d): %s — will retry",
+                    response.status_code,
+                    response.text[:200],
+                )
+                return
+
+            # Enqueue is synchronous and can overflow the buffer during the POST.
+            # Its prefix may now contain NEW frames, so deleting len(batch) loses
+            # unsent output. Acknowledge the sent prefix by seq, trimming any gap
+            # created in flight so it cannot collide with a now-persisted row.
+            acknowledged = max(
+                entry["payload"]["last_seq"] if entry["kind"] == "log_gap" else entry["seq"]
+                for entry in batch
             )
-            return
-        # Idempotent on (session_id, seq), so removing exactly the sent count is
-        # safe even if newer frames were appended during the POST.
-        async with self._event_log_lock:
-            del self._event_log_buffer[: len(batch)]
+            remaining = []
+            for entry in self._event_log_buffer:
+                if entry["seq"] > acknowledged:
+                    remaining.append(entry)
+                    continue
+                if entry["kind"] != "log_gap":
+                    continue
+                gap = entry["payload"]
+                if gap["last_seq"] <= acknowledged:
+                    continue
+                entry["seq"] = gap["first_seq"] = acknowledged + 1
+                gap["dropped"] = gap["last_seq"] - acknowledged
+                remaining.append(entry)
+            self._event_log_buffer[:] = remaining
 
     async def _init_event_log(self) -> None:
         """Resume the seq counter from the backend so restarts don't collide.
@@ -543,10 +565,20 @@ class EventLogMixin:
         head = 0
         try:
             response = await client.get(path)
-            if response.status_code < 300:
-                head = int(response.json().get("latest_seq", 0))
-        except Exception:
-            logger.debug("event log head fetch failed — starting seq at 0", exc_info=True)
+            if not 200 <= response.status_code < 300:
+                raise ValueError(f"head request returned HTTP {response.status_code}")
+            head = response.json()["latest_seq"]
+            if type(head) is not int or head < 0:
+                raise ValueError("latest_seq must be a non-negative integer")
+        except Exception as exc:
+            # A guessed zero on a resumed session reuses persisted sequence IDs.
+            # The server cannot recover overwritten intent from conflicting rows.
+            # Match upstream's fail-before-start policy (3978c6be), preserving
+            # the buffered capture window for diagnostics instead of launching.
+            raise RuntimeError(
+                f"Cannot initialize durable event log for session {self.session_id}: "
+                "a valid head is required before starting the agent"
+            ) from exc
         await self._resume_seq_from_head(head)
         self._event_log_task = asyncio.create_task(self._event_log_flush_loop())
         logger.info("Durable event log started (resume seq=%d)", self._event_log_seq)
@@ -575,6 +607,9 @@ class EventLogMixin:
                 return
             for entry in self._event_log_buffer:
                 entry["seq"] += head
+                if entry["kind"] == "log_gap":
+                    entry["payload"]["first_seq"] += head
+                    entry["payload"]["last_seq"] += head
             self._event_log_seq += head
 
     async def _stop_event_log(self) -> None:

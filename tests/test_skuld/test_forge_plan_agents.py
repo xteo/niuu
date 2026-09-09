@@ -39,6 +39,7 @@ async def _wait_until(predicate, timeout: float = 5.0) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_plan_surfaces_to_client_and_is_tracked() -> None:
     """A TodoWrite call surfaces a structured `plan` frame + is tracked live."""
@@ -72,6 +73,7 @@ async def test_plan_surfaces_to_client_and_is_tracked() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_plan_replays_on_reconnect() -> None:
     """A client joining after the plan was set immediately receives it."""
@@ -93,6 +95,7 @@ async def test_plan_replays_on_reconnect() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_agent_lifecycle_surfaces_and_tracks() -> None:
     """A Task subagent surfaces started -> stopped agent_update frames + is tracked."""
@@ -122,6 +125,7 @@ async def test_agent_lifecycle_surfaces_and_tracks() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_running_agents_replay_on_reconnect() -> None:
     """A still-running agent is replayed to a freshly-connecting client."""
@@ -141,6 +145,7 @@ async def test_running_agents_replay_on_reconnect() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_subagent_start_stop_surfaces_and_tracks() -> None:
     """The SubagentStart/SubagentStop hooks surface + track like the Task path."""
@@ -163,6 +168,7 @@ async def test_subagent_start_stop_surfaces_and_tracks() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_task_and_subagent_signals_dedup_by_id() -> None:
     """A SubagentStart carrying the Task's tool_use_id merges, not duplicates.

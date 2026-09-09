@@ -236,6 +236,7 @@ broker:
   #   "skuld.transports.sdk.SDKTransport"                       # Claude Code (default)
   #   "skuld.transports.codex.CodexSubprocessTransport"         # OpenAI Codex
   #   "skuld.transports.grok.GrokACPTransport"                  # xAI Grok Build (ACP / Scaldy)
+  #   "skuld.transports.muse.MuseMSPTransport"                  # Meta Muse Code (MSP / Scaldy)
   transportAdapter: "skuld.transports.sdk.SDKTransport"
   # -- CLI executable used by subprocess-based transports.
   cliBinary: "claude"
@@ -247,7 +248,7 @@ broker:
   # Codex approvalPolicy=never with danger-full-access)
   skipPermissions: true
   # -- Enable Claude Code experimental Agent Teams (Claude only)
-  agentTeams: false
+  agentTeams: true
 
 # Volundr API (for token usage reporting back to the control plane)
 volundr:

@@ -185,8 +185,8 @@ class TestSkuldWsProxyTransientBlip:
                 with client.websocket_connect("/s/sess-live/session") as ws:
                     ws.receive_text()
 
-        # Closed deterministically with 4410 so the browser can branch/retry...
-        assert exc.value.code == 4410
+        # Startup/transient failure is retryable, distinct from confirmed death.
+        assert exc.value.code == 4411
         # ...but the live port is RETAINED so the very next connect can succeed.
         assert reg.get_port("sess-live") == 9100
 
@@ -525,7 +525,10 @@ class TestRootServerBuildApp:
         client = TestClient(app)
         resp = client.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        assert resp.json()["status"] == "ok"
+        assert resp.json()["revision"]
+        assert len(resp.json()["source_sha256"]) == 64
+        assert resp.json()["failed_plugins"] == []
 
     def test_cors_headers_are_only_added_when_configured(self) -> None:
         registry = PluginRegistry()
@@ -594,8 +597,8 @@ class TestRootServerBuildApp:
         client = TestClient(app)
 
         with pytest.raises(WebSocketDisconnect) as exc:
-            with client.websocket_connect("/s/dead-session/session"):
-                pass
+            with client.websocket_connect("/s/dead-session/session") as ws:
+                ws.receive_text()
 
         assert exc.value.code == 4410
         assert reconciled == ["dead-session"]
@@ -2238,32 +2241,40 @@ class TestRootServerLifespan:
             def create_api_app(self):
                 return sub_app
 
+            def api_route_domains(self):
+                return (APIRouteDomain(name="forge-api", prefixes=("/api/v1/forge",)),)
+
         registry = PluginRegistry()
         registry.register(VolundrPlugin(name="volundr"))
 
-        server = RootServer(registry=registry)
+        server = RootServer(registry=registry, enabled_mounts={"forge-api"})
         with patch.dict(os.environ, {"NIUU_NO_WEB": "true"}):
             app = server._build_app()
 
         # Should not raise despite sub-app failure
         with TestClient(app) as client:
             resp = client.get("/health")
-            assert resp.status_code == 200
+            assert resp.status_code == 503
+            assert resp.json()["status"] == "degraded"
+            assert resp.json()["failed_plugins"] == ["volundr"]
 
 
 class TestSkuldWsProxy:
     """Tests for the Skuld WebSocket proxy endpoint."""
 
     def test_ws_proxy_session_not_found(self) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
         registry = PluginRegistry()
         server = RootServer(registry=registry)
         with patch.dict(os.environ, {"NIUU_NO_WEB": "true"}):
             app = server._build_app()
         client = TestClient(app)
-        with pytest.raises(Exception):
-            # WebSocket to unknown session should close with 4004
-            with client.websocket_connect("/s/unknown/session"):
-                pass
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect("/s/unknown/session") as ws:
+                ws.receive_text()
+        # Without a liveness authority this may be a create-time race.
+        assert exc.value.code == 4411
 
 
 class TestPluginApiPrefixes:

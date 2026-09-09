@@ -6,7 +6,10 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from uuid import UUID
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from niuu.adapters.inbound.rest_credentials_settings import create_credentials_settings_router
 from niuu.adapters.inbound.rest_integrations_settings import create_integrations_settings_router
@@ -48,6 +51,7 @@ from volundr.adapters.inbound.rest_events import create_events_router
 from volundr.adapters.inbound.rest_git import create_git_router
 from volundr.adapters.inbound.rest_integrations import create_canonical_integrations_router
 from volundr.adapters.inbound.rest_issues import create_canonical_issues_router
+from volundr.adapters.inbound.rest_message_delivery import create_message_delivery_router
 from volundr.adapters.inbound.rest_oauth import create_canonical_oauth_router
 from volundr.adapters.inbound.rest_openshell_credentials import (
     create_openshell_credentials_router,
@@ -69,6 +73,7 @@ from volundr.adapters.outbound.git_registry import create_git_registry
 from volundr.adapters.outbound.linear import LinearAdapter
 from volundr.adapters.outbound.memory_secrets import InMemorySecretManager
 from volundr.adapters.outbound.pg_event_sink import PostgresEventSink
+from volundr.adapters.outbound.pg_message_delivery import PostgresMessageDelivery
 from volundr.adapters.outbound.pg_session_event_log import PostgresSessionEventLog
 from volundr.adapters.outbound.postgres import PostgresSessionRepository
 from volundr.adapters.outbound.postgres_chronicles import PostgresChronicleRepository
@@ -194,16 +199,17 @@ async def _bootstrap_startup_schema(settings: Settings) -> None:
     import asyncpg
 
     from cli.resources import migration_dir, ordered_migration_files
+    from volundr.adapters.outbound.startup_schema import apply_startup_migrations
 
     try:
         mig_dir = migration_dir("volundr")
     except FileNotFoundError:
-        logger.debug("No Volundr migrations available for startup bootstrap")
-        return
+        logger.error("Volundr startup migrations are missing; refusing an unverified schema")
+        raise
 
     sql_files = ordered_migration_files(mig_dir)
     if not sql_files:
-        return
+        raise RuntimeError("Volundr startup migration directory is empty; schema is unverified")
 
     conn = await asyncpg.connect(
         host=settings.database.host,
@@ -213,11 +219,7 @@ async def _bootstrap_startup_schema(settings: Settings) -> None:
         database=settings.database.name,
     )
     try:
-        for sql_file in sql_files:
-            try:
-                await conn.execute(sql_file.read_text())
-            except Exception:
-                logger.debug("Migration %s skipped", sql_file.name, exc_info=True)
+        await apply_startup_migrations(conn, sql_files)
     finally:
         await conn.close()
 
@@ -404,6 +406,30 @@ def create_app(
         settings = Settings()
 
     app = build_app_shell(settings)
+
+    # Observability (FORGE tmux-reconnect bug): FastAPI returns 422 for request-body
+    # validation failures but logs NOTHING about what failed — which made the repeated
+    # tmux `/activity` 422s completely invisible server-side. Log the path + the exact
+    # validation errors + a bounded slice of the offending body so the next schema
+    # mismatch (on /activity, /log, or anything else) is self-documenting. Response
+    # shape is unchanged (still 422 + {"detail": [...]}).
+    @app.exception_handler(RequestValidationError)
+    async def _log_request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        try:
+            raw_body = (await request.body())[:2000]
+            body_preview = raw_body.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 — best-effort diagnostics, never mask the 422
+            body_preview = "<unreadable>"
+        logger.warning(
+            "422 request validation: %s %s errors=%s body=%s",
+            request.method,
+            request.url.path,
+            exc.errors(),
+            body_preview,
+        )
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
     # Bifrost is its own service/plugin. Volundr no longer co-hosts it; it consumes
     # the model catalog over HTTP from settings.bifrost.url for cost/pricing only.
@@ -882,6 +908,7 @@ def create_app(
                     session_service,
                     allowed_workspace_prefixes=settings.local_mounts.allowed_prefixes,
                     allow_root_workspace=settings.local_mounts.allow_root_mount,
+                    event_log_repository=session_event_log,
                 )
 
             # Create and include routers
@@ -1141,6 +1168,25 @@ def create_app(
                 default_show_internal=settings.replay.default_show_internal,
             )
             app.include_router(session_log_router)
+            app.include_router(
+                create_message_delivery_router(PostgresMessageDelivery(pool), session_service)
+            )
+
+            # Replay-as-live: paced re-emit of recorded frames over a WebSocket,
+            # speaking the live-session frame protocol so existing clients
+            # (web SessionSocket, ?qa=stream, iOS) render a finished session live.
+            if settings.replay.enabled:
+                from volundr.adapters.inbound.ws_session_replay import (
+                    create_session_replay_router,
+                )
+
+                session_replay_router = create_session_replay_router(
+                    session_event_log,
+                    session_service=session_service,
+                    prefix="/api/v1/forge",
+                    config=settings.replay,
+                )
+                app.include_router(session_replay_router)
 
             # Replay-as-live: paced re-emit of recorded frames over a WebSocket,
             # speaking the live-session frame protocol so existing clients

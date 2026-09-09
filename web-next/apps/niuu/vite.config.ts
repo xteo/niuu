@@ -152,6 +152,7 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    allowedHosts: ['thor.tail737f2a.ts.net', 'thor-host.tail737f2a.ts.net'],
     proxy: {
       '/api': {
         target: apiProxyTarget,

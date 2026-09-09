@@ -1,7 +1,7 @@
 """CodexWebSocketTransport — Codex app-server over WebSocket (JSON-RPC 2.0).
 
-Spawns ``codex app-server --listen ws://127.0.0.1:PORT`` and connects to it as a
-WebSocket client over loopback. Communication uses JSON-RPC 2.0
+Spawns ``codex app-server --listen unix://PATH`` and connects to it as a
+WebSocket client over the Unix socket. Communication uses JSON-RPC 2.0
 (requests, responses, notifications) rather than the NDJSON protocol used by
 Claude's ``--sdk-url``.
 
@@ -11,16 +11,24 @@ connects back to Skuld.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shlex
+import shutil
+import sys
+import tempfile
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
+from typing import Any
 
 import websockets
-from websockets.asyncio.client import ClientConnection
-from websockets.asyncio.client import connect as ws_connect
+from websockets.asyncio.client import ClientConnection, unix_connect
 
 from niuu.adapters.cli.runtime import (
     drain_process_stream as _drain_stream,
@@ -31,6 +39,7 @@ from niuu.adapters.cli.runtime import (
 from niuu.adapters.cli.runtime import (
     stop_subprocess as _stop_process,
 )
+from niuu.domain.transcript_reducer import TOOL_ENDED_AT
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.codex_auth import CodexAuthProviderError, CodexAuthProviderPort, HostCodexAuthProvider
 from skuld.transports.codex import (
@@ -39,9 +48,28 @@ from skuld.transports.codex import (
     resolve_codex_cli,
 )
 from skuld.transports.mcp_config import build_codex_mcp_overrides
+from skuld.transports.owned_codex_process import OwnedCodexProcess, OwnedProcessError
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
+
+
+@dataclass
+class _CodexTextItem:
+    """One public native message, independent of other messages in its turn."""
+
+    id: str
+    index: int
+    id_source: str
+    thread_id: str | None = None
+    turn_id: str | None = None
+    phase: str | None = None
+    private: bool = False
+    started: bool = False
+    completion_fingerprint: str | None = None
+    streamed_hash: Any = field(default_factory=hashlib.sha256)
+    streamed_bytes: int = 0
+
 
 _MAX_WS_FRAME_BYTES = 1024 * 1024
 _WS_FRAME_HEADROOM_BYTES = 8 * 1024
@@ -92,8 +120,11 @@ _CODEX_APP_SERVER_SLASH_BY_NAME = {
 _next_id = count(1)
 
 # Codex models whose app-server build accepts the `ultra` reasoning effort.
-# Sol supports it, but Völundr deliberately defaults every model to `high`.
-_ULTRA_EFFORT_MODELS = ("gpt-5.6-sol",)
+# GPT-5.6 Sol introduced Ultra (subagent-parallel reasoning); GPT-6 Astra keeps
+# it (its bundled Codex metadata lists low/medium/high/xhigh/max/ultra, where
+# ultra = maximum reasoning with automatic task delegation). Every earlier
+# Codex model tops out at `high`, so `ultra` must be clamped for them.
+_ULTRA_EFFORT_MODELS = ("gpt-5.6-sol", "gpt-6-astra")
 
 
 def _model_supports_ultra(model: str) -> bool:
@@ -104,8 +135,12 @@ def _model_supports_ultra(model: str) -> bool:
 def _codex_effort_for_model(model: str) -> str:
     """Default reasoning effort to push a new Codex session to, by model.
 
-    Völundr defaults all Codex models, including GPT-5.6 Sol, to ``high``.
+    GPT-6 Astra and GPT-5.6 Sol default to the ``ultra`` effort; every other
+    Codex model keeps the ``high`` default (their app-server build has no
+    ultra tier).
     """
+    if _model_supports_ultra(model):
+        return "ultra"
     return "high"
 
 
@@ -194,7 +229,7 @@ class CodexWebSocketTransport(CLITransport):
     """Long-lived Codex app-server process controlled via WebSocket JSON-RPC.
 
     Lifecycle:
-        1. ``start()`` spawns ``codex app-server --listen ws://127.0.0.1:PORT``
+        1. ``start()`` spawns ``codex app-server --listen unix://PATH``
         2. Skuld connects to the server as a WebSocket client
         3. JSON-RPC ``initialize`` handshake, then ``thread/start``
         4. User messages are sent via ``turn/start``
@@ -216,17 +251,22 @@ class CodexWebSocketTransport(CLITransport):
         system_prompt: str = "",
         initial_prompt: str = "",
         codex_port: int = 0,
+        codex_receive_max_bytes: int = _DEFAULT_MAX_WS_MESSAGE_BYTES,
+        live_frame_max_bytes: int = 900 * 1024,
         mcp_servers: list[dict] | None = None,
         resume_session_id: str = "",
         reasoning_effort: str = "",
-        max_ws_message_bytes: int = _DEFAULT_MAX_WS_MESSAGE_BYTES,
+        max_ws_message_bytes: int | None = None,
         codex_auth_provider: CodexAuthProviderPort | None = None,
+        session_id: str = "",
         **_kwargs: object,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
         self._model = model
-        # Default every Codex model to high unless launch configuration overrides it.
+        # Default reasoning effort by model when none is specified — GPT-6 Astra
+        # and GPT-5.6 Sol launch at the `ultra` tier, every other Codex model at
+        # `high`.
         self._reasoning_effort = reasoning_effort or _codex_effort_for_model(model)
         self._skip_permissions = skip_permissions
         self._approval_policy = approval_policy.strip()
@@ -234,16 +274,40 @@ class CodexWebSocketTransport(CLITransport):
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
         self._codex_port = codex_port or _pick_free_port()
+        # Preserve the earlier constructor keyword while routing both names to
+        # the actual native socket receive bound.
+        receive_limit = (
+            max(_MIN_MAX_WS_MESSAGE_BYTES, int(max_ws_message_bytes))
+            if max_ws_message_bytes is not None
+            else codex_receive_max_bytes
+        )
+        if receive_limit <= 0:
+            raise ValueError("codex_receive_max_bytes must be positive")
+        self._receive_max_bytes = receive_limit
+        if live_frame_max_bytes <= 0:
+            raise ValueError("live_frame_max_bytes must be positive")
+        self._live_frame_max_bytes = live_frame_max_bytes
         self._mcp_servers = list(mcp_servers or [])
         self._mcp_overrides = build_codex_mcp_overrides(self._mcp_servers)
         self._resume_session_id = (resume_session_id or "").strip() or None
-        self._max_ws_message_bytes = max(_MIN_MAX_WS_MESSAGE_BYTES, int(max_ws_message_bytes))
         self._env = dict(os.environ)
         self._codex_auth_provider = codex_auth_provider or HostCodexAuthProvider()
+        self._process_owner = (
+            OwnedCodexProcess(
+                session_id,
+                workspace_dir,
+                Path(self._env.get("SKULD__PERSISTENCE_MOUNT_PATH") or Path.home() / ".niuu"),
+            )
+            if sys.platform == "linux" and session_id
+            else None
+        )
 
         self._process: asyncio.subprocess.Process | None = None
         self._ws: ClientConnection | None = None
         self._receive_task: asyncio.Task | None = None
+        self._compaction_task: asyncio.Task | None = None
+        self._codex_socket_dir: str | None = None
+        self._codex_socket_path: str | None = None
         self._fallback_transport: CodexSubprocessTransport | None = None
         self._thread_id: str | None = None
         self._current_turn_id: str | None = None
@@ -251,13 +315,18 @@ class CodexWebSocketTransport(CLITransport):
         self._turn_error: str | None = None
         self._last_usage: dict | None = None
         self._alive = False
+        self._start_lock = asyncio.Lock()
         self._block_index: int = 0
+        self._text_items: dict[str, _CodexTextItem] = {}
+        self._active_text_item_id: str | None = None
         self._pending_redirects: list[str] = []
         # Steering correlation, mirroring the tmux transport. (msg_id, request_id) is recorded when
         # we fire a turn/start for a user message and popped on the matching turn/started to emit
         # a `user_consumed` event (which the broker turns into the pending→active flip). One
         # turn/start ⇒ one turn/started ⇒ one pop, so a single FIFO stays aligned.
         self._pending_prompt_correlations: list[tuple[str | None, str | None]] = []
+        self._current_turn_request_id: str | None = None
+        self._completed_turn_ids: set[str] = set()
         # Parallel to _pending_redirects. INVARIANT: every append/drain of _pending_redirects
         # mirrors _redirect_correlations in the SAME branch, so when queued mid-turn redirects are
         # coalesced into one replacement turn we still flip the right N bubbles.
@@ -276,6 +345,32 @@ class CodexWebSocketTransport(CLITransport):
         # Pending approval RPC ids keyed by string request_id. The second value
         # identifies which app-server approval response shape the request needs.
         self._pending_approvals: dict[str, tuple[int, str] | int] = {}
+        self._pending_user_inputs: dict[str, tuple[object, list[dict]]] = {}
+        self._answer_lock = asyncio.Lock()
+        self._agent_states: dict[str, str] = {}
+
+    async def _emit(self, data: dict) -> None:
+        """Carry native identity through normalization so clients can reject stale frames."""
+        if data.get("type") in {
+            "assistant",
+            "user",
+            "result",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "plan",
+            "user_consumed",
+            "agent_status",
+        }:
+            data = dict(data)
+            if self._thread_id:
+                data.setdefault("thread_id", self._thread_id)
+            if self._current_turn_id:
+                data.setdefault("turn_id", self._current_turn_id)
+            if self._current_turn_request_id:
+                data.setdefault("request_id", self._current_turn_request_id)
+        await super()._emit(data)
 
     def _permission_thread_params(self) -> dict[str, str]:
         """Return Codex thread permission params for start/resume."""
@@ -312,6 +407,19 @@ class CodexWebSocketTransport(CLITransport):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        async with self._start_lock:
+            if self.is_alive:
+                return
+            # A dropped socket does not end the conversation. Reuse the thread
+            # selected by the previous successful handshake, even when the
+            # transport was originally created without a resume_session_id.
+            if self._thread_id:
+                self._resume_session_id = self._thread_id
+            if self._process or self._ws or self._receive_task or self._fallback_transport:
+                await self.stop()
+            await self._start()
+
+    async def _start(self) -> None:
         try:
             await self._spawn_app_server()
             await self._connect_ws()
@@ -320,7 +428,16 @@ class CodexWebSocketTransport(CLITransport):
             await self._emit({"type": "error", "error": str(exc)})
             await self.stop()
             raise
+        except OwnedProcessError:
+            await self.stop()
+            # A competing or unverifiable writer must never trigger a fresh-thread fallback.
+            raise
         except Exception as exc:
+            # The subprocess adapter cannot resume app-server history. Falling
+            # back here would silently replace the user's conversation.
+            if self._resume_session_id or self._thread_id:
+                await self.stop()
+                raise RuntimeError("Could not resume the existing Codex conversation") from exc
             await self._start_fallback_transport(exc)
             return
 
@@ -336,8 +453,17 @@ class CodexWebSocketTransport(CLITransport):
 
         self._alive = False
 
+        await self._finalize_stranded_turn("cancelled", "Codex transport stopped")
+
+        if self._compaction_task and not self._compaction_task.done():
+            self._compaction_task.cancel()
+            await asyncio.gather(self._compaction_task, return_exceptions=True)
+        self._compaction_task = None
+
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
+            await asyncio.gather(self._receive_task, return_exceptions=True)
+        self._receive_task = None
 
         if self._ws:
             try:
@@ -346,9 +472,19 @@ class CodexWebSocketTransport(CLITransport):
                 logger.debug("Error closing Codex WS: %r", exc)
             self._ws = None
 
-        if self._process:
-            await _stop_process(self._process)
-            self._process = None
+        try:
+            if self._process:
+                with suppress(ProcessLookupError):
+                    await _stop_process(self._process)
+                self._process = None
+        finally:
+            if self._process_owner:
+                self._process_owner.release()
+
+        if self._codex_socket_dir:
+            shutil.rmtree(self._codex_socket_dir, ignore_errors=True)
+            self._codex_socket_dir = None
+            self._codex_socket_path = None
 
         # Cancel any awaiting RPC futures.
         for fut in self._pending.values():
@@ -386,7 +522,13 @@ class CodexWebSocketTransport(CLITransport):
     # ------------------------------------------------------------------
 
     async def _spawn_app_server(self) -> None:
-        listen_url = f"ws://127.0.0.1:{self._codex_port}"
+        if self._process_owner:
+            await self._process_owner.acquire()
+        if self._codex_socket_dir:
+            shutil.rmtree(self._codex_socket_dir, ignore_errors=True)
+        self._codex_socket_dir = tempfile.mkdtemp(prefix="skuld-codex-")
+        self._codex_socket_path = os.path.join(self._codex_socket_dir, "app-server.sock")
+        listen_url = f"unix://{self._codex_socket_path}"
         codex_cli = resolve_codex_cli()
 
         _, shim_env = ensure_codex_tool_shims(
@@ -417,13 +559,16 @@ class CodexWebSocketTransport(CLITransport):
             listen_url,
             env.get("CODEX_HOME", ""),
         )
+        spawn_cmd = self._process_owner.spawn_command(cmd, env) if self._process_owner else cmd
         self._process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *spawn_cmd,
             cwd=self.workspace_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
+        if self._process_owner:
+            self._process_owner.record_child(self._process.pid, cmd, spawn_cmd)
         logger.info("Codex app-server PID %s", self._process.pid)
 
         asyncio.create_task(_drain_stream(self._process.stdout, "codex-app-stdout"))
@@ -431,17 +576,20 @@ class CodexWebSocketTransport(CLITransport):
 
     async def _connect_ws(self) -> None:
         """Connect to the Codex app-server with retries."""
-        uri = f"ws://127.0.0.1:{self._codex_port}"
+        socket_path = self._codex_socket_path
+        if not socket_path:
+            raise RuntimeError("Codex socket path missing before connect")
+        uri = "ws://localhost/"
         max_attempts = 30
         for attempt in range(1, max_attempts + 1):
             if self._process and self._process.returncode is not None:
                 raise RuntimeError(f"Codex app-server exited with code {self._process.returncode}")
             try:
-                self._ws = await ws_connect(
-                    uri,
+                self._ws = await unix_connect(
+                    path=socket_path,
+                    uri=uri,
                     compression=None,
-                    max_size=self._max_ws_message_bytes,
-                    proxy=None,
+                    max_size=self._receive_max_bytes,
                 )
                 logger.info("Connected to Codex app-server (attempt %d)", attempt)
                 self._alive = True
@@ -450,7 +598,7 @@ class CodexWebSocketTransport(CLITransport):
             except (OSError, websockets.exceptions.InvalidHandshake):
                 if attempt == max_attempts:
                     raise RuntimeError(
-                        f"Could not connect to Codex app-server at {uri} "
+                        f"Could not connect to Codex app-server at {socket_path} "
                         f"after {max_attempts} attempts"
                     )
                 await asyncio.sleep(0.5)
@@ -471,18 +619,15 @@ class CodexWebSocketTransport(CLITransport):
 
         try:
             payload = _encode_rpc_message(msg, method)
-        except Exception:
-            self._pending.pop(rid, None)
-            raise
-
-        await self._ws.send(payload)
-        logger.debug("RPC → %s id=%d", method, rid)
-
-        try:
+            await self._ws.send(payload)
+            logger.debug("RPC → %s id=%d", method, rid)
             return await asyncio.wait_for(fut, timeout=60.0)
         except TimeoutError:
-            self._pending.pop(rid, None)
             raise RuntimeError(f"RPC timeout for {method} (id={rid})")
+        finally:
+            self._pending.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
 
     async def _send_notification(self, method: str) -> None:
         """Send a JSON-RPC notification (fire-and-forget)."""
@@ -528,7 +673,10 @@ class CodexWebSocketTransport(CLITransport):
 
             result = await self._send_rpc("thread/resume", resume_params)
             thread = result.get("thread", {})
-            self._thread_id = thread.get("id") or self._resume_session_id
+            resumed_id = thread.get("id") or self._resume_session_id
+            if resumed_id != self._resume_session_id:
+                raise RuntimeError("Codex resumed a different conversation than requested")
+            self._thread_id = resumed_id
             logger.info("Codex thread resumed: %s", self._thread_id)
         else:
             thread_params: dict = {
@@ -596,6 +744,8 @@ class CodexWebSocketTransport(CLITransport):
         """Read JSON-RPC messages from the Codex WebSocket."""
         logger.info("Codex WS receive loop started")
         msg_count = 0
+        failure_detail = "Codex WebSocket closed"
+        last_method = "unknown frame"
         try:
             async for raw in self._ws:
                 if isinstance(raw, bytes):
@@ -606,8 +756,12 @@ class CodexWebSocketTransport(CLITransport):
                 except json.JSONDecodeError:
                     logger.warning("Non-JSON from Codex WS: %.200s", raw)
                     continue
+                if not isinstance(data, dict):
+                    logger.warning("Ignoring non-object Codex WS frame")
+                    continue
 
                 msg_count += 1
+                last_method = str(data.get("method") or data.get("type") or "RPC response")
 
                 # JSON-RPC response (has "id" + "result" or "error")
                 if "id" in data and ("result" in data or "error" in data):
@@ -637,10 +791,80 @@ class CodexWebSocketTransport(CLITransport):
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            failure_detail = (
+                f"Codex event reader closed for {last_method} ({type(exc).__name__}): {exc}"
+            )
             logger.warning("Codex WS receive error: %r", exc, exc_info=True)
         finally:
             self._alive = False
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError(failure_detail))
+            self._pending.clear()
+            await self._finalize_stranded_turn("error", failure_detail)
             logger.info("Codex WS receive loop ended after %d messages", msg_count)
+
+    async def _finalize_stranded_turn(
+        self, reason: str, detail: str, *, force: bool = False
+    ) -> None:
+        """Close a lost turn before any await so EOF and stop cannot double-close it."""
+        active = bool(force or self._current_turn_id or self._active_user_prompt)
+        turn_id = self._current_turn_id
+        turn_request_id = self._current_turn_request_id
+        if turn_id:
+            self._completed_turn_ids.add(turn_id)
+        self._current_turn_id = None
+        self._active_user_prompt = None
+        self._pending_context_retry_prompt = None
+        self._context_compaction_active = False
+        self._context_compaction_starting = False
+        self._context_compaction_turn_id = None
+        self._pending_prompt_correlations.clear()
+        self._pending_redirects.clear()
+        self._redirect_correlations.clear()
+        self._redirect_interrupt_requested = False
+        self._pending_approvals.clear()
+        pending_questions = list(self._pending_user_inputs)
+        self._pending_user_inputs.clear()
+        running_agents = [
+            agent_id
+            for agent_id, state in self._agent_states.items()
+            if state in {"running", "started", "pendingInit"}
+        ]
+        self._agent_states.clear()
+        self._buffered_item_output.clear()
+        for request_id in pending_questions:
+            await self._emit(
+                {
+                    "type": "ask_user_resolved",
+                    "request_id": request_id,
+                    "decision": "transport_closed",
+                    "accepted": False,
+                }
+            )
+        for agent_id in running_agents:
+            await self._emit(
+                {
+                    "type": "agent_update",
+                    "action": "stopped",
+                    "agent": {"id": agent_id, "kind": "subagent", "status": "failed"},
+                    "metadata": {"source": "codex_app_server", "reason": detail},
+                }
+            )
+        if not active:
+            return
+        self._last_result = {
+            "type": "result",
+            "result": "",
+            "stop_reason": reason,
+            "is_error": reason == "error",
+            "error": detail,
+            "modelUsage": self._last_usage or {},
+            **({"turn_id": turn_id} if turn_id else {}),
+            **({"request_id": turn_request_id} if turn_request_id else {}),
+        }
+        await self._emit(self._last_result)
+        self._current_turn_request_id = None
 
     def _resolve_pending(self, data: dict) -> None:
         """Match a JSON-RPC response to its pending future."""
@@ -666,6 +890,49 @@ class CodexWebSocketTransport(CLITransport):
         params = data.get("params", {})
         logger.debug("Codex notification: %s", method)
 
+        event_thread = params.get("threadId")
+        if method == "thread/started":
+            # Unlike other native notifications, thread/started nests its ID.
+            # Worker starts must not replace the conversation receiving input.
+            event_thread = params.get("thread", {}).get("id")
+        bound_thread = self._thread_id or self._resume_session_id
+        if "id" not in data and bound_thread and event_thread and event_thread != bound_thread:
+            # app-server multiplexes worker threads onto the same socket. Their
+            # text and turn/completed notifications must never finalize the parent.
+            await self._emit(
+                {
+                    "type": "agent_event",
+                    "agent_id": event_thread,
+                    "method": method,
+                    "payload": params,
+                    "metadata": {"source": "codex_app_server"},
+                }
+            )
+            return
+
+        event_turn = params.get("turnId")
+        if not event_turn and isinstance(params.get("turn"), dict):
+            event_turn = params["turn"].get("id")
+        if (
+            "id" not in data
+            and isinstance(event_turn, str)
+            and method != "turn/started"
+            and (
+                event_turn in self._completed_turn_ids
+                or (self._current_turn_id and event_turn != self._current_turn_id)
+            )
+        ):
+            await self._emit(
+                {
+                    "type": "agent_event",
+                    "method": method,
+                    "thread_id": event_thread,
+                    "turn_id": event_turn,
+                    "metadata": {"reason": "stale_turn_event"},
+                }
+            )
+            return
+
         # --- Server requests (need a response) ---
         if "id" in data:
             await self._handle_server_request(data)
@@ -673,7 +940,12 @@ class CodexWebSocketTransport(CLITransport):
 
         # --- Streaming text ---
         if method == "item/agentMessage/delta":
-            await self._emit_text_delta(params.get("delta", ""))
+            await self._emit_text_delta(
+                params.get("delta", ""),
+                item_id=params.get("itemId"),
+                phase=params.get("phase") or params.get("channel"),
+                context={"thread_id": event_thread, "turn_id": event_turn},
+            )
             return
 
         # --- Reasoning / thinking ---
@@ -691,14 +963,23 @@ class CodexWebSocketTransport(CLITransport):
         # --- Turn lifecycle ---
         if method == "turn/started":
             turn = params.get("turn", {})
+            if turn.get("id") != self._current_turn_id:
+                self._text_items.clear()
+                self._active_text_item_id = None
+                self._block_index = 0
             self._current_turn_id = turn.get("id")
-            self._block_index = 0
             if self._is_context_compaction_turn(turn):
                 self._context_compaction_active = True
                 self._context_compaction_starting = False
                 self._context_compaction_turn_id = self._current_turn_id
                 logger.info("Codex context compaction turn started: %s", self._current_turn_id)
                 return
+            correlation = (
+                self._pending_prompt_correlations.pop(0)
+                if self._pending_prompt_correlations
+                else (None, None)
+            )
+            self._current_turn_request_id = correlation[1]
             # Emit an assistant event to signal a new streaming message.
             # The browser uses this to create a new message with status 'running'.
             await self._emit(
@@ -714,13 +995,12 @@ class CodexWebSocketTransport(CLITransport):
             # that requested this turn and tell the broker (which flips it pending→active and
             # broadcasts user_active). A non-compaction turn/started always pairs with one
             # send_message → one correlation push, so a single pop stays aligned.
-            if self._pending_prompt_correlations:
-                msg_id, request_id = self._pending_prompt_correlations.pop(0)
-                await self._emit_user_consumed(msg_id, request_id)
+            await self._emit_user_consumed(*correlation)
             return
 
         if method == "turn/completed":
             turn = params.get("turn", {})
+            completed_turn_id = turn.get("id") or self._current_turn_id
             self._current_turn_id = None
 
             if self._is_context_compaction_turn(turn):
@@ -732,7 +1012,9 @@ class CodexWebSocketTransport(CLITransport):
                 recovered = await self._recover_from_context_window_exceeded(message)
                 if recovered:
                     return
+                self._current_turn_id = completed_turn_id
                 await self._emit({"type": "error", "error": message})
+                await self._finalize_stranded_turn("error", message, force=True)
                 return
 
             self._active_user_prompt = None
@@ -750,10 +1032,21 @@ class CodexWebSocketTransport(CLITransport):
             usage = self._last_usage or {}
             self._last_result = {
                 "type": "result",
-                "stop_reason": "end_turn",
+                "result": "",
+                "stop_reason": {
+                    "failed": "error",
+                    "interrupted": "cancelled",
+                }.get(turn.get("status"), "end_turn"),
+                "is_error": turn.get("status") == "failed",
                 "modelUsage": usage,
+                **({"turn_id": completed_turn_id} if completed_turn_id else {}),
             }
+            if turn.get("error"):
+                self._last_result["error"] = self._turn_error_message(turn)
             await self._emit(self._last_result)
+            if completed_turn_id:
+                self._completed_turn_ids.add(completed_turn_id)
+            self._current_turn_request_id = None
             next_prompt, redirect_correlations = self._consume_pending_redirects()
             if next_prompt is not None:
                 logger.info("Codex redirect: starting replacement turn after interrupt")
@@ -799,15 +1092,47 @@ class CodexWebSocketTransport(CLITransport):
                 )
             return
 
+        if method == "turn/plan/updated":
+            tasks = [
+                {
+                    "content": step["step"],
+                    "status": "in_progress" if step["status"] == "inProgress" else step["status"],
+                }
+                for step in params.get("plan", [])
+                if isinstance(step, dict)
+                and isinstance(step.get("step"), str)
+                and step.get("status")
+            ]
+            await self._emit(
+                {
+                    "type": "plan",
+                    "event_type": "codex.plan",
+                    "tasks": tasks,
+                    "counts": {
+                        "total": len(tasks),
+                        **{
+                            status: sum(t["status"] == status for t in tasks)
+                            for status in ("pending", "in_progress", "completed")
+                        },
+                    },
+                    "metadata": {"source": "codex_app_server"},
+                }
+            )
+            return
+
         # --- Item lifecycle (tool calls, agent text blocks) ---
         if method == "item/started":
             item = params.get("item", {})
-            await self._handle_item_started(item)
+            await self._handle_item_started(
+                item, text_context={"thread_id": event_thread, "turn_id": event_turn}
+            )
             return
 
         if method == "item/completed":
             item = params.get("item", {})
-            await self._handle_item_completed(item)
+            await self._handle_item_completed(
+                item, text_context={"thread_id": event_thread, "turn_id": event_turn}
+            )
             return
 
         if method == "rawResponseItem/completed":
@@ -861,6 +1186,7 @@ class CodexWebSocketTransport(CLITransport):
 
         if method == "thread/closed":
             self._alive = False
+            await self._finalize_stranded_turn("error", "Codex thread closed")
             return
 
         logger.debug("Codex: unhandled notification %s", method)
@@ -965,9 +1291,27 @@ class CodexWebSocketTransport(CLITransport):
             await self._send_rpc_response(rid, tokens.app_server_payload())
             return
 
+        if method == "item/tool/requestUserInput":
+            request_id = f"codex-question-{rid}-{uuid.uuid4().hex}"
+            questions = [
+                {**question, "options": question.get("options") or []}
+                for question in params.get("questions", [])
+            ]
+            self._pending_user_inputs[request_id] = (rid, questions)
+            await self._emit(
+                {
+                    "type": "ask_user_question",
+                    "request_id": request_id,
+                    "questions": questions,
+                    "metadata": {"source": "codex_app_server"},
+                }
+            )
+            return
+
         if method == "item/commandExecution/requestApproval":
-            request_id = str(rid)
+            request_id = f"codex-approval-{rid}-{uuid.uuid4().hex}"
             command = params.get("command", "")
+            self._pending_approvals[request_id] = (rid, "command_execution")
             await self._emit(
                 {
                     "type": "control_request",
@@ -977,12 +1321,12 @@ class CodexWebSocketTransport(CLITransport):
                     "input": {"command": command},
                 }
             )
-            self._pending_approvals[request_id] = (rid, "command_execution")
             return
 
         if method == "execCommandApproval":
-            request_id = str(rid)
+            request_id = f"codex-approval-{rid}-{uuid.uuid4().hex}"
             command = self._display_command(params.get("command"))
+            self._pending_approvals[request_id] = (rid, "exec_command")
             await self._emit(
                 {
                     "type": "control_request",
@@ -996,7 +1340,6 @@ class CodexWebSocketTransport(CLITransport):
                     },
                 }
             )
-            self._pending_approvals[request_id] = (rid, "exec_command")
             return
 
         if method in (
@@ -1004,7 +1347,8 @@ class CodexWebSocketTransport(CLITransport):
             "item/permissions/requestApproval",
             "applyPatchApproval",
         ):
-            request_id = str(rid)
+            request_id = f"codex-approval-{rid}-{uuid.uuid4().hex}"
+            self._pending_approvals[request_id] = (rid, "command_execution")
             await self._emit(
                 {
                     "type": "control_request",
@@ -1014,7 +1358,6 @@ class CodexWebSocketTransport(CLITransport):
                     "input": params,
                 }
             )
-            self._pending_approvals[request_id] = (rid, "command_execution")
             return
 
         if method == "item/tool/call":
@@ -1268,6 +1611,144 @@ class CodexWebSocketTransport(CLITransport):
         """Emit a content_block_stop event."""
         await self._emit({"type": "content_block_stop"})
 
+    def _text_item(
+        self, identifier: object, *, phase: object = None, context: dict | None = None
+    ) -> _CodexTextItem:
+        native_id = identifier if isinstance(identifier, str) and identifier else None
+        context = context or {}
+        thread_id = context.get("thread_id") or self._thread_id
+        turn_id = context.get("turn_id") or self._current_turn_id
+        thread_id = thread_id if isinstance(thread_id, str) else None
+        turn_id = turn_id if isinstance(turn_id, str) else None
+        key = native_id or self._active_text_item_id
+        state = self._text_items.get(key) if key else None
+        if state is not None and (
+            (thread_id and state.thread_id and thread_id != state.thread_id)
+            or (turn_id and state.turn_id and turn_id != state.turn_id)
+        ):
+            state = None
+        if state is None:
+            state = _CodexTextItem(
+                id=native_id or f"codex-text-{uuid.uuid4()}",
+                index=self._next_block_index(),
+                id_source="native" if native_id else "synthetic",
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+            self._text_items[state.id] = state
+        else:
+            state.thread_id = state.thread_id or thread_id
+            state.turn_id = state.turn_id or turn_id
+        if isinstance(phase, str) and phase in {"commentary", "final_answer"}:
+            state.phase = phase
+        elif phase == "analysis":
+            state.private = True
+        return state
+
+    def _text_context(self, state: _CodexTextItem) -> dict:
+        context = {"item_id": state.id, "index": state.index}
+        if state.thread_id:
+            context["thread_id"] = state.thread_id
+        if state.turn_id:
+            context["turn_id"] = state.turn_id
+        if state.phase:
+            context["phase"] = state.phase
+        if state.id_source == "synthetic":
+            context["metadata"] = {"text_identity_source": "synthetic"}
+        return context
+
+    def _text_block(self, state: _CodexTextItem, text: str, *, complete: bool) -> dict:
+        block = {
+            "type": "text",
+            "id": state.id,
+            "text": text,
+            "index": state.index,
+            "id_source": state.id_source,
+            "complete": complete,
+        }
+        if state.phase:
+            block["phase"] = state.phase
+        if state.thread_id:
+            block["thread_id"] = state.thread_id
+        if state.turn_id:
+            block["turn_id"] = state.turn_id
+        return block
+
+    async def _start_text_item(self, state: _CodexTextItem) -> None:
+        if state.private or state.started or state.completion_fingerprint is not None:
+            return
+        await self._emit(
+            {
+                "type": "content_block_start",
+                **self._text_context(state),
+                "content_block": self._text_block(state, "", complete=False),
+            }
+        )
+        state.started = True
+        self._active_text_item_id = state.id
+
+    async def _complete_text_item(self, item: dict, *, context: dict | None = None) -> bool:
+        """Reconcile authoritative text at its original anchor, once per completion.
+
+        A full native completion can repair missed or partial deltas. Its text
+        is an identity-based replacement, never another append to streamed text.
+        The boolean also prevents a repeated item from reopening an async question.
+        """
+        state = self._text_item(
+            item.get("id"), phase=item.get("phase") or item.get("channel"), context=context
+        )
+        text = item.get("text")
+        fingerprint = hashlib.sha256(
+            json.dumps([text if isinstance(text, str) else None, state.phase]).encode()
+        ).hexdigest()
+        if state.private or state.completion_fingerprint == fingerprint:
+            return False
+        first_completion = state.completion_fingerprint is None
+        text_proof = {}
+        if isinstance(text, str):
+            await self._start_text_item(state)
+            completion = {
+                "type": "assistant",
+                **self._text_context(state),
+                "message": {
+                    "model": self._model,
+                    "content": [self._text_block(state, text, complete=True)],
+                },
+            }
+            encoded_text = text.encode("utf-8")
+            text_proof = {
+                "text_bytes": len(encoded_text),
+                "text_sha256": hashlib.sha256(encoded_text).hexdigest(),
+            }
+            streamed_matches = (
+                len(encoded_text) == state.streamed_bytes
+                and hashlib.sha256(encoded_text).digest() == state.streamed_hash.digest()
+            )
+            # The live channel accepts 900 KiB by default, while Codex can send
+            # a 16 MiB native item. A redundant whole-message copy need not turn
+            # a successfully streamed answer into a REST recovery notice. Reserve
+            # room for broker envelope fields using the exact channel serializer.
+            oversized = len(json.dumps(completion, ensure_ascii=False).encode("utf-8")) > max(
+                1, self._live_frame_max_bytes - _WS_FRAME_HEADROOM_BYTES
+            )
+            if not (streamed_matches and oversized):
+                # Missing/partial/mismatching text still enters the durable log
+                # whole. The existing channel projection provides explicit REST
+                # recovery if it cannot fit; it never truncates authoritative text.
+                await self._emit(completion)
+        await self._emit(
+            {
+                "type": "content_block_stop",
+                **self._text_context(state),
+                "complete": True,
+                **text_proof,
+            }
+        )
+        state.completion_fingerprint = fingerprint
+        if self._active_text_item_id == state.id:
+            self._active_text_item_id = None
+        return first_completion
+
     async def _emit_tool_result(
         self, tool_use_id: str, content: str, *, is_error: bool = False
     ) -> None:
@@ -1288,6 +1769,25 @@ class CodexWebSocketTransport(CLITransport):
         }
         if is_error:
             block["is_error"] = True
+        # D1 per-tool timing — the end stamp a hierarchical row reads for "ran in 3m 12s".
+        block[TOOL_ENDED_AT] = datetime.now(UTC).isoformat()
+
+        # DURABLE FIRST, browser second.
+        #
+        # This used to emit ONLY the content_block lifecycle below, which is a
+        # browser-facing stream: neither the transcript reducer nor the broker's live
+        # turn assembly consumes `content_block_start`. So a Codex session persisted
+        # its tool CALLS with no results at all — verified on a real session, which
+        # stored 2 tool_use parts, zero tool_result, and no per-tool end stamp. In
+        # hierarchical mode that is a tool row whose output never arrives.
+        #
+        # A tool_result belongs in a **user** frame carrying the `message` envelope:
+        # that is the Anthropic convention (model calls, harness answers), it is the
+        # only shape the reducer harvests results from, and the broker recognises such
+        # a frame via `_is_tool_result_only_user_event` so it never shows as a user
+        # turn. Same fault, same fix as the Grok transport.
+        await self._emit({"type": "user", "message": {"content": [block]}, "content": [block]})
+
         await self._emit_content_block_start(block)
         await self._emit_content_block_stop()
 
@@ -1325,10 +1825,29 @@ class CodexWebSocketTransport(CLITransport):
             }
         )
 
-    async def _handle_item_started(self, item: dict) -> None:
+    async def _handle_item_started(self, item: dict, *, text_context: dict | None = None) -> None:
         """Emit proper content_block lifecycle events when an item starts."""
         item_type = item.get("type", "")
         item_id = item.get("id", "")
+
+        if item_type == "collabAgentToolCall":
+            name = "Agent" if item.get("tool") == "spawnAgent" else f"Agent:{item.get('tool')}"
+            await self._emit_tool_use(
+                item_id,
+                name,
+                {
+                    "prompt": item.get("prompt"),
+                    "receiverThreadIds": item.get("receiverThreadIds", []),
+                    "senderThreadId": item.get("senderThreadId"),
+                    "model": item.get("model"),
+                },
+            )
+            return
+
+        if item_type == "subAgentActivity":
+            # The installed Codex build exposes native collaboration as an
+            # instantaneous activity item, not a collabAgentToolCall pair.
+            return
 
         if item_type == "commandExecution":
             await self._emit_tool_use(item_id, "Bash", {"command": item.get("command", "")})
@@ -1354,12 +1873,10 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         if item_type == "agentMessage":
-            # Start a text content block — deltas will follow via agentMessage/delta.
-            block = {"type": "text", "id": item_id}
-            phase = item.get("phase")
-            if isinstance(phase, str) and phase:
-                block["phase"] = phase
-            await self._emit_content_block_start(block)
+            state = self._text_item(
+                item_id, phase=item.get("phase") or item.get("channel"), context=text_context
+            )
+            await self._start_text_item(state)
             return
 
         if item_type == "reasoning":
@@ -1367,17 +1884,45 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         if item_type == "webSearch":
-            await self._emit_tool_use(
-                item_id,
-                "WebSearch",
-                self._web_search_activity(item),
-            )
+            await self._emit_tool_use(item_id, "WebSearch", self._web_search_input(item))
             return
 
-    async def _handle_item_completed(self, item: dict) -> None:
+    @staticmethod
+    def _web_search_input(item: dict) -> dict:
+        """Keep native search/open/find arguments, including fields added by Codex."""
+        action = item.get("action")
+        query = item.get("query") or ""
+        if not query and isinstance(action, dict):
+            query = action.get("query") or action.get("url") or ""
+        result = {"query": query}
+        if isinstance(action, dict):
+            result["action"] = dict(action)
+        return result
+
+    async def _handle_item_completed(self, item: dict, *, text_context: dict | None = None) -> None:
         """Emit content_block_stop and any final content when an item completes."""
         item_type = item.get("type", "")
         item_id = item.get("id", "")
+
+        if item_type == "collabAgentToolCall":
+            await self._emit_content_block_stop()
+            await self._emit_tool_result(
+                item_id,
+                json.dumps(
+                    {
+                        "receiverThreadIds": item.get("receiverThreadIds", []),
+                        "agentsStates": item.get("agentsStates", {}),
+                        "status": item.get("status"),
+                    }
+                ),
+                is_error=item.get("status") in {"failed", "interrupted"},
+            )
+            await self._surface_collab_agents(item)
+            return
+
+        if item_type == "subAgentActivity":
+            await self._surface_subagent_activity(item)
+            return
 
         if item_type == "commandExecution":
             # Close the tool_use block, then emit the output as a tool_result
@@ -1389,29 +1934,91 @@ class CodexWebSocketTransport(CLITransport):
             if not isinstance(output, str):
                 output = str(output)
             exit_code = item.get("exitCode", 0)
+            # ALWAYS emit a result for a finished call, even a silent success.
+            # Gating on `output or exit_code != 0` meant a command that succeeded with
+            # no stdout produced no tool_result at all — so the call never paired and
+            # never got its D1 end stamp, and a hierarchical row for a perfectly good
+            # `touch`/`mkdir` renders as a tool that never finished.
             prefix = "" if exit_code == 0 else f"[exit code {exit_code}] "
             await self._emit_tool_result(item_id, prefix + output, is_error=exit_code != 0)
             return
 
         if item_type == "agentMessage":
-            # The full text was already streamed via item/agentMessage/delta
-            # notifications, so just close the block without re-emitting.
-            await self._emit_content_block_stop()
+            if not await self._complete_text_item(item, context=text_context):
+                return
+            if item.get("delivery") == "async" and item.get("questions"):
+                questions = [
+                    {
+                        "id": f"{item_id}:{index}",
+                        "header": "Question",
+                        "question": question["title"],
+                        "options": [
+                            {"label": option, "description": ""}
+                            for option in question.get("options") or []
+                        ],
+                    }
+                    for index, question in enumerate(item["questions"])
+                ]
+                request_id = f"codex-question-{item_id}-{uuid.uuid4().hex}"
+                self._pending_user_inputs[request_id] = (None, questions)
+                await self._emit(
+                    {
+                        "type": "ask_user_question",
+                        "request_id": request_id,
+                        "questions": questions,
+                        "metadata": {"source": "codex_app_server", "delivery": "async"},
+                    }
+                )
             return
 
         if item_type == "reasoning":
             await self._emit_content_block_stop()
             return
 
-        if item_type in ("fileChange", "mcpToolCall", "webSearch"):
+        if item_type == "webSearch":
+            await self._emit_content_block_stop()
+            # Started notifications may be placeholders with an empty query.
+            # Refresh the existing call's input by ID, without starting another
+            # streaming block. Both live and durable folds upsert this tool ID.
+            await self._emit(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": self._model,
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": item_id,
+                                "name": "WebSearch",
+                                "input": self._web_search_input(item),
+                            }
+                        ],
+                    },
+                }
+            )
+            if item.get("results") is not None:
+                # The app-server schema intentionally leaves these result objects
+                # opaque: retain search hits, open-page results, and future fields.
+                output = json.dumps(
+                    {key: item[key] for key in ("query", "action", "results") if key in item},
+                    ensure_ascii=False,
+                )
+            else:
+                output = self._extract_item_result_text(item)
+                if not output:
+                    output = self._consume_buffered_item_output(item_id)
+                if not output and (activity := self._web_search_activity(item)):
+                    output = json.dumps(activity, ensure_ascii=False)
+            await self._emit_tool_result(
+                item_id, output, is_error=bool(item.get("isError") or item.get("is_error"))
+            )
+            return
+
+        if item_type in ("fileChange", "mcpToolCall"):
             await self._emit_content_block_stop()
             result_text = self._extract_item_result_text(item)
             if not result_text:
                 result_text = self._consume_buffered_item_output(item_id)
-            if item_type == "webSearch" and not result_text:
-                activity = self._web_search_activity(item)
-                if activity:
-                    result_text = json.dumps(activity)
             is_error = bool(item.get("isError") or item.get("is_error"))
             await self._emit_tool_result(item_id, result_text, is_error=is_error)
             return
@@ -1427,6 +2034,125 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         self._buffered_item_output.pop(item_id, None)
+
+    async def _surface_subagent_activity(self, item: dict) -> None:
+        agent_id = item.get("agentThreadId")
+        kind = item.get("kind")
+        if not agent_id or kind not in {"started", "completed"}:
+            return
+        if self._agent_states.get(agent_id) == kind:
+            return
+        self._agent_states[agent_id] = kind
+        if kind == "started":
+            await self._emit_tool_use(
+                item["id"], "Agent", {"agent_id": agent_id, "agent_path": item.get("agentPath")}
+            )
+            await self._emit_content_block_stop()
+            await self._emit_tool_result(
+                item["id"], json.dumps({"agent_id": agent_id, "status": "started"})
+            )
+        await self._emit(
+            {
+                "type": "agent_update",
+                "event_type": "codex.agent",
+                "action": "started" if kind == "started" else "stopped",
+                "agent": {
+                    "id": agent_id,
+                    "kind": "subagent",
+                    "name": item.get("agentPath") or agent_id,
+                    "status": "running" if kind == "started" else "done",
+                    "parent_id": self._thread_id,
+                },
+                "metadata": {"source": "codex_app_server"},
+            }
+        )
+
+    async def _surface_collab_agents(self, item: dict) -> None:
+        for agent_id in item.get("receiverThreadIds", []):
+            state = item.get("agentsStates", {}).get(agent_id, {})
+            status = state.get("status")
+            if (
+                not status
+                and item.get("tool") == "spawnAgent"
+                and item.get("status") == "completed"
+            ):
+                status = "running"
+            if not status or self._agent_states.get(agent_id) == status:
+                continue
+            terminal = status in {"completed", "errored", "shutdown", "notFound", "interrupted"}
+            failed = status in {"errored", "notFound", "interrupted"}
+            self._agent_states[agent_id] = status
+            await self._emit(
+                {
+                    "type": "agent_update",
+                    "event_type": "codex.agent",
+                    "action": "stopped" if terminal else "started",
+                    "agent": {
+                        "id": agent_id,
+                        "kind": "subagent",
+                        "name": agent_id,
+                        "status": "failed" if failed else "done" if terminal else "running",
+                        "description": item.get("prompt") or "",
+                        "parent_id": item.get("senderThreadId"),
+                        "result": state.get("message"),
+                    },
+                    "metadata": {"source": "codex_app_server"},
+                }
+            )
+
+    async def _answer_user_input(self, request_id: str, answers: object) -> None:
+        async with self._answer_lock:
+            await self._answer_user_input_locked(request_id, answers)
+
+    async def _answer_user_input_locked(self, request_id: str, answers: object) -> None:
+        pending = self._pending_user_inputs.get(request_id)
+        if pending is None:
+            raise ValueError("Unknown or already answered Codex question")
+        rid, questions = pending
+        if not isinstance(answers, list) or not answers:
+            raise ValueError("Codex question requires explicit answers")
+        mapped = {}
+        for question in questions:
+            match = next(
+                (
+                    answer
+                    for answer in answers
+                    if isinstance(answer, dict)
+                    and (
+                        answer.get("question_id") == question["id"]
+                        or answer.get("question") in {question["id"], question["question"]}
+                    )
+                ),
+                None,
+            )
+            if match is None:
+                raise ValueError(f"Missing answer for Codex question {question['id']}")
+            value = match.get("answer")
+            values = value if isinstance(value, list) else [value]
+            if not values or not all(isinstance(v, str) and v.strip() for v in values):
+                raise ValueError("Codex question answer must contain non-empty strings")
+            mapped[question["id"]] = {"answers": values}
+        if rid is None:
+            content = "\n".join(
+                f"{question['question']}: " + ", ".join(mapped[question["id"]]["answers"])
+                for question in questions
+            )
+            if self._thread_id and self._current_turn_id:
+                await self.send_control("steer", content=content)
+            else:
+                await self.send_message(content)
+        else:
+            await self._send_rpc_response(rid, {"answers": mapped})
+        self._pending_user_inputs.pop(request_id, None)
+        await self._emit(
+            {
+                "type": "ask_user_resolved",
+                "request_id": request_id,
+                "decision": "answered",
+                "accepted": True,
+                "metadata": {"source": "codex_app_server"},
+            }
+        )
 
     @staticmethod
     def _dynamic_tool_content_text(content_items: object) -> str:
@@ -1489,17 +2215,32 @@ class CodexWebSocketTransport(CLITransport):
     # Helpers
     # ------------------------------------------------------------------
 
-    async def _emit_text_delta(self, text: str) -> None:
-        """Emit a text delta event, filtering empties."""
-        if not text:
+    async def _emit_text_delta(
+        self,
+        text: str,
+        *,
+        item_id: object = None,
+        phase: object = None,
+        context: dict | None = None,
+    ) -> None:
+        """Keep arbitrary chunks on their own text item, without inserting bytes."""
+        if not isinstance(text, str) or not text:
             return
+        state = self._text_item(item_id, phase=phase, context=context)
+        if state.private or state.completion_fingerprint is not None:
+            return
+        await self._start_text_item(state)
         event = {
             "type": "content_block_delta",
+            **self._text_context(state),
             "delta": {"type": "text_delta", "text": text},
         }
         filtered = _filter_event(event)
         if filtered:
             await self._emit(filtered)
+            encoded = text.encode("utf-8")
+            state.streamed_hash.update(encoded)
+            state.streamed_bytes += len(encoded)
 
     @staticmethod
     def _is_context_window_error(error: object, message: object = "") -> bool:
@@ -1534,6 +2275,8 @@ class CodexWebSocketTransport(CLITransport):
                 message = error.get("message")
                 if message:
                     return str(message)
+            if isinstance(error, str) and error:
+                return error
         return "Codex ran out of room in the model context window."
 
     def _is_context_compaction_turn(self, turn: object) -> bool:
@@ -1588,6 +2331,13 @@ class CodexWebSocketTransport(CLITransport):
             }
         )
 
+        # The caller can be the sole WS reader. Waiting for an RPC here prevents
+        # that same reader from consuming its response, forcing a timeout.
+        self._compaction_task = asyncio.create_task(self._start_context_compaction(message))
+        self._compaction_task.add_done_callback(self._log_dynamic_tool_task_result)
+        return True
+
+    async def _start_context_compaction(self, message: str) -> None:
         try:
             result = await self._send_rpc(
                 "thread/compact/start",
@@ -1604,12 +2354,12 @@ class CodexWebSocketTransport(CLITransport):
                     "error": f"{message}\n\nAutomatic context compaction failed: {exc}",
                 }
             )
-            return True
+            await self._finalize_stranded_turn("error", "Automatic context compaction failed")
+            return
 
         turn = result.get("turn") if isinstance(result, dict) else None
         if isinstance(turn, dict) and turn.get("id"):
             self._context_compaction_turn_id = turn["id"]
-        return True
 
     async def _complete_context_compaction(self) -> None:
         prompt = self._pending_context_retry_prompt
@@ -1662,7 +2412,6 @@ class CodexWebSocketTransport(CLITransport):
         self._last_result = None
         self._turn_error = None
         self._last_usage = None
-        self._block_index = 0
         self._active_user_prompt = content
         # Correlate this turn/start back to the originating steer; popped on the matching
         # turn/started to emit user_consumed. Appended BEFORE the RPC so the correlation is ready
@@ -1697,11 +2446,14 @@ class CodexWebSocketTransport(CLITransport):
             await self._fallback_transport.send_control_response(request_id, response)
             return
 
-        """Respond to a Codex approval request."""
-        pending = self._pending_approvals.pop(request_id, None)
+        async with self._answer_lock:
+            await self._send_approval_response(request_id, response)
+
+    async def _send_approval_response(self, request_id: str, response: dict) -> None:
+        """Retain a failed approval send; never resolve an unknown native RPC."""
+        pending = self._pending_approvals.get(request_id)
         if pending is None:
-            logger.warning("No pending approval for request_id=%s", request_id)
-            return
+            raise ValueError("Unknown or already answered Codex approval")
         if isinstance(pending, tuple):
             rid, approval_kind = pending
         else:
@@ -1725,6 +2477,7 @@ class CodexWebSocketTransport(CLITransport):
             decision = "accept" if behavior in ("allow", "allowForever") else "decline"
             result = {"decision": decision}
         await self._send_rpc_response(rid, result)
+        self._pending_approvals.pop(request_id, None)
 
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         if self._fallback_transport is not None:
@@ -1732,6 +2485,10 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         """Handle control messages (interrupt, set_model, etc.)."""
+        if subtype == "ask_user_answer":
+            await self._answer_user_input(str(kwargs.get("request_id", "")), kwargs.get("answers"))
+            return
+
         if subtype == "interrupt":
             if self._thread_id and self._current_turn_id:
                 logger.info(

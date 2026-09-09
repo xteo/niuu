@@ -223,10 +223,18 @@ pnpm lint
 pnpm format:check
 pnpm test
 
+# Forge contracts and real-tmux acceptance
+make test-forge
+make test-forge-tmux
+
 # Informational module-size and dependency-coupling review
 cd ..
 make review-modules
 ```
+
+See the [Forge stability review](docs/testing/forge-stability-review-2026-09-07.md)
+for findings and the [test workflow](docs/testing/forge-stability-workflow.md) for
+database, Chromium, repeated tmux, and explicit live-provider checks.
 
 ## Deployment
 
@@ -281,3 +289,9 @@ Full documentation at [niuulabs.github.io/volundr](https://niuulabs.github.io/vo
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+Forge's [live agentic acceptance plan](docs/testing/forge-live-agentic-acceptance.md)
+drives real Claude/tmux and Codex sessions through tool use, search, workers,
+questions, reconnects, and background capture. Run `make test-forge-live` against
+a configured local platform; use `make forge-trace-lab` to replay reviewed traces
+without provider calls. Legacy Claude SDK modes remain compatibility coverage.

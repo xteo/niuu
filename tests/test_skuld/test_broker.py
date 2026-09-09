@@ -992,7 +992,9 @@ class TestBroker:
     async def test_backstop_flips_pending_on_result_for_non_native(self, test_broker):
         """A non-native transport that finishes a turn has consumed any still-pending steer."""
         test_broker._transport = AsyncMock()
-        test_broker._transport.capabilities = TransportCapabilities(steering_mode="live")
+        test_broker._transport.capabilities = TransportCapabilities(
+            steering_mode="interrupt_resume"
+        )
         mock_channel = self._pending_user_turn(test_broker, "m-2")
 
         await test_broker._handle_cli_event({"type": "result", "stop_reason": "end_turn"})
@@ -1026,10 +1028,12 @@ class TestBroker:
 
     @pytest.mark.asyncio
     async def test_backstop_empty_assistant_frame_does_not_flip(self, test_broker):
-        """Codex's empty turn/started assistant frame (content: []) must NOT trip the backstop;
+        """An empty legacy assistant frame (content: []) must NOT trip the backstop;
         a frame with real content does."""
         test_broker._transport = AsyncMock()
-        test_broker._transport.capabilities = TransportCapabilities(steering_mode="live")
+        test_broker._transport.capabilities = TransportCapabilities(
+            steering_mode="interrupt_resume"
+        )
         self._pending_user_turn(test_broker, "m-4")
 
         await test_broker._handle_cli_event({"type": "assistant", "message": {"content": []}})
@@ -1046,13 +1050,13 @@ class TestBroker:
     async def test_backstop_flips_pending_on_error_for_non_native(self, test_broker):
         """A terminal error on a non-native transport must not strand the steer pending forever."""
         test_broker._transport = AsyncMock()
-        test_broker._transport.capabilities = TransportCapabilities(steering_mode="live")
+        test_broker._transport.capabilities = TransportCapabilities(
+            steering_mode="interrupt_resume"
+        )
         mock_channel = self._pending_user_turn(test_broker, "m-err")
 
         with patch.object(
-            test_broker,
-            "_report_activity_state",
-            new=AsyncMock(),
+            test_broker, "_report_activity_state", new_callable=AsyncMock
         ) as report_activity:
             await test_broker._handle_cli_event({"type": "error", "error": "boom"})
             await asyncio.sleep(0)
@@ -2772,10 +2776,10 @@ class TestDispatchBrowserMessage:
         )
 
     @pytest.mark.asyncio
-    async def test_dispatch_no_transport_noop(self, test_broker):
+    async def test_dispatch_no_transport_rejects_instead_of_dropping_message(self, test_broker):
         test_broker._transport = None
-        # Should not raise
-        await test_broker._dispatch_browser_message({"content": "hello"})
+        with pytest.raises(RuntimeError, match="transport is not ready"):
+            await test_broker._dispatch_browser_message({"content": "hello"})
 
     @pytest.mark.asyncio
     async def test_dispatch_guard_blocks_unsupported_control(self, test_broker):
@@ -3099,6 +3103,10 @@ class TestFastAPIEndpoints:
         data = response.json()
         assert data["status"] == "healthy"
         assert data["session_id"] == "test-123"
+        assert len(data["source_sha256"]) == 64
+        assert data["revision"]
+        assert isinstance(data["dirty"], bool)
+        assert data["build"]
 
     def test_ready_endpoint_not_ready(self, client):
         broker._transport = None
@@ -4184,10 +4192,20 @@ class TestShutdownEdgeCases:
 
     @pytest.mark.asyncio
     async def test_startup_with_volundr_api_url(self, test_broker):
-        """Startup logs when volundr_api_url is set."""
-        await test_broker.startup()
-        assert test_broker._transport is not None
-        assert test_broker.service_manager is not None
+        """Startup verifies the durable head before warming the transport."""
+        client = AsyncMock()
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"latest_seq": 41}
+        client.get.return_value = response
+        with patch.object(test_broker, "_get_http_client", AsyncMock(return_value=client)):
+            try:
+                await test_broker.startup()
+                assert test_broker._transport is not None
+                assert test_broker.service_manager is not None
+                assert test_broker._event_log_seq == 41
+            finally:
+                await test_broker.shutdown()
 
 
 class TestHandleWebSocket:

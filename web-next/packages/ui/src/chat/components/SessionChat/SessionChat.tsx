@@ -19,7 +19,14 @@ import {
 } from 'lucide-react';
 import { cn } from '../../../utils/cn';
 import { useRoomState } from '../../hooks/useRoomState';
-import { UserMessage, AssistantMessage, StreamingMessage, SystemMessage } from '../ChatMessages';
+import {
+  UserMessage,
+  AssistantMessage,
+  StreamingMessage,
+  SystemMessage,
+  hasNativeMessageParts,
+  messageRenderKey,
+} from '../ChatMessages';
 import { RoomMessage } from '../RoomMessage';
 import { ThreadGroup } from '../ThreadGroup';
 import { MeshCascadePanel } from '../MeshCascadePanel';
@@ -889,13 +896,13 @@ export function SessionChat({
 
                 const msg = group.message;
                 if (msg.metadata?.messageType === 'system') {
-                  return <SystemMessage key={msg.id} message={msg} />;
+                  return <SystemMessage key={messageRenderKey(msg)} message={msg} />;
                 }
 
                 if ((isRoomMode && msg.participant) || isRoomSession) {
                   return (
                     <div
-                      key={msg.id}
+                      key={messageRenderKey(msg)}
                       id={`msg-${msg.id}`}
                       data-highlighted={highlightedMsgId === msg.id || undefined}
                     >
@@ -920,14 +927,20 @@ export function SessionChat({
                 }
 
                 if (msg.role === 'user') {
-                  return <UserMessage key={msg.id} message={msg} />;
+                  return <UserMessage key={messageRenderKey(msg)} message={msg} />;
                 }
-                if (msg.status === 'running') {
-                  return <StreamingMessage key={msg.id} content={msg.content} parts={msg.parts} />;
+                if (msg.status === 'running' && !hasNativeMessageParts(msg.parts)) {
+                  return (
+                    <StreamingMessage
+                      key={messageRenderKey(msg)}
+                      content={msg.content}
+                      parts={msg.parts}
+                    />
+                  );
                 }
                 return (
                   <AssistantMessage
-                    key={msg.id}
+                    key={messageRenderKey(msg)}
                     message={msg}
                     onCopy={handleCopy}
                     onRegenerate={handleRegenerate}

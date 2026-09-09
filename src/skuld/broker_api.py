@@ -22,6 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from niuu.build_identity import build_identity
+from niuu.domain.text_projection import projection_revision
 from skuld.conversation_models import ConversationTurn
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turn, is_elided_input
 from skuld.event_log import FORGE_SESSIONS_PATH
@@ -38,6 +40,7 @@ WORKFLOW_GATE_INTENT_HEADER = "x-niuu-workflow-gate-intent"
 WORKFLOW_GATE_INTENT_RESOLVE = "resolve"
 
 logger = logging.getLogger("skuld.broker")
+_BUILD_IDENTITY = build_identity()
 _broker_getter: Callable[[], Any] | None = None
 _log_buffer: deque[dict] = deque()
 
@@ -123,7 +126,7 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict:
     """Health check endpoint."""
-    return {"status": "healthy", "session_id": broker.session_id}
+    return {"status": "healthy", "session_id": broker.session_id, **_BUILD_IDENTITY}
 
 
 @app.get("/ready")
@@ -320,6 +323,7 @@ async def get_conversation_history(detail: str = "full") -> dict:
     )
     return {
         "turns": turns,
+        "projection_revision": projection_revision(turns),
         "is_active": is_active,
         "last_activity": last_activity,
         "_prep": prep,
@@ -328,6 +332,9 @@ async def get_conversation_history(detail: str = "full") -> dict:
         # next SSE/activity report to know whether the session is active/idle/etc.
         "activity_state": broker._activity_state,
         "activity_state_since": broker._state_since_iso(broker._activity_state_since),
+        # The stable turn anchor for the running elapsed (null ⇔ no turn in
+        # flight). Mirrors the /activity report so a reconnect's first paint can
+        # anchor "running Ns" to the prompt instant, not the coarse _since.
         "turn_started_at": (
             broker._state_since_iso(broker._turn_started_at)
             if broker._turn_started_at is not None
@@ -347,10 +354,16 @@ async def get_tool_result(tool_use_id: str) -> dict:
     tool_result exists in this session.
     """
 
+    # P1 input elision (2026-07-12): the response also carries the matching tool_use's FULL
+    # ``input`` so an elided-input card expands from the same lazy fetch. Use and result live
+    # in DIFFERENT turns (assistant emits the use; the result rides the next user event), so
+    # collect both across all sources. An input-only hit (tool still running) answers 200 with
+    # empty content instead of 404 — the expand shows the input immediately.
     found_result: dict | None = None
     found_input = None
 
     sources = [turn.parts for turn in broker._conversation_turns]
+    sources.append(list(broker._live_tool_details.get(tool_use_id, {}).values()))
     in_progress = broker._serialize_in_progress_turn()
     if in_progress is not None:
         sources.append(in_progress.get("parts", []))
@@ -1125,3 +1138,18 @@ class _TokenRedactFilter(logging.Filter):
         elif isinstance(record.args, dict):
             record.args = {key: self._redact(value) for key, value in record.args.items()}
         return True
+
+
+@app.get("/api/control-state")
+async def get_control_state() -> dict:
+    """Expose live controls and retained, explicitly non-answerable recovery cards."""
+    return {
+        "questions": [
+            *broker._unrestored_questions.values(),
+            *broker._pending_ask_user_questions.values(),
+        ],
+        "permissions": [
+            *broker._unrestored_permissions.values(),
+            *broker._pending_permission_requests.values(),
+        ],
+    }

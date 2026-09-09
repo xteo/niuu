@@ -554,6 +554,20 @@ async def test_after_id_match_returns_delta_and_mismatch_returns_invalid_window(
     assert [t["id"] for t in legacy["turns"]] == ["live-a", "live-u2"]
     assert legacy["window_offset"] == 1
 
+    # Repair can preserve every turn ID, so the explicit revision must still
+    # invalidate a cached prefix even when the incremental window is empty.
+    original_revision = ok["projection_revision"]
+    live_body["turns"][1]["metadata"] = {
+        "text_projection_repair": {"schema": 1, "digest": "verified-repair"},
+    }
+    full = _get({})
+    shallow = _get({"detail": "shallow", "limit": 1})
+    empty_delta = _get({"after": 2, "after_id": "live-u2"})
+    assert empty_delta["turns"] == []
+    assert full["projection_revision"] != original_revision
+    assert full["projection_revision"] == shallow["projection_revision"]
+    assert full["projection_revision"] == empty_delta["projection_revision"]
+
 
 @pytest.mark.asyncio
 async def test_running_streaming_live_body_is_kept_verbatim(

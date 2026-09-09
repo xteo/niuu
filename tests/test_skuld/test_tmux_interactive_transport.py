@@ -631,6 +631,7 @@ def test_capabilities_advertise_interactive_terminal_controls(tmp_path: Path) ->
 
 
 @pytest.mark.integration
+@pytest.mark.tmux
 @pytest.mark.asyncio
 async def test_real_tmux_smoke_with_fake_claude(
     tmp_path: Path,
@@ -800,7 +801,7 @@ async def test_message_display_hook_streams_interleaved_prose(tmp_path: Path) ->
         {
             "hook_event_name": "MessageDisplay",
             "turn_id": "turn-1",
-            "message_id": "msg-2b",
+            "message_id": "msg-2",
             "index": 0,
             "final": True,
             "delta": "Found it —\npatching.",
@@ -1289,10 +1290,18 @@ async def test_answer_deny_presses_escape(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_ask_user_question_tool_surfaces_and_answers(tmp_path: Path) -> None:
-    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    from tests.test_skuld.test_tmux_native_question_consumption import (
+        NATIVE_ID,
+        TOOL_ID,
+        NativeQuestionTransport,
+    )
+
+    transport = NativeQuestionTransport(str(tmp_path))
     events = await _collect_events(transport)
     await transport.start()
-    transport.capture_stdout = "\n".join(["❯ 1. Postgres", "  2. SQLite", ""])
+    transport.capture_stdout = "\n".join(
+        ["☐ Database", "Which DB?", "❯ 1. Postgres", "  2. SQLite", ""]
+    )
 
     questions = [
         {
@@ -1307,6 +1316,9 @@ async def test_ask_user_question_tool_surfaces_and_answers(tmp_path: Path) -> No
             "hook_event_name": "PreToolUse",
             "tool_name": "AskUserQuestion",
             "tool_input": {"questions": questions},
+            "session_id": NATIVE_ID,
+            "tool_use_id": TOOL_ID,
+            "transcript_path": str(transport.native_path),
         }
     )
 
@@ -1321,9 +1333,11 @@ async def test_ask_user_question_tool_surfaces_and_answers(tmp_path: Path) -> No
         for e in events
     )
 
+    transport.steps.append(("2", "❯\n"))
+    transport.consumed = {"answers": {"Which DB?": "SQLite"}}
     await transport.send_control("ask_user_answer", request_id=rid, answers=[{"answer": "SQLite"}])
     keys = _send_keys(transport)
-    assert keys[-2:] == ["2", "Enter"]  # select row 2 + confirm
+    assert keys == ["2"]  # Native selection commits on its digit, then exact result proves it.
     await transport.stop()
 
 
@@ -1364,8 +1378,7 @@ async def test_correlated_prompt_captures_claude_native_session_id(tmp_path: Pat
     transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
     await _collect_events(transport)
     await transport.start()
-    tmux_name = transport._session_name
-    assert transport.session_id == tmux_name
+    assert transport.session_id is None
 
     # Uncorrelated prompt (a teammate pane's own hook) — no capture.
     await transport.handle_claude_hook(
@@ -1375,7 +1388,7 @@ async def test_correlated_prompt_captures_claude_native_session_id(tmp_path: Pat
             "session_id": "11111111-2222-3333-4444-555555555555",
         }
     )
-    assert transport.session_id == tmux_name
+    assert transport.session_id is None
 
     # Correlated prompt (we pasted it) — capture claude's native id.
     await transport.send_message("do the thing", msg_id="m-1")
@@ -1692,3 +1705,29 @@ def _async_return(value: Any):
         return value
 
     return _coro()
+
+
+@pytest.mark.asyncio
+async def test_workspace_trust_menu_is_not_a_prompt_and_cannot_receive_chat(tmp_path):
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    await transport.start()
+    transport.capture_stdout = (
+        "Accessing workspace:\n/test\n❯ No, exit\n  Yes, I trust this folder\nEnter to confirm"
+    )
+    before = list(transport.loaded_buffers)
+    assert not transport._repl_looks_ready(transport.capture_stdout)
+    with pytest.raises(RuntimeError, match="Workspace trust"):
+        await transport.send_message("This must not select No, exit")
+    assert transport.loaded_buffers == before
+    assert not transport._turn_active
+    assert not transport._send_lock.locked()
+    await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_seed_prompt_and_command_discovery_reject_workspace_trust_menu(tmp_path):
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    transport.capture_stdout = "Accessing workspace:\n❯ No, exit\nYes, I trust this folder"
+    with pytest.raises(RuntimeError, match="Workspace trust"):
+        await transport._wait_for_repl_ready()
+    assert not transport.loaded_buffers

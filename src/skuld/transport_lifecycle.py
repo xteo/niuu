@@ -47,6 +47,8 @@ class TransportLifecycleMixin:
             "resume_session_id": self._settings.session.resume_session_id,
             "ask_user_question_enabled": self._settings.ask_user_question_enabled,
             "acp_prompt_timeout_s": self._settings.acp_prompt_timeout_s,
+            "codex_receive_max_bytes": self._settings.codex_receive_max_bytes,
+            "live_frame_max_bytes": self._settings.live_frame_max_bytes,
         }
 
     def _create_codex_auth_provider(self) -> CodexAuthProviderPort:
@@ -146,7 +148,9 @@ class TransportLifecycleMixin:
         os.makedirs(self.workspace_dir, exist_ok=True)
 
         # Load conversation history from disk
+        self._load_control_state()
         self._load_conversation_history()
+        await self._hydrate_conversation_history()
 
         # Evict participants whose heartbeats lapse (room mode only)
         if self._room_bridge is not None:

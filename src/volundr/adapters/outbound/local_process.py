@@ -1001,7 +1001,9 @@ class LocalProcessPodManager(PodManager):
             env["SKULD__CLI_BINARY"] = self._resolve_claude_binary()
 
         log_path = workspace / ".skuld.log"
-        log_file = log_path.open("w", encoding="utf-8")
+        # Multiple sessions may share a workspace; retain diagnostics from every
+        # broker while preserving the path consumed by aggregation and archives.
+        log_file = log_path.open("a", encoding="utf-8")
         try:
             process = await asyncio.create_subprocess_exec(
                 *skuld_cmd,

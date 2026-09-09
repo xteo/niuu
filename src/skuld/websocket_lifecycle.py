@@ -11,8 +11,14 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import PER_CONNECT_MARKER
 from skuld.channels import WebSocketChannel, _is_expected_ws_disconnect
+from skuld.control_errors import control_error_frame
+from skuld.conversation_snapshot import (
+    ConversationSnapshotTooLargeError,
+    prepare_conversation_snapshot,
+)
 from skuld.websocket_auth import (
     _decode_jwt_claims,
     _extract_token_from_websocket,
@@ -136,7 +142,11 @@ class WebSocketLifecycleMixin:
         # FR-7 / INV-10) — NOT the hardcoded WebSocketChannel default — so the live
         # channel, the replay tail, and the cold-read all read the same default and
         # move together when it is flipped.
-        channel = WebSocketChannel(websocket, show_internal=self._settings.default_show_internal)
+        channel = WebSocketChannel(
+            websocket,
+            show_internal=self._settings.default_show_internal,
+            max_frame_bytes=self._settings.live_frame_max_bytes,
+        )
         self._channels.add(channel)
         conn_count = self._channels.count
         logger.info("WebSocket connected, total channels: %d", conn_count)
@@ -144,7 +154,9 @@ class WebSocketLifecycleMixin:
         try:
             if not self._transport:
                 logger.error("handle_websocket: transport not initialized")
-                _transport_err = {"type": "error", "content": "Transport not initialized"}
+                _transport_err = control_error_frame(
+                    "Transport not initialized", code="transport_not_ready"
+                )
                 self._enqueue_event_log(_transport_err)
                 await self._safe_browser_send_json(websocket, _transport_err)
                 return
@@ -219,19 +231,37 @@ class WebSocketLifecycleMixin:
                     "Replaying %d conversation turn(s) to new browser",
                     len(replay_turns),
                 )
-                if not await self._safe_browser_send_json(
-                    websocket,
-                    {
-                        "type": "conversation_history",
-                        "turns": replay_turns,
-                        # SRD FR-6: the durable-log head seq at reconnect time. The
-                        # client loads this state, then resumes the live tail from
-                        # head_seq+1 with no gap and no duplicate (the broker keeps
-                        # appending to the SAME monotonic seq it broadcasts from).
-                        "head_seq": self._event_log_seq,
-                    },
-                ):
-                    return
+                try:
+                    snapshot = prepare_conversation_snapshot(
+                        {
+                            "type": "conversation_history",
+                            "turns": replay_turns,
+                            "projection_revision": projection_revision(replay_turns),
+                            # SRD FR-6: the durable-log head seq at reconnect time. The
+                            # client loads this state, then resumes the live tail from
+                            # head_seq+1 with no gap and no duplicate (the broker keeps
+                            # appending to the SAME monotonic seq it broadcasts from).
+                            "head_seq": self._event_log_seq,
+                        },
+                        max_bytes=self._settings.conversation_snapshot_max_bytes,
+                    )
+                except ConversationSnapshotTooLargeError as exc:
+                    logger.warning("WebSocket conversation replay requires REST: %s", exc)
+                    if not await self._safe_send_broker_frame_to(
+                        websocket,
+                        {
+                            "type": "error",
+                            "code": "conversation_history_too_large",
+                            "content": (
+                                "Conversation history is too large for WebSocket replay. "
+                                "Reload history through REST."
+                            ),
+                        },
+                    ):
+                        return
+                else:
+                    if not await self._safe_browser_send_json(websocket, snapshot):
+                        return
 
             # Send current room state to late-joining browsers when room mode active
             if self._room_bridge is not None:
@@ -266,6 +296,26 @@ class WebSocketLifecycleMixin:
                 for ask_question in list(self._pending_ask_user_questions.values()):
                     if not await self._safe_browser_send_json(websocket, ask_question):
                         return
+
+            # Persisted question text is evidence, not a usable RPC address after
+            # the native process restarts. Show the retained card honestly and
+            # never route its answer onto a different live prompt.
+            for recovered in [
+                *self._unrestored_questions.values(),
+                *self._unrestored_permissions.values(),
+            ]:
+                if not await self._safe_browser_send_json(websocket, recovered):
+                    return
+                if not await self._safe_browser_send_json(
+                    websocket,
+                    control_error_frame(
+                        "This pending control survived in history, but the native process "
+                        "must reissue it before an answer can be delivered.",
+                        recovered,
+                        code="question_recovery_required",
+                    ),
+                ):
+                    return
 
             # Plan + running agents: a late-joining client should immediately know
             # the current plan and the running fleet without waiting for the next
@@ -315,6 +365,7 @@ class WebSocketLifecycleMixin:
                     )
                     _bad_frame_err = {
                         "type": "error",
+                        "code": "malformed_message",
                         "content": f"malformed message ignored: {e}",
                     }
                     self._enqueue_event_log(_bad_frame_err)
@@ -329,7 +380,7 @@ class WebSocketLifecycleMixin:
                     await self._dispatch_browser_message(data, sender_ws=websocket)
                 except Exception as e:
                     logger.exception("Error processing browser message: %s", _sanitize_log(data))
-                    _dispatch_err = {"type": "error", "content": str(e)}
+                    _dispatch_err = control_error_frame(e, data)
                     self._enqueue_event_log(_dispatch_err)
                     with contextlib.suppress(Exception):
                         await websocket.send_json(_dispatch_err)
@@ -342,7 +393,7 @@ class WebSocketLifecycleMixin:
                 return
             logger.exception("WebSocket error")
             try:
-                _ws_err = {"type": "error", "content": str(e)}
+                _ws_err = control_error_frame(e, code="websocket_error")
                 self._enqueue_event_log(_ws_err)
                 await websocket.send_json(_ws_err)
             except Exception:

@@ -26,12 +26,14 @@ from fastapi import WebSocket, WebSocketDisconnect  # noqa: F401
 
 from niuu.domain.logging import LoggingConfig
 from niuu.domain.outcome import parse_outcome_block
+from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import (
     TurnAccumulator,
     apply_assistant_blocks,
-    apply_content_block_start,
     apply_result_content,
     apply_text_delta,
+    apply_text_start,
+    apply_text_stop,
     apply_thinking_delta,
     apply_tool_result_blocks,
     assistant_turn_id,
@@ -59,6 +61,13 @@ from skuld.channels import (
 from skuld.chronicle import ChronicleMixin
 from skuld.chronicle_watcher import ChronicleWatcher
 from skuld.config import SkuldSettings
+from skuld.control_errors import ControlRecoveryError, control_error_frame
+from skuld.control_state import (
+    load_control_state,
+    pending_controls,
+    save_control_state,
+    unrestored_control,
+)
 from skuld.conversation_models import (  # noqa: F401
     CHRONICLE_SUMMARY_PROMPT,
     CONVERSATION_HISTORY_DIR,
@@ -66,6 +75,8 @@ from skuld.conversation_models import (  # noqa: F401
     SUMMARY_TIMEOUT_SECONDS,
     ConversationTurn,
 )
+from skuld.delivery_claims import claim_message, settle_message
+from skuld.delivery_errors import DeliveryNotAcceptedError
 from skuld.event_log import EventLogMixin
 from skuld.file_routes import (  # noqa: F401
     MkdirRequest,
@@ -82,6 +93,7 @@ from skuld.file_routes import (  # noqa: F401
     upload_file_raw,
     upload_files,
 )
+from skuld.history_hydration import fetch_durable_history, merge_history_turns
 from skuld.service_manager import (  # noqa: F401
     ServiceCreateRequest,
     ServiceManager,
@@ -494,6 +506,9 @@ class Broker(
         self._conversation_turns: list[ConversationTurn] = []
         self._pending_assistant_content: str = ""
         self._pending_assistant_parts: list[dict] = []
+        # Tool details are available before their live preview is sent, including
+        # while broadcast yields before the conversation accumulator folds them.
+        self._live_tool_details: dict[str, dict[str, dict]] = {}
         self._pending_block_type: str = ""
         self._pending_reasoning_text: str = ""
         # Durable-log seq of the LAST frame folded into the open assistant turn. Drives the
@@ -550,6 +565,8 @@ class Broker(
         # card. Cleared on answer (browser ask_user_answer), in-terminal resolve
         # (ask_user.resolved), and turn completion (result).
         self._pending_ask_user_questions: dict[str, dict[str, Any]] = {}
+        self._unrestored_questions: dict[str, dict[str, Any]] = {}
+        self._unrestored_permissions: dict[str, dict[str, Any]] = {}
 
         # Msg ids whose transport delivery task is still in flight (mid-retry, not yet
         # acked). A turn here is "pending" because it has NOT plausibly reached the
@@ -559,6 +576,7 @@ class Broker(
         # "failed", never "active" (SRD §3.4 / INV-7). Populated when the deliver task
         # starts, cleared in its finally.
         self._delivering_msg_ids: set[str] = set()
+        self._message_claim_tokens: dict[str, str] = {}
 
         # Live plan + running-agents surfacing (Claude tmux). The latest `plan`
         # frame (Claude's TodoWrite task list) and the set of running agents
@@ -655,7 +673,8 @@ class Broker(
         path = self._conversation_history_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            data = {"turns": [asdict(t) for t in self._conversation_turns]}
+            turns = [asdict(t) for t in self._conversation_turns]
+            data = {"turns": turns, "projection_revision": projection_revision(turns)}
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             logger.warning("Failed to save conversation history to %s", path, exc_info=True)
@@ -679,7 +698,7 @@ class Broker(
         array on BOTH reconnect replay and REST GET. Stable sentinel id so clients dedup
         across polls. visibility:'public' included so the row is shape-identical to asdict()
         on the replay path (web normalizers that read visibility don't choke). Mutation-safe:
-        snapshots parts via list() and appends the reasoning tail only to the local copy, so
+        copies part dictionaries and appends the reasoning tail only to the local copy, so
         repeated polls never disturb the eventual real flush; once the turn flushes this
         predicate goes False and it is served once as a real completed turn instead.
         """
@@ -689,7 +708,7 @@ class Broker(
             or self._pending_reasoning_text
         ):
             return None
-        parts: list[dict] = list(self._pending_assistant_parts)
+        parts: list[dict] = [dict(part) for part in self._pending_assistant_parts]
         if self._pending_reasoning_text:
             parts = [
                 *parts,
@@ -2749,6 +2768,8 @@ class Broker(
             request_id,
             cancel_auto_approval=not auto_approved,
         )
+        self._unrestored_permissions.pop(request_id, None)
+        self._save_control_state()
         await self._exit_attention(request_id)
         await self._emit_broker_frame(
             {
@@ -2839,6 +2860,16 @@ class Broker(
         # exception is a room-suppressed echo (above): not broadcast ⇒ not logged,
         # keeping the durable log == the live stream (INV-5).
         if not suppress_channel_broadcast:
+            message = data.get("message")
+            blocks = message.get("content") if isinstance(message, dict) else None
+            if isinstance(blocks, list):
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    identity = block.get("id") if kind == "tool_use" else block.get("tool_use_id")
+                    if kind in {"tool_use", "tool_result"} and isinstance(identity, str):
+                        self._live_tool_details.setdefault(identity, {})[kind] = block
             self._enqueue_event_log(data, ts=frame_ts)
 
         if event_type == "remote_control":
@@ -2863,6 +2894,8 @@ class Broker(
 
         if event_type == "control_request":
             self._track_pending_permission_request(data)
+            self._unrestored_permissions.pop(str(data.get("request_id", "")), None)
+            self._save_control_state()
 
         if event_type == "ask_user_question":
             # The agent is blocked on a human answer. Flip the session to
@@ -2873,6 +2906,13 @@ class Broker(
             # blocked must still receive the answerable question (tmux-reconnect fix).
             if ask_request_id:
                 self._pending_ask_user_questions[ask_request_id] = dict(data)
+                self._unrestored_questions.pop(ask_request_id, None)
+                # A native adapter may reissue the same question with a fresh
+                # RPC ID. Retire only matching historical text, never another ask.
+                for old_id, old in list(self._unrestored_questions.items()):
+                    if old.get("questions") == data.get("questions"):
+                        self._unrestored_questions.pop(old_id, None)
+                self._save_control_state()
             # Mark attention SYNCHRONOUSLY (before scheduling the report task) so
             # the assistant tool_use frame that the tmux bridge emits right after
             # this question cannot schedule an "active" report that clobbers the
@@ -2900,6 +2940,8 @@ class Broker(
             resolved_request_id = str(data.get("request_id", ""))
             if resolved_request_id:
                 self._pending_ask_user_questions.pop(resolved_request_id, None)
+                self._unrestored_questions.pop(resolved_request_id, None)
+                self._save_control_state()
                 asyncio.create_task(self._exit_attention(resolved_request_id))
 
         # Plan + running-agents surfacing: keep the latest plan and the live agent
@@ -2924,7 +2966,8 @@ class Broker(
             # "pending" to "active" and tell live clients via user_active. tmux emits
             # terminal_prompt_submitted (UserPromptSubmit hook); Codex emits user_consumed
             # (turn/started). Both carry the msg_id; _activate_user_turn no-ops if it's absent.
-            await self._activate_user_turn(data)
+            # Activation emits user_active. Broadcast the consumed frame first
+            # below so that live order matches the durable capture order.
             # TURN START — converge clients to "active" immediately, not only when
             # the first assistant token arrives (which can be seconds later). Skip
             # while blocked on a human gate: the answer that unblocks the turn also
@@ -2943,7 +2986,9 @@ class Broker(
             # precise UserPromptSubmit signal AND streams assistant content for the IN-PROGRESS turn
             # while a mid-turn steer is still queued, so this floor would otherwise flip it early.
             caps = getattr(self._transport, "capabilities", None)
-            if getattr(caps, "steering_mode", "none") != "native":
+            # Codex's live steering also emits exact user_consumed identities.
+            # An old turn's output cannot prove a queued/uncertain send arrived.
+            if getattr(caps, "steering_mode", "none") not in {"native", "live"}:
                 await self._activate_pending_user_turns_backstop()
 
         tool_result_only_user_event = event_type == "user" and self._is_tool_result_only_user_event(
@@ -2963,6 +3008,8 @@ class Broker(
 
         if not suppress_channel_broadcast:
             await self._channels.broadcast(data)
+        if event_type in ("terminal_prompt_submitted", "user_consumed"):
+            await self._activate_user_turn(data)
 
         # Record user messages that arrive via the transport (e.g. the
         # initial prompt flushed as a pending message) into conversation
@@ -3078,6 +3125,11 @@ class Broker(
             # SHARED reducer transition (the same enrichment a later log rebuild applies).
             tr_msg = data.get("message", {})
             tr_blocks = tr_msg.get("content", []) if isinstance(tr_msg, dict) else []
+            # D1: ``frame_ts`` (== this frame's durable row ts) closes each tool — it stamps
+            # the tool_result part AND back-fills ended_at/duration_ms onto the open tool_use
+            # part. The accumulator shares the pending parts LIST object, and the back-fill
+            # mutates those part dicts in place, so both the in-progress serialization and the
+            # eventual flush carry the completed timing.
             apply_tool_result_blocks(self._pending_accumulator(), tr_blocks, ts=frame_ts)
             self._pending_assistant_last_seq = self._event_log_seq
         elif event_type == "result":
@@ -3086,6 +3138,11 @@ class Broker(
             # awaiting_input.
             self._pending_attention.clear()
             self._pending_ask_user_questions.clear()
+            for permission_id in list(self._pending_permission_requests):
+                self._clear_pending_permission_request(permission_id)
+            self._unrestored_questions.clear()
+            self._unrestored_permissions.clear()
+            self._save_control_state()
             asyncio.create_task(self._report_activity_state("idle"))
             if self._pending_explicit_human_response_count == 0:
                 asyncio.create_task(self._on_result_publish_mesh())
@@ -3105,14 +3162,19 @@ class Broker(
             message = data.get("message", {})
             content_blocks = message.get("content", [])
             acc = self._pending_accumulator()
+            # D1: ``frame_ts`` (== this frame's durable row ts) is the tool_use start stamp.
             apply_assistant_blocks(acc, content_blocks, ts=frame_ts)
             self._pending_assistant_content = acc.content
             self._pending_assistant_last_seq = self._event_log_seq
 
-        if event_type == "content_block_start":
-            block = data.get("content_block", {})
+        # Reserve/close text anchors as part of the same shared fold as raw replay.
+        if event_type in ("content_block_start", "content_block_stop"):
             acc = self._pending_accumulator()
-            apply_content_block_start(acc, block if isinstance(block, dict) else {})
+            if event_type == "content_block_start":
+                apply_text_start(acc, data)
+            else:
+                apply_text_stop(acc, data)
+            self._pending_assistant_content = acc.content
             self._pending_assistant_last_seq = self._event_log_seq
 
         # HTTP streaming format: accumulate deltas
@@ -3125,7 +3187,7 @@ class Broker(
                 apply_thinking_delta(acc, delta.get("thinking", ""))
                 self._pending_reasoning_text = acc.reasoning
             else:
-                apply_text_delta(acc, delta.get("text", ""))
+                apply_text_delta(acc, delta.get("text", ""), frame=data)
                 self._pending_assistant_content = acc.content
             self._pending_assistant_last_seq = self._event_log_seq
 
@@ -3218,6 +3280,7 @@ class Broker(
                 self._pending_reasoning_text = ""
             else:
                 self._flush_pending_assistant_turn(metadata=turn_metadata)
+            self._live_tool_details.clear()
 
             # Emit CLI turn as room_message so it shows participant color
             if self._room_bridge is not None and self._mesh_adapter is not None and content:
@@ -3342,9 +3405,12 @@ class Broker(
         sender_ws: WebSocket | None = None,
     ) -> None:
         """Route a browser WebSocket message to the appropriate handler."""
+        if not isinstance(data, dict):
+            raise ValueError("A browser message must be a JSON object")
+        if "type" in data and not isinstance(data["type"], str):
+            raise ValueError("A browser message type must be a string")
         if not self._transport:
-            logger.warning("_dispatch_browser_message: transport is None, dropping message")
-            return
+            raise RuntimeError("The session transport is not ready")
 
         msg_type = data.get("type")
         logger.info(
@@ -3359,13 +3425,17 @@ class Broker(
             error_msg = f"{msg_type} not supported by this transport"
             logger.warning("_dispatch_browser_message: %s", _sanitize_log(error_msg))
             if sender_ws:
-                await self._send_broker_frame_to(sender_ws, {"type": "error", "content": error_msg})
+                await self._send_broker_frame_to(
+                    sender_ws, control_error_frame(error_msg, data, code="unsupported_control")
+                )
             return
 
         match msg_type:
             # Phase 2: permission response from browser
             case "permission_response":
                 request_id = data.get("request_id", "")
+                if request_id in self._unrestored_permissions:
+                    raise ControlRecoveryError("This approval belongs to a previous native process")
                 behavior = data.get("behavior", "deny")
                 response = {
                     "behavior": behavior,
@@ -3382,6 +3452,11 @@ class Broker(
             # AskUserQuestion: a human answered a question the agent asked.
             # Resolves the blocking can_use_tool future in SDKTransport.
             case "ask_user_answer":
+                if data.get("request_id") in self._unrestored_questions:
+                    raise ControlRecoveryError(
+                        "This question survived in history, but its native control was not "
+                        "restored. Wait for the agent to reissue it or inspect the native session."
+                    )
                 await self._transport.send_control(
                     "ask_user_answer",
                     request_id=data.get("request_id", ""),
@@ -3392,6 +3467,7 @@ class Broker(
                 # already-answered question.
                 answered_request_id = str(data.get("request_id", ""))
                 self._pending_ask_user_questions.pop(answered_request_id, None)
+                self._save_control_state()
                 await self._exit_attention(answered_request_id)
 
             # Phase 3: interrupt current turn
@@ -3507,7 +3583,7 @@ class Broker(
                     if sender_ws:
                         await self._send_broker_frame_to(
                             sender_ws,
-                            {"type": "error", "content": "Room mode is not enabled"},
+                            control_error_frame("Room mode is not enabled", data),
                         )
                     return
                 target = data.get("targetPeerId", "")
@@ -3526,9 +3602,7 @@ class Broker(
                     )
                 except LookupError as exc:
                     if sender_ws:
-                        await self._send_broker_frame_to(
-                            sender_ws, {"type": "error", "content": str(exc)}
-                        )
+                        await self._send_broker_frame_to(sender_ws, control_error_frame(exc, data))
 
             case "resend_initial_prompt":
                 try:
@@ -3540,9 +3614,7 @@ class Broker(
                     )
                 except (ValueError, RuntimeError) as exc:
                     if sender_ws:
-                        await self._send_broker_frame_to(
-                            sender_ws, {"type": "error", "content": str(exc)}
-                        )
+                        await self._send_broker_frame_to(sender_ws, control_error_frame(exc, data))
                     return
                 if sender_ws:
                     await self._send_broker_frame_to(
@@ -3563,9 +3635,7 @@ class Broker(
                     )
                 except (ValueError, RuntimeError) as exc:
                     if sender_ws:
-                        await self._send_broker_frame_to(
-                            sender_ws, {"type": "error", "content": str(exc)}
-                        )
+                        await self._send_broker_frame_to(sender_ws, control_error_frame(exc, data))
                     return
                 if sender_ws:
                     await self._send_broker_frame_to(
@@ -3637,7 +3707,7 @@ class Broker(
                     logger.info("_dispatch_browser_message: %s", error_msg)
                     if sender_ws:
                         await self._send_broker_frame_to(
-                            sender_ws, {"type": "error", "content": error_msg}
+                            sender_ws, control_error_frame(error_msg, data)
                         )
                     return
 
@@ -3645,6 +3715,30 @@ class Broker(
                 msg_id = str(uuid.uuid4())
                 request_id = data.get("request_id")
                 request_id = request_id if isinstance(request_id, str) and request_id else None
+                if request_id and self.volundr_api_url:
+                    msg_id = str(
+                        uuid.uuid5(uuid.NAMESPACE_URL, f"{self.session_id}:message:{request_id}")
+                    )
+                    token = str(uuid.uuid4())
+                    claim = await claim_message(
+                        await self._get_http_client(),
+                        session_id=self.session_id,
+                        request_id=request_id,
+                        content=content_str,
+                        token=token,
+                        timeout=self._settings.delivery.attempt_timeout_seconds,
+                        attempts=self._settings.delivery.max_attempts,
+                    )
+                    if not claim["claimed"] or claim["status"] != "pending":
+                        await self._emit_delivery_ack(
+                            request_id,
+                            msg_id,
+                            claim["status"],
+                            error=claim.get("error"),
+                            settle_claim=False,
+                        )
+                        return
+                    self._message_claim_tokens[request_id] = token
                 self._append_turn(
                     ConversationTurn(
                         id=msg_id,
@@ -3655,12 +3749,15 @@ class Broker(
                         # italic) until the correlated UserPromptSubmit flips it to
                         # "active". Survives reconnect + REST since metadata is
                         # serialized with the turn.
-                        metadata={"steering_state": "pending"},
+                        metadata={
+                            "steering_state": "pending",
+                            **({"request_id": request_id} if request_id else {}),
+                        },
                     )
                 )
                 # Mirror the human turn into the durable event log so log-only
                 # transcript replay (web/iOS) includes it.
-                self._enqueue_human_turn_event(content_str, msg_id)
+                self._enqueue_human_turn_event(content_str, msg_id, request_id=request_id)
                 now = datetime.now(UTC)
                 await self._complete_trace_span(
                     kind="turn.user",
@@ -3792,7 +3889,7 @@ class Broker(
         except Exception as exc:
             logger.exception("Transport send_control failed in background task")
             try:
-                await self._emit_broker_frame({"type": "error", "content": str(exc)})
+                await self._emit_broker_frame(control_error_frame(exc, {"type": subtype, **kwargs}))
             except Exception:
                 logger.debug("Failed to broadcast transport control error", exc_info=True)
 
@@ -3876,21 +3973,27 @@ class Broker(
         if self._resolve_delivery_routing():
             # Carry the ids so a native transport (tmux) can correlate the eventual
             # UserPromptSubmit back to this message and flip it active.
-            await asyncio.wait_for(
+            accepted = await asyncio.wait_for(
                 self._transport.send_control(
                     "redirect", content=content, msg_id=msg_id, request_id=request_id
                 ),
                 timeout=timeout,
             )
+            if accepted is False:
+                raise DeliveryNotAcceptedError(
+                    "Transport rejected the message before accepting input"
+                )
             return
         # Idle / non-native transports (Codex turn/start, SDK, …). Thread the ids so a
         # transport that CAN correlate a consumption signal (Codex turn/started) flips
         # the bubble; transports that can't simply ignore the kwargs.
         outbound = await self._apply_retrieval_reflex(content)
-        await asyncio.wait_for(
+        accepted = await asyncio.wait_for(
             self._transport.send_message(outbound, msg_id=msg_id, request_id=request_id),
             timeout=timeout,
         )
+        if accepted is False:
+            raise DeliveryNotAcceptedError("Transport rejected the message before accepting input")
 
     async def _deliver_user_message_and_ack(
         self,
@@ -3931,6 +4034,10 @@ class Broker(
             )
 
         cfg = self._settings.delivery
+        claimed_delivery = request_id in self._message_claim_tokens
+        # A refusal before input crosses the provider boundary can safely retry.
+        # A lost acknowledgement cannot: the provider might already be executing.
+        attempts = cfg.max_attempts
         backoff = cfg.initial_backoff_seconds
         last_error: Exception | None = None
         # Mark the turn as in-flight so the non-native pending->active backstop EXCLUDES
@@ -3940,7 +4047,7 @@ class Broker(
         # failure path stamps "failed" before the turn becomes backstop-eligible again.
         self._delivering_msg_ids.add(msg_id)
         try:
-            for attempt in range(1, cfg.max_attempts + 1):
+            for attempt in range(1, attempts + 1):
                 try:
                     await self._attempt_transport_delivery(
                         content, msg_id=msg_id, request_id=request_id
@@ -3952,16 +4059,28 @@ class Broker(
                     logger.warning(
                         "user message delivery attempt %d/%d failed (request_id=%s): %s",
                         attempt,
-                        cfg.max_attempts,
+                        attempts,
                         _sanitize_log(request_id),
                         _sanitize_log(str(exc)),
                     )
-                    if attempt >= cfg.max_attempts:
+                    if attempt >= attempts or (
+                        claimed_delivery and not isinstance(exc, DeliveryNotAcceptedError)
+                    ):
                         break
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * cfg.backoff_multiplier, cfg.max_backoff_seconds)
 
             if last_error is not None:
+                if claimed_delivery and not isinstance(last_error, DeliveryNotAcceptedError):
+                    await self._emit_delivery_ack(
+                        request_id,
+                        msg_id,
+                        "pending",
+                        error="Native delivery was not confirmed. Check the conversation "
+                        "before continuing; the same request ID will not resend this message.",
+                        settle_claim=False,
+                    )
+                    return
                 await self._fail_user_delivery(msg_id, request_id, last_error)
                 return
         finally:
@@ -3988,7 +4107,9 @@ class Broker(
             self._save_conversation_history()
         await self._emit_delivery_ack(request_id, msg_id, "failed", error=str(error))
         try:
-            await self._emit_broker_frame({"type": "error", "content": str(error)})
+            await self._emit_broker_frame(
+                control_error_frame(error, {"request_id": request_id}, code="user_delivery_failed")
+            )
         except Exception:
             logger.debug("Failed to broadcast delivery error", exc_info=True)
 
@@ -4016,6 +4137,7 @@ class Broker(
         *,
         error: str | None = None,
         pending_questions: int = 0,
+        settle_claim: bool = True,
     ) -> None:
         """Broadcast a steering delivery ACK (BUG-3).
 
@@ -4023,8 +4145,30 @@ class Broker(
         reached the agent; live UI clients can also use it to clear a "sending…" state or
         warn the user to answer an open question first.
         """
+        token = self._message_claim_tokens.get(request_id) if request_id else None
+        if settle_claim and token and status != "pending":
+            try:
+                await settle_message(
+                    await self._get_http_client(),
+                    session_id=self.session_id,
+                    request_id=request_id,
+                    token=token,
+                    status="failed" if status == "failed" else "delivered",
+                    error=error,
+                    timeout=self._settings.delivery.attempt_timeout_seconds,
+                )
+            except (httpx.HTTPError, ValueError):
+                logger.exception("Could not persist message delivery outcome")
+                status = "pending"
+                error = (
+                    "The native send returned, but Forge could not persist its delivery outcome."
+                )
+            else:
+                self._message_claim_tokens.pop(request_id, None)
         event: dict[str, Any] = {
-            "type": "user_delivery_failed" if status == "failed" else "user_delivered",
+            "type": {"failed": "user_delivery_failed", "pending": "user_delivery_pending"}.get(
+                status, "user_delivered"
+            ),
             "status": status,
             "id": msg_id,
         }
@@ -4603,6 +4747,74 @@ class Broker(
             self._artifacts.outcome_valid = outcome.valid
         except Exception:
             logger.warning("Failed to extract outcome block from transcript", exc_info=True)
+
+    async def _hydrate_conversation_history(self) -> None:
+        """Recover a resumed native session's durable prefix before the CLI starts."""
+        if (
+            not self._settings.history_hydration_enabled
+            or not self._settings.session.resume_session_id
+            or not self.volundr_api_url
+            or not self._settings.event_log_enabled
+        ):
+            return
+        try:
+            durable = await fetch_durable_history(
+                await self._get_http_client(),
+                session_id=self.session_id,
+                path=self.FORGE_LOG_PATH_TEMPLATE.format(sid=self.session_id),
+                timeout_seconds=self._settings.history_hydration_timeout_seconds,
+                page_size=self._settings.history_hydration_page_size,
+                max_frames=self._settings.history_hydration_max_frames,
+                max_bytes=self._settings.history_hydration_max_bytes,
+                on_frames=self._restore_durable_controls,
+            )
+            merged = merge_history_turns(
+                durable, [asdict(turn) for turn in self._conversation_turns]
+            )
+            hydrated = [ConversationTurn(**turn) for turn in merged]
+        except Exception as exc:
+            logger.warning(
+                "Durable history hydration skipped for session %s; preserving local cache: %s",
+                self.session_id,
+                exc,
+            )
+            return
+        # Direct cache replacement, never _append_turn: replayed frames are
+        # already durable and must not be emitted/persisted a second time.
+        self._conversation_turns = hydrated
+        self._save_conversation_history()
+        logger.info("Hydrated %d conversation turns from durable history", len(hydrated))
+
+    def _control_state_path(self) -> Path:
+        return self._conversation_history_path().with_name(f"controls_{self.session_id}.json")
+
+    def _save_control_state(self) -> None:
+        try:
+            save_control_state(
+                self._control_state_path(),
+                {**self._unrestored_questions, **self._pending_ask_user_questions},
+                {**self._unrestored_permissions, **self._pending_permission_requests},
+            )
+        except (OSError, TypeError, ValueError):
+            logger.exception("Failed to persist pending control state")
+
+    def _restore_durable_controls(self, frames: list) -> None:
+        questions, permissions = pending_controls(frames)
+        self._unrestored_questions = {
+            identity: unrestored_control(frame) for identity, frame in questions.items()
+        }
+        self._unrestored_permissions = {
+            identity: unrestored_control(frame) for identity, frame in permissions.items()
+        }
+        self._save_control_state()
+
+    def _load_control_state(self) -> None:
+        try:
+            self._unrestored_questions, self._unrestored_permissions = load_control_state(
+                self._control_state_path()
+            )
+        except (OSError, TypeError, ValueError):
+            logger.exception("Failed to recover pending control state")
 
 
 # Global broker instance

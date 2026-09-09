@@ -170,6 +170,38 @@ def is_elided_input(input_obj: Any) -> bool:
     return isinstance(input_obj, dict) and bool(input_obj.get("_elided_input"))
 
 
+NEVER_ELIDED_INPUT_TOOLS = frozenset({"askuserquestion", "ask_user_question"})
+"""Tools whose ``input`` IS the user-facing payload, never mere detail.
+
+``AskUserQuestion`` is the one tool where the input is not an argument the client
+summarises to one line — it is the entire thing the user has to read in order to
+answer. Eliding it is not a payload saving, it is deleting the UI: the client is
+left with a placeholder it cannot render a card from, and the perverse property
+is that the BETTER the question (several questions, four options each, a real
+description per option) the more certainly it blows the 1 KB limit and vanishes.
+
+Observed live (session ``agents-diet``, 2026-08-11): a four-question ask with
+per-option descriptions serialised to 3387 B, was elided, and the app had nothing
+to render while the agent sat blocked on the answer.
+
+The lazy per-result endpoint is not a sufficient escape hatch here either: it is
+keyed on the tool_use_id of a *result*, and a question that is still waiting for
+its answer has no result by definition. (It does serve input-only hits — see
+``get_tool_result`` — but that is a recovery path, not a reason to break the
+common case.) Keeping these inline costs a few KB once per ask.
+"""
+
+
+def _is_never_elided_tool(name: Any) -> bool:
+    """True for tools exempt from input elision (see ``NEVER_ELIDED_INPUT_TOOLS``)."""
+    return isinstance(name, str) and name.strip().lower() in NEVER_ELIDED_INPUT_TOOLS
+
+
+DESCRIPTION_LIMIT = 200
+"""Max characters of a tool_use ``input.description`` carried through elision — the model writes a
+handful of words, and this is only a defence against a pathological one."""
+
+
 def elide_tool_use_block(block: Any, *, inline_limit: int = INLINE_BYTE_LIMIT) -> Any:
     """Return a tool_use block with a heavy ``input`` replaced by a placeholder.
 
@@ -185,20 +217,30 @@ def elide_tool_use_block(block: Any, *, inline_limit: int = INLINE_BYTE_LIMIT) -
     """
     if not isinstance(block, dict) or block.get("type") != "tool_use":
         return block
+    if _is_never_elided_tool(block.get("name")):
+        return block
     input_obj = block.get("input")
     if input_obj is None or is_elided_input(input_obj):
         return block
     byte_size = _content_byte_size(input_obj)
     if byte_size <= inline_limit:
         return block
-    return {
-        **block,
-        "input": {
-            "_elided_input": True,
-            "byte_size": byte_size,
-            "preview": _input_preview(input_obj),
-        },
+    placeholder = {
+        "_elided_input": True,
+        "byte_size": byte_size,
+        "preview": _input_preview(input_obj),
     }
+    # KEEP THE MODEL'S OWN `description` (2026-08-07). Claude Code's Bash schema asks the model for
+    # a short human-readable description of what a command does ("Read AGENTS.md", "Find manipulator
+    # files"), and that string — not the raw command — is what a reader wants as the title of the
+    # row. Dropping it here lost the title on exactly the HEAVIEST calls, which are the ones whose
+    # raw command is least readable. It is bounded and tiny (a handful of words), so it costs
+    # nothing next to the KBs this elision saves.
+    if isinstance(input_obj, dict):
+        description = input_obj.get("description")
+        if isinstance(description, str) and description.strip():
+            placeholder["description"] = description[:DESCRIPTION_LIMIT]
+    return {**block, "input": placeholder}
 
 
 def elide_tool_result_block(block: Any, *, inline_limit: int = INLINE_BYTE_LIMIT) -> Any:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from niuu.domain.text_projection import projection_revision
 from volundr.domain.models import LocalMountSource
 from volundr.domain.services.transcript_rebuild import rebuild_turns
 from volundr.log_aggregate import aggregate_workspace_logs
@@ -15,6 +16,8 @@ from volundr.session_archive import (
     load_workspace_transcript,
     resolve_contained_path,
 )
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +390,7 @@ class SessionArchiveService:
             return None  # preserve the existing None -> fall-through contract
         return {
             "turns": result.turns,
+            "projection_revision": projection_revision(result.turns),
             "is_active": False,
             "last_activity": "",
         }

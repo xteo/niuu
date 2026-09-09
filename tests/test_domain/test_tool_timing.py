@@ -185,14 +185,32 @@ class TestLateAndOutOfOrderResults:
         assert call[TOOL_DURATION_MS] == 3_000
         assert call[TOOL_ENDED_AT] == (T0 + timedelta(seconds=3)).isoformat()
 
-    def test_repeated_id_closes_the_most_recent_open_call(self):
+    def test_legacy_repeated_id_closes_the_most_recent_open_call(self):
         acc = TurnAccumulator()
         apply_assistant_blocks(acc, [_tool_use("dup")], ts=T0)
-        apply_assistant_blocks(acc, [_tool_use("dup")], ts=T0 + timedelta(seconds=10))
+        # Older snapshots could already contain repeated IDs. New assistant
+        # frames upsert by ID, but result timing must still safely handle that
+        # historical shape by closing its most recent open call.
+        acc.parts.append(
+            {**_tool_use("dup"), TOOL_STARTED_AT: (T0 + timedelta(seconds=10)).isoformat()}
+        )
         apply_tool_result_blocks(acc, [_tool_result("dup")], ts=T0 + timedelta(seconds=12))
         calls = [p for p in acc.parts if p.get("type") == "tool_use"]
         assert TOOL_ENDED_AT not in calls[0]  # the older call stays open
         assert calls[1][TOOL_DURATION_MS] == 2_000
+
+    def test_same_id_input_refresh_keeps_original_completed_duration(self):
+        acc = TurnAccumulator()
+        apply_assistant_blocks(acc, [_tool_use("t1")], ts=T0)
+        apply_tool_result_blocks(acc, [_tool_result("t1")], ts=T0 + timedelta(seconds=3))
+        updated = {**_tool_use("t1"), "input": {"command": "actual completed arguments"}}
+        apply_assistant_blocks(acc, [updated], ts=T0 + timedelta(seconds=90))
+        calls = [part for part in acc.parts if part["type"] == "tool_use"]
+        assert len(calls) == 1
+        assert calls[0]["input"] == updated["input"]
+        assert calls[0][TOOL_STARTED_AT] == T0.isoformat()
+        assert calls[0][TOOL_ENDED_AT] == (T0 + timedelta(seconds=3)).isoformat()
+        assert calls[0][TOOL_DURATION_MS] == 3_000
 
 
 class TestClockAndFormatEdges:

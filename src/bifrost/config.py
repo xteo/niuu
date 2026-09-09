@@ -127,8 +127,11 @@ def _default_models() -> list[ManagedModelConfig]:
     """Built-in Bifrost model catalog used when no explicit catalog is configured."""
     return [
         ManagedModelConfig(
-            id="claude-fable-5",
-            name="Claude Fable 5",
+            # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
+            # (Damien, 2026-09-02). `claude-fable-5` is still served, so a client on an old
+            # build that keeps sending it is not broken — it just no longer appears here.
+            id="claude-fable-5-1",
+            name="Claude Fable 5.1",
             vendor="anthropic",
             provider=ManagedModelProvider.CLOUD,
             tier=ManagedModelTier.FRONTIER,
@@ -137,7 +140,7 @@ def _default_models() -> list[ManagedModelConfig]:
                 "Anthropic's most capable model for demanding reasoning and "
                 "long-horizon agentic work; 1M-token context."
             ),
-            # Claude Fable 5 is $10 in / $50 out per 1M tokens (blended shown).
+            # Claude Fable 5.1 is $10 in / $50 out per 1M tokens (blended shown).
             cost_per_million_tokens=30.0,
             session_definition="skuldClaude",
             supports_tools=True,
@@ -172,16 +175,36 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
+        # Astra + Sol are the only two Codex choices, Astra the default (Damien,
+        # 2026-09-05). Terra was removed with the same decision.
+        ManagedModelConfig(
+            id="gpt-6-astra",
+            name="GPT-6 Astra",
+            vendor="openai",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#059669",
+            description=(
+                "OpenAI GPT-6 Astra — the GPT-6 flagship for the hardest end-to-end "
+                "coding, computer-use and research work; 1M-token context; defaults "
+                "to Ultra reasoning"
+            ),
+            # GPT-6 Astra is $10 in / $50 out per 1M tokens; use the output rate.
+            cost_per_million_tokens=50.0,
+            session_definition="skuldCodex",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
         ManagedModelConfig(
             id="gpt-5.6-sol",
             name="GPT-5.6 Sol",
             vendor="openai",
             provider=ManagedModelProvider.CLOUD,
             tier=ManagedModelTier.FRONTIER,
-            color="#059669",
+            color="#10B981",
             description=(
-                "OpenAI GPT-5.6 Sol flagship coding model; Völundr sessions "
-                "default to high reasoning effort."
+                "OpenAI GPT-5.6 Sol flagship coding model; defaults to the new "
+                "Ultra reasoning effort."
             ),
             # GPT-5.6 Sol is $5 in / $30 out per 1M tokens; use the output rate.
             cost_per_million_tokens=30.0,
@@ -189,6 +212,8 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
+        # Model ids MUST match `grok models` exactly — the CLI rejects an unknown id,
+        # which kills the session at its first prompt (the "grok-build" outage).
         ManagedModelConfig(
             id="gpt-5.6-terra",
             name="GPT-5.6 Terra",
@@ -200,6 +225,84 @@ def _default_models() -> list[ManagedModelConfig]:
             # GPT-5.6 Terra is $2.50 in / $15 out per 1M tokens; use the output rate.
             cost_per_million_tokens=15.0,
             session_definition="skuldCodex",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
+        ManagedModelConfig(
+            id="grok-4.6",
+            name="Grok 4.6 (Build)",
+            vendor="xai",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#1DA1F2",
+            description=(
+                "xAI Grok 4.6 agentic coding model (ACP over stdio). Served as grok-4.6-build."
+            ),
+            cost_per_million_tokens=None,
+            session_definition="skuldGrok",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
+        ManagedModelConfig(
+            id="grok-4.5",
+            name="Grok 4.5 (Build)",
+            vendor="xai",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#1DA1F2",
+            description="xAI Grok 4.5 agentic coding model (ACP over stdio).",
+            cost_per_million_tokens=None,
+            session_definition="skuldGrok",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
+        # Meta Muse Spark — served by Muse Code (`muse serve`, MSP over stdio) and the Meta
+        # Model API. Ids are exactly what the API accepts; the -contributor variants are
+        # the discounted tier whose traffic Meta uses to improve its products.
+        ManagedModelConfig(
+            id="muse-spark-1.3",
+            name="Muse Spark 1.3",
+            vendor="meta",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#0866FF",
+            description=(
+                "Meta Muse Spark 1.3 — long-horizon coding and agentic work through Muse "
+                "Code (MSP over stdio); 1M-token context."
+            ),
+            # Muse Spark 1.3 is $1.25 in / $4.25 out per 1M tokens; use the output rate.
+            cost_per_million_tokens=4.25,
+            session_definition="skuldMuse",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
+        ManagedModelConfig(
+            id="muse-spark-1.2",
+            name="Muse Spark 1.2",
+            vendor="meta",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.BALANCED,
+            color="#0866FF",
+            description="Meta Muse Spark 1.2 — the previous Muse Code model; 1M-token context.",
+            cost_per_million_tokens=4.25,
+            session_definition="skuldMuse",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
+        ManagedModelConfig(
+            id="muse-spark-1.3-contributor",
+            name="Muse Spark 1.3 (Contributor)",
+            vendor="meta",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.EXECUTION,
+            color="#0866FF",
+            description=(
+                "Meta Muse Spark 1.3 at the contributor rate — prompts and outputs are "
+                "used by Meta to improve its products. Not for confidential code."
+            ),
+            # $0.10 in / $0.20 out per 1M tokens; use the output rate.
+            cost_per_million_tokens=0.20,
+            session_definition="skuldMuse",
             supports_tools=True,
             supports_thinking=True,
         ),

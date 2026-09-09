@@ -11,12 +11,24 @@ from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    status,
+)
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp
 
 from niuu.adapters.inbound.auth import extract_principal
 from niuu.adapters.inbound.remote_urls import build_remote_url
+from niuu.adapters.inbound.ws_forge_replay import forward_replay
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.services.instances import InstanceService
 
@@ -1100,7 +1112,19 @@ def create_volundr_router(
         )
         _ensure_remote_success(response)
         payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        flags = dict(payload) if isinstance(payload, dict) else {}
+        # Advertise this facade's public surface, not routes that exist only on
+        # its embedded service. Clients can avoid expected 404s and keep the
+        # existing Bifrost model fallback.
+        flags["capabilities"] = {
+            "models": False,
+            "chronicles": False,
+            "session_chronicle": False,
+            "session_events": False,
+            "message_delivery": True,
+            "native_history_import": True,
+        }
+        return flags
 
     @router.get("/external-sessions")
     async def list_external_sessions(
@@ -1234,6 +1258,14 @@ def create_volundr_router(
     ) -> dict[str, Any]:
         return await _start_session_on_owner(request, session_id, principal, "resume")
 
+    @router.post("/sessions/{session_id}/history/import")
+    async def import_session_history(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        return await _start_session_on_owner(request, session_id, principal, "history/import")
+
     @router.post("/sessions/{session_id}/log", status_code=status.HTTP_201_CREATED)
     async def append_log(
         request: Request,
@@ -1302,6 +1334,24 @@ def create_volundr_router(
         # ("session looks dead / no final message") even with hundreds of
         # frames stored (latest_seq high, replay empty).
         return response.json()
+
+    @router.websocket("/sessions/{session_id}/replay")
+    async def replay_session(websocket: WebSocket, session_id: str) -> None:
+        principal = await extract_principal(websocket)
+        try:
+            instance, _ = await _find_session_owner(
+                service, principal, websocket, session_id, embedded_app=embedded_forge_app
+            )
+        except HTTPException:
+            await websocket.close(code=1008)
+            return
+        await forward_replay(
+            websocket,
+            instance,
+            session_id,
+            headers=_forward_headers(websocket),
+            embedded_app=embedded_forge_app,
+        )
 
     @router.post("/sessions/{session_id}/activity", status_code=status.HTTP_204_NO_CONTENT)
     async def report_activity(
@@ -1652,7 +1702,7 @@ def create_volundr_router(
         session_id: str = Path(description="Volundr session identifier"),
         body: dict[str, Any] = Body(default_factory=dict),
         principal: Principal = Depends(extract_principal),
-    ) -> dict[str, Any]:
+    ) -> Response:
         instance, _ = await _find_session_owner(
             service,
             principal,
@@ -1670,7 +1720,40 @@ def create_volundr_router(
         )
         _ensure_remote_success(response)
         payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        return JSONResponse(
+            content=payload if isinstance(payload, dict) else {}, status_code=response.status_code
+        )
+
+    @router.api_route("/sessions/{session_id}/message-deliveries/{request_id}", methods=["GET"])
+    @router.api_route(
+        "/sessions/{session_id}/message-deliveries/{request_id}/{operation}", methods=["POST"]
+    )
+    async def message_delivery(
+        request: Request,
+        session_id: str,
+        request_id: str = Path(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$"),
+        operation: str | None = None,
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        if request.method == "POST" and operation not in ("claim", "settle"):
+            raise HTTPException(404, "Unknown delivery operation")
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        # GET has no operation path segment. Never treat an unrelated query
+        # parameter as part of a forwarded URL.
+        suffix = f"/{operation}" if request.method == "POST" else ""
+        response = await _request_remote(
+            instance,
+            request,
+            method=request.method,
+            path=f"/sessions/{session_id}/message-deliveries/{request_id}{suffix}",
+            json_body=body if request.method == "POST" else None,
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
 
     @router.get("/sessions/{session_id}/logs")
     async def get_logs(

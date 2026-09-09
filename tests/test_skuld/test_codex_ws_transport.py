@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import json
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -247,20 +249,20 @@ class TestConstruction:
     @pytest.mark.asyncio
     async def test_connect_ws_uses_configured_large_message_limit(self, tmp_path):
         t = _make_transport(tmp_path, max_ws_message_bytes=12 * 1024 * 1024)
+        t._codex_socket_path = str(tmp_path / "app-server.sock")
         t._process = FakeRunningProcess()
         ws = FakeWebSocket()
 
         with patch(
-            "skuld.transports.codex_ws.ws_connect",
+            "skuld.transports.codex_ws.unix_connect",
             new=AsyncMock(return_value=ws),
         ) as connect:
             await t._connect_ws()
 
         connect.assert_awaited_once()
-        assert connect.await_args.args == ("ws://127.0.0.1:19999",)
+        assert connect.await_args.kwargs["path"] == t._codex_socket_path
         assert connect.await_args.kwargs["max_size"] == 12 * 1024 * 1024
         assert connect.await_args.kwargs["compression"] is None
-        assert connect.await_args.kwargs["proxy"] is None
         if t._receive_task is not None:
             t._receive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -494,7 +496,8 @@ class TestSpawnAppServer:
                 "app-server",
                 "--listen",
             )
-            assert call_args[3] == "ws://127.0.0.1:19999"
+            assert call_args[3] == f"unix://{t._codex_socket_path}"
+            assert Path(t._codex_socket_dir).stat().st_mode & 0o777 == 0o700
             assert "-c" in call_args
             assert any(arg == 'mcp_servers.mimir-local.command="python3"' for arg in call_args)
             assert mock_exec.call_args.kwargs["env"]["PATH"] == "/tmp/shims:/usr/bin"
@@ -641,6 +644,11 @@ class TestSendMessage:
 
         assert t._last_result is None
         assert t._last_usage is None
+        # Sending steering input must not renumber blocks in the active turn.
+        assert t._block_index == 5
+        await t._handle_server_message(
+            {"method": "turn/started", "params": {"turn": {"id": "new-turn"}}}
+        )
         assert t._block_index == 0
 
     @pytest.mark.asyncio
@@ -674,10 +682,13 @@ class TestEventNormalization:
         )
 
         events = _emitted_events(emit)
-        assert len(events) == 1
-        assert events[0]["type"] == "content_block_delta"
-        assert events[0]["delta"]["type"] == "text_delta"
-        assert events[0]["delta"]["text"] == "Hello "
+        assert len(events) == 2
+        assert events[0]["type"] == "content_block_start"
+        assert events[0]["content_block"]["id"] == "i1"
+        assert events[1]["type"] == "content_block_delta"
+        assert events[1]["delta"]["type"] == "text_delta"
+        assert events[1]["delta"]["text"] == "Hello "
+        assert events[1]["item_id"] == "i1"
 
     @pytest.mark.asyncio
     async def test_reasoning_delta(self, tmp_path):
@@ -815,6 +826,7 @@ class TestEventNormalization:
             }
         )
 
+        await t._compaction_task
         t._send_rpc.assert_awaited_once_with(
             "thread/compact/start",
             {"threadId": "thread-1"},
@@ -1147,6 +1159,10 @@ class TestItemLifecycle:
             "type": "text",
             "id": "msg-1",
             "phase": "commentary",
+            "text": "",
+            "index": 0,
+            "id_source": "native",
+            "complete": False,
         }
 
     @pytest.mark.asyncio
@@ -1650,7 +1666,7 @@ class TestApprovals:
         assert event["type"] == "control_request"
         assert event["tool"] == "Bash"
         assert event["input"]["command"] == "rm -rf /tmp/test"
-        assert "42" in t._pending_approvals
+        assert event["request_id"] in t._pending_approvals
 
     @pytest.mark.asyncio
     async def test_file_change_approval(self, tmp_path):
@@ -1668,7 +1684,7 @@ class TestApprovals:
         event = emit.call_args[0][0]
         assert event["type"] == "control_request"
         assert event["tool"] == "Edit"
-        assert "99" in t._pending_approvals
+        assert event["request_id"] in t._pending_approvals
 
     @pytest.mark.asyncio
     async def test_exec_command_approval_uses_review_decision_shape(self, tmp_path):
@@ -1697,7 +1713,7 @@ class TestApprovals:
         assert event["tool"] == "Bash"
         assert event["input"]["command"] == "/bin/zsh -lc 'echo hi'"
 
-        await t.send_control_response("43", {"behavior": "allow"})
+        await t.send_control_response(event["request_id"], {"behavior": "allow"})
 
         sent = json.loads(t._ws.sent[0])
         assert sent["id"] == 43
@@ -2716,7 +2732,23 @@ class TestItemCompletedEdgeCases:
             for event in _events_of_type(emit, "content_block_start")
             if event["content_block"]["type"] == "tool_result"
         ]
+        assert len(results) == 1
+        ended_at = results[0].pop("ended_at")
+        assert datetime.fromisoformat(ended_at).tzinfo is not None
         assert results == [{"type": "tool_result", "tool_use_id": "fc-1", "content": ""}]
+        # 2 stops now: the tool_use block, plus the tool_result lifecycle every
+        # completed call emits. A completed tool ALWAYS produces a result — that is
+        # what pairs it and stamps its duration; silence left rows hanging open.
+        assert len(stops) == 2
+        # The durable half: a tool_result must ride in a `user` frame (the only shape
+        # the transcript reducer harvests results from).
+        user_results = [
+            e
+            for e in _emitted_events(emit)
+            if e.get("type") == "user"
+            and any(b.get("type") == "tool_result" for b in (e.get("content") or []))
+        ]
+        assert len(user_results) == 1
 
     @pytest.mark.asyncio
     async def test_web_search_completed_preserves_query(self, tmp_path):
@@ -2734,6 +2766,20 @@ class TestItemCompletedEdgeCases:
             if event["content_block"]["type"] == "tool_result"
         ]
         assert json.loads(results[0]["content"]) == {"query": "test"}
+
+        # 2 stops now: the tool_use block, plus the tool_result lifecycle every
+        # completed call emits. A completed tool ALWAYS produces a result — that is
+        # what pairs it and stamps its duration; silence left rows hanging open.
+        assert len(stops) == 2
+        # The durable half: a tool_result must ride in a `user` frame (the only shape
+        # the transcript reducer harvests results from).
+        user_results = [
+            e
+            for e in _emitted_events(emit)
+            if e.get("type") == "user"
+            and any(b.get("type") == "tool_result" for b in (e.get("content") or []))
+        ]
+        assert len(user_results) == 1
 
     @pytest.mark.asyncio
     async def test_web_search_completed_preserves_activity(self, tmp_path):
@@ -2774,7 +2820,19 @@ class TestItemCompletedEdgeCases:
         await t._handle_item_completed({"type": "mcpToolCall", "id": "mcp-1", "tool": "read_file"})
 
         stops = _events_of_type(emit, "content_block_stop")
+        # 2 stops now: the tool_use block, plus the tool_result lifecycle every
+        # completed call emits. A completed tool ALWAYS produces a result — that is
+        # what pairs it and stamps its duration; silence left rows hanging open.
         assert len(stops) == 2
+        # The durable half: a tool_result must ride in a `user` frame (the only shape
+        # the transcript reducer harvests results from).
+        user_results = [
+            e
+            for e in _emitted_events(emit)
+            if e.get("type") == "user"
+            and any(b.get("type") == "tool_result" for b in (e.get("content") or []))
+        ]
+        assert len(user_results) == 1
 
     @pytest.mark.asyncio
     async def test_command_completed_no_output_emits_empty_tool_result(self, tmp_path):
@@ -2794,7 +2852,23 @@ class TestItemCompletedEdgeCases:
             for event in _events_of_type(emit, "content_block_start")
             if event["content_block"]["type"] == "tool_result"
         ]
+        assert len(results) == 1
+        ended_at = results[0].pop("ended_at")
+        assert datetime.fromisoformat(ended_at).tzinfo is not None
         assert results == [{"type": "tool_result", "tool_use_id": "cmd-1", "content": ""}]
+        # 2 stops now: the tool_use block, plus the tool_result lifecycle every
+        # completed call emits. A completed tool ALWAYS produces a result — that is
+        # what pairs it and stamps its duration; silence left rows hanging open.
+        assert len(stops) == 2
+        # The durable half: a tool_result must ride in a `user` frame (the only shape
+        # the transcript reducer harvests results from).
+        user_results = [
+            e
+            for e in _emitted_events(emit)
+            if e.get("type") == "user"
+            and any(b.get("type") == "tool_result" for b in (e.get("content") or []))
+        ]
+        assert len(user_results) == 1
         # No text delta emitted
         text_deltas = [
             e
@@ -2822,7 +2896,23 @@ class TestItemCompletedEdgeCases:
             for event in _events_of_type(emit, "content_block_start")
             if event["content_block"]["type"] == "tool_result"
         ]
+        assert len(results) == 1
+        ended_at = results[0].pop("ended_at")
+        assert datetime.fromisoformat(ended_at).tzinfo is not None
         assert results == [{"type": "tool_result", "tool_use_id": "cmd-1", "content": ""}]
+        # 2 stops now: the tool_use block, plus the tool_result lifecycle every
+        # completed call emits. A completed tool ALWAYS produces a result — that is
+        # what pairs it and stamps its duration; silence left rows hanging open.
+        assert len(stops) == 2
+        # The durable half: a tool_result must ride in a `user` frame (the only shape
+        # the transcript reducer harvests results from).
+        user_results = [
+            e
+            for e in _emitted_events(emit)
+            if e.get("type") == "user"
+            and any(b.get("type") == "tool_result" for b in (e.get("content") or []))
+        ]
+        assert len(user_results) == 1
         text_deltas = [
             e
             for e in events
@@ -3008,12 +3098,13 @@ class TestResumeEdgeCases:
 
 class TestSendControlResponseEdgeCases:
     @pytest.mark.asyncio
-    async def test_unknown_request_id_logs_warning(self, tmp_path):
-        """Responding to an unknown request_id should be a no-op (warning logged)."""
+    async def test_unknown_request_id_is_explicitly_rejected(self, tmp_path):
+        """A stale approval must fail visibly without replying to another RPC."""
         t = _make_transport(tmp_path)
         t._ws = FakeWebSocket()
 
-        await t.send_control_response("nonexistent", {"behavior": "allow"})
+        with pytest.raises(ValueError, match="Unknown or already answered"):
+            await t.send_control_response("nonexistent", {"behavior": "allow"})
 
         # Nothing sent
         assert len(t._ws.sent) == 0
@@ -3195,10 +3286,11 @@ class TestEmitTextDelta:
 
         await t._emit_text_delta("hello")
 
-        assert emit.call_count == 1
+        assert emit.call_count == 2  # A late attachment still receives its text anchor.
         event = emit.call_args[0][0]
         assert event["delta"]["type"] == "text_delta"
         assert event["delta"]["text"] == "hello"
+        assert event["item_id"] == emit.call_args_list[0][0][0]["content_block"]["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -3389,7 +3481,7 @@ class TestSteeringCorrelation:
 
 
 # ---------------------------------------------------------------------------
-# Reasoning effort
+# Reasoning effort (GPT-6 Astra / GPT-5.6 Sol Ultra)
 # ---------------------------------------------------------------------------
 
 
@@ -3419,13 +3511,24 @@ class TestReasoningEffort:
         assert _model_supports_ultra("gpt-5.6-sol") is True
         assert _model_supports_ultra("GPT-5.6-Sol") is True
         assert _model_supports_ultra("gpt-5.5") is False
-        assert _codex_effort_for_model("gpt-5.6-sol") == "high"
+        assert _codex_effort_for_model("gpt-5.6-sol") == "ultra"
         assert _codex_effort_for_model("gpt-5.5") == "high"
         assert _codex_effort_for_model("") == "high"
 
-    def test_sol_defaults_to_high(self, tmp_path) -> None:
+    def test_effort_helpers_recognize_astra(self) -> None:
+        # GPT-6 Astra's bundled Codex metadata lists low/medium/high/xhigh/max/ultra;
+        # it launches at `ultra` exactly like Sol.
+        assert _model_supports_ultra("gpt-6-astra") is True
+        assert _model_supports_ultra("GPT-6-Astra") is True
+        assert _codex_effort_for_model("gpt-6-astra") == "ultra"
+
+    def test_sol_defaults_to_ultra(self, tmp_path) -> None:
         t = _make_transport(tmp_path, model="gpt-5.6-sol")
-        assert t._reasoning_effort == "high"
+        assert t._reasoning_effort == "ultra"
+
+    def test_astra_defaults_to_ultra(self, tmp_path) -> None:
+        t = _make_transport(tmp_path, model="gpt-6-astra")
+        assert t._reasoning_effort == "ultra"
 
     def test_non_sol_defaults_to_high(self, tmp_path) -> None:
         t = _make_transport(tmp_path, model="gpt-5.5")
@@ -3436,10 +3539,22 @@ class TestReasoningEffort:
         assert t._reasoning_effort == "low"
 
     @pytest.mark.asyncio
-    async def test_sol_handshake_sends_high_effort(self, tmp_path) -> None:
+    async def test_sol_handshake_sends_ultra_effort(self, tmp_path) -> None:
         t = _make_transport(tmp_path, model="gpt-5.6-sol")
         params = await _capture_thread_start_params(t)
-        assert params["config"]["model_reasoning_effort"] == "high"
+        assert params["config"]["model_reasoning_effort"] == "ultra"
+
+    @pytest.mark.asyncio
+    async def test_astra_handshake_sends_ultra_effort(self, tmp_path) -> None:
+        t = _make_transport(tmp_path, model="gpt-6-astra")
+        params = await _capture_thread_start_params(t)
+        assert params["config"]["model_reasoning_effort"] == "ultra"
+
+    @pytest.mark.asyncio
+    async def test_astra_explicit_ultra_not_clamped(self, tmp_path) -> None:
+        t = _make_transport(tmp_path, model="gpt-6-astra", reasoning_effort="ultra")
+        params = await _capture_thread_start_params(t)
+        assert params["config"]["model_reasoning_effort"] == "ultra"
 
     @pytest.mark.asyncio
     async def test_ultra_clamped_to_high_on_non_sol_model(self, tmp_path) -> None:

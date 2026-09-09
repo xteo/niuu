@@ -66,7 +66,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             display_name="Claude Code",
             description="Anthropic Claude — full IDE with terminal, tools, and MCP",
             labels=["session", "claude"],
-            default_model="claude-opus-4-8",
+            default_model="claude-opus-5",
             compatible_providers=["anthropic"],
             defaults={
                 "broker": {
@@ -85,7 +85,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 "for subscription sessions, slash commands, and terminal controls"
             ),
             labels=["session", "claude", "interactive"],
-            default_model="claude-sonnet-4-6",
+            default_model="claude-opus-5",
             compatible_providers=["anthropic"],
             defaults={
                 "broker": {
@@ -104,7 +104,11 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             display_name="OpenAI Codex",
             description="OpenAI Codex — WebSocket protocol with streaming and tools",
             labels=["session", "codex"],
-            default_model="",
+            # Astra is the default Codex model (Damien, 2026-09-05). It was empty, which
+            # left the choice entirely to whatever the caller happened to pass — the app
+            # always sends one, but a REST/tool launch that omitted it got no model at
+            # all.
+            default_model="gpt-6-astra",
             compatible_providers=["openai"],
             defaults={
                 "broker": {
@@ -121,7 +125,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 "OpenAI Codex — app-server transport tuned for autonomous workflow execution"
             ),
             labels=["session", "codex", "batch"],
-            default_model="",
+            default_model="gpt-6-astra",
             compatible_providers=["openai"],
             defaults={
                 "broker": {
@@ -134,16 +138,34 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldGrok": SessionDefinitionConfig(
             enabled=True,
             display_name="xAI Grok Build",
-            description=(
-                "xAI Grok Build — Agent Client Protocol (ACP) over stdio (Scaldy pipeline)"
-            ),
+            description="xAI Grok Build — Agent Client Protocol (ACP) over stdio (Scaldy pipeline)",
             labels=["session", "grok"],
-            default_model="grok-build",
+            default_model="grok-4.6",
             compatible_providers=["xai"],
             defaults={
                 "broker": {
                     "cliType": "grok",
                     "transportAdapter": "skuld.transports.grok.GrokACPTransport",
+                    "agentTeams": False,
+                },
+            },
+        ),
+        "skuldMuse": SessionDefinitionConfig(
+            enabled=True,
+            display_name="Meta Muse Code",
+            description=(
+                "Meta Muse Code — Muse Session Protocol (MSP) over stdio (Scaldy pipeline); "
+                "native mid-turn steering, durable resumable sessions, real token usage"
+            ),
+            labels=["session", "muse"],
+            # Muse Spark 1.3 shipped 2026-09-02 and is what `muse` serves by default in
+            # Muse Code 1.0.2; the id is exactly what the Meta Model API accepts.
+            default_model="muse-spark-1.3",
+            compatible_providers=["meta"],
+            defaults={
+                "broker": {
+                    "cliType": "muse",
+                    "transportAdapter": "skuld.transports.muse.MuseMSPTransport",
                     "agentTeams": False,
                 },
             },
@@ -177,6 +199,27 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 "broker": {
                     "cliType": "claude",
                     "transportAdapter": "skuld.transports.remote_control.RemoteControlTransport",
+                    "agentTeams": False,
+                },
+            },
+        ),
+        "skuldCodexRemote": SessionDefinitionConfig(
+            enabled=True,
+            display_name="Codex Remote Control",
+            description=(
+                "Codex Remote Control — requires the standalone Codex install; "
+                "fails fast with guidance until it exists"
+            ),
+            labels=["session", "codex", "remote-control"],
+            # Astra is the default Codex model (Damien, 2026-09-05).
+            default_model="gpt-6-astra",
+            compatible_providers=["openai"],
+            defaults={
+                "broker": {
+                    "cliType": "codex",
+                    "transportAdapter": (
+                        "skuld.transports.remote_control.CodexRemoteControlTransport"
+                    ),
                     "agentTeams": False,
                 },
             },

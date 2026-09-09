@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from niuu.domain.text_projection import projection_revision
+
 ARCHIVE_VERSION = 1
 DEFAULT_WORKSPACE_ARCHIVE_DIR = Path(".volundr") / "archive"
 DEFAULT_CONFIG_ARCHIVE_DIR = Path("archives")
@@ -654,7 +656,12 @@ def _normalise_transcript_payload(data: dict[str, Any]) -> dict[str, Any]:
     turns = data.get("turns", [])
     if not isinstance(turns, list):
         turns = []
-    return {"turns": turns, "is_active": False, "last_activity": ""}
+    return {
+        "turns": turns,
+        "projection_revision": projection_revision(turns),
+        "is_active": False,
+        "last_activity": "",
+    }
 
 
 def _write_json(root: Path, path: str | Path, payload: dict[str, Any]) -> None:

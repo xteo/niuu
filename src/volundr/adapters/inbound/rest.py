@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, require_scope
 from niuu.domain.session_endpoint import public_session_endpoint
+from niuu.domain.text_projection import projection_revision
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
 from skuld.tool_result_preview import (
     PreviewCache,
@@ -30,6 +31,12 @@ from skuld.tool_result_preview import (
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
 from volundr.config import PermissionAutoApprovalConfig
+from volundr.domain.history_import import (
+    HistoryImportConflictError,
+    HistoryImportError,
+    HistoryImportSessionNotFoundError,
+    HistoryImportValidationError,
+)
 from volundr.domain.models import (
     Chronicle,
     ChronicleStatus,
@@ -1532,7 +1539,7 @@ def create_router(
             detail="OpenShell workload token is not bound to this session",
         )
 
-    async def _optional_principal(request: Request) -> Principal | None:
+    async def _optional_principal(request: Request, *, strict: bool = False) -> Principal | None:
         """Extract principal if identity is configured, else return None.
 
         Allows dev mode (no IDP) to work without auth headers while
@@ -1550,6 +1557,8 @@ def create_router(
         try:
             principal = await extract_principal(request)
         except HTTPException:
+            if strict:
+                raise
             return None
 
         try:
@@ -1780,7 +1789,7 @@ def create_router(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="External session discovery not available",
             )
-        principal = await _optional_principal(request)
+        principal = await _optional_principal(request, strict=True)
         try:
             session = await external_session_service.import_session(
                 provider=data.provider,
@@ -1808,7 +1817,38 @@ def create_router(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(e),
             )
+        except HistoryImportValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        except HistoryImportError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
         return _session_response(session)
+
+    @router.post("/sessions/{session_id}/history/import", tags=["Sessions"])
+    async def import_session_history(request: Request, session_id: UUID) -> dict:
+        """Backfill a recovered native session before starting it.
+
+        Uses the session's stored provider and native ID. Existing conversation
+        data or an active writer causes a conflict; identical retries are safe.
+        """
+        if external_session_service is None:
+            raise HTTPException(status_code=503, detail="External session discovery not available")
+        principal = await _optional_principal(request, strict=True)
+        try:
+            return await external_session_service.backfill_session(session_id, principal)
+        except (SessionAccessDeniedError, ExternalSessionPathNotAllowedError) as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        except (
+            HistoryImportSessionNotFoundError,
+            ExternalSessionProviderNotFoundError,
+            ExternalSessionNotFoundError,
+        ) as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except HistoryImportConflictError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except (HistoryImportValidationError, ExternalSessionWorkspaceError) as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        except HistoryImportError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
 
     @router.post(
         "/sessions",
@@ -2747,11 +2787,19 @@ def create_router(
         from websockets.asyncio.client import connect
 
         content = body.get("content", "")
-        if not content:
+        if not isinstance(content, str) or not content.strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="content is required",
             )
+
+        # Keep the caller's identity across a timeout/retry. The broker atomically
+        # claims it in durable storage before dispatching to the native process.
+        import re
+
+        req_id = body.get("request_id") or str(uuid4())
+        if not isinstance(req_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", req_id):
+            raise HTTPException(status_code=400, detail="Invalid request_id")
 
         # Verify the caller owns this session
         principal = await extract_principal(request)
@@ -2802,13 +2850,14 @@ def create_router(
         # If no ACK arrives within the grace, the broker has ACCEPTED the message and its
         # retry loop is still driving delivery: we report 202 "pending" (NOT "sent"), so
         # the caller never reads an undelivered message as success.
-        req_id = str(uuid4())
         delivery: dict[str, Any] | None = None
+        dispatch_attempted = False
         try:
             async with connect(ws_url, **connect_kwargs) as ws:
                 # Send immediately. Draining startup traffic *before* sending can
                 # delay or drop the first user turn for transports that emit
                 # welcome or capability events while still coming online.
+                dispatch_attempted = True
                 await ws.send(
                     json.dumps({"type": "user", "content": content, "request_id": req_id})
                 )
@@ -2827,7 +2876,13 @@ def create_router(
                         if (
                             isinstance(frame, dict)
                             and frame.get("request_id") == req_id
-                            and frame.get("type") in ("user_delivered", "user_delivery_failed")
+                            and frame.get("type")
+                            in (
+                                "user_delivered",
+                                "user_delivery_failed",
+                                "user_delivery_pending",
+                                "error",
+                            )
                         ):
                             return frame
 
@@ -2836,6 +2891,20 @@ def create_router(
                         _await_ack(), timeout=SEND_MESSAGE_ACK_GRACE_SECONDS
                     )
         except Exception as e:
+            if dispatch_attempted:
+                # The send may have reached the broker before the socket failed.
+                # Preserve the identity so the caller can inspect/retry that same
+                # claim without executing a new instruction.
+                return JSONResponse(
+                    status_code=status.HTTP_202_ACCEPTED,
+                    content={
+                        "status": "pending",
+                        "delivery": "pending",
+                        "session_id": str(session_id),
+                        "request_id": req_id,
+                        "message": "Delivery is unconfirmed; check this request before retrying.",
+                    },
+                )
             # The endpoint looked live (chat_endpoint set) but the broker socket
             # is unreachable — the pod is gone. Reconcile the row so its stale
             # RUNNING/endpoint self-heals, then fail deterministically (409) so
@@ -2852,6 +2921,24 @@ def create_router(
                 detail=detail,
             )
 
+        if isinstance(delivery, dict) and delivery.get("type") == "error":
+            code = delivery.get("code")
+            error_status = {
+                "request_id_conflict": status.HTTP_409_CONFLICT,
+                "message_claim_unavailable": status.HTTP_503_SERVICE_UNAVAILABLE,
+            }.get(code, status.HTTP_502_BAD_GATEWAY)
+            return JSONResponse(
+                status_code=error_status,
+                content={
+                    "status": "failed",
+                    "delivery": "failed",
+                    "request_id": req_id,
+                    "session_id": str(session_id),
+                    "code": code,
+                    "message": delivery.get("content") or "Message was not accepted",
+                },
+            )
+
         # Terminal failure: the broker exhausted its bounded retry and the transport
         # rejected the message. Surface as an error — never a 200 "sent" (INV-7).
         if isinstance(delivery, dict) and delivery.get("type") == "user_delivery_failed":
@@ -2866,7 +2953,7 @@ def create_router(
         # No ACK within the grace: the broker ACCEPTED the message and its retry loop
         # is still driving delivery. This is NOT a confirmed send — report 202 pending
         # so the caller can tell it is in flight, not delivered (INV-7).
-        if not isinstance(delivery, dict):
+        if not isinstance(delivery, dict) or delivery.get("type") == "user_delivery_pending":
             return JSONResponse(
                 status_code=status.HTTP_202_ACCEPTED,
                 content={
@@ -2962,6 +3049,11 @@ def create_router(
             if not isinstance(payload, dict) or not isinstance(payload.get("turns"), list):
                 return payload
             all_turns = payload["turns"]
+            # Compute over the complete prefix BEFORE pagination/shallow elision.
+            payload = {
+                **payload,
+                "projection_revision": projection_revision(all_turns),
+            }
             total = len(all_turns)
             if after >= 0:
                 # P2 incremental window: everything past the client's cached prefix. An `after`

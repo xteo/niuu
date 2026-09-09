@@ -349,11 +349,16 @@ async def _proxy_ws(
     port = skuld_reg.get_port(session_id)
     target = None if port is not None else await skuld_reg.resolve_target(session_id)
     if port is None and target is None:
-        # No live port — the broker is gone. Reconcile the row so a stale
-        # RUNNING tombstone self-heals, then close with a deterministic
-        # "session gone" code (4410) the client can branch on.
-        await skuld_reg.reconcile_dead(session_id)
-        await websocket.close(code=4410, reason="Session is no longer running")
+        # A newly advertised session may not have a listening broker yet.
+        # Only the runtime's confirmed death makes this connection terminal.
+        confirmed_dead = await skuld_reg.reconcile_dead(session_id)
+        await websocket.accept()
+        await websocket.close(
+            code=4410 if confirmed_dead else 4411,
+            reason="Session is no longer running"
+            if confirmed_dead
+            else "Session is starting; retry",
+        )
         return
 
     connected = False
@@ -391,7 +396,12 @@ async def _proxy_ws(
             if confirmed_dead:
                 skuld_reg.unregister(session_id)
             with suppress(Exception):
-                await websocket.close(code=4410, reason="Session is no longer running")
+                await websocket.close(
+                    code=4410 if confirmed_dead else 4411,
+                    reason="Session is no longer running"
+                    if confirmed_dead
+                    else "Session is starting; retry",
+                )
             return
         with suppress(Exception):
             await websocket.close()

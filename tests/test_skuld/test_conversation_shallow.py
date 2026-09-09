@@ -362,6 +362,78 @@ STARTED = "2026-08-03T10:00:00+00:00"
 ENDED = "2026-08-03T10:03:12+00:00"
 
 
+class TestAskUserQuestionNeverElided:
+    """A question's input IS the UI — eliding it deletes the card, not a payload.
+
+    Regression for the live `agents-diet` session (2026-08-11): a four-question ask
+    with per-option descriptions serialised to 3387 B, blew the 1 KB limit, and the
+    client had nothing to render a card from while the agent sat blocked on an
+    answer. The perverse property this guards: the richer the question, the more
+    certainly it used to vanish.
+    """
+
+    ASK_INPUT = {
+        "questions": [
+            {
+                "question": "Are eggs and dairy in or out?",
+                "header": "Diet scope",
+                "options": [
+                    {"label": f"option {i}", "description": "why this matters " * 20}
+                    for i in range(4)
+                ],
+            }
+        ]
+    }
+
+    def _ask_block(self, name="AskUserQuestion", block_id="q1"):
+        return {
+            "type": "tool_use",
+            "id": block_id,
+            "name": name,
+            "input": dict(self.ASK_INPUT),
+        }
+
+    def test_oversized_ask_input_is_kept_inline(self):
+        assert len(json.dumps(self.ASK_INPUT)) > INLINE_BYTE_LIMIT, "fixture must exceed limit"
+        out = elide_tool_use_block(self._ask_block())
+        assert not is_elided_input(out["input"]), "the ask must survive shallow serialization"
+        first = out["input"]["questions"][0]["options"][0]["description"]
+        assert first.startswith("why this matters")
+
+    def test_exemption_is_name_normalized(self):
+        for name in ("AskUserQuestion", "ask_user_question", "  askuserquestion  "):
+            out = elide_tool_use_block(self._ask_block(name=name))
+            assert not is_elided_input(out["input"]), name
+
+    def test_other_tools_still_elide(self):
+        """The exemption is surgical — it must not disarm the payload diet."""
+        out = elide_tool_use_block(
+            {"type": "tool_use", "id": "e", "name": "Edit", "input": dict(BIG_INPUT)}
+        )
+        assert is_elided_input(out["input"])
+
+    def test_shallow_endpoint_keeps_the_ask_renderable(self):
+        broker._conversation_turns = [
+            ConversationTurn(
+                id="aq",
+                role="assistant",
+                content="asking",
+                parts=[self._ask_block(block_id="ask1")],
+            ),
+        ]
+        client = TestClient(app, raise_server_exceptions=False)
+        body = client.get("/api/conversation/history?detail=shallow").json()
+        blocks = [
+            b
+            for t in body["turns"]
+            for b in t.get("parts", [])
+            if b.get("type") == "tool_use" and b.get("id") == "ask1"
+        ]
+        assert len(blocks) == 1
+        assert not is_elided_input(blocks[0]["input"])
+        assert blocks[0]["input"]["questions"][0]["question"] == "Are eggs and dairy in or out?"
+
+
 class TestToolTimingSurvivesElision:
     def test_tool_use_timing_passes_through_input_elision(self):
         block = {
