@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
 import { useService } from '@niuulabs/plugin-sdk';
 import { Rune } from '@niuulabs/ui';
 import type { RepoRecord } from '@niuulabs/ui';
@@ -28,6 +29,7 @@ type RepoCatalogService = {
  *         Full-width on running and approved (content fills the width).
  */
 export function PlanWizard() {
+  const navigate = useNavigate();
   const ting = useService<ITingService>('ting');
   const queryClient = useQueryClient();
   const repoCatalog = useService<RepoCatalogService>('niuu.repos');
@@ -55,6 +57,16 @@ export function PlanWizard() {
     enabled: state.step === 'prompt' && Boolean(ting.listPlanSessions),
     refetchInterval: state.step === 'prompt' ? 5000 : false,
   });
+
+  // A plan is resumable only while it is still running. The rest are history:
+  // still reachable by slug, and now listed instead of only linkable.
+  const RESUMABLE = ['pending', 'running', 'blocked'];
+  const activePlanSessions = planSessions.filter((s) =>
+    RESUMABLE.includes((s.status ?? 'running').toLowerCase()),
+  );
+  const completedPlanSessions = planSessions.filter(
+    (s) => !RESUMABLE.includes((s.status ?? 'running').toLowerCase()),
+  );
 
   function handleNewPlan() {
     // Navigate back to /ting/plan to start fresh (the wizard unmounts and remounts)
@@ -95,10 +107,20 @@ export function PlanWizard() {
           {state.step === 'prompt' && (
             <>
               <ActivePlanSessions
-                sessions={planSessions}
+                sessions={activePlanSessions}
                 loading={state.loading}
                 onResume={resumePlanSession}
                 onCancel={handleCancelPlanSession}
+              />
+              <CompletedPlanSessions
+                sessions={completedPlanSessions}
+                loading={state.loading}
+                onOpen={(session) =>
+                  void navigate({
+                    to: '/ting/plan/$slug',
+                    params: { slug: session.campaignSlug ?? '' },
+                  })
+                }
               />
               <PlanPrompt
                 onSubmit={submitPrompt}
@@ -162,6 +184,50 @@ export function PlanWizard() {
         </div>
       )}
     </div>
+  );
+}
+
+function CompletedPlanSessions({
+  sessions,
+  loading,
+  onOpen,
+}: {
+  sessions: PlanSession[];
+  loading: boolean;
+  onOpen(session: PlanSession): void;
+}) {
+  if (sessions.length === 0) return null;
+
+  return (
+    <section className="ting-plan-card ting-plan-sessions" aria-label="Completed planning sessions">
+      <div className="ting-plan-sessions__head">
+        <div>
+          <h2>Completed plans</h2>
+          <p>Open an approved plan and the runs it decomposed into.</p>
+        </div>
+        <span>{sessions.length}</span>
+      </div>
+      <div className="ting-plan-sessions__list">
+        {sessions.map((session) => (
+          <div key={session.campaignSlug ?? session.sessionId} className="ting-plan-session-row">
+            <span>
+              <strong>{session.name || session.prompt || session.campaignSlug || 'Plan'}</strong>
+              <small>{session.repo || 'no repository selected'}</small>
+            </span>
+            <span className="ting-plan-session-row__actions">
+              <span className="ting-plan-session-row__meta">{session.status || 'completed'}</span>
+              <button
+                type="button"
+                disabled={loading || !session.campaignSlug}
+                onClick={() => onOpen(session)}
+              >
+                View
+              </button>
+            </span>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

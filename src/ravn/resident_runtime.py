@@ -19,6 +19,7 @@ from ravn.domain.resident_continuation import (
     ContinuationDecisionKind,
     ResidentA2ATaskRecord,
     ResidentBudgetSnapshot,
+    ResidentDecisionStreakRecord,
     ResidentMemoryEntry,
     ResidentScheduledWakeRecord,
     ResidentTurnRecord,
@@ -30,7 +31,11 @@ from ravn.domain.resident_continuation import (
 from ravn.domain.resident_state import ResidentStatePort
 from ravn.odin.review import ReviewItem, ReviewKind, ReviewRequester
 from ravn.ports.trigger import TriggerPort
-from ravn.resident_continuation import _parse_a2a_task, _scheduled_wake_at
+from ravn.resident_continuation import (
+    _parse_a2a_task,
+    _scheduled_wake_at,
+    decision_fingerprint,
+)
 from ravn.resident_inbox import (
     ResidentInboxBackend,
     ResidentInboxClassification,
@@ -41,6 +46,16 @@ from ravn.resident_inbox import (
 from ravn.resident_text import compact_line
 
 logger = logging.getLogger(__name__)
+
+
+def _log_health_refresh_failure(task: asyncio.Task[dict[str, int]]) -> None:
+    """Surface a failed background health recount instead of losing it."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("resident health recount failed: %s", exc, exc_info=exc)
+
 
 EnqueueResidentTask = Callable[[AgentTask], Awaitable[bool | None]]
 
@@ -122,6 +137,8 @@ class ResidentRuntime:
         context_max_chars: int = 12000,
         tool_result_max_chars: int = 2000,
         scheduled_wake_default_seconds: float = 3600.0,
+        repeated_decision_escalate_after: int = 5,
+        health_refresh_interval_seconds: float = 300.0,
         stewardship_interval_seconds: float = 0.0,
         directed_messages_enabled: bool = True,
         environment_id: str = "",
@@ -137,6 +154,8 @@ class ResidentRuntime:
         self._context_max_chars = max(1000, int(context_max_chars))
         self._tool_result_max_chars = max(100, int(tool_result_max_chars))
         self._scheduled_wake_default_seconds = max(1.0, float(scheduled_wake_default_seconds))
+        self._repeated_decision_escalate_after = max(0, int(repeated_decision_escalate_after))
+        self._health_refresh_interval_seconds = max(1.0, float(health_refresh_interval_seconds))
         self._stewardship_interval_seconds = max(0.0, float(stewardship_interval_seconds))
         self._directed_messages_enabled = directed_messages_enabled
         self._environment_id = environment_id.strip() or "unknown"
@@ -144,6 +163,11 @@ class ResidentRuntime:
         self._enqueue: EnqueueResidentTask | None = None
         self._inflight_cases: set[str] = set()
         self._inflight_refs: set[str] = set()
+        # Latest durable-health counts, refreshed off the hot path and
+        # re-stated as gauges on every telemetry heartbeat so they never age
+        # out of the metrics backend between refreshes.
+        self._health_snapshot: dict[str, int] = {}
+        self._health_refreshed_at: float | None = None
 
     @property
     def state(self) -> ResidentStatePort:
@@ -162,6 +186,99 @@ class ResidentRuntime:
 
     def bind_review_requester(self, requester: ReviewRequester | None) -> None:
         self._review_requester = requester
+
+    # ------------------------------------------------------------------
+    # Health scorecard
+    # ------------------------------------------------------------------
+
+    def health_snapshot(self) -> dict[str, int]:
+        """Latest durable-health counts (possibly empty before first refresh)."""
+        return dict(self._health_snapshot)
+
+    async def refresh_health_snapshot(self) -> dict[str, int]:
+        """Recount durable state and re-state the resident health gauges.
+
+        Every number here is a judgment surface: cases that can still resume,
+        wakes waiting to fire, inbox signals not yet triaged, and how long the
+        resident has been reaching the same conclusion. The counts are cached
+        so ``publish_health_gauges`` can restate them cheaply each heartbeat.
+        """
+        snapshot: dict[str, int] = {}
+
+        counts = await self._state.count_cases()
+        if counts is not None:
+            live, total = counts
+            snapshot["cases_live"] = live
+            snapshot["cases_total"] = total
+
+        wakes = await self._state.list_scheduled_wakes()
+        snapshot["scheduled_wakes_pending"] = len(wakes)
+
+        if self._inbox is not None:
+            pending = await self._inbox.list_signals(
+                status=ResidentInboxStatus.NEW.value, limit=1000
+            )
+            snapshot["inbox_pending"] = len(pending)
+
+        streak = await self._state.read_decision_streak(self._resident_id)
+        snapshot["repeated_decision_streak"] = streak.count if streak is not None else 0
+
+        self._health_snapshot = snapshot
+        self._health_refreshed_at = time.monotonic()
+        self._emit_health_gauges(snapshot)
+        return dict(snapshot)
+
+    def publish_health_gauges(self) -> None:
+        """Re-state cached health gauges; schedule a recount when stale.
+
+        Registered as a drive-loop telemetry refresher, so it must stay
+        synchronous and off the disk: it re-emits the cached counts and, at a
+        coarser cadence, kicks the actual recount off as a task.
+        """
+        if self._health_snapshot:
+            self._emit_health_gauges(self._health_snapshot)
+
+        now = time.monotonic()
+        if (
+            self._health_refreshed_at is not None
+            and now - self._health_refreshed_at < self._health_refresh_interval_seconds
+        ):
+            return
+        # Mark refreshed first so overlapping heartbeats do not stack recounts.
+        self._health_refreshed_at = now
+        task = asyncio.get_running_loop().create_task(self.refresh_health_snapshot())
+        task.add_done_callback(_log_health_refresh_failure)
+
+    def _emit_health_gauges(self, snapshot: Mapping[str, int]) -> None:
+        telemetry = get_observability()
+        attributes = {"ravn.resident.id": self._resident_id}
+        gauges = {
+            "cases_live": (
+                "ravn.resident.cases.live",
+                "Durable resident cases that can still resume.",
+            ),
+            "cases_total": (
+                "ravn.resident.cases.total",
+                "Durable resident cases on disk, live and dead.",
+            ),
+            "scheduled_wakes_pending": (
+                "ravn.resident.scheduled_wakes.pending",
+                "Durable scheduled resident wakes still pending.",
+            ),
+            "inbox_pending": (
+                "ravn.resident.inbox.pending",
+                "Resident inbox signals not yet triaged.",
+            ),
+            "repeated_decision_streak": (
+                "ravn.resident.decision_streak",
+                "Consecutive resident turns reaching an unchanged conclusion.",
+            ),
+        }
+        for key, (name, description) in gauges.items():
+            value = snapshot.get(key)
+            if value is None:
+                continue
+            telemetry.gauge(name, value, attributes=attributes, description=description)
 
     async def prepare_context(self, task: AgentTask) -> str:
         """Present the resident's exact prior working state to a new model turn."""
@@ -678,6 +795,30 @@ class ResidentRuntime:
                         budget_ref=budget_ref,
                         reason=budget_reason,
                     )
+            stuck_reason = await self._repeated_decision_reason(
+                fields, record=record, case_id=case_id
+            )
+            if stuck_reason:
+                # Sleeping again would restate the same conclusion on the next
+                # wake and learn nothing. Time passing is not evidence, so hand
+                # this to a human rather than schedule another identical turn.
+                return await self._ask_operator(
+                    task=task,
+                    record=record,
+                    fields={
+                        **fields,
+                        "question": (
+                            "I have reached the same conclusion "
+                            f"{self._repeated_decision_escalate_after} times running and my "
+                            "tools have returned nothing new each time, so re-checking is "
+                            "not making progress. Is the thing I am waiting for real, and "
+                            "what should I do instead?"
+                        ),
+                    },
+                    turn_ref=turn_ref,
+                    budget_ref=budget_ref,
+                    reason=stuck_reason,
+                )
             wake_ref, wake_at = await self._schedule_wake(
                 task=task,
                 fields=fields,
@@ -757,6 +898,116 @@ class ResidentRuntime:
                 if action is not None
                 else "no selected next action"
             ),
+        )
+
+    async def _repeated_decision_reason(
+        self,
+        fields: Mapping[str, Any],
+        *,
+        record: ResidentTurnRecord,
+        case_id: str,
+    ) -> str:
+        """Track consecutive turns that learned nothing new; return why to escalate.
+
+        The streak is keyed on the resident rather than the case on purpose. A
+        resident that wakes into a fresh case each tick and re-derives the same
+        verdict never accumulates turns in any single case, so a per-case budget
+        sees nothing wrong while the resident has in fact been stuck for days.
+        """
+        if self._repeated_decision_escalate_after <= 0:
+            return ""
+
+        decision = str(fields.get("decision") or "").strip()
+        rationale = str(fields.get("rationale") or fields.get("state_summary") or "").strip()
+        working_state = fields.get("working_state")
+        objectives = (
+            working_state.get("objectives") if isinstance(working_state, dict) else working_state
+        )
+        fingerprint = decision_fingerprint(
+            decision=decision,
+            objectives=objectives,
+            tool_results=record.tool_results,
+        )
+
+        prior = await self._state.read_decision_streak(self._resident_id)
+        now = datetime.now(UTC)
+        if prior is not None and prior.fingerprint == fingerprint:
+            streak = ResidentDecisionStreakRecord(
+                resident_id=self._resident_id,
+                fingerprint=fingerprint,
+                count=prior.count + 1,
+                decision=decision,
+                rationale=rationale,
+                case_id=case_id,
+                first_seen_at=prior.first_seen_at,
+                updated_at=now,
+            )
+        else:
+            streak = ResidentDecisionStreakRecord(
+                resident_id=self._resident_id,
+                fingerprint=fingerprint,
+                count=1,
+                decision=decision,
+                rationale=rationale,
+                case_id=case_id,
+                first_seen_at=now,
+                updated_at=now,
+            )
+        await self._state.write_decision_streak(streak)
+        # Keep the cached scorecard honest between recounts — the streak is
+        # the one health number that can jump many steps within one interval.
+        self._health_snapshot["repeated_decision_streak"] = streak.count
+
+        telemetry = get_observability()
+        telemetry.count(
+            "ravn.resident.repeated_decisions",
+            attributes={
+                "ravn.resident.id": self._resident_id,
+                "ravn.resident.decision": decision or "unknown",
+            },
+            description="Consecutive resident turns reaching an unchanged conclusion.",
+        )
+        if streak.count < self._repeated_decision_escalate_after:
+            return ""
+
+        # Reset once escalated: the operator now owns this. Without the reset
+        # every later turn would re-trip the guard and file the same question
+        # again, which is the loop this guard exists to stop.
+        await self._state.write_decision_streak(
+            ResidentDecisionStreakRecord(
+                resident_id=self._resident_id,
+                fingerprint=fingerprint,
+                count=0,
+                decision=decision,
+                rationale=rationale,
+                case_id=case_id,
+                first_seen_at=now,
+                updated_at=now,
+            )
+        )
+
+        stuck_for = (now - streak.first_seen_at).total_seconds()
+        telemetry.event(
+            "ravn.resident.repeated_decision_escalated",
+            attributes={
+                "ravn.resident.id": self._resident_id,
+                "ravn.resident.case_id": case_id,
+                "ravn.resident.repeat_count": streak.count,
+            },
+            content={"decision": decision, "rationale": rationale},
+        )
+        logger.warning(
+            "resident %s: reached decision %r %d times running without its tools returning "
+            "anything new (stuck for %.0fs) — escalating to the operator instead of "
+            "sleeping again",
+            self._resident_id,
+            decision or "unknown",
+            streak.count,
+            stuck_for,
+        )
+        return (
+            f"repeated the same conclusion {streak.count} times without gathering any new "
+            f"evidence; re-checking is not making progress"
         )
 
     async def _schedule_wake(

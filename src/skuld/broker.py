@@ -1047,14 +1047,48 @@ class Broker(
             return ""
         return self._settings.room.default_target_peer_id.strip()
 
+    def _is_declared_room_routed(self) -> bool:
+        """True when configuration declares this broker owns no CLI agent.
+
+        ``ravn room create`` sets this: the room exists to host ravns, so the
+        broker must never start a CLI agent of its own even while the room is
+        still empty. Without it such a broker lazy-starts Claude on the first
+        browser connect and silently answers chat meant for a ravn.
+        """
+        return self._room_bridge is not None and bool(self._settings.room.routed)
+
     def _is_room_routed_session(self) -> bool:
         """True when browser traffic flows through the room, not a CLI transport.
 
-        Covers flock workflow sessions (mesh peers do the work) and resident
-        sessions (one long-lived ravn behind ``room.default_target_peer_id``).
-        Both must never lazy-start the broker's own CLI transport.
+        Covers flock workflow sessions (mesh peers do the work), resident
+        sessions (one long-lived ravn behind ``room.default_target_peer_id``),
+        and brokers that declare ``room.routed``. None may lazy-start the
+        broker's own CLI transport.
         """
-        return self._is_room_only_workflow_session() or bool(self._room_default_target_peer_id())
+        return (
+            self._is_room_only_workflow_session()
+            or bool(self._room_default_target_peer_id())
+            or self._is_declared_room_routed()
+        )
+
+    def _sole_room_ravn_peer_id(self) -> str:
+        """Peer id of the room's only ravn, or "" when that is ambiguous.
+
+        Used solely for declared-routed brokers with no configured default
+        target: with exactly one ravn there is no ambiguity about who an
+        untargeted message is for. Two or more is genuinely ambiguous and must
+        be reported rather than guessed at.
+        """
+        if self._room_bridge is None:
+            return ""
+        peer_ids = [
+            participant.peer_id
+            for participant in self._room_bridge.participants.values()
+            if participant.participant_type == "ravn"
+        ]
+        if len(peer_ids) != 1:
+            return ""
+        return peer_ids[0]
 
     def _workflow_trigger_consumer_peer_ids(self, event_type: str) -> set[str]:
         """Return flock peer ids that subscribe to the workflow trigger event."""
@@ -1405,6 +1439,22 @@ class Broker(
     async def _run_workflow_trigger_task(self) -> None:
         """Dispatch the initial workflow trigger after broker startup completes."""
         cfg = self._settings.workflow_trigger
+        marker_path = (
+            Path(self.workspace_dir)
+            / CONVERSATION_HISTORY_DIR
+            / f"workflow_kickoff_{self.session_id}.json"
+        )
+        marker = {
+            "workflow_id": str(self._settings.workflow.workflow_id or ""),
+            "event_type": cfg.event_type,
+            "node_id": cfg.node_id,
+        }
+        try:
+            if json.loads(marker_path.read_text(encoding="utf-8")) == marker:
+                logger.info("Workflow kickoff already acknowledged — skipping restart dispatch")
+                return
+        except (FileNotFoundError, OSError, ValueError):
+            pass
         telemetry = get_observability()
         workflow_name = (
             str(getattr(self._settings.workflow, "name", "") or "").strip()
@@ -1455,6 +1505,10 @@ class Broker(
                 self._trace_workflow_span_id = None
                 logger.exception("Workflow trigger dispatch failed")
                 raise
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker_path.with_name(f".{marker_path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+            temporary.replace(marker_path)
             telemetry.event("skuld.workflow.dispatched", attributes=attributes)
 
     def _observer_peer_id(self) -> str:
@@ -3673,6 +3727,23 @@ class Broker(
                 # the CLI transport path does — a bare str() would deliver a
                 # Python repr of the block list (base64 blobs inline).
                 default_target = self._room_default_target_peer_id()
+                if not default_target and self._is_declared_room_routed():
+                    # A declared-routed broker has no CLI agent to fall through
+                    # to, so an unresolvable target must be reported, never
+                    # dropped into a transport that does not exist.
+                    default_target = self._sole_room_ravn_peer_id()
+                    if not default_target:
+                        error_msg = (
+                            "No room participant to deliver this message to. Set "
+                            "room.default_target_peer_id, or address a participant "
+                            "explicitly with a directed_message."
+                        )
+                        logger.info("_dispatch_browser_message: %s", error_msg)
+                        if sender_ws:
+                            await self._send_broker_frame_to(
+                                sender_ws, {"type": "error", "content": error_msg}
+                            )
+                        return
                 if default_target:
                     request_id = data.get("request_id")
                     request_id = request_id if isinstance(request_id, str) and request_id else None

@@ -51,7 +51,7 @@ async def _run_daemon(
     workspace = _resolve_workspace(settings)
     from ravn.cli.tool_builders import _build_learned_tool_resolver  # noqa: PLC0415
 
-    _build_learned_tool_resolver(settings, workspace)
+    learned_tool_resolver = _build_learned_tool_resolver(settings, workspace)
     cli_transport_executor = _uses_cli_transport_executor(persona_config)
     llm = None if cli_transport_executor else _build_llm(settings)
     memory = _build_memory(settings)
@@ -292,6 +292,9 @@ async def _run_daemon(
             user_input_fn=None,
             memory=memory,
             mimir=daemon_mimir,
+            inject_learnings=settings.reflection.inject_learnings,
+            max_learnings_injected=settings.reflection.max_learnings_injected,
+            learning_token_budget=settings.reflection.learning_token_budget,
             episode_summary_max_chars=settings.agent.episode_summary_max_chars,
             episode_task_max_chars=settings.agent.episode_task_max_chars,
             iteration_budget=budget,
@@ -449,11 +452,28 @@ async def _run_daemon(
         )
         if hasattr(drive_loop, "set_persona_config"):
             drive_loop.set_persona_config(persona_config)
+        if learned_tool_resolver is not None and hasattr(drive_loop, "register_telemetry_refresh"):
+            # The inventory is published once while the resolver is built, so
+            # the gauge ages out and the fleet reads zero installed tools while
+            # hundreds sit on disk. Re-state it on every heartbeat.
+            def _refresh_learned_tool_inventory() -> None:
+                from ravn.tool_observability import (  # noqa: PLC0415
+                    publish_learned_tool_inventory,
+                )
+
+                publish_learned_tool_inventory(learned_tool_resolver.list_artifacts())
+
+            drive_loop.register_telemetry_refresh(_refresh_learned_tool_inventory)
         if resident_runtime is not None:
             from ravn.resident_runtime import ResidentHomeTrigger  # noqa: PLC0415
 
             if hasattr(drive_loop, "set_resident_runtime"):
                 drive_loop.set_resident_runtime(resident_runtime)
+            if hasattr(drive_loop, "register_telemetry_refresh"):
+                # The health scorecard gauges (cases, wakes, inbox, streak)
+                # age out like any other steady-state gauge — restate them on
+                # every heartbeat; the recount behind them paces itself.
+                drive_loop.register_telemetry_refresh(resident_runtime.publish_health_gauges)
             if http_gateway is not None:
                 http_gateway.bind_resident_status_provider(drive_loop.resident_hud_status)
             if hasattr(drive_loop, "register_directed_message_interceptor"):

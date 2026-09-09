@@ -1586,6 +1586,32 @@ class InitiativeConfig(BaseModel):
         default=30.0,
         description="Seconds between cron trigger ticks (scheduler wake interval).",
     )
+    cron_max_jobs: int = Field(
+        default=12,
+        ge=0,
+        description=(
+            "Maximum enabled cron jobs one agent may hold. Further cron_create "
+            "calls are refused until a job is deleted. A resident that cannot "
+            "close a case schedules another check instead, so the job count "
+            "grows without bound: one k8s resident reached 24 jobs firing ~87 "
+            "tasks/hour, which is more than its queue could ever drain. "
+            "0 disables the cap."
+        ),
+    )
+    cron_duplicate_similarity: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Word-overlap threshold above which a new cron job counts as a "
+            "restatement of an existing one and is refused. Exact-match dedup "
+            "caught nothing in production because a resident never repeats "
+            "itself verbatim: 20 jobs on one resident were all the same etcd "
+            "check under names like 'etcd-health-check', 'recheck-etcd-latency' "
+            "and 'etcd-latency-investigation'. 0 disables near-duplicate "
+            "detection, leaving only exact matching."
+        ),
+    )
     trigger_adapters: list[TriggerAdapterConfig] = Field(
         default_factory=list,
         description=(
@@ -1807,8 +1833,14 @@ class MimirSourceTriggerConfig(BaseModel):
     """Config for the source-ingest synthesis trigger."""
 
     enabled: bool = Field(
-        default=True,
-        description="Enable automatic synthesis when unprocessed sources are detected.",
+        default=False,
+        description=(
+            "Enable automatic synthesis when unprocessed sources are detected. "
+            "Off by default: any Ravn that mounts a shared Mímir sees the same "
+            "unprocessed sources as every other Ravn mounting it, so leaving "
+            "this on curates one corpus N times over. Enable it only on the "
+            "agent that owns the mount it writes to."
+        ),
     )
     poll_interval_seconds: int = Field(
         default=60,
@@ -2513,6 +2545,18 @@ class PostSessionReflectionConfig(BaseModel):
         default=1024,
         description="Maximum tokens the reflection LLM call may produce.",
     )
+    inject_learnings: bool = Field(
+        default=True,
+        description=(
+            "Read promoted learnings from every configured Mímir mount at session "
+            "start and put them in the system prompt. Separate from `enabled`, "
+            "which governs whether reflection *writes* learnings: a resident can "
+            "usefully read what its peers promoted without producing its own. "
+            "Injection is how learnings reach a turn at all — `mimir_search` is a "
+            "tool the model must elect, and across every resident it has never "
+            "been called once."
+        ),
+    )
     learning_token_budget: int = Field(
         default=500,
         description=("Maximum tokens of injected learnings in the session-start system prompt."),
@@ -2896,7 +2940,7 @@ class ResidentEvolutionConfig(BaseModel):
             "Fully-qualified ToolBuildBackend class commissioned by build_tool "
             "when the agent supplies a build_request (for example "
             "ravn.adapters.tool_build.ForgeSessionToolBuildBackend or "
-            "ravn.adapters.tool_build.TingWorkflowToolBuildBackend). Empty: the "
+            "ravn.adapters.tool_build.a2a.A2AToolBuildBackend). Empty: the "
             "investigating agent authors tool code inline in-session. The result "
             "flows through the same review/canary/install path regardless of "
             "backend."
@@ -2914,8 +2958,8 @@ class ResidentEvolutionConfig(BaseModel):
         default_factory=WorkflowSelectorConfig,
         description=(
             "Optional selector for the tool-builder workflow. When configured "
-            "with a Ting workflow build backend, the backend discovers the "
-            "matching workflow from the catalog instead of requiring a "
+            "with the A2A build backend, the backend discovers the matching "
+            "workflow skill from the agent card instead of requiring a "
             "hardcoded workflow_id."
         ),
     )
@@ -3164,6 +3208,37 @@ class ResidentStateConfig(BaseModel):
         ge=100,
         description="Maximum characters persisted from each resident tool result.",
     )
+    case_retention_max_cases: int = Field(
+        default=200,
+        ge=0,
+        description=(
+            "Target maximum resident continuation cases kept on disk. A case is "
+            "eligible only when nothing can resume it — no pending scheduled wake "
+            "and no unanswered operator question — so live work is never pruned. "
+            "Cases are a rolling working set, not an archive: episodic memory is "
+            "the durable record. Measured on one resident, 754 of 841 cases were "
+            "unresumable and recall() read all 56 MB of them on every turn. "
+            "Oldest eligible cases beyond the cap are pruned. 0 disables "
+            "count-based pruning."
+        ),
+    )
+    case_retention_max_age_days: float = Field(
+        default=14.0,
+        ge=0,
+        description=(
+            "Maximum age in days of an unresumable resident case; older ones are "
+            "pruned. 0 disables age-based pruning."
+        ),
+    )
+    case_retention_sweep_interval_seconds: float = Field(
+        default=900.0,
+        ge=0,
+        description=(
+            "Minimum seconds between case retention sweeps. Sweeps run off the "
+            "turn write path in a worker thread; this throttle bounds how often "
+            "the cases directory is rescanned."
+        ),
+    )
     directed_message_context_max_chars: int = Field(
         default=4000,
         ge=200,
@@ -3183,6 +3258,27 @@ class ResidentStateConfig(BaseModel):
         description=(
             "Delay applied when a resident turn sleeps for a scheduled time without "
             "naming an explicit wake_at timestamp."
+        ),
+    )
+    repeated_decision_escalate_after: int = Field(
+        default=5,
+        ge=0,
+        description=(
+            "Consecutive turns reaching the same conclusion with no change in working "
+            "state before the resident asks the operator instead of sleeping again. "
+            "Per-case turn budgets do not catch this: a resident re-deriving one verdict "
+            "in a fresh case each wake never accumulates turns in any single case. "
+            "0 disables the guard."
+        ),
+    )
+    health_refresh_interval_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Seconds between recounts of the resident health scorecard (durable "
+            "cases, pending wakes, inbox depth, decision streak). Gauges are "
+            "re-stated every telemetry heartbeat regardless; this only paces the "
+            "store walk behind them."
         ),
     )
     stewardship_interval_seconds: float = Field(

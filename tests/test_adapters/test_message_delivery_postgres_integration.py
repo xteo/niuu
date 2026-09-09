@@ -1,7 +1,9 @@
 """Real PostgreSQL contention and rollback, isolated from user sessions."""
 
 import asyncio
+import json
 import os
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -175,15 +177,82 @@ async def test_existing_schema_without_ledger_adopts_and_preserves_user_rows(iso
             ("volundr_launch_specs", spec),
             ("integration_connections", integration),
         ]:
-            assert (
+            after = json.loads(
                 await conn.fetchval(f"SELECT row_to_json(t)::text FROM {table} t WHERE id=$1", key)
-                == before[table]
             )
+            original = json.loads(before[table])
+            assert {column: after[column] for column in original} == original
         assert await conn.fetchval("SELECT count(*) FROM volundr_presets") == 0
         assert await conn.fetchval("SELECT count(*) FROM volundr_schema_history") == len(files)
+
         assert await conn.fetchval("SELECT to_regclass('session_message_deliveries')") is not None
         await apply_startup_migrations(conn, files)
         assert await conn.fetchval("SELECT count(*) FROM volundr_schema_history") == len(files)
+
+
+def released_migration_stream(directory):
+    """Reconstruct released filenames from their byte-identical canonical SQL."""
+    directory.mkdir()
+    for path in MIGRATIONS.glob("*.up.sql"):
+        if path.name[:6] < "000049":
+            shutil.copyfile(path, directory / path.name)
+    aliases = json.loads((MIGRATIONS / "lineage-aliases.json").read_text())
+    for canonical, entries in aliases.items():
+        for entry in entries:
+            shutil.copyfile(MIGRATIONS / canonical, directory / entry["filename"])
+    return sorted(directory.glob("*.up.sql"))
+
+
+async def test_released_checksum_ledger_is_preserved_during_full_upgrade(isolated_pool, tmp_path):
+    old = released_migration_stream(tmp_path / "released")
+    canonical = sorted(MIGRATIONS.glob("*.up.sql"))
+    async with isolated_pool.acquire() as conn:
+        await apply_startup_migrations(conn, old)
+        before = await conn.fetch("SELECT * FROM volundr_schema_history ORDER BY filename")
+        await conn.execute(
+            "INSERT INTO sessions (id, name, model) VALUES ($1, 'keep', 'codex')", uuid4()
+        )
+        await apply_startup_migrations(conn, canonical)
+        await apply_startup_migrations(conn, canonical)
+        for row in before:
+            assert (
+                await conn.fetchrow(
+                    "SELECT * FROM volundr_schema_history WHERE filename=$1", row["filename"]
+                )
+                == row
+            )
+        assert await conn.fetchval("SELECT count(*) FROM sessions WHERE name='keep'") == 1
+        for table in ("session_message_deliveries", "resident_runtimes", "realms"):
+            assert await conn.fetchval("SELECT to_regclass($1)", table) is not None
+
+
+@pytest.mark.parametrize("lineage", ["released", "integration"])
+async def test_numbered_55_upgrade_preserves_cursor_and_satisfies_dependencies(
+    isolated_pool, tmp_path, lineage
+):
+    from volundr.schema_bridge import prepare_numbered_migrations
+
+    files = sorted(MIGRATIONS.glob("*.up.sql"))
+    history = (
+        released_migration_stream(tmp_path / "released")
+        if lineage == "released"
+        else [path for path in files if path.name[:6] <= "000055"]
+    )
+    async with isolated_pool.acquire() as conn:
+        for path in history:
+            await conn.execute(path.read_text())
+        await conn.execute("CREATE TABLE schema_migrations (version BIGINT, dirty BOOLEAN)")
+        await conn.execute("INSERT INTO schema_migrations VALUES (55, false)")
+        before = await conn.fetchrow("SELECT * FROM schema_migrations")
+        assert await prepare_numbered_migrations(conn, MIGRATIONS) == 4
+        assert await conn.fetchrow("SELECT * FROM schema_migrations") == before
+        # This is the numbered runner's next step: execute files above its cursor.
+        for path in files:
+            if path.name[:6] > "000055":
+                await conn.execute(path.read_text())
+        assert await conn.fetchval("SELECT to_regclass('resident_runtimes')") is not None
+        assert await conn.fetchval("SELECT to_regclass('session_message_deliveries')") is not None
+        assert await conn.fetchval("SELECT workload_config FROM sessions LIMIT 1") is None
 
 
 async def test_adoption_rejects_conflicting_legacy_presets_without_deleting_rows(isolated_pool):

@@ -126,6 +126,12 @@ class RavnAgent:
         repo_slug: str = "",
         # NIU-588: learnings injection at session start
         mimir: MimirPort | None = None,
+        # Learning injection budget. Configurable rather than hardcoded: a
+        # resident with two Mímir mounts and a flock's worth of promoted
+        # learnings needs a different budget from a one-shot coding session.
+        inject_learnings: bool = False,
+        max_learnings_injected: int = 5,
+        learning_token_budget: int = 500,
         # NIU-594: persona config for outcome block parsing
         persona_config: PersonaConfig | None = None,
         # Retained for constructor compatibility. A tool-use response is never
@@ -188,6 +194,9 @@ class RavnAgent:
         self._session_ended_emitted: bool = False
         # NIU-588: learnings injection at session start
         self._mimir = mimir
+        self._inject_learnings_enabled = inject_learnings
+        self._max_learnings_injected = max_learnings_injected
+        self._learning_token_budget = learning_token_budget
         # NIU-594: persona config for outcome block parsing
         self._persona_config = persona_config
         self._context_window_tokens = max(0, context_window_tokens)
@@ -215,6 +224,17 @@ class RavnAgent:
     def tools(self) -> list[ToolPort]:
         """Return all registered tools in registration order."""
         return list(self._tools.values())
+
+    @property
+    def persona_config(self) -> PersonaConfig | None:
+        """Return the persona this agent was actually built with.
+
+        A triggered task may request a persona other than the resident's own
+        (``mimir_source`` tasks run as ``mimir-curator``).  The agent factory
+        resolves that override, so this is the only authority on which outcome
+        contract the response was written against.
+        """
+        return self._persona_config
 
     def register_tool(self, tool: ToolPort, *, replace: bool = False) -> None:
         """Register a tool for subsequent LLM iterations in this session."""
@@ -392,6 +412,12 @@ class RavnAgent:
         if self._turn_count == 0:
             await self._emit_session_started()
         self._turn_count += 1
+
+        # NIU-588: promoted learnings go in once, on the first turn. They are
+        # rules over many episodes, not per-turn context, so re-reading every
+        # turn would spend the budget without changing the content.
+        if self._turn_count == 1:
+            await self._inject_learnings()
 
         # Check budget before starting the turn.
         if self._iteration_budget is not None and self._iteration_budget.exhausted:
@@ -835,6 +861,42 @@ class RavnAgent:
         logger.error("%s", error)
         raise error
 
+    def _budget_tool_result_char_limit(self) -> int:
+        """Chars one tool result may contribute before the prompt budget breaks.
+
+        The configured ``max_result_chars`` is a flat number that knows nothing
+        about the budget it has to fit inside, and on the valhalla k8s resident
+        the two contradicted each other: 100_000 chars estimate to 37_500 tokens
+        (100_000/4, times the 1.5 safety factor), while ``max_prompt_tokens``
+        of 48_000 minus a ~14_600-token fixed cost left only ~33_400 for the
+        whole history. One result at the cap therefore blew the budget on its
+        own, and because it lands in the compaction-protected tail nothing
+        downstream could recover: 195 turns died on PromptBudgetExceededError
+        in 20 hours, each after the model had already paid for the tool call.
+
+        So derive the ceiling from what is actually free. The fixed cost is
+        measured, not assumed, and the remainder is shared across the protected
+        tail — every slot in it could hold a result this size, and all of them
+        must fit together.
+
+        Returns 0 when no budget is configured, leaving the flat cap in charge.
+        """
+        if self._max_prompt_tokens <= 0:
+            return 0
+        fixed_tokens = sum(
+            tokens
+            for name, tokens in self._prompt_section_estimates(self._system_prompt, []).items()
+            if name != "history"
+        )
+        headroom = self._max_prompt_tokens - fixed_tokens
+        if headroom <= 0:
+            return 0
+        slots = max(1, self._compressor.protect_last if self._compressor else 1)
+        return TokenEstimator.chars_for_tokens(
+            headroom // slots,
+            self._token_estimate_safety_factor,
+        )
+
     def _truncate_oversized_tool_result(
         self,
         tool_call: ToolCall,
@@ -847,18 +909,31 @@ class RavnAgent:
         so nothing downstream could shrink it and the turn died on the prompt
         budget. Truncate here with an explicit marker so the model knows the
         result is partial and the turn can continue.
+
+        The effective limit is the tighter of the configured cap and what the
+        prompt budget can actually hold — see
+        :meth:`_budget_tool_result_char_limit` for why the configured one alone
+        was not enough.
         """
-        limit = self._max_tool_result_chars
         content = result.content
-        if limit <= 0 or not isinstance(content, str) or len(content) <= limit:
+        if not isinstance(content, str):
+            return result
+        budget_limit = self._budget_tool_result_char_limit()
+        limits = [value for value in (self._max_tool_result_chars, budget_limit) if value > 0]
+        if not limits:
+            return result
+        limit = min(limits)
+        if len(content) <= limit:
             return result
         dropped = len(content) - limit
         logger.warning(
-            "tool result for %r truncated: %d of %d chars dropped (max_tool_result_chars=%d)",
+            "tool result for %r truncated: %d of %d chars dropped "
+            "(max_tool_result_chars=%d, prompt-budget limit=%d)",
             tool_call.name,
             dropped,
             len(content),
-            limit,
+            self._max_tool_result_chars,
+            budget_limit,
         )
         marker = (
             f"\n\n[tool result truncated: {dropped} characters beyond the "
@@ -870,6 +945,43 @@ class RavnAgent:
             content=content[:limit] + marker,
             is_error=result.is_error,
         )
+
+    async def _inject_learnings(self) -> None:
+        """Put promoted Mímir learnings into the system prompt for this session.
+
+        Restored from NIU-588, which added it and was then dropped in c1253e9d
+        — a large refactor whose message never mentions it. Everything it needs
+        survived the removal: fetch_relevant_learnings, set_learnings_context,
+        and both budget settings. Only the call was missing, and with it the
+        entire learning pipeline: 780 candidates and 167 promoted learnings on
+        one resident, reachable in principle by `mimir_search` and in practice
+        by nothing, because that tool has never been called once on any
+        resident.
+
+        Injection rather than a tool is deliberate. The comparison is direct:
+        episodic prefetch injects and hits on every turn; Mímir waits to be
+        elected and never is.
+
+        Not best-effort. The original logged a warning and continued, which is
+        how a dead learning pipeline stayed invisible for months.
+        """
+        if not self._inject_learnings_enabled:
+            return
+        if self._mimir is None or self._prompt_builder is None:
+            return
+
+        from ravn.adapters.reflection.post_session import (  # noqa: PLC0415
+            fetch_relevant_learnings,
+        )
+
+        learnings_text = await fetch_relevant_learnings(
+            self._mimir,
+            repo_slug=self._repo_slug,
+            max_pages=self._max_learnings_injected,
+            token_budget=self._learning_token_budget,
+        )
+        if learnings_text:
+            self._prompt_builder.set_learnings_context(learnings_text)
 
     async def _maybe_compress(
         self,

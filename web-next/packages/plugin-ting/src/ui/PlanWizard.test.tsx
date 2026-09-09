@@ -20,6 +20,12 @@ import type { Saga } from '../domain/saga';
 import type { Workflow } from '../domain/workflow';
 import type { RepoRecord } from '@niuulabs/ui';
 
+const mockNavigate = vi.fn();
+vi.mock('@tanstack/react-router', () => ({
+  useNavigate: () => mockNavigate,
+  useParams: () => ({ slug: '' }),
+}));
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -1061,5 +1067,68 @@ describe('PlanWizard integration', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
     expect(screen.getByText('Ting unavailable')).toBeInTheDocument();
+  });
+});
+
+describe('completed plan sessions', () => {
+  // A finished plan used to disappear from /plan entirely: the API filtered to
+  // PENDING/RUNNING/BLOCKED, so the only way back to an approved plan was to
+  // already know its slug URL.
+  const running: PlanSession = {
+    sessionId: 'plan-active-1',
+    campaignSlug: 'plan-running',
+    name: 'Still planning',
+    prompt: 'Still planning',
+    repo: '',
+    status: 'running',
+    chatEndpoint: null,
+  };
+  const finished: PlanSession = {
+    sessionId: 'plan-done-1',
+    campaignSlug: 'plan-niu-1104-define-ravnclaw-as-niuu-s-advanced',
+    name: 'NIU-1104 RavnClaw runtime specialization',
+    prompt: 'Define RavnClaw',
+    repo: '',
+    status: 'completed',
+    chatEndpoint: null,
+  };
+
+  it('lists a finished plan separately from a resumable one', async () => {
+    const svc = makeSvc({
+      listPlanSessions: vi.fn().mockResolvedValue([running, finished]),
+    });
+    render(<PlanWizard />, { wrapper: wrap(svc) });
+
+    await waitFor(() => expect(screen.getByText('Completed plans')).toBeInTheDocument());
+    expect(screen.getByText('Active plans')).toBeInTheDocument();
+    expect(screen.getByText('NIU-1104 RavnClaw runtime specialization')).toBeInTheDocument();
+    expect(screen.getByText('Still planning')).toBeInTheDocument();
+  });
+
+  it('opens a finished plan without offering resume or cancel on it', async () => {
+    const svc = makeSvc({
+      listPlanSessions: vi.fn().mockResolvedValue([finished]),
+    });
+    render(<PlanWizard />, { wrapper: wrap(svc) });
+
+    await waitFor(() => expect(screen.getByText('Completed plans')).toBeInTheDocument());
+    expect(screen.queryByText('Active plans')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /resume/i })).not.toBeInTheDocument();
+
+    // View goes to the addressable page rather than re-entering the wizard,
+    // which is the whole point of the detail route.
+    fireEvent.click(screen.getByRole('button', { name: /view/i }));
+    expect(mockNavigate).toHaveBeenCalledWith({
+      to: '/ting/plan/$slug',
+      params: { slug: 'plan-niu-1104-define-ravnclaw-as-niuu-s-advanced' },
+    });
+  });
+
+  it('hides the section when every plan is still running', async () => {
+    const svc = makeSvc({ listPlanSessions: vi.fn().mockResolvedValue([running]) });
+    render(<PlanWizard />, { wrapper: wrap(svc) });
+
+    await waitFor(() => expect(screen.getByText('Active plans')).toBeInTheDocument());
+    expect(screen.queryByText('Completed plans')).not.toBeInTheDocument();
   });
 });

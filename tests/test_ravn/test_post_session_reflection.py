@@ -15,8 +15,12 @@ from ravn.adapters.reflection.post_session import (
     _build_candidate_path,
     _build_page_content,
     _build_page_path,
+    _claims_similar,
+    _evidence_is_new,
     _insert_timeline_entry,
+    _mark_candidate_promoted,
     _merge_timeline_entry,
+    _promoted_learning_path,
     _strip_frontmatter,
     _titles_similar,
     fetch_relevant_learnings,
@@ -714,6 +718,165 @@ def test_merge_timeline_appends_new_entry():
 
 
 # ---------------------------------------------------------------------------
+# Repeated-observation hygiene
+#
+# A resident polling one unchanged fact produced 34 timeline entries and 22
+# separate "learnings" saying the same thing. Each guard below closes one step
+# of that.
+# ---------------------------------------------------------------------------
+
+
+def _loop_page(evidence: str) -> str:
+    return _build_page_content(
+        title="Wait for research campaign findings before acting on backlog items",
+        learning=(
+            "When a tracker issue is in Backlog and its linked research campaign has no "
+            "published findings in Mimir, deferring work until the campaign completes "
+            "prevents premature action."
+        ),
+        page_type="observation",
+        tags=["research"],
+        evidence=evidence,
+        repo_slug="",
+        session_id="sess-1",
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_merge_timeline_ignores_a_restatement_of_existing_evidence():
+    content = _loop_page(
+        "The Mimir search for campaign 62ac5327 returned no results while tracker "
+        "issue NIU-1118 remained in Backlog."
+    )
+
+    updated = _merge_timeline_entry(
+        content,
+        session_id="sess-2",
+        evidence=(
+            "The session showed that research campaign 62ac5327 had no published "
+            "findings in Mimir and tracker issue NIU-1118 remained in Backlog."
+        ),
+        date=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+
+    assert updated == content
+    assert "confidence: low" in updated
+    assert "sess-2" not in updated
+
+
+def test_merge_timeline_still_records_genuinely_new_evidence():
+    content = _loop_page("The campaign returned no findings while NIU-1118 stayed in Backlog.")
+
+    updated = _merge_timeline_entry(
+        content,
+        session_id="sess-2",
+        evidence="The Helm configmap was missing migration 000042, so production drifted.",
+        date=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+
+    assert "sess-2" in updated
+    assert "confidence: medium" in updated
+
+
+def test_evidence_is_new_rejects_a_reworded_repeat():
+    content = _loop_page("Tracker issue NIU-1118 is in Backlog and the campaign has no findings.")
+
+    assert not _evidence_is_new(
+        content,
+        "The campaign has no findings and tracker issue NIU-1118 remains in Backlog.",
+    )
+
+
+def test_claims_similar_catches_reworded_versions_of_one_claim():
+    assert _claims_similar(
+        "When a research campaign yields no published findings and its associated tracker "
+        "issue remains in backlog, the agent should defer action until results are available.",
+        "When a tracker issue is in Backlog and its linked research campaign has no "
+        "published findings in Mimir, deferring work until the campaign completes "
+        "prevents premature action.",
+    )
+
+
+def test_claims_similar_keeps_unrelated_learnings_apart():
+    assert not _claims_similar(
+        "Migrations must be written to both the migrations directory and the Helm configmap.",
+        "When a research campaign yields no published findings, defer action on the ticket.",
+    )
+
+
+def test_claims_similar_requires_near_identity_for_very_short_claims():
+    assert not _claims_similar("Retry once.", "Retry twice quickly.")
+    assert _claims_similar("Retry once.", "Retry once.")
+
+
+def test_promoted_learning_path_is_reused_so_one_claim_keeps_one_page():
+    content = _mark_candidate_promoted(
+        _loop_page("First observation."), "learnings/general/wait-for-research-findings.md"
+    )
+
+    assert _promoted_learning_path(content) == "learnings/general/wait-for-research-findings.md"
+
+
+def test_promoted_learning_path_rejects_paths_outside_the_learnings_tree():
+    assert _promoted_learning_path('promoted_to: "../../etc/passwd"') == ""
+    assert _promoted_learning_path('promoted_to: "learnings/../../secrets.md"') == ""
+    assert _promoted_learning_path("no marker here") == ""
+
+
+@pytest.mark.asyncio
+async def test_promotion_reuses_the_recorded_learning_path_after_a_retitle():
+    """One belief promotes to one page even when the model rewords its title."""
+    mimir = AsyncMock()
+    mimir.search.return_value = []
+    svc = PostSessionReflectionService(InProcessBus(), mimir, AsyncMock(), _make_config())
+
+    candidate = _mark_candidate_promoted(
+        _loop_page("First observation."), "learnings/general/original-title.md"
+    )
+    await svc._persist_candidate_and_maybe_promote(
+        candidate_path="learning-candidates/general/original-title.md",
+        candidate_content=candidate,
+        title="Defer action on backlog items pending research findings",
+        repo_slug="",
+        payload={"reviewed_promotion": True},
+    )
+
+    written = [call.args[0] for call in mimir.upsert_page.await_args_list]
+    assert "learnings/general/original-title.md" in written
+    assert not [
+        path
+        for path in written
+        if path.startswith("learnings/") and path != "learnings/general/original-title.md"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_find_existing_page_matches_on_claim_when_titles_diverge():
+    mimir = AsyncMock()
+    page = MimirPage(
+        meta=MimirPageMeta(
+            path="learning-candidates/general/wait-for-research.md",
+            title="Wait for research campaign findings before acting on backlog items",
+            summary="",
+            category="learning-candidates",
+            updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+        content=_loop_page("First observation."),
+    )
+    mimir.search.return_value = [page]
+    svc = PostSessionReflectionService(InProcessBus(), mimir, AsyncMock(), _make_config())
+
+    found = await svc._find_existing_page(
+        "Delay backlog work pending research campaign results",
+        "",
+        "When a research campaign yields no published findings and its associated tracker "
+        "issue remains in backlog, the agent should defer action until results are available.",
+    )
+
+    assert found is page
+
+
+# ---------------------------------------------------------------------------
 # Page content helpers
 # ---------------------------------------------------------------------------
 
@@ -941,9 +1104,25 @@ async def test_fetch_relevant_learnings_includes_page_content():
 
 
 @pytest.mark.asyncio
-async def test_fetch_relevant_learnings_returns_empty_on_error():
+async def test_fetch_relevant_learnings_raises_when_mimir_cannot_be_listed():
+    """An unreadable Mímir is not the same as a resident with no learnings.
+
+    Both used to return "". One means nothing has been promoted yet; the other
+    means the resident has lost access to everything its flock ever promoted,
+    and it would inject an empty block and carry on saying nothing was wrong.
+    """
     mimir = AsyncMock()
     mimir.list_pages.side_effect = RuntimeError("storage error")
+
+    with pytest.raises(RuntimeError, match="storage error"):
+        await fetch_relevant_learnings(mimir, repo_slug="myrepo", max_pages=5, token_budget=500)
+
+
+@pytest.mark.asyncio
+async def test_fetch_relevant_learnings_returns_empty_when_none_exist():
+    """No learnings is an answer, and stays an empty string."""
+    mimir = AsyncMock()
+    mimir.list_pages.return_value = []
 
     result = await fetch_relevant_learnings(
         mimir, repo_slug="myrepo", max_pages=5, token_budget=500
@@ -988,7 +1167,7 @@ async def test_fetch_relevant_learnings_returns_empty_when_no_matching_repo():
 
 
 @pytest.mark.asyncio
-async def test_fetch_relevant_learnings_skips_pages_with_read_error():
+async def test_fetch_relevant_learnings_raises_when_a_named_page_cannot_be_read():
     meta = MimirPageMeta(
         path="learnings/general/some-learning",
         title="Some learning",
@@ -1000,8 +1179,11 @@ async def test_fetch_relevant_learnings_skips_pages_with_read_error():
     mimir.list_pages.return_value = [meta]
     mimir.read_page.side_effect = RuntimeError("read error")
 
-    result = await fetch_relevant_learnings(mimir, repo_slug="", max_pages=5, token_budget=500)
-    assert result == ""
+    # list_pages just named this page, so a failed read means the mount went
+    # away mid-call — not that the page is absent. Skipping it silently
+    # shrinks the injected learnings with nothing to show it happened.
+    with pytest.raises(RuntimeError, match="read error"):
+        await fetch_relevant_learnings(mimir, repo_slug="", max_pages=5, token_budget=500)
 
 
 @pytest.mark.asyncio

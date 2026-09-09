@@ -28,6 +28,7 @@ def _install_tool(
     tool_code: str = "def run(input):\n    return {'ok': True, 'echo': input}\n",
     required_permission: str = "mimir:read",
     write_code: bool = True,
+    verified: bool = True,
 ) -> LearnedToolArtifact:
     artifact = LearnedToolArtifact(
         artifact_id=f"learned-tool:{name}",
@@ -39,6 +40,10 @@ def _install_tool(
             declared_reach=[],
         ),
         tool_code=tool_code,
+        # An installed tool carries the verification the build path performs;
+        # loading refuses anything else, so a fixture without it is not a tool
+        # this resident would ever have.
+        provenance={"verification": {"ok": True, "logs": "fixture"}} if verified else {},
     )
     code_dir, artifacts_dir = learned_tool_storage(state_dir)
     if write_code:
@@ -237,3 +242,125 @@ class TestLearnedToolRunTool:
 
         assert result.is_error
         assert "archived" in result.content
+
+
+class TestOrphanedArtifactReaping:
+    """An artifact with no code file is removed, not warned about forever.
+
+    A manifest whose .py never landed can never execute, but it kept the
+    capability it claims looking installable. The resident saw the same gap on
+    every sweep and commissioned the same build again — 34 rebuilds of one
+    tool over five days, and 26 such orphans across the fleet.
+    """
+
+    def test_orphaned_artifact_is_removed_from_the_registry(self, tmp_path: Path) -> None:
+        _install_tool(tmp_path, "good_tool")
+        _install_tool(tmp_path, "orphan_tool", write_code=False)
+        code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+        resolver = LearnedToolResolver(state_dir=tmp_path)
+
+        listed = resolver.list_artifacts()
+
+        assert [a.manifest.name for a in listed] == ["good_tool"]
+        # Reaped from disk, so the next sweep does not see it again.
+        assert not (artifacts_dir / "orphan_tool.json").exists()
+        assert (artifacts_dir / "good_tool.json").exists()
+        assert (code_dir / "good_tool.py").exists()
+
+    def test_a_second_sweep_is_quiet(self, tmp_path: Path) -> None:
+        _install_tool(tmp_path, "orphan_tool", write_code=False)
+        resolver = LearnedToolResolver(state_dir=tmp_path)
+
+        assert resolver.list_artifacts() == []
+        # Nothing left to warn about — this is what stops the rebuild loop.
+        assert resolver.list_artifacts() == []
+
+    def test_a_healthy_catalog_is_untouched(self, tmp_path: Path) -> None:
+        _install_tool(tmp_path, "one")
+        _install_tool(tmp_path, "two")
+        resolver = LearnedToolResolver(state_dir=tmp_path)
+
+        assert sorted(a.manifest.name for a in resolver.list_artifacts()) == ["one", "two"]
+
+
+class TestCapabilityKeyDedup:
+    """One capability must not fork into several tools over a naming whim.
+
+    Observed in production: `inspect_k8s_node_disk_pressure` and
+    `inspect_kubernetes_node_disk_pressure` are the same capability, but
+    matching was exact-name only and every artifact carried an empty
+    capability_id — so neither answered to the other's name, and a resident
+    that could not find what it built asked for it again. One resident held 101
+    tools covering 92 capabilities; one capability was built 34 times.
+    """
+
+    def test_spelling_variants_fold_to_one_key(self) -> None:
+        from ravn.valkyrie_evolution.learned_tools import capability_key
+
+        assert capability_key("inspect_k8s_node_disk_pressure") == capability_key(
+            "inspect_kubernetes_node_disk_pressure"
+        )
+        assert capability_key("inspect.k8s.node.disk.pressure") == capability_key(
+            "inspect_kubernetes_node_disk_pressure"
+        )
+        assert capability_key("inspect_daemonset_faileddaemonpod") == capability_key(
+            "inspect_daemonset_failed_daemon_pod"
+        )
+
+    def test_different_capabilities_stay_distinct(self) -> None:
+        """It folds spelling, never meaning."""
+        from ravn.valkyrie_evolution.learned_tools import capability_key
+
+        assert capability_key("inspect_node_disk_pressure") != capability_key(
+            "inspect_node_memory_pressure"
+        )
+        assert capability_key("get_pod") != capability_key("get_pod_logs")
+
+    def test_an_existing_tool_is_found_under_a_different_spelling(self, tmp_path: Path) -> None:
+        from ravn.valkyrie_evolution.learned_tools import find_installed_capability
+
+        _install_tool(tmp_path, "inspect_kubernetes_node_disk_pressure")
+        code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+
+        found = find_installed_capability(
+            artifacts_dir=artifacts_dir,
+            tools_dir=code_dir,
+            capability_id="",
+            name="inspect_k8s_node_disk_pressure",
+        )
+
+        assert found is not None
+        assert found.manifest.name == "inspect_kubernetes_node_disk_pressure"
+
+    def test_exact_name_still_wins_over_a_fold(self, tmp_path: Path) -> None:
+        from ravn.valkyrie_evolution.learned_tools import find_installed_capability
+
+        _install_tool(tmp_path, "inspect_k8s_node_disk_pressure")
+        _install_tool(tmp_path, "inspect_kubernetes_node_disk_pressure")
+        code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+
+        found = find_installed_capability(
+            artifacts_dir=artifacts_dir,
+            tools_dir=code_dir,
+            capability_id="",
+            name="inspect_k8s_node_disk_pressure",
+        )
+
+        assert found is not None
+        assert found.manifest.name == "inspect_k8s_node_disk_pressure"
+
+    def test_an_unrelated_tool_is_not_matched(self, tmp_path: Path) -> None:
+        from ravn.valkyrie_evolution.learned_tools import find_installed_capability
+
+        _install_tool(tmp_path, "inspect_node_memory_pressure")
+        code_dir, artifacts_dir = learned_tool_storage(tmp_path)
+
+        assert (
+            find_installed_capability(
+                artifacts_dir=artifacts_dir,
+                tools_dir=code_dir,
+                capability_id="",
+                name="inspect_node_disk_pressure",
+            )
+            is None
+        )

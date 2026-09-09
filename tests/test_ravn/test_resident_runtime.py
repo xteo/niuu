@@ -1463,3 +1463,344 @@ def test_empty_metadata_does_not_absorb_the_next_line() -> None:
     # unrelated reference and the runtime raises on a ref that never existed.
     assert _metadata(content, "turn_ref") == ""
     assert _metadata(content, "wake_at") == "2026-07-25T09:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Repeated-decision guard
+#
+# A resident once re-derived one verdict in a fresh case every wake for 30
+# hours. Per-case turn budgets never fired because no single case accumulated
+# turns; the streak below is keyed on the resident so it survives that.
+# ---------------------------------------------------------------------------
+
+
+def _stuck_outcome(*, wake_at: str, rationale: str = "", observations: list | None = None) -> dict:
+    """A sleeping turn. Rationale and observations vary the way a stuck one really does."""
+    return {
+        "continuation": "sleep",
+        "next_action_timing": "scheduled_time",
+        "wake_at": wake_at,
+        "decision": "watch",
+        "rationale": rationale or "Research campaign still has no published findings.",
+        "signal_refs": ["tracker_issue:get:NIU-1118"],
+        "working_state": {
+            "objectives": ["wait for research campaign findings"],
+            "observations": observations or ["tracker issue is in Backlog"],
+            "hypotheses": ["waiting prevents premature action"],
+            "unknowns": ["when will the campaign produce findings?"],
+            "capability_gaps": [],
+            "attempts": ["rechecked the tracker"],
+        },
+    }
+
+
+_UNCHANGED_EVIDENCE = {"tracker_issue": '{"identifier": "NIU-1118", "status": "Backlog"}'}
+
+
+async def _run_stuck_turns(
+    runtime: ResidentRuntime,
+    count: int,
+    *,
+    case_prefix: str = "case",
+    evidence: dict[str, str] | None = None,
+    reword: bool = False,
+):
+    """Drive *count* sleeping turns, each in its own case, over the same evidence."""
+    dispositions = []
+    for index in range(count):
+        wake_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        # A stuck resident narrates differently every turn while learning nothing;
+        # the guard must not be fooled by that, so vary the prose by default.
+        outcome = _stuck_outcome(
+            wake_at=wake_at,
+            rationale=(
+                f"Still no findings as of check {index}; the ticket remains open." if reword else ""
+            ),
+            observations=[f"tracker issue is in Backlog (checked {index} times)"]
+            if reword
+            else None,
+        )
+        outcome["working_state"]["attempts"] = [f"recheck {i}" for i in range(index + 1)]
+        dispositions.append(
+            await runtime.handle_completed_turn(
+                task=_task(
+                    task_id=f"task-{index}",
+                    root_correlation_id=f"{case_prefix}-{index}",
+                ),
+                prompt="stewardship turn",
+                result=_result(
+                    outcome,
+                    tools=tuple(evidence or _UNCHANGED_EVIDENCE),
+                    tool_outputs=evidence or _UNCHANGED_EVIDENCE,
+                ),
+                response_text="still waiting",
+            )
+        )
+    return dispositions
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_conclusions_escalate_to_the_operator(tmp_path) -> None:
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+
+    dispositions = await _run_stuck_turns(runtime, 3)
+
+    assert [d.kind for d in dispositions[:2]] == [
+        ContinuationDecisionKind.SLEEP,
+        ContinuationDecisionKind.SLEEP,
+    ]
+    assert dispositions[-1].kind is ContinuationDecisionKind.ASK_OPERATOR
+    assert "repeated the same conclusion 3 times" in dispositions[-1].reason
+    assert "nothing new" in dispositions[-1].question
+
+
+@pytest.mark.asyncio
+async def test_rewording_the_same_verdict_does_not_escape_the_guard(tmp_path) -> None:
+    """The regression that made the first version of this guard useless.
+
+    A real stuck resident rewrote its rationale every turn (40 distinct forms
+    across 55 turns) and appended to `attempts` each time, so a fingerprint over
+    the narration matched nothing and it looped for 30 hours. The guard must key
+    on evidence, not prose.
+    """
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+
+    dispositions = await _run_stuck_turns(runtime, 3, reword=True)
+
+    assert dispositions[-1].kind is ContinuationDecisionKind.ASK_OPERATOR
+
+
+@pytest.mark.asyncio
+async def test_new_evidence_restarts_the_streak(tmp_path) -> None:
+    """A resident whose tools return something new is working, not stuck."""
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+
+    await _run_stuck_turns(runtime, 2)
+    moved = await _run_stuck_turns(
+        runtime,
+        1,
+        case_prefix="moved",
+        evidence={"tracker_issue": '{"identifier": "NIU-1118", "status": "In Progress"}'},
+    )
+
+    assert moved[0].kind is ContinuationDecisionKind.SLEEP
+
+
+@pytest.mark.asyncio
+async def test_a_watcher_reading_changing_measurements_is_never_escalated(tmp_path) -> None:
+    """Modelled on a live resident watching real etcd latency.
+
+    It sleeps on the same verdict for dozens of turns, but each turn reads a new
+    measurement. Over 657 real turns it never reached a streak of 5.
+    """
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="k8s-valkyrie",
+        repeated_decision_escalate_after=3,
+    )
+
+    dispositions = []
+    for latency in (402, 195, 308, 315, 329, 377, 413):
+        dispositions += await _run_stuck_turns(
+            runtime,
+            1,
+            case_prefix=f"etcd-{latency}",
+            evidence={"kubernetes_inspect": f"apply request took too long: {latency}ms"},
+        )
+
+    assert {d.kind for d in dispositions} == {ContinuationDecisionKind.SLEEP}
+
+
+@pytest.mark.asyncio
+async def test_a_timestamp_that_only_moves_the_clock_is_not_new_evidence(tmp_path) -> None:
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+
+    dispositions = []
+    for stamp in ("2026-08-11T10:00:00Z", "2026-08-11T10:30:00Z", "2026-08-11T11:00:00Z"):
+        dispositions += await _run_stuck_turns(
+            runtime,
+            1,
+            case_prefix=f"tick-{stamp}",
+            evidence={"tracker_issue": f'{{"status": "Backlog", "checked_at": "{stamp}"}}'},
+        )
+
+    assert dispositions[-1].kind is ContinuationDecisionKind.ASK_OPERATOR
+
+
+@pytest.mark.asyncio
+async def test_the_streak_survives_a_restart(tmp_path) -> None:
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+    await _run_stuck_turns(runtime, 2)
+
+    restarted = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+    dispositions = await _run_stuck_turns(restarted, 1, case_prefix="after-restart")
+
+    assert dispositions[0].kind is ContinuationDecisionKind.ASK_OPERATOR
+
+
+@pytest.mark.asyncio
+async def test_escalating_resets_the_streak_so_it_does_not_ask_every_turn(tmp_path) -> None:
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=3,
+    )
+
+    dispositions = await _run_stuck_turns(runtime, 4)
+
+    assert dispositions[2].kind is ContinuationDecisionKind.ASK_OPERATOR
+    assert dispositions[3].kind is ContinuationDecisionKind.SLEEP
+
+
+@pytest.mark.asyncio
+async def test_the_guard_can_be_disabled(tmp_path) -> None:
+    runtime = ResidentRuntime(
+        state=LocalResidentState(tmp_path),
+        resident_id="regin",
+        repeated_decision_escalate_after=0,
+    )
+
+    dispositions = await _run_stuck_turns(runtime, 6)
+
+    assert {d.kind for d in dispositions} == {ContinuationDecisionKind.SLEEP}
+
+
+# ---------------------------------------------------------------------------
+# Health scorecard
+# ---------------------------------------------------------------------------
+
+
+async def _seed_health_state(tmp_path):
+    """One live case, one dead case, one pending wake, one untriaged signal."""
+    from ravn.domain.resident_continuation import ResidentTurnRecord
+    from ravn.resident_inbox import ResidentInboxSignal
+
+    state = LocalResidentState(tmp_path / "state")
+    inbox = LocalResidentInbox(tmp_path / "inbox")
+
+    def _turn(case_id: str) -> ResidentTurnRecord:
+        return ResidentTurnRecord(
+            turn_index=1,
+            prompt="look around",
+            response="observing",
+            outcome_fields={"decision": "observe"},
+            tool_names=(),
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            case_id=case_id,
+        )
+
+    await state.write_turn(_turn("dead-case"))
+    await state.write_turn(_turn("sleeping-case"))
+    await state.write_scheduled_wake(
+        ResidentScheduledWakeRecord(
+            case_id="sleeping-case",
+            root_correlation_id="sleeping-case",
+            wake_at=datetime.now(UTC) + timedelta(hours=1),
+            reason="waiting on the next measurement",
+        )
+    )
+    await inbox.write_signal(
+        ResidentInboxSignal(
+            id="sig-1",
+            source="test",
+            kind="k8s_event",
+            summary="node pressure",
+        )
+    )
+    return state, inbox
+
+
+@pytest.mark.asyncio
+async def test_refresh_health_snapshot_counts_durable_state(tmp_path) -> None:
+    state, inbox = await _seed_health_state(tmp_path)
+    runtime = ResidentRuntime(state=state, inbox=inbox, resident_id="ivaldi")
+
+    snapshot = await runtime.refresh_health_snapshot()
+
+    assert snapshot["cases_live"] == 1
+    assert snapshot["cases_total"] == 2
+    assert snapshot["scheduled_wakes_pending"] == 1
+    assert snapshot["inbox_pending"] == 1
+    assert snapshot["repeated_decision_streak"] == 0
+    # The cached view serves the HUD without touching the store again.
+    assert runtime.health_snapshot() == snapshot
+
+
+@pytest.mark.asyncio
+async def test_publish_health_gauges_restates_and_paces_recounts(tmp_path) -> None:
+    state, inbox = await _seed_health_state(tmp_path)
+    runtime = ResidentRuntime(
+        state=state,
+        inbox=inbox,
+        resident_id="ivaldi",
+        health_refresh_interval_seconds=3600.0,
+    )
+    await runtime.refresh_health_snapshot()
+
+    recounts = 0
+    original = runtime.refresh_health_snapshot
+
+    async def _counting_refresh():
+        nonlocal recounts
+        recounts += 1
+        return await original()
+
+    runtime.refresh_health_snapshot = _counting_refresh  # type: ignore[method-assign]
+
+    # Within the interval the heartbeat only restates gauges — no store walk.
+    runtime.publish_health_gauges()
+    runtime.publish_health_gauges()
+    assert recounts == 0
+
+    # Past the interval one recount is kicked off (and only one).
+    runtime._health_refreshed_at = None
+    runtime.publish_health_gauges()
+    runtime.publish_health_gauges()
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0)
+    assert recounts == 1
+
+
+@pytest.mark.asyncio
+async def test_hud_status_carries_the_health_snapshot(tmp_path) -> None:
+    state, inbox = await _seed_health_state(tmp_path)
+    runtime = ResidentRuntime(state=state, inbox=inbox, resident_id="ivaldi")
+    await runtime.refresh_health_snapshot()
+
+    settings = Settings()
+    loop = DriveLoop(
+        agent_factory=lambda *a, **k: None,
+        config=InitiativeConfig(),
+        settings=settings,
+    )
+    loop.set_resident_runtime(runtime)
+
+    status = loop.resident_hud_status()
+
+    assert status["health"]["cases_live"] == 1
+    assert status["health"]["inbox_pending"] == 1

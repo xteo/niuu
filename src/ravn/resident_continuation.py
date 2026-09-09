@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import re
+import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +19,7 @@ from ravn.domain.resident_continuation import (
     ResidentBudgetDecision,
     ResidentBudgetLimits,
     ResidentBudgetSnapshot,
+    ResidentDecisionStreakRecord,
     ResidentMemoryEntry,
     ResidentMemoryPort,
     ResidentPolicyDecisionRecord,
@@ -34,10 +38,13 @@ from ravn.resident_text import (
     timestamp_slug as _timestamp_slug,
 )
 
+logger = logging.getLogger(__name__)
+
 _OPERATOR_NEEDED_PATH = "operator-needed/latest.md"
 _OPERATOR_ANSWER_PATH = "operator-answers/latest.md"
 _SCHEDULED_WAKE_PATH = "scheduled-wake/latest.md"
 _A2A_TASKS_PATH = Path("a2a-tasks")
+_DECISION_STREAK_DIR = "decision-streak"
 
 
 def _case_path(case_id: str, leaf: str) -> Path:
@@ -186,9 +193,144 @@ class NullResidentMemory(ResidentMemoryPort):
 class LocalResidentMemory(ResidentMemoryPort):
     """Filesystem fallback that mirrors the Mimir memory shape."""
 
-    def __init__(self, root: Path, *, prefix: str = "resident/continuation") -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        prefix: str = "resident/continuation",
+        retention_max_cases: int = 0,
+        retention_max_age_days: float = 0.0,
+        retention_sweep_interval_seconds: float = 900.0,
+    ) -> None:
         self._root = Path(root)
         self._prefix = Path(prefix.strip("/").strip() or "resident/continuation")
+        self._retention_max_cases = max(0, retention_max_cases)
+        self._retention_max_age_days = max(0.0, retention_max_age_days)
+        self._retention_sweep_interval_seconds = max(0.0, retention_sweep_interval_seconds)
+        self._last_retention_sweep: float | None = None
+
+    # ------------------------------------------------------------------
+    # Case retention
+    # ------------------------------------------------------------------
+
+    def _case_is_resumable(self, case_dir: Path) -> bool:
+        """Whether any mechanism can still bring this case back.
+
+        Three things resume a case: a pending scheduled wake, an unanswered
+        operator question, and an operator answer the resident has not yet
+        consumed — ``ResidentRuntime.retry_unconsumed_answers`` drives that
+        last one. Answering a question flips its marker from pending to
+        answered, so a case waiting on nothing but a fresh answer looks
+        unresumable to the first two tests; pruning on that alone would
+        delete the operator's answer and the suspended work it was about to
+        resume, which is the one loss this sweep must never cause.
+        """
+        for leaf in (_SCHEDULED_WAKE_PATH, _OPERATOR_NEEDED_PATH):
+            marker = case_dir / leaf
+            if not marker.is_file():
+                continue
+            try:
+                if _operator_marker_is_pending(marker.read_text(encoding="utf-8")):
+                    return True
+            except OSError:
+                # Unreadable marker: assume the case is live rather than delete it.
+                return True
+
+        answer = case_dir / _OPERATOR_ANSWER_PATH
+        if answer.is_file():
+            try:
+                return not _operator_answer_is_consumed(answer.read_text(encoding="utf-8"))
+            except OSError:
+                return True
+        return False
+
+    async def count_cases(self) -> tuple[int, int] | None:
+        """Return (live, total) durable case counts for health reporting."""
+        return await asyncio.to_thread(self._count_cases_sync)
+
+    def _count_cases_sync(self) -> tuple[int, int]:
+        base = self._root / self._prefix / "cases"
+        if not base.is_dir():
+            return (0, 0)
+        live = 0
+        total = 0
+        for case_dir in base.iterdir():
+            if not case_dir.is_dir():
+                continue
+            total += 1
+            if self._case_is_resumable(case_dir):
+                live += 1
+        return (live, total)
+
+    async def prune_cases(self) -> int:
+        """Delete unresumable cases beyond the retention policy; return the count."""
+        return await asyncio.to_thread(self._prune_cases_sync)
+
+    def _prune_cases_sync(self) -> int:
+        base = self._root / self._prefix / "cases"
+        if not base.is_dir():
+            return 0
+        if self._retention_max_cases <= 0 and self._retention_max_age_days <= 0:
+            return 0
+
+        eligible: list[tuple[float, Path]] = []
+        live = 0
+        for case_dir in base.iterdir():
+            if not case_dir.is_dir():
+                continue
+            if self._case_is_resumable(case_dir):
+                live += 1
+                continue
+            try:
+                eligible.append((case_dir.stat().st_mtime, case_dir))
+            except OSError:
+                continue
+
+        eligible.sort(reverse=True)
+        doomed: list[Path] = []
+        if self._retention_max_age_days > 0:
+            cutoff = time.time() - self._retention_max_age_days * 86400
+            doomed.extend(path for mtime, path in eligible if mtime < cutoff)
+        if self._retention_max_cases > 0:
+            # The cap counts every case on disk, live ones included, so a
+            # resident holding many open cases keeps them and trims further
+            # into its dead tail rather than pruning nothing.
+            surplus = len(eligible) + live - self._retention_max_cases
+            if surplus > 0:
+                doomed.extend(path for _mtime, path in eligible[-surplus:])
+
+        removed = 0
+        for case_dir in dict.fromkeys(doomed):
+            try:
+                shutil.rmtree(case_dir)
+            except OSError:
+                logger.warning("resident cases: could not prune %s", case_dir, exc_info=True)
+                continue
+            removed += 1
+        if removed:
+            logger.info(
+                "resident cases: pruned %d unresumable case(s); %d live, %d retained",
+                removed,
+                live,
+                len(eligible) + live - removed,
+            )
+        return removed
+
+    async def _maybe_prune_cases(self) -> None:
+        """Sweep when one is due. Never blocking, never on the read path."""
+        if self._retention_max_cases <= 0 and self._retention_max_age_days <= 0:
+            return
+        now = time.monotonic()
+        if (
+            self._last_retention_sweep is not None
+            and now - self._last_retention_sweep < self._retention_sweep_interval_seconds
+        ):
+            return
+        self._last_retention_sweep = now
+        try:
+            await self.prune_cases()
+        except Exception:  # noqa: BLE001 — bookkeeping must never break a turn
+            logger.warning("resident cases: retention sweep failed", exc_info=True)
 
     async def recall(self, mandate: str, *, limit: int = 5) -> list[ResidentMemoryEntry]:
         base = self._root / self._prefix
@@ -240,12 +382,53 @@ class LocalResidentMemory(ResidentMemoryPort):
             record.case_id,
             f"turns/{stamp}-{record.turn_index}.md",
         )
-        return self._write(rel, _render_turn_record(record))
+        ref = self._write(rel, _render_turn_record(record))
+        # Every turn writes here, so this is the natural sweep tick. The
+        # interval throttle keeps it off all but one write in fifteen minutes.
+        await self._maybe_prune_cases()
+        return ref
 
     async def write_working_state(self, record: ResidentWorkingStateRecord) -> str:
         return self._write(
             self._working_state_path(record.resident_id), _render_working_state(record)
         )
+
+    async def read_decision_streak(self, resident_id: str) -> ResidentDecisionStreakRecord | None:
+        entry = await self.read(str(self._decision_streak_path(resident_id)))
+        if entry is None:
+            return None
+        return _parse_decision_streak(resident_id, entry.content)
+
+    async def write_decision_streak(self, record: ResidentDecisionStreakRecord) -> str:
+        return self._write(
+            self._decision_streak_path(record.resident_id), _render_decision_streak(record)
+        )
+
+    async def clear_decision_streak(self, resident_id: str) -> bool:
+        """Forget the repeated-decision streak; return whether one existed."""
+        path = self._root / self._decision_streak_path(resident_id)
+        if not path.is_file():
+            return False
+        path.unlink()
+        return True
+
+    async def delete_case(self, case_id: str) -> int:
+        """Delete one durable case directory; return the number of refs removed."""
+        return await asyncio.to_thread(self._delete_case_sync, case_id)
+
+    def _delete_case_sync(self, case_id: str) -> int:
+        case_slug = _slug(case_id)
+        if not case_slug:
+            return 0
+        base = (self._root / self._prefix / "cases").resolve()
+        case_dir = (base / case_slug).resolve()
+        # A case id arriving from an operator is still input; refuse anything
+        # that resolves outside the cases tree rather than deleting it.
+        if not case_dir.is_relative_to(base) or case_dir == base or not case_dir.is_dir():
+            return 0
+        removed = sum(1 for path in case_dir.rglob("*") if path.is_file())
+        shutil.rmtree(case_dir)
+        return removed
 
     async def read_a2a_task(self, task_id: str) -> ResidentMemoryEntry | None:
         return await self.read(str(self._prefix / _a2a_task_path(task_id)))
@@ -428,6 +611,10 @@ class LocalResidentMemory(ResidentMemoryPort):
         resident_slug = _slug(resident_id) or "resident"
         return self._prefix / "working-state" / f"{resident_slug}.md"
 
+    def _decision_streak_path(self, resident_id: str) -> Path:
+        resident_slug = _slug(resident_id) or "resident"
+        return self._prefix / _DECISION_STREAK_DIR / f"{resident_slug}.md"
+
 
 def _render_turn_record(record: ResidentTurnRecord) -> str:
     action = record.selected_next_action
@@ -490,6 +677,106 @@ def _render_working_state(record: ResidentWorkingStateRecord) -> str:
         "## Evidence References\n\n"
         f"{evidence_refs}\n"
     )
+
+
+def _render_decision_streak(record: ResidentDecisionStreakRecord) -> str:
+    return (
+        "# Resident Decision Streak\n\n"
+        f"- resident_id: {record.resident_id}\n"
+        f"- fingerprint: {record.fingerprint}\n"
+        f"- count: {record.count}\n"
+        f"- decision: {_compact_line(record.decision, limit=200)}\n"
+        f"- case_id: {record.case_id}\n"
+        f"- first_seen_at: {record.first_seen_at.isoformat()}\n"
+        f"- updated_at: {record.updated_at.isoformat()}\n\n"
+        "## Rationale\n\n"
+        f"{_compact_line(record.rationale, limit=1000)}\n"
+    )
+
+
+def _parse_decision_streak(resident_id: str, content: str) -> ResidentDecisionStreakRecord | None:
+    fingerprint = _marker_field(content, "fingerprint")
+    if not fingerprint:
+        return None
+    try:
+        count = int(_marker_field(content, "count") or "0")
+    except ValueError:
+        return None
+    return ResidentDecisionStreakRecord(
+        resident_id=resident_id,
+        fingerprint=fingerprint,
+        count=count,
+        decision=_marker_field(content, "decision"),
+        rationale=_section_body(content, "Rationale"),
+        case_id=_marker_field(content, "case_id"),
+        first_seen_at=_marker_datetime(content, "first_seen_at") or datetime.now(UTC),
+        updated_at=_marker_datetime(content, "updated_at") or datetime.now(UTC),
+    )
+
+
+def _marker_field(content: str, key: str) -> str:
+    match = re.search(rf"^- {re.escape(key)}:\s*(.*?)\s*$", content, flags=re.MULTILINE)
+    return _unquote(match.group(1).strip()) if match else ""
+
+
+def _marker_datetime(content: str, key: str) -> datetime | None:
+    raw = _marker_field(content, key)
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _section_body(content: str, heading: str) -> str:
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*$\n+(.*?)(?=\n## |\Z)",
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else ""
+
+
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ][\d:.+\-]+")
+
+
+def decision_fingerprint(
+    *,
+    decision: str,
+    objectives: Any,
+    tool_results: tuple[str, ...],
+) -> str:
+    """Fingerprint the evidence a turn acted on, not the prose it wrote about it.
+
+    Keyed on what the resident was trying to do and what its tools actually
+    returned. Everything the model narrates — rationale, state summary, its own
+    observations — is excluded, because a resident stuck on one belief restates
+    it differently every turn: across 55 real stuck turns the rationale took 40
+    distinct forms and the attempts list grew by one entry each time, so any
+    fingerprint including them matched nothing and the guard never fired.
+
+    Tool results are the honest signal. A resident re-reading one unchanged fact
+    gets byte-identical results; one watching a real condition gets new numbers
+    every turn and never trips. Objectives keep separate subjects apart while
+    staying stable within one — and a frozen objective is itself the symptom.
+
+    Validated against two live residents: a stuck one reached runs of 8 identical
+    turns, a busy one watching genuine etcd latency peaked at 4.
+    """
+    payload = json.dumps(
+        {
+            "decision": decision.strip().casefold(),
+            "objectives": objectives,
+            # Timestamps differ on every read of the same thing; they are the
+            # clock moving, not the world changing.
+            "evidence": [_TIMESTAMP_RE.sub("<ts>", str(item)) for item in tool_results],
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
 def _render_a2a_task(record: ResidentA2ATaskRecord) -> str:

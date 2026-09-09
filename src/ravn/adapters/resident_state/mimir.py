@@ -9,6 +9,7 @@ from ravn.adapters.resident_pages import collect_pages
 from ravn.domain.resident_continuation import (
     ResidentA2ATaskRecord,
     ResidentBudgetSnapshot,
+    ResidentDecisionStreakRecord,
     ResidentMemoryEntry,
     ResidentPolicyDecisionRecord,
     ResidentPolicyObservation,
@@ -25,6 +26,7 @@ from ravn.memory_telemetry import (
 from ravn.ports.mimir import MimirPort
 from ravn.resident_continuation import (
     _A2A_TASKS_PATH,
+    _DECISION_STREAK_DIR,
     _OPERATOR_ANSWER_PATH,
     _OPERATOR_NEEDED_PATH,
     _SCHEDULED_WAKE_PATH,
@@ -35,12 +37,14 @@ from ravn.resident_continuation import (
     _first_heading_or_line,
     _operator_answer_is_consumed,
     _operator_marker_is_pending,
+    _parse_decision_streak,
     _parse_policy_observation,
     _render_a2a_task,
     _render_answered_operator_needed,
     _render_budget_snapshot,
     _render_consumed_operator_answer,
     _render_consumed_scheduled_wake,
+    _render_decision_streak,
     _render_operator_answer,
     _render_operator_needed,
     _render_policy_decision,
@@ -108,6 +112,84 @@ class MimirResidentState(ResidentStatePort):
         path = self._working_state_path(record.resident_id)
         await self._mimir.upsert_page(path, _render_working_state(record))
         return path
+
+    async def read_decision_streak(self, resident_id: str) -> ResidentDecisionStreakRecord | None:
+        entry = await self.read(self._decision_streak_path(resident_id))
+        if entry is None:
+            return None
+        return _parse_decision_streak(resident_id, entry.content)
+
+    async def write_decision_streak(self, record: ResidentDecisionStreakRecord) -> str:
+        path = self._decision_streak_path(record.resident_id)
+        await self._mimir.upsert_page(path, _render_decision_streak(record))
+        return path
+
+    async def clear_decision_streak(self, resident_id: str) -> bool:
+        return await self._mimir.delete_page(self._decision_streak_path(resident_id))
+
+    async def delete_case(self, case_id: str) -> int:
+        """Delete every page under one case; return how many were removed."""
+        case_slug = _slug(case_id)
+        if not case_slug:
+            return 0
+        prefix = f"{self._prefix}/cases/{case_slug}"
+        removed = 0
+        for path in await self._case_page_paths(prefix=prefix):
+            if await self._mimir.delete_page(path):
+                removed += 1
+        return removed
+
+    async def prune_cases(self) -> int:
+        """Delete every case no wake or question can resume.
+
+        Unlike the local store this has no retention policy to respect: Mimir
+        residents never had a sweep, so there is no age or count bound here to
+        honour, only the resumability test the gauges count by.
+        """
+        # Unconsumed answers count as resumable for the same reason they do in
+        # the local store: retry_unconsumed_answers resumes from them, and
+        # answering flips the question marker out of "pending".
+        resumable = {
+            self._case_slug_of(entry.path)
+            for entry in (
+                (await self.list_scheduled_wakes())
+                + (await self.list_operator_needed())
+                + (await self.list_operator_answers())
+            )
+        }
+        removed = 0
+        for case_slug in sorted(await self._case_slugs()):
+            if case_slug in resumable:
+                continue
+            if await self.delete_case(case_slug):
+                removed += 1
+        return removed
+
+    async def _case_page_paths(self, *, prefix: str) -> list[str]:
+        """Every page path under a case prefix, boundary-safe.
+
+        ``list_pages(prefix=...)`` is a string prefix, so asking for
+        ``cases/watch`` would also match ``cases/watch-2``. Compare on the
+        path segment instead.
+        """
+        pages = await self._mimir.list_pages(prefix=prefix)
+        paths = []
+        for page in pages:
+            path = str(getattr(page, "path", "") or "")
+            if path == prefix or path.startswith(f"{prefix}/"):
+                paths.append(path)
+        return paths
+
+    async def _case_slugs(self) -> set[str]:
+        pages = await self._mimir.list_pages(prefix=f"{self._prefix}/cases")
+        slugs = {self._case_slug_of(str(getattr(page, "path", "") or "")) for page in pages}
+        return {slug for slug in slugs if slug}
+
+    def _case_slug_of(self, path: str) -> str:
+        marker = f"{self._prefix}/cases/"
+        if not path.startswith(marker):
+            return ""
+        return path[len(marker) :].split("/", 1)[0]
 
     async def read_a2a_task(self, task_id: str) -> ResidentMemoryEntry | None:
         return await self.read(str(Path(self._prefix) / _a2a_task_path(task_id)))
@@ -259,6 +341,12 @@ class MimirResidentState(ResidentStatePort):
         )
         return path
 
+    async def count_cases(self) -> tuple[int, int] | None:
+        """Mimir-backed case counting would walk every case page remotely on
+        each health refresh — decline instead; None is the documented answer
+        for a store that cannot count cheaply."""
+        return None
+
     async def list_operator_needed(self) -> list[ResidentMemoryEntry]:
         return await self._list_case_entries(_OPERATOR_NEEDED_PATH, pending=True)
 
@@ -325,6 +413,10 @@ class MimirResidentState(ResidentStatePort):
         resident_slug = _slug(resident_id) or "resident"
         return f"{self._prefix}/working-state/{resident_slug}.md"
 
+    def _decision_streak_path(self, resident_id: str) -> str:
+        resident_slug = _slug(resident_id) or "resident"
+        return f"{self._prefix}/{_DECISION_STREAK_DIR}/{resident_slug}.md"
+
 
 class LocalResidentState(LocalResidentMemory, ResidentStatePort):
     """Filesystem-backed resident state adapter for local development/tests."""
@@ -335,8 +427,18 @@ class LocalResidentState(LocalResidentMemory, ResidentStatePort):
         *,
         continuation_prefix: str = "resident/continuation",
         environment_id: str = "",
+        retention_max_cases: int = 0,
+        retention_max_age_days: float = 0.0,
+        retention_sweep_interval_seconds: float = 900.0,
     ) -> None:
-        LocalResidentMemory.__init__(self, root, prefix=continuation_prefix)
+        LocalResidentMemory.__init__(
+            self,
+            root,
+            prefix=continuation_prefix,
+            retention_max_cases=retention_max_cases,
+            retention_max_age_days=retention_max_age_days,
+            retention_sweep_interval_seconds=retention_sweep_interval_seconds,
+        )
         self._environment_id = environment_id
 
     async def available(self) -> bool:

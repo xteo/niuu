@@ -28,6 +28,7 @@ from ravn.valkyrie_evolution.tool_runtime import (
     DEFAULT_TOOL_VENV_PIP_TIMEOUT_SECONDS,
     TOOL_VENV_REQUIREMENTS_STAMP,
     TOOL_VENV_UV_CACHE_DIRNAME,
+    HostCall,
     ToolRunResult,
     ToolVenvError,
     ensure_tool_venv,
@@ -95,6 +96,7 @@ class LearnedToolRunner(Protocol):
         timeout_seconds: float,
         requirements: Sequence[str] = (),
         declared_reach: Sequence[ToolReachGrant] = (),
+        host_call: HostCall | None = None,
     ) -> ToolRunResult:
         """Execute a learned tool and return a structured run result."""
 
@@ -132,6 +134,7 @@ class LocalLearnedToolRunner:
         timeout_seconds: float,
         requirements: Sequence[str] = (),
         declared_reach: Sequence[ToolReachGrant] = (),
+        host_call: HostCall | None = None,
     ) -> ToolRunResult:
         self._warn_unenforced_reach(tool_path, declared_reach)
         python_executable: Path | None = None
@@ -164,6 +167,7 @@ class LocalLearnedToolRunner:
             entry_point=entry_point,
             timeout_seconds=timeout_seconds,
             python_executable=python_executable,
+            host_call=host_call,
         )
 
     def _warn_unenforced_reach(
@@ -276,7 +280,17 @@ class ContainedLearnedToolRunner:
         timeout_seconds: float,
         requirements: Sequence[str] = (),
         declared_reach: Sequence[ToolReachGrant] = (),
+        host_call: HostCall | None = None,
     ) -> ToolRunResult:
+        if host_call is not None:
+            return ToolRunResult(
+                ok=False,
+                error=(
+                    "this execution backend cannot provide the host SDK: the tool asks to "
+                    "call the resident's own tools and there is no channel back from here. "
+                    "Run it on the local backend, or rebuild it self-contained."
+                ),
+            )
         path = tool_path.resolve()
         if not path.is_file():
             return ToolRunResult(ok=False, error=f"tool implementation missing: {path}")
@@ -808,7 +822,17 @@ class ForgeSandboxLearnedToolRunner:
         timeout_seconds: float,
         requirements: Sequence[str] = (),
         declared_reach: Sequence[ToolReachGrant] = (),
+        host_call: HostCall | None = None,
     ) -> ToolRunResult:
+        if host_call is not None:
+            return ToolRunResult(
+                ok=False,
+                error=(
+                    "this execution backend cannot provide the host SDK: the tool asks to "
+                    "call the resident's own tools and there is no channel back from here. "
+                    "Run it on the local backend, or rebuild it self-contained."
+                ),
+            )
         if not tool_path.resolve().is_relative_to(self._workspace_root):
             return ToolRunResult(
                 ok=False,
@@ -1019,6 +1043,33 @@ def _reach_enforcement(*, network: str | None, network_allowed: bool) -> str:
     return REACH_ENFORCEMENT_UNAVAILABLE
 
 
+def require_verified_artifact(artifact: LearnedToolArtifact) -> None:
+    """Raise unless *artifact* carries a passing independent verification.
+
+    Adoption is supposed to verify, but a second path installed tools without
+    it: of 105 artifacts on one resident, 28 carried no verification record at
+    all. An unverified tool is not merely unproven — the ones observed here
+    call a host SDK that does not exist, swallow the ImportError, and return
+    ``None``, so they report success while doing nothing. Refusing to load
+    them turns a silent no-op back into a visible failure.
+    """
+    verification = artifact.provenance.get("verification")
+    name = artifact.manifest.name
+    if verification is None:
+        raise LearnedToolError(
+            f"learned tool {name!r} has no verification record and will not be run. "
+            f"Rebuild it with build_tool, which verifies before installing."
+        )
+    if not isinstance(verification, dict) or verification.get("ok") is not True:
+        detail = ""
+        if isinstance(verification, dict):
+            detail = str(verification.get("error") or verification.get("summary") or "").strip()
+        raise LearnedToolError(
+            f"learned tool {name!r} failed verification and will not be run"
+            + (f": {detail}" if detail else "")
+        )
+
+
 class LearnedTool(ToolPort):
     """Expose a resident-authored artifact through the normal agent tool port."""
 
@@ -1030,6 +1081,7 @@ class LearnedTool(ToolPort):
         timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
         runner: LearnedToolRunner | None = None,
         requirements: Sequence[str] = (),
+        host_call: HostCall | None = None,
     ) -> None:
         _validate_manifest(manifest)
         self._manifest = manifest
@@ -1037,6 +1089,7 @@ class LearnedTool(ToolPort):
         self._timeout_seconds = timeout_seconds
         self._runner = runner or LocalLearnedToolRunner()
         self._requirements = list(requirements)
+        self._host_call = host_call
 
     @property
     def name(self) -> str:
@@ -1070,6 +1123,7 @@ class LearnedTool(ToolPort):
             timeout_seconds=self._timeout_seconds,
             requirements=self._requirements,
             declared_reach=self._manifest.declared_reach,
+            host_call=self._host_call,
         )
         if not result.ok:
             detail = result.error
@@ -1204,6 +1258,30 @@ def find_installed_duplicate(
     return None
 
 
+#: Naming whims that fork one capability into several tools. A resident asked
+#: for the same thing as ``inspect_k8s_node_disk_pressure`` and
+#: ``inspect_kubernetes_node_disk_pressure``; nothing linked them, so it built
+#: both — and kept building, because neither answered to the other's name.
+_CAPABILITY_SYNONYMS = (("k8s", "kubernetes"),)
+
+
+def capability_key(name: str) -> str:
+    """Return the stable identity of the capability *name* describes.
+
+    Case, separators and the k8s/kubernetes shorthand are naming choices, not
+    different capabilities. Collapsing them lets a build recognise a tool the
+    resident already has, whatever the model decided to call it this time.
+
+    Deliberately conservative: it folds spelling, never meaning. Two tools whose
+    names differ only in punctuation are the same tool in practice; two that
+    differ in a word are left alone.
+    """
+    folded = name.strip().lower()
+    for shorthand, full in _CAPABILITY_SYNONYMS:
+        folded = folded.replace(shorthand, full)
+    return re.sub(r"[^a-z0-9]", "", folded)
+
+
 def find_installed_capability(
     *,
     artifacts_dir: str | Path,
@@ -1231,6 +1309,8 @@ def find_installed_capability(
         return None
 
     by_name: LearnedToolArtifact | None = None
+    by_key: LearnedToolArtifact | None = None
+    wanted_key = capability_key(wanted_capability or wanted_name)
     for candidate_path in sorted(artifacts_path.glob("*.json")):
         try:
             payload = json.loads(candidate_path.read_text(encoding="utf-8"))
@@ -1245,7 +1325,16 @@ def find_installed_capability(
             return candidate
         if wanted_name and candidate.manifest.name == wanted_name and by_name is None:
             by_name = candidate
-    return by_name
+        # Last resort: the same capability under a different spelling. Exact
+        # matching alone let one capability fork into several tools, and a
+        # resident that cannot find what it built asks for it again.
+        if by_key is None and wanted_key:
+            candidate_key = capability_key(
+                candidate.source_gap_id.strip() or candidate.manifest.name
+            )
+            if candidate_key == wanted_key:
+                by_key = candidate
+    return by_name or by_key
 
 
 def _manifest_contract(manifest: LearnedToolManifest) -> str:
@@ -1318,6 +1407,7 @@ def load_learned_tool(
     runner: LearnedToolRunner | None = None,
     requirements: list[str] | None = None,
     venvs_dir: str | Path | None = None,
+    host_call: HostCall | None = None,
 ) -> LearnedTool:
     """Create an agent-callable ToolPort from a learned artifact.
 
@@ -1336,6 +1426,7 @@ def load_learned_tool(
         timeout_seconds=timeout_seconds,
         runner=runner,
         requirements=resolved_requirements,
+        host_call=host_call,
     )
 
 
@@ -1558,9 +1649,10 @@ class LearnedToolResolver:
     def list_artifacts(self) -> list[LearnedToolArtifact]:
         """Return every loadable artifact envelope, without building callables.
 
-        Envelopes that fail validation or whose code file is missing are
-        skipped with a warning — a broken artifact must not hide the rest of
-        the catalog.
+        Envelopes that fail validation are skipped with a warning — a broken
+        artifact must not hide the rest of the catalog. One whose code file is
+        missing is removed: it can never execute, and left in place it keeps a
+        capability looking installable that never resolves.
         """
         if not self._artifacts_dir.exists():
             return []
@@ -1572,15 +1664,24 @@ class LearnedToolResolver:
                 logger.warning("Failed to read learned tool artifact %s: %s", artifact_file, exc)
                 continue
             if not self._tool_path(artifact.manifest.name).exists():
+                # An artifact with no code file can never execute, and leaving
+                # it in place is not harmless: the capability it claims never
+                # resolves, so the resident sees the same gap on every sweep
+                # and commissions the same build again. One such orphan drove
+                # 34 rebuilds of the same tool over five days. Reap it, and say
+                # so once, rather than warning about it every minute forever.
                 logger.warning(
-                    "Learned tool %s has an artifact but no code file; skipping",
+                    "Learned tool %s has an artifact but no code file; removing "
+                    "the orphaned artifact so its capability stops reading as "
+                    "installable",
                     artifact.manifest.name,
                 )
+                artifact_file.unlink(missing_ok=True)
                 continue
             artifacts.append(artifact)
         return artifacts
 
-    def load(self, name: str) -> LearnedTool:
+    def load(self, name: str, *, host_call: HostCall | None = None) -> LearnedTool:
         """Load one learned tool as an executable ToolPort, by manifest name.
 
         Raises :class:`LearnedToolError` when the tool does not exist or its
@@ -1592,6 +1693,7 @@ class LearnedToolResolver:
         if not artifact_path.is_file():
             raise LearnedToolError(f"no learned tool named {name!r} is installed")
         artifact = read_learned_tool_artifact(artifact_path)
+        require_verified_artifact(artifact)
         tool_path = self._tool_path(artifact.manifest.name)
         if not tool_path.exists():
             raise LearnedToolError(f"learned tool {name!r} has no code file at {tool_path}")
@@ -1601,6 +1703,7 @@ class LearnedToolResolver:
             timeout_seconds=self._timeout_seconds,
             runner=self._runner(),
             venvs_dir=self._venvs_dir,
+            host_call=host_call,
         )
 
     def _tool_path(self, name: str) -> Path:

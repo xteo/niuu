@@ -369,6 +369,9 @@ class SqliteMemoryAdapter(MemoryPort):
         return matches
 
     async def prefetch(self, context: str) -> str:
+        # Before the query, not after: a prefetch that raises must still have
+        # reported how much of the corpus was reachable when it tried.
+        await self._maybe_emit_corpus_gauges()
         if self._prefetch_limit == 0:
             return ""
         started = monotonic()
@@ -396,8 +399,16 @@ class SqliteMemoryAdapter(MemoryPort):
     async def _maybe_emit_corpus_gauges(self) -> None:
         """Sample corpus-health gauges at most once per configured interval.
 
-        Coverage ratios only change slowly, so sampling on write keeps them
-        current without a dedicated scheduler or a per-call table scan.
+        Coverage ratios only change slowly, so sampling on the turn path keeps
+        them current without a dedicated scheduler or a per-call table scan.
+
+        Sampled from both ``prefetch`` and ``record_episode``, and from
+        ``prefetch`` *before* the query runs. Sampling on write alone inverted
+        the signal these gauges exist for: a resident whose memory is failing
+        stops recording, so its corpus series went stale and vanished — and an
+        absent gauge reads as an idle resident, not a broken one. Over one 6h
+        window glitnir recorded nothing at all and reported no corpus health
+        whatsoever, which is precisely the case worth seeing.
         """
         if self._corpus_stats_interval_seconds <= 0:
             return
@@ -419,7 +430,9 @@ class SqliteMemoryAdapter(MemoryPort):
         record_corpus(
             backend=_BACKEND,
             episodes=episodes,
-            embedding_coverage=embedded / episodes,
+            # Clamped like index_coverage: search_index can hold slightly more
+            # rows than episodes, and a coverage above 1.0 reads as a fault.
+            embedding_coverage=min(1.0, embedded / episodes),
             index_coverage=min(1.0, indexed / episodes),
             environment_id=self._environment_id,
         )
@@ -606,19 +619,34 @@ class SqliteMemoryAdapter(MemoryPort):
         return self._with_retry(_do)
 
     def _corpus_stats_sync(self) -> tuple[int, int, int]:
-        """Return ``(episodes, episodes_with_embedding, indexed_documents)``.
+        """Return ``(episodes, documents_with_embedding, indexed_documents)``.
 
         ``indexed_documents`` counts rows the search adapter owns; a shortfall
         against ``episodes`` means part of the corpus is unreachable by any
         query regardless of how it is scored.
+
+        The embedding count comes from ``search_index``, not ``episodes``.
+        Vectors live in the search adapter's table — that is what a semantic
+        query is scored against — and ``episodes.embedding`` is a column
+        nothing writes. Counting it made this gauge report 0.0000 permanently:
+        it read zero on residents whose index was in fact fully embedded, and
+        would have kept reading zero after any backfill. A gauge that can only
+        ever report failure is worse than no gauge, because it sends people
+        hunting a fault that is not there.
         """
 
         def _do_stats() -> tuple[int, int, int]:
             conn = self._connect()
             try:
-                row = conn.execute("SELECT COUNT(*), COUNT(embedding) FROM episodes").fetchone()
+                row = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()
                 episodes = int(row[0]) if row else 0
-                embedded = int(row[1]) if row else 0
+                try:
+                    embedded_row = conn.execute(
+                        "SELECT COUNT(embedding) FROM search_index"
+                    ).fetchone()
+                    embedded = int(embedded_row[0]) if embedded_row else 0
+                except sqlite3.OperationalError:
+                    embedded = 0
                 try:
                     index_row = conn.execute("SELECT COUNT(*) FROM search_index").fetchone()
                     indexed = int(index_row[0]) if index_row else 0

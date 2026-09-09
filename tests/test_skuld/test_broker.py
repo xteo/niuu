@@ -33,6 +33,7 @@ from skuld.broker import (
     send_message_to_session,
 )
 from skuld.config import SkuldSettings
+from skuld.event_log import EventLogRejectedError
 from skuld.transports import (
     CodexSubprocessTransport,
     SDKTransport,
@@ -577,6 +578,35 @@ class TestBroker:
             mock_service_manager_cls.return_value = AsyncMock()
             with pytest.raises(RuntimeError, match="never acknowledged"):
                 await broker.startup()
+
+    @pytest.mark.asyncio
+    async def test_acknowledged_workflow_kickoff_is_not_repeated_after_restart(self, tmp_path):
+        settings = SkuldSettings(
+            session={
+                "id": "wf-session-restarted",
+                "workspace_dir": str(tmp_path),
+                "initial_prompt": "Implement the requested change",
+            },
+            workflow_trigger={
+                "enabled": True,
+                "node_id": "trigger-1",
+                "event_type": "code.requested",
+            },
+        )
+        first = Broker(settings=settings)
+        first._trace_workflow_span_id = "trace-1"
+        first_publish = AsyncMock()
+        with patch.object(first, "_publish_workflow_trigger", new=first_publish):
+            await first._run_workflow_trigger_task()
+
+        restarted = Broker(settings=settings)
+        restarted._trace_workflow_span_id = "trace-2"
+        restarted_publish = AsyncMock()
+        with patch.object(restarted, "_publish_workflow_trigger", new=restarted_publish):
+            await restarted._run_workflow_trigger_task()
+
+        first_publish.assert_awaited_once()
+        restarted_publish.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_publish_workflow_trigger_waits_for_connected_consumers(self, tmp_path):
@@ -4206,6 +4236,29 @@ class TestShutdownEdgeCases:
                 assert test_broker._event_log_seq == 41
             finally:
                 await test_broker.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_startup_with_unreachable_volundr_fails_loudly(self, test_broker):
+        """A configured durable log that cannot start is fatal, not degraded.
+
+        volundr_api_url names a backend that must hold the transcript; booting
+        without it would silently record nothing.
+        """
+        with pytest.raises(EventLogRejectedError):
+            await test_broker.startup()
+
+    @pytest.mark.asyncio
+    async def test_startup_without_event_log_succeeds(self, tmp_path):
+        """Disabling the event log is an operator decision — startup honours it."""
+        settings = SkuldSettings(
+            session={"id": "s1", "workspace_dir": str(tmp_path)},
+            volundr_api_url="http://volundr.test:80",
+            event_log_enabled=False,
+        )
+        broker = Broker(settings=settings)
+        await broker.startup()
+        assert broker._transport is not None
+        assert broker.service_manager is not None
 
 
 class TestHandleWebSocket:

@@ -172,6 +172,16 @@ async def _build_resident_state(
                 resolved["mimir"] = mimir
             if "environment_id" in params and "environment_id" not in resolved:
                 resolved["environment_id"] = settings.environment.id
+            for name, value in (
+                ("retention_max_cases", cfg.case_retention_max_cases),
+                ("retention_max_age_days", cfg.case_retention_max_age_days),
+                (
+                    "retention_sweep_interval_seconds",
+                    cfg.case_retention_sweep_interval_seconds,
+                ),
+            ):
+                if name in params and name not in resolved:
+                    resolved[name] = value
             return cls(**resolved)
         except Exception as exc:
             raise RuntimeError(
@@ -208,6 +218,8 @@ def _build_resident_runtime(
         context_max_chars=cfg.continuation_context_max_chars,
         tool_result_max_chars=cfg.continuation_tool_result_max_chars,
         scheduled_wake_default_seconds=cfg.scheduled_wake_default_seconds,
+        repeated_decision_escalate_after=cfg.repeated_decision_escalate_after,
+        health_refresh_interval_seconds=cfg.health_refresh_interval_seconds,
         stewardship_interval_seconds=cfg.stewardship_interval_seconds,
         directed_messages_enabled=settings.resident_inbox.directed_messages_enabled,
         environment_id=settings.environment.id,
