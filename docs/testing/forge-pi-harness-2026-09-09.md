@@ -1,8 +1,24 @@
 # PI harness integration: initial evidence and acceptance plan
 
-Status: native protocol investigation started; PI is not yet a Forge session engine.
-The existing Claude, Codex, Grok and Muse adapters are unchanged. Lexi must not offer
-PI as ready until a real adapter and host capability discovery pass the gates below.
+Status: PI RPC transport and `skuldPi` session definition implemented. The initial
+model catalog offers `openai-codex/gpt-6-astra` and `openai-codex/gpt-5.6-sol`.
+Native authenticated execution, tool capture and restart replay have passed on Thor.
+Server/database and Lexi build 2244 acceptance are tracked in the deployment evidence.
+
+Configuration is `skuld.pi`: `binary`, optional `agent_dir` and `session_dir`,
+`command_timeout_s` (30), `turn_timeout_s` (1800), and `shutdown_timeout_s` (5).
+PI owns its native provider configuration and credentials. The deployed hosts use
+PI's supported command-based API-key lookup to read their own Codex access token
+at request time. Codex retains refresh-token ownership; no credential crosses hosts.
+Renew a host's Codex login if its stored access token expires without Codex refreshing it.
+Native PI `/login` credentials take precedence if configured by the operator.
+
+The adapter supports native streaming, tool results/timing, steering consumption
+receipts, interruption, model changes, slash-command discovery and extension input
+questions. Prompt acceptance is distinct from consumption and completion. Existing
+Forge brokers retain their durable transcript on restart; PI resumes the same native
+UUID. Importing unrelated pre-existing PI histories, external search/subagent
+extensions, and the broader chaos corpus remain separate acceptance work below.
 
 ## Evidence collected
 
@@ -14,8 +30,8 @@ PI as ready until a real adapter and host capability discovery pass the gates be
   file until an assistant message exists. A returned `sessionFile` path alone is
   not proof that a session is recoverable. Forge must persist accepted user input
   independently and represent this early state accurately.
-- Thor's configured PI model list was empty and its auth file contained no provider
-  entries. Authenticated model execution and native restart acceptance are pending.
+- The initial empty PI credential store was resolved through a per-host, access-only
+  Codex credential lookup. Authenticated native execution and restart replay passed.
 - Seventeen harness tests (96% probe coverage) cover response correlation, Unicode framing, rejected commands,
   missing tools/streaming, missing completion, and failed or aborted agent turns.
 
@@ -74,5 +90,6 @@ credentials or private user conversations.
    reconnect mid-stream, and two hosts with colliding native IDs. Run simulator-only
    acceptance before enabling the PI creation option in Lexi.
 
-Authenticated native execution is the next gate. The native probe is a starting
-point for that work; it does not implement or certify the Forge adapter.
+The native probe remains independent evidence. Adapter unit tests cover the common
+transcript projection, lifecycle failures, controls and command correlation. Live
+Forge and simulator evidence must be recorded separately from native smoke results.

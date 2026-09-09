@@ -97,7 +97,7 @@ class TestBifrostConfig:
         sol = next((m for m in models if m.id == "gpt-5.6-sol"), None)
         assert sol is not None, "gpt-5.6-sol must stay in the catalogue"
         assert sol.session_definition == "skuldCodex"
-        openai_ids = [m.id for m in models if m.vendor == "openai"]
+        openai_ids = [m.id for m in models if m.session_definition == "skuldCodex"]
         assert openai_ids == ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"], (
             f"Codex catalogue must preserve Astra, Sol and upstream Terra, got {openai_ids}"
         )

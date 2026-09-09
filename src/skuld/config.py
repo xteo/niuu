@@ -502,6 +502,17 @@ class CodexAuthConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
 
 
+class PiRuntimeConfig(BaseModel):
+    """Native PI RPC process settings; credentials remain owned by PI on the host."""
+
+    binary: str = "pi"
+    agent_dir: str = ""
+    session_dir: str = ""
+    command_timeout_s: float = Field(default=30, gt=0)
+    turn_timeout_s: float = Field(default=1800, gt=0)
+    shutdown_timeout_s: float = Field(default=5, gt=0)
+
+
 class DshRuntimeConfig(BaseModel):
     """DeepSeek Harness (dsh) SDK runtime settings for DshJsonRpcTransport."""
 
@@ -703,6 +714,7 @@ class SkuldSettings(BaseSettings):
     workload_identity: WorkloadIdentityConfig = Field(default_factory=WorkloadIdentityConfig)
     codex_auth: CodexAuthConfig = Field(default_factory=CodexAuthConfig)
     dsh: DshRuntimeConfig = Field(default_factory=DshRuntimeConfig)
+    pi: PiRuntimeConfig = Field(default_factory=PiRuntimeConfig)
     service_user_id: str = Field(default="skuld-broker")
     service_tenant_id: str = Field(default="default")
     persistence_mount_path: str = Field(default="/volundr/sessions")

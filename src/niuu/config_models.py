@@ -170,6 +170,21 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 },
             },
         ),
+        "skuldPi": SessionDefinitionConfig(
+            enabled=True,
+            display_name="PI",
+            description="PI coding agent — native RPC, streaming, steering and durable sessions",
+            labels=["session", "pi"],
+            default_model="openai-codex/gpt-6-astra",
+            compatible_providers=[],
+            defaults={
+                "broker": {
+                    "cliType": "pi",
+                    "transportAdapter": "skuld.transports.pi.PiRpcTransport",
+                    "agentTeams": False,
+                },
+            },
+        ),
         "skuldOpenCode": SessionDefinitionConfig(
             enabled=True,
             display_name="OpenCode",

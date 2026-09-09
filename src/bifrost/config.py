@@ -127,6 +127,22 @@ def _default_models() -> list[ManagedModelConfig]:
     """Built-in Bifrost model catalog used when no explicit catalog is configured."""
     return [
         ManagedModelConfig(
+            id="openai-codex/gpt-6-astra",
+            name="PI · Astra",
+            vendor="openai",
+            tier=ManagedModelTier.FRONTIER,
+            description="GPT-6 Astra through the PI coding agent and host Codex subscription.",
+            session_definition="skuldPi",
+        ),
+        ManagedModelConfig(
+            id="openai-codex/gpt-5.6-sol",
+            name="PI · Sol",
+            vendor="openai",
+            tier=ManagedModelTier.BALANCED,
+            description="GPT-5.6 Sol through the PI coding agent and host Codex subscription.",
+            session_definition="skuldPi",
+        ),
+        ManagedModelConfig(
             # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
             # (Damien, 2026-09-02). `claude-fable-5` is still served, so a client on an old
             # build that keeps sending it is not broken — it just no longer appears here.
