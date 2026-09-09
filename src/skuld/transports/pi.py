@@ -251,7 +251,12 @@ class PiRpcTransport(CLITransport):
                 if not future.done():
                     future.set_exception(PiProtocolError(error))
             if not self._stopping:
-                await self._finish(error, force=self._active)
+                try:
+                    await self._finish(error, force=self._active)
+                finally:
+                    # A malformed/closed stream can leave the OS process alive.
+                    # Never spawn a replacement while that orphan still owns tools.
+                    await self.stop()
 
     def _begin(self) -> None:
         if self._active:

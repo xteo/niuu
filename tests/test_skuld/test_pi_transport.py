@@ -195,6 +195,7 @@ async def test_eof_and_malformed_frames_close_active_turn(runtime, wire):
     assert not runtime.is_turn_active
     assert runtime.last_result["is_error"]
     assert runtime._turn_done.done()
+    runtime._process.terminate.assert_called_once()
     await runtime.stop()
 
 
