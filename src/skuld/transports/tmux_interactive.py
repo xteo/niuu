@@ -30,6 +30,7 @@ from stat import S_ISREG
 from typing import Any
 
 from niuu.build_info import build_info
+from niuu.domain.reasoning import MODEL_EFFORTS, validate_effort
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.agent_usage import AgentUsageTracker
 from skuld.control_errors import ControlRecoveryError
@@ -211,10 +212,18 @@ class TmuxInteractiveTransport(CLITransport):
         frame_interval_s: float | None = None,
         question_transcript_max_bytes: int = 1048576,
         question_result_history_limit: int = 128,
+        reasoning_effort: str = "",
+        effort_control_timeout_s: float = 15.0,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
         self._model = model
+        self._reasoning_effort = (
+            validate_effort(reasoning_effort, MODEL_EFFORTS.get(model, ()))
+            if reasoning_effort
+            else ""
+        )
+        self._effort_control_timeout = effort_control_timeout_s
         self._forge_session_id = session_id or "skuld-interactive"
         self._skip_permissions = skip_permissions
         self._agent_teams = agent_teams
@@ -438,6 +447,7 @@ class TmuxInteractiveTransport(CLITransport):
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
             interrupt=True,
+            set_effort=True,
             slash_commands=True,
             steer=True,
             # The interactive CLI inserts queued input at the right moment, so a
@@ -879,9 +889,40 @@ class TmuxInteractiveTransport(CLITransport):
     async def interrupt(self) -> None:
         await self.send_control("interrupt")
 
+    async def get_effort(self) -> dict:
+        return {
+            "current": self._reasoning_effort,
+            "levels": list(MODEL_EFFORTS.get(self._model, ())),
+            "mutable": True,
+            "applies_to": "next_turn",
+        }
+
+    async def _set_effort(self, effort: str) -> None:
+        effort = validate_effort(effort, MODEL_EFFORTS.get(self._model, ()))
+        if self._turn_active:
+            raise ValueError("Claude is working. Change /effort after this turn finishes.")
+        async with self._send_lock:
+            await self._wait_for_repl_ready()
+            await self._send_slash_command("effort", arguments=effort)
+            async with asyncio.timeout(self._effort_control_timeout):
+                while True:
+                    text = await self._capture_pane_text()
+                    # Native CLI acknowledgement, never merely the echoed command.
+                    confirmations = re.findall(
+                        r"Set effort level to (low|medium|high|xhigh|max)\b", text
+                    )
+                    if confirmations and confirmations[-1] == effort:
+                        self._reasoning_effort = effort
+                        return
+                    await asyncio.sleep(self._pane_poll_interval_s)
+
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         if not self.is_alive:
             await self.start()
+
+        if subtype == "set_effort":
+            await self._set_effort(str(kwargs.get("effort") or ""))
+            return
 
         if subtype == "interrupt":
             await self._send_key("C-c", pane_id=self._coerce_str(kwargs.get("pane_id")))
@@ -2627,6 +2668,8 @@ class TmuxInteractiveTransport(CLITransport):
         cmd = ["claude"]
         if self._model:
             cmd.extend(["--model", self._model])
+        if self._reasoning_effort:
+            cmd.extend(["--effort", self._reasoning_effort])
         if self._resume_session_id:
             # Resume-aware restart: a fresh tmux launching ``claude --resume <id>`` replays the
             # prior conversation while re-writing the CURRENT broker port into the hook settings

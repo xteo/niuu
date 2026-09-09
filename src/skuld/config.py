@@ -782,6 +782,9 @@ class SkuldSettings(BaseSettings):
         ),
         description="Maximum size of a file staged by the present-file endpoint.",
     )
+    effort_control_timeout_s: float = Field(
+        default=15.0, gt=0, description="Time allowed for native effort-change acknowledgement."
+    )
     acp_prompt_timeout_s: float = Field(default=300.0)  # ACP/MSP (Grok Build, Muse) turn timeout
     mcp_servers: list[dict[str, Any]] = Field(default_factory=list)
     reflex: ReflexConfig = Field(default_factory=ReflexConfig)

@@ -991,6 +991,9 @@ class LocalProcessPodManager(PodManager):
         session_vals = spec.values.get("session", {})
         system_prompt = session_vals.get("systemPrompt", "")
         initial_prompt = session_vals.get("initialPrompt", "")
+        effort = session_vals.get("reasoningEffort") or session_vals.get("reasoning_effort")
+        if effort:
+            env["SKULD__SESSION__REASONING_EFFORT"] = str(effort)
         if system_prompt:
             env["SKULD__SESSION__SYSTEM_PROMPT"] = system_prompt
         if initial_prompt:

@@ -254,7 +254,16 @@ async def test_start_resumes_exact_session_and_validates_selected_model(runtime,
     spawn = AsyncMock(return_value=process)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
     runtime._command = AsyncMock(
-        return_value={"sessionId": SID, "model": {"provider": "openai-codex", "id": "gpt-6-astra"}}
+        return_value={
+            "sessionId": SID,
+            "thinkingLevel": "xhigh",
+            "model": {
+                "provider": "openai-codex",
+                "id": "gpt-6-astra",
+                "reasoning": True,
+                "thinkingLevelMap": {"off": None, "xhigh": "xhigh", "max": "max"},
+            },
+        }
     )
     runtime._effort = "xhigh"
     runtime._agent_dir = "/configured/pi"

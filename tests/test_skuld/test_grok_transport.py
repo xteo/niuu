@@ -729,6 +729,7 @@ class TestGrokACPTransport:
     @pytest.mark.asyncio
     async def test_resume_hint_in_new_session(self, tmp_path):
         t = GrokACPTransport(str(tmp_path), session_id="resume-me-42")
+        t._preflight_auth = AsyncMock()
         responses = [
             b'{"jsonrpc":"2.0","id":1,"result":{}}\n',
             b'{"jsonrpc":"2.0","id":2,"result":{"sessionId":"resumed-42"}}\n',

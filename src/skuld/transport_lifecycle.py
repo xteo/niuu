@@ -29,7 +29,8 @@ class TransportLifecycleMixin:
         return {
             "workspace_dir": self.workspace_dir,
             "model": self.model,
-            "reasoning_effort": self._settings.session.reasoning_effort,
+            "reasoning_effort": self._restored_effort(),
+            "effort_control_timeout_s": self._settings.effort_control_timeout_s,
             "sdk_port": self._settings.port,
             "session_id": self.session_id,
             "skip_permissions": self._settings.skip_permissions,

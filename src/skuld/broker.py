@@ -77,6 +77,7 @@ from skuld.conversation_models import (  # noqa: F401
 )
 from skuld.delivery_claims import claim_message, settle_message
 from skuld.delivery_errors import DeliveryNotAcceptedError
+from skuld.effort import EffortControlMixin, effort_argument
 from skuld.event_log import EventLogMixin
 from skuld.file_routes import (  # noqa: F401
     MkdirRequest,
@@ -433,6 +434,7 @@ def _workflow_terminal_requirements_satisfied(
 
 
 class Broker(
+    EffortControlMixin,
     TransportLifecycleMixin,
     WebSocketLifecycleMixin,
     EventLogMixin,
@@ -451,6 +453,7 @@ class Broker(
         sleipnir_publisher: SleipnirPublisher | None = None,
     ):
         self._settings = settings or SkuldSettings()
+        self._effort_lock = asyncio.Lock()
         self.session_id = self._settings.session.id
         self.model = self._settings.session.model
         self.workspace_dir = self._settings.workspace_path
@@ -3130,7 +3133,7 @@ class Broker(
                     # catalog when one exists (reconnect / re-init) and only probes the
                     # terminal on a truly fresh session — and even then the probe now
                     # waits for the REPL prompt before typing, so it can't corrupt boot.
-                    commands = await transport.discover_slash_commands(refresh=False)
+                    commands = await self.discover_slash_commands(refresh=False)
                 except Exception:
                     logger.debug("slash-command discovery failed at init", exc_info=True)
             if slash_commands or skills or commands:
@@ -3475,7 +3478,12 @@ class Broker(
 
         # Guard: reject control messages the transport does not support.
         cap_field = self._CONTROL_CAPABILITY_MAP.get(msg_type or "")
-        if cap_field and not getattr(self._transport.capabilities, cap_field):
+        forge_command = msg_type == "discover_slash_commands" or (
+            msg_type == "slash_command"
+            and str(data.get("command") or "").strip().lstrip("/").split(maxsplit=1)[:1]
+            == ["effort"]
+        )
+        if cap_field and not forge_command and not getattr(self._transport.capabilities, cap_field):
             error_msg = f"{msg_type} not supported by this transport"
             logger.warning("_dispatch_browser_message: %s", _sanitize_log(error_msg))
             if sender_ws:
@@ -3525,6 +3533,12 @@ class Broker(
                 await self._exit_attention(answered_request_id)
 
             # Phase 3: interrupt current turn
+            case "get_effort" | "set_effort":
+                await self.handle_effort(
+                    str(data.get("effort") or "") if msg_type == "set_effort" else "",
+                    request_id=self._extract_request_id(data),
+                )
+
             case "interrupt":
                 await self._transport.send_control("interrupt")
 
@@ -3609,6 +3623,15 @@ class Broker(
                 )
 
             case "slash_command":
+                command = str(data.get("command") or "").strip().lstrip("/")
+                if command.split(maxsplit=1)[:1] == ["effort"]:
+                    argument = effort_argument(
+                        "/" + command + " " + str(data.get("arguments") or data.get("args") or "")
+                    )
+                    await self.handle_effort(
+                        argument or "", request_id=self._extract_request_id(data)
+                    )
+                    return
                 await self._transport.send_control(
                     "slash_command",
                     command=data.get("command", ""),
@@ -4094,6 +4117,8 @@ class Broker(
         delivered, but flagged ``blocked_on_question`` so the client can tell the user to
         answer the open question rather than assume the steer landed.
         """
+        if await self._deliver_effort_command(content, msg_id, request_id):
+            return
         pending_q = len(self._pending_ask_user_questions)
         if pending_q:
             logger.warning(
@@ -4385,13 +4410,21 @@ class Broker(
             return []
 
         commands = await self._transport.discover_slash_commands(refresh=refresh)
-        if commands:
-            return self._normalize_slash_commands(commands)
-
-        raw_commands = getattr(self._transport, "slash_commands", [])
-        if callable(raw_commands):
-            raw_commands = raw_commands()
-        return self._normalize_slash_commands(raw_commands)
+        if not commands:
+            commands = getattr(self._transport, "slash_commands", [])
+            if callable(commands):
+                commands = commands()
+        normalized = self._normalize_slash_commands(commands)
+        return [
+            {
+                "name": "/effort",
+                "command": "effort",
+                "kind": "command",
+                "source": "forge",
+                "description": "Show effort or set a supported level: /effort xhigh",
+            },
+            *[item for item in normalized if item["name"] != "/effort"],
+        ]
 
     @staticmethod
     def _normalize_slash_commands(raw_commands: Any) -> list[dict[str, Any]]:

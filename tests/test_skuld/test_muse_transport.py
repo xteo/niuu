@@ -222,8 +222,9 @@ class TestHelpers:
         assert _resolve_reasoning_effort("XHIGH") == "xhigh"
         assert _resolve_reasoning_effort("") is None
         # The Meta provider rejects "none"; an unknown value falls back to the host default.
-        assert _resolve_reasoning_effort("none") is None
-        assert _resolve_reasoning_effort("turbo") is None
+        assert _resolve_reasoning_effort("none") == "none"
+        with pytest.raises(ValueError):
+            _resolve_reasoning_effort("turbo")
 
     def test_approval_mode_aliases(self):
         assert _resolve_approval_mode("allowAll", default="onRequest") == "allowAll"

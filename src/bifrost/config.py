@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from bifrost.auth import AuthMode
 from niuu.domain.model_catalog import ManagedModelProvider, ManagedModelTier
+from niuu.domain.reasoning import MODEL_EFFORTS, preferred_effort
 
 
 class RoutingStrategy(StrEnum):
@@ -117,6 +118,25 @@ class ManagedModelConfig(BaseModel):
         default=True,
         description="Whether the model supports higher-latency reasoning modes.",
     )
+    effort_levels: list[str] | None = Field(
+        default=None,
+        description="Native harness effort levels; an empty list disables the selector.",
+    )
+    default_effort: str = Field(default="", description="Preferred native launch effort.")
+    effort_note: str = Field(
+        default="", description="Model-specific effort behavior shown to users."
+    )
+
+    @model_validator(mode="after")
+    def resolve_effort_options(self) -> ManagedModelConfig:
+        if self.effort_levels is None:
+            self.effort_levels = list(MODEL_EFFORTS.get(self.id, ()))
+        if not self.default_effort:
+            self.default_effort = preferred_effort(self.effort_levels)
+        if self.default_effort and self.default_effort not in self.effort_levels:
+            raise ValueError("default_effort must be one of effort_levels")
+        return self
+
     enabled: bool = Field(
         default=True,
         description="Whether the model should be shown to operators and consumers.",
@@ -838,6 +858,18 @@ class BifrostConfig(BaseModel):
         default_factory=_default_models,
         description="Canonical Bifrost-owned model catalog used across the platform.",
     )
+    additional_models: list[ManagedModelConfig] = Field(
+        default_factory=list,
+        description="Host-specific catalog entries added to the shared defaults.",
+    )
+
+    @model_validator(mode="after")
+    def merge_additional_models(self) -> BifrostConfig:
+        entries = {model.id: model for model in self.models}
+        entries.update({model.id: model for model in self.additional_models})
+        self.models = list(entries.values())
+        return self
+
     aliases: dict[str, str] = Field(
         default_factory=dict,
         description="Model alias → canonical model name.",

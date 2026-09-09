@@ -26,6 +26,7 @@ import signal
 from datetime import UTC, datetime
 from typing import Any
 
+from niuu.domain.reasoning import validate_effort
 from niuu.domain.transcript_reducer import TOOL_ENDED_AT
 from skuld.transports import (
     CLITransport,
@@ -183,8 +184,10 @@ class GrokACPTransport(CLITransport):
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
+        reasoning_effort: str = "",
         acp_prompt_timeout_s: float = 300.0,
         acp_auth_preflight_timeout_s: float = 60.0,
+        live_frame_max_bytes: int = 8 * 1024 * 1024,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -196,8 +199,11 @@ class GrokACPTransport(CLITransport):
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
+        self._reasoning_effort = reasoning_effort
+        self._effort_options: dict = {}
         self._prompt_timeout = acp_prompt_timeout_s
         self._auth_preflight_timeout = acp_auth_preflight_timeout_s
+        self._live_frame_max_bytes = live_frame_max_bytes
 
         self._process: asyncio.subprocess.Process | None = None
         # Set synchronously at the top of start() so a concurrent start cannot
@@ -258,6 +264,7 @@ class GrokACPTransport(CLITransport):
         Best-effort: failures are logged, never fatal (the agent may still work,
         or fail with a clearer error of its own).
         """
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 grok_bin,
@@ -276,6 +283,9 @@ class GrokACPTransport(CLITransport):
             logger.info("Grok auth preflight complete (rc=%s)", proc.returncode)
         except Exception as exc:
             logger.warning("Grok auth preflight skipped (%r); continuing to ACP agent", exc)
+        finally:
+            if proc is not None and proc.returncode is None:
+                await _stop_process(proc)
 
     async def start(self) -> None:
         logger.info(
@@ -340,6 +350,7 @@ class GrokACPTransport(CLITransport):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ},  # inherits XAI_API_KEY / auth.json etc.
+            limit=self._live_frame_max_bytes,
         )
         self._process = process
 
@@ -667,6 +678,9 @@ class GrokACPTransport(CLITransport):
 
         result = await self._acp_send("session/new", params)
         self._session_id = result.get("sessionId") or result.get("session_id")
+        self._read_effort_options(result)
+        if self._reasoning_effort:
+            await self.send_control("set_effort", effort=self._reasoning_effort)
         logger.info("Grok ACP new session established: %s", self._session_id)
 
     async def send_message(
@@ -1042,6 +1056,7 @@ class GrokACPTransport(CLITransport):
             cli_websocket=False,  # we use stdio ACP, not the --sdk-url WS
             session_resume=True,
             interrupt=True,
+            set_effort=True,
             # ACP turns are sequential (no native mid-turn input like tmux), so a
             # mid-turn message steers by interrupting the current turn and
             # resuming with the new text — the SDK's interrupt_resume model.
@@ -1055,8 +1070,46 @@ class GrokACPTransport(CLITransport):
     # Control support for broker parity (interrupt, etc.)
     # ------------------------------------------------------------------
 
+    def _read_effort_options(self, result: dict) -> None:
+        self._effort_options = next(
+            (
+                option
+                for option in result.get("configOptions", [])
+                if option.get("category") == "thought_level"
+            ),
+            {},
+        )
+
+    async def get_effort(self) -> dict:
+        option = self._effort_options
+        levels = [item["value"] for item in option.get("options", []) if "value" in item]
+        return {
+            "current": option.get("currentValue", ""),
+            "levels": levels,
+            "mutable": bool(levels),
+            "applies_to": "next_model_call",
+        }
+
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         """Handle server-initiated controls (interrupt, steer) for broker parity."""
+        if subtype == "set_effort":
+            effort = validate_effort(
+                str(kwargs.get("effort") or ""), (await self.get_effort())["levels"]
+            )
+            result = await self._acp_send(
+                "session/set_config_option",
+                {
+                    "sessionId": self._session_id,
+                    "configId": self._effort_options["id"],
+                    "value": effort,
+                },
+            )
+            self._read_effort_options(result)
+            if self._effort_options.get("currentValue") != effort:
+                raise RuntimeError("Grok did not confirm the requested effort")
+            self._reasoning_effort = effort
+            return
+
         if subtype == "interrupt":
             logger.info("GrokACPTransport: received interrupt control")
             self._interrupt_current_prompt(reason="interrupted by control")

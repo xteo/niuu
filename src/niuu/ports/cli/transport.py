@@ -21,6 +21,7 @@ class TransportCapabilities:
     steering_mode: str = "none"
     set_model: bool = False
     set_thinking_tokens: bool = False
+    set_effort: bool = False
     set_permission_mode: bool = False
     rewind_files: bool = False
     mcp_set_servers: bool = False
@@ -89,6 +90,10 @@ class CLITransport(ABC):
     async def discover_slash_commands(self, *, refresh: bool = False) -> list[dict]:
         """Return slash commands available in this transport, if discoverable."""
         return []
+
+    async def get_effort(self) -> dict:
+        """Return effective effort, supported levels and when a change takes effect."""
+        return {"current": "", "levels": [], "mutable": False}
 
     @property
     @abstractmethod

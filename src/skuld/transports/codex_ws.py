@@ -39,6 +39,7 @@ from niuu.adapters.cli.runtime import (
 from niuu.adapters.cli.runtime import (
     stop_subprocess as _stop_process,
 )
+from niuu.domain.reasoning import MODEL_EFFORTS, validate_effort
 from niuu.domain.transcript_reducer import TOOL_ENDED_AT
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.codex_auth import CodexAuthProviderError, CodexAuthProviderPort, HostCodexAuthProvider
@@ -146,20 +147,7 @@ def _codex_effort_for_model(model: str) -> str:
 
 def _normalize_codex_effort(effort: str, model: str) -> str:
     """Map launch aliases to an effort accepted by the current app-server."""
-    mapped = {
-        "minimal": "minimal",
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "extra-high": "high",
-        "extra_high": "high",
-        "xhigh": "high",
-        "max": "high",
-        "ultra": "ultra",
-    }.get(effort.strip().lower(), "high")
-    if mapped == "ultra" and not _model_supports_ultra(model):
-        return "high"
-    return mapped
+    return validate_effort(effort, MODEL_EFFORTS.get(model, ("low", "medium", "high")))
 
 
 def _rpc_request(method: str, params: dict | None = None) -> tuple[int, dict]:
@@ -2485,6 +2473,12 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         """Handle control messages (interrupt, set_model, etc.)."""
+        if subtype == "set_effort":
+            self._reasoning_effort = validate_effort(
+                str(kwargs.get("effort") or ""), (await self.get_effort())["levels"]
+            )
+            return
+
         if subtype == "ask_user_answer":
             await self._answer_user_input(str(kwargs.get("request_id", "")), kwargs.get("answers"))
             return
@@ -2681,6 +2675,16 @@ class CodexWebSocketTransport(CLITransport):
     async def _emit_system_notice(self, content: str) -> None:
         await self._emit({"type": "system", "subtype": "notice", "content": content})
 
+    async def get_effort(self) -> dict:
+        if self._fallback_transport is not None:
+            return await self._fallback_transport.get_effort()
+        return {
+            "current": self._reasoning_effort,
+            "levels": list(MODEL_EFFORTS.get(self._model, ())),
+            "mutable": True,
+            "applies_to": "next_turn",
+        }
+
     async def discover_slash_commands(self, *, refresh: bool = False) -> list[dict]:
         if self._fallback_transport is not None:
             return await self._fallback_transport.discover_slash_commands(refresh=refresh)
@@ -2720,6 +2724,7 @@ class CodexWebSocketTransport(CLITransport):
             cli_websocket=False,  # We don't expose a /ws/cli endpoint
             session_resume=True,
             interrupt=True,
+            set_effort=True,
             steer=True,
             steering_mode="live",
             set_model=True,

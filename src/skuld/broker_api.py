@@ -518,8 +518,6 @@ async def get_slash_commands(refresh: bool = Query(True)) -> dict[str, Any]:
     """Return slash commands available in the active CLI session."""
     if not broker._transport:
         raise HTTPException(status_code=503, detail="Transport not initialized")
-    if not broker._transport.capabilities.slash_commands:
-        raise HTTPException(status_code=501, detail="Slash commands not supported")
     commands = await broker.discover_slash_commands(refresh=refresh)
     return {"commands": commands, "count": len(commands)}
 
@@ -529,6 +527,16 @@ async def send_slash_command(body: _SlashCommandRequest) -> dict[str, str]:
     """Send a slash command to the active CLI session as terminal input."""
     if not broker._transport:
         raise HTTPException(status_code=503, detail="Transport not initialized")
+    command_text = "/" + body.command.strip().lstrip("/") + " " + body.arguments
+    from skuld.effort import effort_argument
+
+    argument = effort_argument(command_text)
+    if argument is not None:
+        try:
+            await broker.handle_effort(argument)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"status": "sent", "command": "/effort"}
     if not broker._transport.capabilities.slash_commands:
         raise HTTPException(status_code=501, detail="Slash commands not supported")
     command = body.command.strip()

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from niuu.domain.reasoning import validate_effort
 from niuu.ports.cli import CLITransport, TransportCapabilities
 
 _TOOLS = {
@@ -123,6 +124,7 @@ class PiRpcTransport(CLITransport):
         return TransportCapabilities(
             session_resume=True,
             interrupt=True,
+            set_effort=True,
             steer=True,
             steering_mode="native",
             set_model=True,
@@ -174,7 +176,7 @@ class PiRpcTransport(CLITransport):
                 self._model = actual_model
                 self._session_id = state["sessionId"]
                 if self._effort:
-                    await self._command("set_thinking_level", level=self._effort)
+                    await self.send_control("set_effort", effort=self._effort)
                 self._ready = True
                 await self._emit(
                     {
@@ -551,6 +553,16 @@ class PiRpcTransport(CLITransport):
         await self._answer(request_id, response.get("answers", response.get("value")))
 
     async def send_control(self, subtype: str, **kwargs: Any) -> None:
+        if subtype == "set_effort":
+            effort = validate_effort(
+                str(kwargs.get("effort") or ""), (await self.get_effort())["levels"]
+            )
+            await self._command("set_thinking_level", level=effort)
+            result = await self._command("get_state")
+            if result.get("thinkingLevel") != effort:
+                raise PiProtocolError(f"PI did not accept effort {effort}: {result}")
+            self._effort = effort
+            return
         if subtype == "interrupt":
             await self.interrupt()
             return
@@ -571,6 +583,24 @@ class PiRpcTransport(CLITransport):
             self._model = model
             return
         raise PiProtocolError(f"PI does not support control {subtype}")
+
+    async def get_effort(self) -> dict:
+        state = await self._command("get_state")
+        model = state.get("model") or {}
+        mapping = model.get("thinkingLevelMap") or {}
+        levels = ["off"]
+        if model.get("reasoning"):
+            levels = [
+                level
+                for level in ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+                if mapping.get(level, level if level not in {"xhigh", "max"} else None) is not None
+            ]
+        return {
+            "current": state.get("thinkingLevel", "off"),
+            "levels": levels,
+            "mutable": True,
+            "applies_to": "next_model_call",
+        }
 
     async def discover_slash_commands(self, *, refresh: bool = False) -> list[dict]:
         del refresh

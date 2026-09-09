@@ -3557,12 +3557,12 @@ class TestReasoningEffort:
         assert params["config"]["model_reasoning_effort"] == "ultra"
 
     @pytest.mark.asyncio
-    async def test_ultra_clamped_to_high_on_non_sol_model(self, tmp_path) -> None:
+    async def test_unsupported_ultra_rejected_on_non_sol_model(self, tmp_path) -> None:
         # A stray `ultra` on a model whose Codex build lacks the tier must not
         # reach the app-server as `ultra`.
         t = _make_transport(tmp_path, model="gpt-5.5", reasoning_effort="ultra")
-        params = await _capture_thread_start_params(t)
-        assert params["config"]["model_reasoning_effort"] == "high"
+        with pytest.raises(ValueError, match="Unsupported effort"):
+            await _capture_thread_start_params(t)
 
     @pytest.mark.asyncio
     async def test_high_effort_maps_through(self, tmp_path) -> None:

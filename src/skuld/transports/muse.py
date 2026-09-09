@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from niuu.domain.reasoning import MODEL_EFFORTS, validate_effort
 from niuu.domain.transcript_reducer import TOOL_ENDED_AT
 from skuld.transports import (
     CLITransport,
@@ -83,7 +84,7 @@ _LEGACY_MODEL_ALIASES: dict[str, str] = {
 }
 
 # MSP `ReasoningEffort`. The Meta provider rejects "none", so it is dropped (host default).
-_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "ultra"})
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "ultra"})
 _REASONING_EFFORT_ALIASES: dict[str, str] = {
     "max": "ultra",
     "x-high": "xhigh",
@@ -239,15 +240,14 @@ def _resolve_model(model: str | None) -> str:
 
 
 def _resolve_reasoning_effort(effort: str | None) -> str | None:
-    """Validate a reasoning effort for the wire; unknown values are dropped (host default)."""
+    """Validate a reasoning effort for the wire without silently changing a request."""
     raw = (effort or "").strip().lower()
     if not raw:
         return None
     raw = _REASONING_EFFORT_ALIASES.get(raw, raw)
     if raw in _REASONING_EFFORTS:
         return raw
-    logger.warning("Muse reasoning effort %r is not an MSP value — using the host default", effort)
-    return None
+    raise ValueError(f"Unsupported Muse reasoning effort: {effort}")
 
 
 def _resolve_approval_mode(mode: str | None, *, default: str) -> str:
@@ -1972,8 +1972,22 @@ class MuseMSPTransport(CLITransport):
     # Controls
     # ------------------------------------------------------------------
 
+    async def get_effort(self) -> dict:
+        return {
+            "current": self._reasoning_effort or "",
+            "levels": list(MODEL_EFFORTS.get(self._model, ())),
+            "mutable": True,
+            "applies_to": "next_submission",
+        }
+
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         """Server-initiated controls: interrupt, native steer, question answers, model/approval."""
+        if subtype == "set_effort":
+            self._reasoning_effort = validate_effort(
+                str(kwargs.get("effort") or ""), (await self.get_effort())["levels"]
+            )
+            return
+
         if subtype == "interrupt":
             logger.info("MuseMSPTransport: received interrupt control")
             await self._interrupt_turn(self._active_turn_id, reason="interrupted by control")
@@ -2053,6 +2067,7 @@ class MuseMSPTransport(CLITransport):
             cli_websocket=False,
             session_resume=True,
             interrupt=True,
+            set_effort=True,
             # MSP `turn/start ifBusy: steer` injects input into the RUNNING turn — the CLI
             # absorbs it itself, nothing is interrupted — so steering is native and the
             # broker routes every delivery through `redirect` with a correlation id.
