@@ -99,6 +99,9 @@ def list_models(config: BifrostConfig) -> list[ManagedModel]:
                     "session_definition": None,
                     "supports_tools": True,
                     "supports_thinking": True,
+                    "effort_levels": [],
+                    "default_effort": "",
+                    "effort_note": "",
                     "enabled": True,
                 },
             )()
