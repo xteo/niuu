@@ -314,3 +314,36 @@ def test_pi_definition_and_models_use_native_rpc():
     assert definition.default_model == MODEL
     models = [m for m in BifrostConfig().models if m.session_definition == "skuldPi"]
     assert [m.id for m in models] == [MODEL, "openai-codex/gpt-5.6-sol"]
+
+
+@pytest.mark.asyncio
+async def test_ios_question_answer_array_reaches_pi_as_the_answer(runtime):
+    runtime._write = AsyncMock()
+    await runtime._question(
+        {"id": "q-ios", "method": "select", "title": "Choose", "options": ["A", "B"]}
+    )
+    await runtime.send_control(
+        "ask_user_answer",
+        request_id="q-ios",
+        answers=[
+            {
+                "question_id": "q-ios",
+                "question": "Choose",
+                "answer": "B",
+            }
+        ],
+    )
+    runtime._write.assert_awaited_once_with(
+        {"type": "extension_ui_response", "id": "q-ios", "value": "B"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_turn_resolves_stale_questions(runtime):
+    runtime._begin()
+    await runtime._question({"id": "q-stop", "method": "input", "title": "Input"})
+    await runtime._finish("aborted")
+    assert not runtime._questions
+    resolved = [e for e in captured(runtime) if e["type"] == "ask_user_resolved"]
+    assert resolved[0]["request_id"] == "q-stop"
+    assert resolved[0]["accepted"] is False

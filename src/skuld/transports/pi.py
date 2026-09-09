@@ -457,6 +457,18 @@ class PiRpcTransport(CLITransport):
         if not self._active and not force:
             return
         self._active = False
+        for request_id in list(self._questions):
+            self._questions.pop(request_id)
+            await self._emit(
+                {
+                    "type": "ask_user_resolved",
+                    "event_type": "ask_user.resolved",
+                    "request_id": request_id,
+                    "decision": "cancelled",
+                    "accepted": False,
+                }
+            )
+        self._admissions.clear()
         cost = self._usage.get("cost", 0)
         result = {
             "type": "result",
@@ -505,6 +517,10 @@ class PiRpcTransport(CLITransport):
         if question is None:
             raise PiProtocolError("PI question is no longer pending")
         value = next(iter(answers.values()), "") if isinstance(answers, dict) else answers
+        # Forge clients send [{question_id, question, answer}], while direct
+        # control clients can send a question-to-answer map or a scalar.
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            value = value[0].get("answer")
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value)
         payload: dict = {"type": "extension_ui_response", "id": request_id}
@@ -521,8 +537,8 @@ class PiRpcTransport(CLITransport):
                 "type": "ask_user_resolved",
                 "event_type": "ask_user.resolved",
                 "request_id": request_id,
-                "decision": "answered",
-                "accepted": True,
+                "decision": "cancelled" if value is None else "answered",
+                "accepted": value is not None,
             }
         )
 
