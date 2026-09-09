@@ -16,7 +16,7 @@ PI as ready until a real adapter and host capability discovery pass the gates be
   independently and represent this early state accurately.
 - Thor's configured PI model list was empty and its auth file contained no provider
   entries. Authenticated model execution and native restart acceptance are pending.
-- Nine harness tests cover response correlation, Unicode framing, rejected commands,
+- Seventeen harness tests (96% probe coverage) cover response correlation, Unicode framing, rejected commands,
   missing tools/streaming, missing completion, and failed or aborted agent turns.
 
 The protocol is documented in the upstream [PI RPC specification](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/rpc.md).
