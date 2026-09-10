@@ -377,6 +377,10 @@ async def _proxy_ws(
                 "port": target.connect_port,
                 "proxy": None,
             }
+        # Carry the browser's supported replay negotiation across the proxy.
+        # Auth query parameters are handled as headers, never copied into this URL.
+        if broker_path == "/session" and websocket.query_params.get("history") == "recent":
+            connect_url += "?history=recent"
         await bridge_websocket(
             websocket,
             connect_url,
