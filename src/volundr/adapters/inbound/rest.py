@@ -22,6 +22,7 @@ from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, requir
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
+from skuld.conversation_snapshot import prepare_recent_snapshot
 from skuld.tool_result_preview import (
     PreviewCache,
     PreviewUnavailableError,
@@ -3017,6 +3018,12 @@ def create_router(
                 "indices derivable."
             ),
         ),
+        max_bytes: int = Query(
+            0,
+            ge=0,
+            description="Optional recent-activity byte budget; 0 returns the complete page. "
+            "Oversized single turns are marked history_preview and remain loadable on demand.",
+        ),
         after_id: str | None = Query(
             None,
             description=(
@@ -3105,6 +3112,8 @@ def create_router(
                 "window_offset": window_offset,
                 "_prep": prep,
             }
+            if max_bytes and turns and window_offset >= 0:
+                out = prepare_recent_snapshot(out, max_bytes=max_bytes, max_turns=len(turns))
             logger.info(
                 "[perf] conversation session=%s shallow=%s fetch=%sms reelide=%.1fms "
                 "broker_build=%sms broker_elide=%sms turns=%s",

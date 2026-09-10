@@ -746,6 +746,12 @@ class SkuldSettings(BaseSettings):
     # Leave room below clients with a 1 MiB WebSocket receive limit. Large
     # reconnect histories use the existing lazy tool-result preview contract.
     conversation_snapshot_max_bytes: int = Field(default=900 * 1024, gt=0)
+    conversation_recent_max_turns: int = Field(
+        default=15, gt=0, description="Recent reconnect window requested by history=recent clients."
+    )
+    conversation_recent_max_bytes: int = Field(
+        default=256 * 1024, ge=1024, description="Byte budget for recent reconnect activity."
+    )
     live_frame_max_bytes: int = Field(default=900 * 1024, ge=1024)
     # Native results are retained whole before the browser projection elides them.
     muse_bin: str = Field(

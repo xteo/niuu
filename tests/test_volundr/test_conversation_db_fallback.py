@@ -1106,3 +1106,41 @@ async def test_unknown_session_conversation_404_not_empty_body() -> None:
     resp = client.get(_CONV_PATH.format(sid=uuid4()))
 
     assert resp.status_code == 404
+
+
+async def test_recent_rest_budget_and_on_demand_full_message(monkeypatch):
+    event_log = InMemorySessionEventLog()
+    client, repository = _build_client(
+        Session(name="recent", model="m", status=SessionStatus.STOPPED), event_log
+    )
+    session = await _running_session(repository)
+    live_body = {
+        "turns": [
+            {"id": str(i), "role": "assistant", "content": "activity " * 10_000} for i in range(50)
+        ],
+        "is_active": True,
+    }
+    live_body["turns"][-1]["in_progress"] = True
+    _, mock_client = _patch_live_pod(live_body)
+    client_cls = MagicMock()
+    client_cls.return_value.__aenter__.return_value = mock_client
+    monkeypatch.setattr("volundr.adapters.inbound.rest.httpx.AsyncClient", client_cls)
+    path = _CONV_PATH.format(sid=session.id)
+    recent = client.get(path, params={"detail": "shallow", "limit": 15, "max_bytes": 4096})
+    assert recent.status_code == 200
+    assert len(recent.content) <= 4096
+    body = recent.json()
+    assert body["total_turns"] == 50
+    assert body["window_offset"] == 49
+    assert body["turns"][0]["in_progress"] is True
+    assert body["turns"][0]["history_preview"] is True
+    assert body["is_active"] is True
+    expanded = client.get(path, params={"detail": "shallow", "limit": 1}).json()
+    assert expanded["turns"][0]["content"] == live_body["turns"][-1]["content"]
+    assert not expanded["turns"][0].get("history_preview", False)
+    older = client.get(path, params={"detail": "shallow", "limit": 15, "before": 1}).json()
+    assert older["window_offset"] == 34
+    assert [t["id"] for t in older["turns"]] == [str(i) for i in range(34, 49)]
+    invalid = client.get(path, params={"after": 1, "after_id": "stale", "max_bytes": 4096}).json()
+    assert invalid["window_offset"] == -1
+    assert invalid["turns"] == []

@@ -18,6 +18,7 @@ from skuld.control_errors import control_error_frame
 from skuld.conversation_snapshot import (
     ConversationSnapshotTooLargeError,
     prepare_conversation_snapshot,
+    prepare_recent_snapshot,
 )
 from skuld.websocket_auth import (
     _decode_jwt_claims,
@@ -224,27 +225,46 @@ class WebSocketLifecycleMixin:
             # reconnect mid-run reconstructs the FULL truth (not just new frames from now on).
             in_progress_turn = self._serialize_in_progress_turn()
             if self._conversation_turns or in_progress_turn is not None:
-                replay_turns = [asdict(t) for t in self._conversation_turns]
+                recent_requested = websocket.query_params.get("history") == "recent"
+                total_turns = len(self._conversation_turns) + int(in_progress_turn is not None)
+                completed = self._conversation_turns
+                if recent_requested:
+                    completed = completed[-self._settings.conversation_recent_max_turns :]
+                replay_turns = [asdict(t) for t in completed]
                 if in_progress_turn is not None:
                     replay_turns.append(in_progress_turn)
+                # Revision only needs identities and repair metadata, not the potentially
+                # enormous text/tool payloads outside the requested window.
+                revision_turns = [
+                    {"id": t.id, "metadata": t.metadata} for t in self._conversation_turns
+                ]
+                frame = {
+                    "type": "conversation_history",
+                    "turns": replay_turns,
+                    "projection_revision": projection_revision(revision_turns),
+                    "head_seq": self._event_log_seq,
+                }
                 logger.info(
-                    "Replaying %d conversation turn(s) to new browser",
-                    len(replay_turns),
+                    "Replaying %d recent=%s conversation turns", len(replay_turns), recent_requested
                 )
                 try:
-                    snapshot = prepare_conversation_snapshot(
-                        {
-                            "type": "conversation_history",
-                            "turns": replay_turns,
-                            "projection_revision": projection_revision(replay_turns),
-                            # SRD FR-6: the durable-log head seq at reconnect time. The
-                            # client loads this state, then resumes the live tail from
-                            # head_seq+1 with no gap and no duplicate (the broker keeps
-                            # appending to the SAME monotonic seq it broadcasts from).
-                            "head_seq": self._event_log_seq,
-                        },
-                        max_bytes=self._settings.conversation_snapshot_max_bytes,
-                    )
+                    if recent_requested:
+                        frame.update(
+                            total_turns=total_turns,
+                            window_offset=total_turns - len(replay_turns),
+                        )
+                        snapshot = prepare_recent_snapshot(
+                            frame,
+                            max_bytes=min(
+                                self._settings.conversation_recent_max_bytes,
+                                self._settings.conversation_snapshot_max_bytes,
+                            ),
+                            max_turns=self._settings.conversation_recent_max_turns,
+                        )
+                    else:
+                        snapshot = prepare_conversation_snapshot(
+                            frame, max_bytes=self._settings.conversation_snapshot_max_bytes
+                        )
                 except ConversationSnapshotTooLargeError as exc:
                     logger.warning("WebSocket conversation replay requires REST: %s", exc)
                     if not await self._safe_send_broker_frame_to(
