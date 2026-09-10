@@ -2,6 +2,7 @@
 
 import json
 
+from niuu.domain.json_text import json_text_safe
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns
 
 
@@ -23,6 +24,7 @@ def prepare_conversation_snapshot(frame: dict, *, max_bytes: int) -> dict:
     """
     if max_bytes <= 0:
         raise ValueError("Conversation snapshot byte budget must be positive")
+    frame = json_text_safe(frame)
     if snapshot_byte_size(frame) <= max_bytes:
         return frame
     shallow = {**frame, "turns": elide_turns(frame["turns"]), "detail": SHALLOW_DETAIL}
@@ -47,12 +49,14 @@ def prepare_recent_snapshot(frame: dict, *, max_bytes: int, max_turns: int) -> d
     skipped = max(0, len(source) - max_turns)
     recent = {
         **frame,
-        "turns": elide_turns(source[skipped:]),
+        "turns": source[skipped:],
         "total_turns": frame.get("total_turns", len(source)),
         "window_offset": frame.get("window_offset", 0) + skipped,
         "recent_window": True,
         "detail": SHALLOW_DETAIL,
     }
+    recent = json_text_safe(recent)
+    recent["turns"] = elide_turns(recent["turns"])
     while len(recent["turns"]) > 1 and snapshot_byte_size(recent) > max_bytes:
         recent["turns"] = recent["turns"][1:]
         recent["window_offset"] += 1

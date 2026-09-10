@@ -280,3 +280,25 @@ def test_recent_rejects_unrepresentable_metadata_without_modifying_source(turns)
 def test_recent_rejects_invalid_budgets(max_bytes, max_turns):
     with pytest.raises(ValueError, match="positive"):
         prepare_recent_snapshot(_history(), max_bytes=max_bytes, max_turns=max_turns)
+
+
+def test_unicode_code_units_do_not_break_recent_or_legacy_replay():
+    frame = {
+        "turns": [
+            {
+                "id": "unicode",
+                "content": "paired \ud83d\ude00 lone \ud83d",
+                "parts": [{"type": "text", "text": "tail \udc00"}],
+            }
+        ]
+    }
+    original = copy.deepcopy(frame)
+    for prepare in (
+        lambda f: prepare_recent_snapshot(f, max_bytes=2048, max_turns=15),
+        lambda f: prepare_conversation_snapshot(f, max_bytes=2048),
+    ):
+        wire = prepare(frame)
+        assert wire["turns"][0]["content"] == "paired 😀 lone �"
+        assert wire["turns"][0]["parts"][0]["text"] == "tail �"
+        assert snapshot_byte_size(wire) <= 2048
+        assert frame == original

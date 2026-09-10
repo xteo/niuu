@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from niuu.domain.json_text import json_text_safe
 from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, require_scope
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
@@ -3095,6 +3096,7 @@ def create_router(
             else:
                 turns = all_turns
                 window_offset = 0
+            turns = json_text_safe(turns)
             reelide_ms = 0.0
             if shallow:
                 t = time.perf_counter()
