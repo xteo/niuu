@@ -32,6 +32,7 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
+from volundr.adapters.inbound.rest_projects import create_projects_router, project_result
 from volundr.config import PermissionAutoApprovalConfig
 from volundr.domain.history_import import (
     HistoryImportConflictError,
@@ -66,6 +67,7 @@ from volundr.domain.ports import (
     GitRepoNotFoundError,
     PricingProvider,
 )
+from volundr.domain.projects import SessionCoordination
 from volundr.domain.services import (
     ChronicleNotFoundError,
     ChronicleService,
@@ -409,6 +411,9 @@ _RFC1123_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 class SessionCreate(BaseModel):
     """Request model for creating a session."""
+
+    coordination: SessionCoordination | None = None
+    dispatch_id: UUID | None = None
 
     name: str = Field(
         ...,
@@ -800,6 +805,8 @@ class DeviceResponse(BaseModel):
 class SessionResponse(BaseModel):
     """Response model for a session."""
 
+    coordination: SessionCoordination | None = None
+
     id: UUID = Field(description="Unique session identifier")
     name: str = Field(description="Human-readable session name")
     model: str = Field(description="LLM model identifier")
@@ -955,6 +962,7 @@ class SessionResponse(BaseModel):
         """Create response from domain model."""
         return cls(
             id=session.id,
+            coordination=session.coordination,
             name=session.name,
             model=session.model,
             persona_name=str(session.workload_config.get("persona") or ""),
@@ -1496,6 +1504,7 @@ def create_router(
     server_public_host: str = "127.0.0.1",
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     preview_cache: PreviewCache | None = None,
+    project_service=None,
 ) -> APIRouter:
     """Create FastAPI router with session, stats, token, repo, and SSE endpoints."""
     router = APIRouter(prefix=prefix)
@@ -1529,6 +1538,7 @@ def create_router(
         repo_service=repo_service,
         chronicle_service=chronicle_service,
         archive_service=archive_service,
+        project_service=project_service,
     )
 
     def _require_bound_workload_session(request: Request, session_id: UUID) -> None:
@@ -1578,6 +1588,13 @@ def create_router(
 
         return not isinstance(identity, AllowAllIdentityAdapter)
 
+    if project_service is not None:
+
+        async def project_principal(request: Request):
+            return await _optional_principal(request, strict=_strict_identity_enabled(request))
+
+        router.include_router(create_projects_router(project_service, project_principal))
+
     @router.get("/feature-flags", tags=["Features"])
     async def get_feature_flags(request: Request) -> dict:
         """Return feature flags derived from server configuration.
@@ -1592,6 +1609,9 @@ def create_router(
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
             "mini_mode": settings.local_mounts.mini_mode,
             "local_mounts_allowed_prefixes": settings.local_mounts.allowed_prefixes,
+            "projects_enabled": project_service is not None,
+            "project_contract_version": 1 if project_service is not None else 0,
+            "project_instance_id": project_service.instance_id if project_service else None,
         }
 
     @router.get("/repos/branches", response_model=list[str], tags=["Repositories"])
@@ -1636,6 +1656,10 @@ def create_router(
         include_archived: bool = Query(
             default=False, description="Include archived sessions in results"
         ),
+        project_id: UUID | None = Query(default=None),
+        role: str | None = Query(default=None),
+        parent_session_id: UUID | None = Query(default=None),
+        parent_instance_id: str | None = Query(default=None),
     ) -> list[SessionResponse]:
         """List all sessions. Archived sessions are excluded by default."""
         principal = await _optional_principal(request)
@@ -1646,6 +1670,27 @@ def create_router(
             include_archived=include_archived,
             principal=principal,
         )
+        if project_id is not None:
+            sessions = [
+                s for s in sessions if s.coordination and s.coordination.project_id == project_id
+            ]
+        if role is not None:
+            sessions = [s for s in sessions if s.coordination and s.coordination.role == role]
+        if parent_session_id is not None or parent_instance_id is not None:
+            sessions = [
+                s
+                for s in sessions
+                if s.coordination
+                and s.coordination.parent
+                and (
+                    parent_session_id is None
+                    or s.coordination.parent.session_id == parent_session_id
+                )
+                and (
+                    parent_instance_id is None
+                    or s.coordination.parent.instance_id == parent_instance_id
+                )
+            ]
         return [_session_response(s) for s in sessions]
 
     @router.get(
@@ -1876,9 +1921,14 @@ def create_router(
         A Valkyrie build token must carry the ``forge:session:create`` scope;
         ordinary human PATs and workload tokens are unaffected.
         """
-        principal = await _optional_principal(request)
+        principal = await _optional_principal(
+            request,
+            strict=data.coordination is not None and _strict_identity_enabled(request),
+        )
         try:
-            started = await forge.create_and_start_session(data, principal=principal)
+            started = await project_result(
+                forge.create_and_start_session(data, principal=principal)
+            )
         except RepoValidationError as e:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

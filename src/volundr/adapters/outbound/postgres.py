@@ -34,10 +34,10 @@ class PostgresSessionRepository(SessionRepository):
                  launch_spec_id, archived_at, owner_id, tenant_id, workload_type,
                  origin, external_session_id, cli_session_id, session_definition,
                  activity_state, activity_metadata, activity_state_since,
-                 workload_config, turn_started_at)
+                 workload_config, turn_started_at, coordination)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                    $22, $23, $24, $25, $26, $27, $28, $29, $30)
+                    $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
             """,
             session.id,
             session.name,
@@ -69,6 +69,7 @@ class PostgresSessionRepository(SessionRepository):
             session.activity_state_since,
             json.dumps(session.workload_config or {}),
             session.turn_started_at,
+            session.coordination.model_dump_json() if session.coordination else None,
         )
         return session
 
@@ -141,7 +142,7 @@ class PostgresSessionRepository(SessionRepository):
                 origin = $21, external_session_id = $22, cli_session_id = $23,
                 session_definition = $24, activity_state = $25,
                 activity_metadata = $26, activity_state_since = $27,
-                workload_config = $28, turn_started_at = $29
+                workload_config = $28, turn_started_at = $29, coordination = $30
             WHERE id = $1
             """,
             session.id,
@@ -173,6 +174,7 @@ class PostgresSessionRepository(SessionRepository):
             session.activity_state_since,
             json.dumps(session.workload_config or {}),
             session.turn_started_at,
+            session.coordination.model_dump_json() if session.coordination else None,
         )
         return session
 
@@ -245,6 +247,7 @@ class PostgresSessionRepository(SessionRepository):
             tenant_id=row.get("tenant_id"),
             workload_type=row.get("workload_type") or "session",
             workload_config=self._parse_json_dict(row.get("workload_config")),
+            coordination=self._parse_json_dict(row.get("coordination")) or None,
             origin=row.get("origin") or "volundr",
             external_session_id=row.get("external_session_id"),
             cli_session_id=row.get("cli_session_id"),

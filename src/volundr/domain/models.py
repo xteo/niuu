@@ -26,6 +26,7 @@ from identity.models import (  # noqa: F401
 )
 from niuu.domain import models as shared_models
 from tracker.models import ProjectMapping, TrackerConnectionStatus, TrackerIssue  # noqa: F401
+from volundr.domain.projects import SessionCoordination
 
 CIStatus = shared_models.CIStatus
 GitProviderType = shared_models.GitProviderType
@@ -351,6 +352,8 @@ SessionSource = Annotated[
 
 class Session(BaseModel):
     """A Claude Code coding session."""
+
+    coordination: SessionCoordination | None = None
 
     id: UUID = Field(
         default_factory=uuid4,

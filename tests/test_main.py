@@ -133,6 +133,7 @@ class TestLifespan:
 
         events: list[str] = []
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -178,6 +179,7 @@ class TestLifespan:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -213,6 +215,7 @@ class TestLifespan:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -262,6 +265,7 @@ class TestLifespan:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -311,6 +315,7 @@ class TestLifespan:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -381,6 +386,7 @@ class TestLifespan:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):
@@ -491,6 +497,7 @@ class TestBifrostCatalogLoading:
         from fastapi.testclient import TestClient
 
         mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
 
         @asynccontextmanager
         async def _mock_db_pool(_config):

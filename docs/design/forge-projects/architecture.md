@@ -1,3 +1,5 @@
+> **Implementation update (2026-09-11):** [IMPLEMENTATION.md](IMPLEMENTATION.md) is the current contract. A project is a Git meta-repository with multiple coordinator sessions, coordinated through a Forge CLI skill. Ting is not required. The original design below is retained as a design snapshot.
+
 # Architecture proposal: projects over ordinary Forge sessions
 
 **Design candidate, not an implemented API.** All new field names, endpoints, capability names, and payloads below are provisional contracts for phase 2.

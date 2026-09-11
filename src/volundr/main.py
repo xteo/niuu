@@ -911,6 +911,37 @@ def create_app(
                     event_log_repository=session_event_log,
                 )
 
+            # Projects add durable coordination metadata to ordinary Forge sessions.
+            project_service = None
+            if settings.projects.enabled:
+                from volundr.domain.project_ports import ProjectRepository, ProjectWorkspace
+                from volundr.domain.services.projects import ProjectService
+
+                project_config = settings.projects
+                project_repository = import_class(project_config.repository_adapter)(
+                    pool=pool,
+                    dispatch_wait_seconds=project_config.dispatch_wait_seconds,
+                    dispatch_poll_seconds=project_config.dispatch_poll_seconds,
+                    **project_config.repository_kwargs,
+                )
+                project_workspace = import_class(project_config.workspace_adapter)(
+                    allowed_prefixes=settings.local_mounts.allowed_prefixes,
+                    context_bytes=project_config.context_bytes,
+                    git_timeout=project_config.git_timeout_seconds,
+                    **project_config.workspace_kwargs,
+                )
+                if not isinstance(project_repository, ProjectRepository):
+                    raise TypeError("Project repository adapter must implement ProjectRepository")
+                if not isinstance(project_workspace, ProjectWorkspace):
+                    raise TypeError("Project workspace adapter must implement ProjectWorkspace")
+                project_service = ProjectService(
+                    project_repository,
+                    project_workspace,
+                    session_service,
+                    instance_id=project_config.instance_id or settings.server_public_host,
+                )
+                app.state.project_service = project_service
+
             # Create and include routers
             forge_router = create_router(
                 session_service,
@@ -926,6 +957,7 @@ def create_app(
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,
+                project_service=project_service,
             )
             app.include_router(forge_router)
             app.include_router(create_resident_runtimes_router(resident_runtime_service))

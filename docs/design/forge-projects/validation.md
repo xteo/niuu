@@ -1,3 +1,5 @@
+> **Implementation update (2026-09-11):** [IMPLEMENTATION.md](IMPLEMENTATION.md) is the current contract. A project is a Git meta-repository with multiple coordinator sessions, coordinated through a Forge CLI skill. Ting is not required. The original design below is retained as a design snapshot.
+
 # Pilot and acceptance plan
 
 **Planning artifact only.** These scenarios have not been executed for a Projects implementation. This branch adds documents, not tests that claim the feature exists. Validation of this deliverable is limited to document consistency, references, and Git publication.

@@ -1601,6 +1601,23 @@ class ObservatoryConfig(BaseModel):
     )
 
 
+class ProjectsConfig(BaseModel):
+    """Storage adapters and bounded checkpoint limits; workflows live in agent skills."""
+
+    enabled: bool = True
+    instance_id: str = ""
+    repository_adapter: str = (
+        "volundr.adapters.outbound.postgres_projects.PostgresProjectRepository"
+    )
+    repository_kwargs: dict[str, Any] = Field(default_factory=dict)
+    workspace_adapter: str = "volundr.adapters.outbound.project_workspace.GitProjectWorkspace"
+    workspace_kwargs: dict[str, Any] = Field(default_factory=dict)
+    context_bytes: int = Field(default=8192, ge=1024, le=65536)
+    git_timeout_seconds: float = Field(default=15.0, gt=0)
+    dispatch_wait_seconds: float = Field(default=30.0, gt=0)
+    dispatch_poll_seconds: float = Field(default=0.05, gt=0)
+
+
 class Settings(BaseSettings):
     """Application settings.
 
@@ -1622,6 +1639,7 @@ class Settings(BaseSettings):
     )
 
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    projects: ProjectsConfig = Field(default_factory=ProjectsConfig)
     server_host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("server_host", "NIUU_SERVER_HOST"),

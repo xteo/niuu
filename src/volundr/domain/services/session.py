@@ -48,6 +48,7 @@ from volundr.domain.ports import (
     SessionSpanRepository,
     StoragePort,
 )
+from volundr.domain.projects import SessionCoordination
 
 if TYPE_CHECKING:
     from volundr.adapters.outbound.git_registry import GitProviderRegistry
@@ -167,6 +168,9 @@ class SessionService:
         issue_tracker_url: str | None = None,
         origin: str = "volundr",
         external_session_id: str | None = None,
+        coordination: SessionCoordination | None = None,
+        session_id: UUID | None = None,
+        project_context: str = "",
     ) -> Session:
         """Create a new session.
 
@@ -232,6 +236,8 @@ class SessionService:
                 logger.debug("Skipping repo validation: validation disabled")
 
         session = Session(
+            **({"id": session_id} if session_id else {}),
+            coordination=coordination,
             name=name,
             model=model,
             source=source,
@@ -243,6 +249,7 @@ class SessionService:
             issue_tracker_url=issue_tracker_url,
             origin=origin,
             external_session_id=external_session_id,
+            workload_config={"project_context": project_context} if project_context else {},
         )
         created = await self._repository.create(session)
 
@@ -824,6 +831,12 @@ class SessionService:
         if not workload_config and session.workload_config:
             workload_config = dict(session.workload_config)
 
+        # A project briefing is a persisted snapshot, including on restart. It is
+        # separate from repository-owned AGENTS.md / CLAUDE.md files.
+        project_context = session.workload_config.get("project_context", "")
+        if project_context:
+            workload_config = {**(workload_config or {}), "project_context": project_context}
+
         # Set chat_endpoint eagerly — Flux/Gateway sessions know their public
         # route before the pod is ready; local mode falls back to the root proxy.
         chat_endpoint = self._pod_manager.initial_chat_endpoint(session)
@@ -988,6 +1001,16 @@ class SessionService:
             contributions.append(contribution)
 
         spec = SessionSpec.merge(contributions)
+        if session.coordination and (
+            project_context := session.workload_config.get("project_context")
+        ):
+            # Append after persona/launch-spec resolution. Supplying a project
+            # brief as an ad-hoc system prompt would overwrite those instructions.
+            session_values = spec.values.setdefault("session", {})
+            existing_prompt = session_values.get("systemPrompt", "")
+            session_values["systemPrompt"] = "\n\n".join(
+                part for part in (existing_prompt, project_context) if part
+            )
         self._overlay_resume_session(session, spec)
         return await self._pod_manager.start(session, spec=spec)
 

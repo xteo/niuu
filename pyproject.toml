@@ -111,6 +111,7 @@ dev = [
 
 [project.scripts]
 niuu = "niuu.__main__:main"
+forge = "volundr.cli:main"
 guild = "guild.main:main"
 audit = "audit.main:main"
 identity = "identity.main:main"

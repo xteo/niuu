@@ -1,3 +1,5 @@
+> **Implementation update (2026-09-11):** [IMPLEMENTATION.md](IMPLEMENTATION.md) is the current contract. A project is a Git meta-repository with multiple coordinator sessions, coordinated through a Forge CLI skill. Ting is not required. The original design below is retained as a design snapshot.
+
 # Research and implementation evidence
 
 **Reviewed 11 September 2026.** External statements below describe the fetched official documentation. The “application here” statements are design inferences, not claims that these products implement our proposed Forge contracts. No external product was installed or benchmarked for this review.

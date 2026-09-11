@@ -2844,7 +2844,6 @@ class TestDispatchBrowserMessage:
             "terminal_key",
             "terminal_resize",
             "slash_command",
-            "discover_slash_commands",
         ]
         for msg_type in guarded:
             sender_ws = AsyncMock()
@@ -2946,14 +2945,21 @@ class TestDispatchBrowserMessage:
                 "type": "slash_commands",
                 "commands": [
                     {
+                        "name": "/effort",
+                        "command": "effort",
+                        "kind": "command",
+                        "source": "forge",
+                        "description": "Show effort or set a supported level: /effort xhigh",
+                    },
+                    {
                         "name": "/workflows",
                         "command": "workflows",
                         "description": "Browse workflows",
                         "kind": "command",
                         "source": "tmux_autocomplete",
-                    }
+                    },
                 ],
-                "count": 1,
+                "count": 2,
             }
         )
 
@@ -3244,9 +3250,10 @@ class TestFastAPIEndpoints:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["count"] == 1
-        assert data["commands"][0]["name"] == "/deep-research"
-        assert data["commands"][0]["kind"] == "workflow"
+        assert data["count"] == 2
+        assert data["commands"][0]["name"] == "/effort"
+        assert data["commands"][1]["name"] == "/deep-research"
+        assert data["commands"][1]["kind"] == "workflow"
         mock_transport.discover_slash_commands.assert_awaited_once_with(refresh=True)
         broker._transport = None
 
@@ -3272,15 +3279,17 @@ class TestFastAPIEndpoints:
         )
         broker._transport = None
 
-    def test_slash_commands_endpoint_501_when_unsupported(self, client):
-        """Slash command APIs report unsupported transports clearly."""
+    def test_slash_commands_endpoint_keeps_forge_effort_without_native_discovery(self, client):
+        """Forge effort remains discoverable without querying unsupported native controls."""
         mock_transport = MagicMock()
         mock_transport.capabilities = TransportCapabilities()
         broker._transport = mock_transport
 
         response = client.get("/api/slash-commands")
 
-        assert response.status_code == 501
+        assert response.status_code == 200
+        assert [item["name"] for item in response.json()["commands"]] == ["/effort"]
+        mock_transport.discover_slash_commands.assert_not_called()
         broker._transport = None
 
     def test_logs_endpoint_level_filter(self, client):
@@ -4357,6 +4366,7 @@ class TestHandleWebSocket:
         test_broker._event_log_seq = 42
 
         mock_ws = AsyncMock()
+        mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
         await test_broker.handle_websocket(mock_ws)

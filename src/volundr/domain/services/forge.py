@@ -44,6 +44,7 @@ class ForgeService:
         chronicle_service: ChronicleService | None = None,
         archive_service: SessionArchiveService | None = None,
         workspace_service: WorkspaceService | None = None,
+        project_service=None,
     ) -> None:
         self._session_service = session_service
         self._stats_service = stats_service
@@ -53,6 +54,7 @@ class ForgeService:
         self._chronicle_service = chronicle_service
         self._archive_service = archive_service
         self._workspace_service = workspace_service
+        self._project_service = project_service
 
     @property
     def has_broadcaster(self) -> bool:
@@ -68,6 +70,7 @@ class ForgeService:
             chronicle_service=self._chronicle_service,
             archive_service=self._archive_service,
             workspace_service=workspace_service,
+            project_service=self._project_service,
         )
 
     async def list_sessions(
@@ -92,8 +95,20 @@ class ForgeService:
         *,
         principal: Principal | None = None,
     ) -> Session:
+        if getattr(data, "coordination", None) is not None:
+            if self._project_service is None:
+                raise ValueError("Projects are not enabled on this Forge host")
+            async with self._project_service.dispatch(data, principal) as (existing, options):
+                if existing is not None and existing.status.value != "created":
+                    return existing
+                return await self._launch_session(data, principal, existing, options)
+        if getattr(data, "dispatch_id", None) is not None:
+            raise ValueError("dispatch_id currently requires project coordination metadata")
+        return await self._launch_session(data, principal)
+
+    async def _launch_session(self, data, principal, existing=None, project_options=None):
         resolved_definition = self._resolve_session_definition(data.model, data.definition)
-        session = await self._session_service.create_session(
+        session = existing or await self._session_service.create_session(
             name=data.name,
             model=data.model,
             source=data.source,
@@ -103,6 +118,7 @@ class ForgeService:
             workspace_id=data.workspace_id,
             tracker_issue_id=data.issue_id,
             issue_tracker_url=data.issue_url,
+            **(project_options or {}),
         )
         workload_config = dict(data.workload_config or {})
         persona_name = getattr(data, "persona_name", "")

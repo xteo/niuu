@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from fastapi import (
@@ -334,7 +335,13 @@ async def _find_session_owner(
     *,
     embedded_app: ASGIApp | None = None,
 ) -> tuple[RegisteredInstance, dict[str, Any]]:
-    for instance in await _visible_instances(service, principal):
+    selected = request.query_params.get("instance_id")
+    instances = (
+        [await _resolve_target_instance(service, principal, selected)]
+        if selected
+        else await _visible_instances(service, principal)
+    )
+    for instance in instances:
         response = await _request_remote(
             instance,
             request,
@@ -770,12 +777,132 @@ def create_volundr_router(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @router.get("/projects")
+    async def list_projects(
+        request: Request,
+        response: Response,
+        principal: Principal = Depends(extract_principal),
+    ) -> list[dict[str, Any]]:
+        instances = await _visible_instances(service, principal)
+        selected = request.query_params.get("instance_id")
+        if selected:
+            instances = [await _resolve_target_instance(service, principal, selected)]
+        results = await asyncio.gather(
+            *[
+                _request_remote(
+                    instance,
+                    request,
+                    method="GET",
+                    path="/projects",
+                    embedded_app=embedded_forge_app,
+                )
+                for instance in instances
+            ],
+            return_exceptions=True,
+        )
+        projects, unavailable = [], []
+        successful = 0
+        for instance, result in zip(instances, results, strict=True):
+            if isinstance(result, Exception) or result.status_code >= 400:
+                unavailable.append(instance.id)
+                continue
+            try:
+                payload = result.json()
+            except ValueError:
+                unavailable.append(instance.id)
+                continue
+            if not isinstance(payload, list):
+                unavailable.append(instance.id)
+                continue
+            successful += 1
+            projects.extend(
+                _with_instance(item, instance) for item in payload if isinstance(item, dict)
+            )
+        if instances and not successful:
+            raise HTTPException(503, "No Forge host could load projects")
+        if unavailable:
+            response.headers["X-Forge-Unavailable-Instances"] = ",".join(unavailable)
+        return projects
+
+    @router.post("/projects", status_code=201)
+    async def register_project(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance = await _resolve_target_instance(service, principal, body.get("instance_id"))
+        response = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path="/projects",
+            json_body=_strip_instance_hints(body),
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), instance)
+
+    @router.get("/projects/{project_id}")
+    @router.patch("/projects/{project_id}")
+    @router.get("/projects/{project_id}/{operation:path}")
+    @router.post("/projects/{project_id}/{operation:path}")
+    async def project_operation(
+        request: Request,
+        project_id: UUID,
+        operation: str = "",
+        principal: Principal = Depends(extract_principal),
+    ) -> Any:
+        allowed = {
+            ("GET", ""),
+            ("PATCH", ""),
+            ("GET", "context"),
+            ("GET", "receipts"),
+            ("POST", "receipts"),
+            ("POST", "export"),
+        }
+        pieces = operation.split("/")
+        is_ack = len(pieces) == 3 and pieces[0] == "receipts" and pieces[2] == "ack"
+        if is_ack:
+            try:
+                UUID(pieces[1])
+            except ValueError as exc:
+                raise HTTPException(422, "Invalid receipt ID") from exc
+        if (request.method, operation) not in allowed and not (request.method == "POST" and is_ack):
+            raise HTTPException(404, "Unknown project operation")
+        instance = await _resolve_target_instance(
+            service,
+            principal,
+            request.query_params.get("instance_id"),
+        )
+        body = await request.body()
+        try:
+            document = json.loads(body) if body else None
+        except ValueError as exc:
+            raise HTTPException(422, "Project request must contain valid JSON") from exc
+        if document is not None and not isinstance(document, dict):
+            raise HTTPException(422, "Project request must be a JSON object")
+        response = await _request_remote(
+            instance,
+            request,
+            method=request.method,
+            path=f"/projects/{project_id}" + (f"/{operation}" if operation else ""),
+            params=_query_params(request),
+            json_body=document,
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        payload = response.json()
+        return _with_instance(payload, instance) if not operation else payload
+
     @router.get("/sessions")
     async def list_sessions(
         request: Request,
         principal: Principal = Depends(extract_principal),
     ) -> list[dict[str, Any]]:
         instances = await _visible_instances(service, principal)
+        selected = request.query_params.get("instance_id")
+        if selected:
+            instances = [await _resolve_target_instance(service, principal, selected)]
         params = _query_params(request)
         results = await asyncio.gather(
             *[
@@ -804,7 +931,7 @@ def create_volundr_router(
             for item in payload:
                 if not isinstance(item, dict):
                     continue
-                merged[str(item.get("id") or "")] = _with_instance(item, instance)
+                merged[f"{instance.id}:{item.get('id') or ''}"] = _with_instance(item, instance)
 
         sessions = [item for item in merged.values() if item.get("id")]
         sessions.sort(

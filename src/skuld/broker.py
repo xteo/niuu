@@ -4409,11 +4409,13 @@ class Broker(
         if self._transport is None:
             return []
 
-        commands = await self._transport.discover_slash_commands(refresh=refresh)
-        if not commands:
-            commands = getattr(self._transport, "slash_commands", [])
-            if callable(commands):
-                commands = commands()
+        commands = []
+        if self._transport.capabilities.slash_commands:
+            commands = await self._transport.discover_slash_commands(refresh=refresh)
+            if not commands:
+                commands = getattr(self._transport, "slash_commands", [])
+                if callable(commands):
+                    commands = commands()
         normalized = self._normalize_slash_commands(commands)
         return [
             {
