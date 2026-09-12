@@ -49,6 +49,25 @@ class ProjectService:
             raise ProjectNotFoundError("Project not found")
         return project
 
+    async def discover(self, workspace_path: str, principal) -> ForgeProject:
+        project = await self.workspace.discover(workspace_path)
+        existing = await self.repository.get(project.id)
+        if existing is None:
+            return project
+        if (existing.owner_id, existing.tenant_id) != self.scope(principal):
+            raise ProjectNotFoundError("Project not found")
+        if existing.workspace_path != project.workspace_path:
+            raise ProjectConflictError(
+                "This repository is already connected from another folder on this host"
+            )
+        return existing
+
+    async def connect(self, workspace_path: str, name: str | None, principal) -> ForgeProject:
+        project = await self.discover(workspace_path, principal)
+        if name is not None:
+            project = ForgeProject.model_validate({**project.model_dump(), "name": name})
+        return await self.register(project, principal)
+
     async def register(self, project: ForgeProject, principal: Principal | None) -> ForgeProject:
         owner, tenant = self.scope(principal)
         now = datetime.now(UTC)

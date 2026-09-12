@@ -4,8 +4,11 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from volundr.domain.project_ports import ProjectWorkspace
 from volundr.domain.projects import ForgeProject, ProjectReceipt
@@ -18,14 +21,120 @@ class GitProjectWorkspace(ProjectWorkspace):
         self._git_timeout = git_timeout
 
     def _root(self, project: ForgeProject) -> Path:
-        if not project.workspace_path:
+        return self._checkout_root(project.workspace_path)
+
+    def _checkout_root(self, workspace_path: str) -> Path:
+        if not workspace_path:
             raise ValueError("Project has no local checkout on this host")
-        root = Path(project.workspace_path).resolve()
+        if not Path(workspace_path).is_absolute():
+            raise ValueError("Use an absolute project folder path")
+        root = Path(workspace_path).resolve()
         if not root.is_dir() or not (root / ".git").exists():
             raise ValueError("Project workspace must be an existing Git checkout")
         if self._prefixes and not any(root.is_relative_to(prefix) for prefix in self._prefixes):
             raise ValueError("Project checkout is outside the allowed workspace roots")
         return root
+
+    @staticmethod
+    def _canonical_remote(remote: str) -> str:
+        # Validate before returning anything to the caller; credential-bearing
+        # remotes must never become public project metadata or error text.
+        ForgeProject.validate_repository_url(remote)
+        value = remote
+        if value.startswith("git@"):
+            host, path = value[4:].split(":", 1)
+            value = f"https://{host}/{path}"
+        url = urlsplit(value)
+        path = url.path.rstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if not path or path == "/":
+            raise ValueError("Git remote must identify a repository")
+        if url.hostname == "github.com":
+            path = path.lower()
+        return urlunsplit(("https", url.netloc.lower(), path, "", ""))
+
+    async def _git(self, root: Path, *arguments: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-C",
+            str(root),
+            *arguments,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), self._git_timeout)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise ValueError("Project Git lookup timed out") from None
+        if proc.returncode:
+            raise ValueError("Cannot inspect Git in this project folder")
+        if len(out) > self._context_bytes:
+            raise ValueError("Project Git metadata exceeds the configured context budget")
+        return out.decode("utf-8").strip()
+
+    async def discover(self, workspace_path: str) -> ForgeProject:
+        root = self._checkout_root(workspace_path)
+        output = await self._git(root, "remote", "-v")
+        remotes: dict[str, set[str]] = {}
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[2] == "(fetch)":
+                remotes.setdefault(fields[0], set()).add(fields[1])
+        choices = remotes.get("origin")
+        if choices is None:
+            choices = set().union(*remotes.values()) if remotes else set()
+        if not choices:
+            raise ValueError("This Git checkout has no remote; configure origin and retry")
+        if len(choices) != 1:
+            raise ValueError("This checkout has multiple remotes; configure one origin remote")
+        try:
+            remote = self._canonical_remote(next(iter(choices)))
+        except ValueError:
+            raise ValueError(
+                "Use an HTTPS or git@ Git remote without embedded credentials"
+            ) from None
+
+        manifest = (root / "project.json").resolve()
+        if not manifest.is_relative_to(root):
+            raise ValueError("Project metadata cannot escape its checkout")
+        metadata = {}
+        if manifest.exists():
+            if not manifest.is_file() or manifest.stat().st_size > self._context_bytes:
+                raise ValueError("project.json exceeds the configured context budget")
+            try:
+                metadata = json.loads(await asyncio.to_thread(manifest.read_text, encoding="utf-8"))
+                if not isinstance(metadata, dict) or "id" not in metadata:
+                    raise ValueError("missing project identity")
+                UUID(metadata["id"])
+                if (
+                    "repo_url" in metadata
+                    and self._canonical_remote(metadata["repo_url"]) != remote
+                ):
+                    raise ValueError("repository mismatch")
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError(
+                    "project.json must contain a valid project UUID and matching repository"
+                ) from None
+
+        name = metadata.get("name", root.name)
+        slug = metadata.get("slug", re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")[:63])
+        project = ForgeProject(
+            id=metadata.get("id", uuid5(NAMESPACE_URL, "forge-project:" + remote)),
+            name=name,
+            slug=slug,
+            description=metadata.get("description", ""),
+            repo_url=metadata.get("repo_url", remote),
+            workspace_path=str(root),
+        )
+        # Preview must validate the same checkout and context that registration uses.
+        await self.context(project)
+        return project
 
     async def context(self, project: ForgeProject) -> tuple[str, str]:
         root = self._root(project)

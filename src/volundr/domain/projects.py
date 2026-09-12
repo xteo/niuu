@@ -55,20 +55,24 @@ class ForgeProject(BaseModel):
 
     @model_validator(mode="after")
     def safe_repository(self):
+        self.validate_repository_url(self.repo_url)
+        return self
+
+    @staticmethod
+    def validate_repository_url(repo_url: str) -> None:
         from urllib.parse import urlsplit
 
-        if self.repo_url.startswith("git@"):
+        if repo_url.startswith("git@"):
             import re
 
-            if not re.fullmatch(r"git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_./-]+", self.repo_url):
+            if not re.fullmatch(r"git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_./-]+", repo_url):
                 raise ValueError("Invalid Git repository URL")
-            return self
-        url = urlsplit(self.repo_url)
+            return
+        url = urlsplit(repo_url)
         if url.scheme != "https" or not url.hostname or url.username or url.password:
             raise ValueError("Use an HTTPS or git@ repository URL without embedded credentials")
         if url.query or url.fragment:
             raise ValueError("Repository URLs cannot contain query strings or fragments")
-        return self
 
 
 class ProjectReceipt(BaseModel):

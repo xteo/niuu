@@ -76,3 +76,31 @@ def test_session_collision_and_explicit_target_never_fall_back_to_other_host():
         f"/api/v1/forge/sessions/{session_id}?instance_id=spark", headers=_headers()
     )
     assert response.status_code == 404 and route.called
+
+
+@respx.mock
+def test_checkout_discovery_and_creation_route_only_to_selected_host():
+    project_id = str(uuid4())
+    for operation in ["discover", "connect"]:
+        route = respx.post(f"http://spark.test/api/v1/forge/projects/{operation}").mock(
+            return_value=httpx.Response(
+                201 if operation == "connect" else 200, json={"id": project_id}
+            )
+        )
+        response = client().post(
+            f"/api/v1/forge/projects/{operation}?instance_id=spark",
+            headers=_headers(),
+            json={"workspace_path": "/home/horde/projects/kit"},
+        )
+        assert response.status_code == (201 if operation == "connect" else 200)
+        assert response.json()["instance_id"] == "spark" and route.called
+        assert route.calls[0].request.content == b'{"workspace_path":"/home/horde/projects/kit"}'
+    route = respx.post("http://spark.test/api/v1/forge/projects/connect").mock(
+        return_value=httpx.Response(404, json={"detail": "Not Found"})
+    )
+    response = client().post(
+        "/api/v1/forge/projects/connect",
+        headers=_headers(),
+        json={"instance_id": "spark", "workspace_path": "/absent"},
+    )
+    assert response.status_code == 404 and route.called

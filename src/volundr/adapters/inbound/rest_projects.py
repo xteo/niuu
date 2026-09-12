@@ -12,6 +12,12 @@ from volundr.domain.services.projects import ProjectNotFoundError, ProjectServic
 from volundr.domain.services.session import SessionAccessDeniedError
 
 
+class ProjectCheckout(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    workspace_path: str = Field(min_length=1, max_length=2048)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+
+
 class ProjectUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=1)
@@ -54,6 +60,16 @@ def create_projects_router(service: ProjectService, principal_for_request) -> AP
             )
         principal = await principal_for_request(request)
         return await project_result(service.register(project, principal))
+
+    @router.post("/discover")
+    async def discover_project(request: Request, data: ProjectCheckout) -> ForgeProject:
+        principal = await principal_for_request(request)
+        return await project_result(service.discover(data.workspace_path, principal))
+
+    @router.post("/connect", status_code=201)
+    async def connect_project(request: Request, data: ProjectCheckout) -> ForgeProject:
+        principal = await principal_for_request(request)
+        return await project_result(service.connect(data.workspace_path, data.name, principal))
 
     @router.get("/{project_id}")
     async def get_project(request: Request, project_id: UUID) -> ForgeProject:

@@ -49,6 +49,10 @@ class ProjectRepository(ABC):
 
 class ProjectWorkspace(ABC):
     @abstractmethod
+    async def discover(self, workspace_path: str) -> ForgeProject:
+        """Inspect a local Git checkout and recover its stable project identity."""
+
+    @abstractmethod
     async def context(self, project: ForgeProject) -> tuple[str, str]:
         """Return bounded project context and its Git revision."""
 

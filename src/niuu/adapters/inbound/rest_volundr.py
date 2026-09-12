@@ -842,6 +842,37 @@ def create_volundr_router(
         _ensure_remote_success(response)
         return _with_instance(response.json(), instance)
 
+    async def _project_checkout_request(request, body, principal, path):
+        instance = await _resolve_target_instance(
+            service, principal, body.get("instance_id") or request.query_params.get("instance_id")
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=path,
+            json_body=_strip_instance_hints(body),
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), instance)
+
+    @router.post("/projects/discover")
+    async def discover_project_checkout(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        return await _project_checkout_request(request, body, principal, "/projects/discover")
+
+    @router.post("/projects/connect", status_code=201)
+    async def connect_project_checkout(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        return await _project_checkout_request(request, body, principal, "/projects/connect")
+
     @router.get("/projects/{project_id}")
     @router.patch("/projects/{project_id}")
     @router.get("/projects/{project_id}/{operation:path}")
