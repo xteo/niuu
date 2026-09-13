@@ -6,11 +6,20 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from uuid import UUID
 
-from volundr.domain.projects import ForgeProject, ProjectReceipt
+from volundr.domain.projects import (
+    ForgeProject,
+    ProjectDocument,
+    ProjectDocumentIndex,
+    ProjectReceipt,
+)
 
 
 class ProjectConflictError(ValueError):
     """A retry conflicts with already stored state."""
+
+
+class ProjectDocumentNotFoundError(LookupError):
+    """A requested document is not explicitly published by the project."""
 
 
 class ProjectRepository(ABC):
@@ -55,6 +64,16 @@ class ProjectWorkspace(ABC):
     @abstractmethod
     async def context(self, project: ForgeProject) -> tuple[str, str]:
         """Return bounded project context and its Git revision."""
+
+    @abstractmethod
+    async def documents(self, project: ForgeProject) -> ProjectDocumentIndex:
+        """List repository-published text documents at a single committed revision."""
+
+    @abstractmethod
+    async def read_document(
+        self, project: ForgeProject, document_id: str, expected_revision: str | None = None
+    ) -> ProjectDocument:
+        """Read only an explicitly published committed document, without workflow inference."""
 
     @abstractmethod
     async def archive_receipt(self, project: ForgeProject, receipt: ProjectReceipt) -> None:

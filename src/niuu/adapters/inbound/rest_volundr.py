@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -887,6 +888,7 @@ def create_volundr_router(
             ("GET", ""),
             ("PATCH", ""),
             ("GET", "context"),
+            ("GET", "documents"),
             ("GET", "receipts"),
             ("POST", "receipts"),
             ("POST", "export"),
@@ -898,7 +900,17 @@ def create_volundr_router(
                 UUID(pieces[1])
             except ValueError as exc:
                 raise HTTPException(422, "Invalid receipt ID") from exc
-        if (request.method, operation) not in allowed and not (request.method == "POST" and is_ack):
+        is_document = (
+            request.method == "GET"
+            and len(pieces) == 2
+            and pieces[0] == "documents"
+            and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", pieces[1]) is not None
+        )
+        if (
+            (request.method, operation) not in allowed
+            and not (request.method == "POST" and is_ack)
+            and not is_document
+        ):
             raise HTTPException(404, "Unknown project operation")
         instance = await _resolve_target_instance(
             service,

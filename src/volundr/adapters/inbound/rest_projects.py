@@ -6,8 +6,13 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from volundr.domain.project_ports import ProjectConflictError
-from volundr.domain.projects import ForgeProject, ProjectReceipt
+from volundr.domain.project_ports import ProjectConflictError, ProjectDocumentNotFoundError
+from volundr.domain.projects import (
+    ForgeProject,
+    ProjectDocument,
+    ProjectDocumentIndex,
+    ProjectReceipt,
+)
 from volundr.domain.services.projects import ProjectNotFoundError, ProjectService
 from volundr.domain.services.session import SessionAccessDeniedError
 
@@ -30,7 +35,7 @@ class ProjectUpdate(BaseModel):
 async def project_result(operation):
     try:
         return await operation
-    except ProjectNotFoundError as exc:
+    except (ProjectNotFoundError, ProjectDocumentNotFoundError) as exc:
         raise HTTPException(404, str(exc)) from exc
     except ProjectConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -90,6 +95,23 @@ def create_projects_router(service: ProjectService, principal_for_request) -> AP
         project = await project_result(service.get(project_id, principal))
         context, revision = await project_result(service.workspace.context(project))
         return {"project_id": project.id, "context": context, "revision": revision}
+
+    @router.get("/{project_id}/documents")
+    async def project_documents(request: Request, project_id: UUID) -> ProjectDocumentIndex:
+        principal = await principal_for_request(request)
+        project = await project_result(service.get(project_id, principal))
+        return await project_result(service.workspace.documents(project))
+
+    @router.get("/{project_id}/documents/{document_id}")
+    async def read_project_document(
+        request: Request,
+        project_id: UUID,
+        document_id: str,
+        revision: str | None = Query(default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"),
+    ) -> ProjectDocument:
+        principal = await principal_for_request(request)
+        project = await project_result(service.get(project_id, principal))
+        return await project_result(service.workspace.read_document(project, document_id, revision))
 
     @router.get("/{project_id}/receipts")
     async def receipts(

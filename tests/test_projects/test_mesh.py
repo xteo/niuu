@@ -104,3 +104,26 @@ def test_checkout_discovery_and_creation_route_only_to_selected_host():
         json={"instance_id": "spark", "workspace_path": "/absent"},
     )
     assert response.status_code == 404 and route.called
+
+
+@respx.mock
+def test_committed_documents_keep_selected_host_revision_and_failure():
+    project_id = str(uuid4())
+    revision = "a" * 40
+    index = respx.get(f"http://spark.test/api/v1/forge/projects/{project_id}/documents").mock(
+        return_value=httpx.Response(200, json={"revision": revision, "documents": []})
+    )
+    read = respx.get(f"http://spark.test/api/v1/forge/projects/{project_id}/documents/notes").mock(
+        return_value=httpx.Response(200, json={"revision": revision, "content": "Exact notes"})
+    )
+    api = client()
+    root = f"/api/v1/forge/projects/{project_id}/documents"
+    assert api.get(root + "?instance_id=spark", headers=_headers()).json()["revision"] == revision
+    response = api.get(root + f"/notes?instance_id=spark&revision={revision}", headers=_headers())
+    assert response.json()["content"] == "Exact notes" and index.called and read.called
+    assert read.calls[-1].request.url.params["revision"] == revision
+    assert read.calls[-1].request.url.params["instance_id"] == "spark"
+    read.mock(return_value=httpx.Response(409, json={"detail": "Project documents changed"}))
+    assert api.get(root + "/notes?instance_id=spark", headers=_headers()).status_code == 409
+    assert api.post(root + "/notes?instance_id=spark", headers=_headers()).status_code == 404
+    assert api.get(root + "/notes/extra?instance_id=spark", headers=_headers()).status_code == 404

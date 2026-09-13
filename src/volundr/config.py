@@ -1613,6 +1613,15 @@ class ProjectsConfig(BaseModel):
     workspace_adapter: str = "volundr.adapters.outbound.project_workspace.GitProjectWorkspace"
     workspace_kwargs: dict[str, Any] = Field(default_factory=dict)
     context_bytes: int = Field(default=8192, ge=1024, le=65536)
+    document_bytes: int = Field(
+        default=65536,
+        ge=1024,
+        le=1048576,
+        description="Maximum bytes of one repository-published text document",
+    )
+    document_count: int = Field(
+        default=32, ge=1, le=128, description="Maximum document descriptors in the project manifest"
+    )
     git_timeout_seconds: float = Field(default=15.0, gt=0)
     dispatch_wait_seconds: float = Field(default=30.0, gt=0)
     dispatch_poll_seconds: float = Field(default=0.05, gt=0)

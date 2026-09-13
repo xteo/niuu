@@ -927,6 +927,8 @@ def create_app(
                 project_workspace = import_class(project_config.workspace_adapter)(
                     allowed_prefixes=settings.local_mounts.allowed_prefixes,
                     context_bytes=project_config.context_bytes,
+                    document_bytes=project_config.document_bytes,
+                    document_count=project_config.document_count,
                     git_timeout=project_config.git_timeout_seconds,
                     **project_config.workspace_kwargs,
                 )

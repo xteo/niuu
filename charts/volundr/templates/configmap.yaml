@@ -32,6 +32,11 @@ data:
     server_port: {{ .Values.service.targetPort | default 8080 }}
     openshell_internal_gateway_url: {{ .Values.config.openshellInternalGatewayUrl | default "http://openshell.openshell.svc.cluster.local:8080" | quote }}
 
+    {{- with .Values.projects }}
+    projects:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+
     cors:
       allowed_origins:
         {{- range .Values.config.cors.allowedOrigins }}

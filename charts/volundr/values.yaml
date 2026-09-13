@@ -1926,3 +1926,10 @@ personaSource:
   mountPath: /etc/ravn/personas
   # -- Volundr base URL that sidecars call to fetch personas (http mode)
   httpBaseUrl: http://volundr:8080
+
+
+# Generic Git-backed project storage and explicit text-document publication.
+# Snake-case keys map directly to ProjectsConfig; no workflow state is encoded here.
+projects:
+  document_bytes: 65536
+  document_count: 32

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SessionReference(BaseModel):
@@ -95,3 +95,50 @@ class ProjectReceipt(BaseModel):
         if any(len(item) > 2048 for item in self.evidence):
             raise ValueError("Evidence references must be at most 2048 characters")
         return self
+
+
+class ProjectDocumentDescriptor(BaseModel):
+    """Repository-selected text publication, not a workflow/status or author claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    title: str = Field(min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=512)
+
+    @field_validator("title")
+    @classmethod
+    def readable_title(cls, value: str) -> str:
+        if not value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("Document title must be readable single-line text")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def safe_text_path(cls, value: str) -> str:
+        if (
+            value.startswith(("/", "~"))
+            or "\\" in value
+            or ":" in value
+            or any(ord(c) < 32 for c in value)
+            or any(part in {"", ".", ".."} or part.lower() == ".git" for part in value.split("/"))
+            or not value.lower().endswith((".md", ".txt"))
+        ):
+            raise ValueError("Document path must name checkout-relative Markdown or text")
+        return value
+
+
+class ProjectDocumentIndex(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    project_id: UUID
+    revision: str
+    documents: list[ProjectDocumentDescriptor]
+
+
+class ProjectDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    project_id: UUID
+    revision: str
+    document: ProjectDocumentDescriptor
+    content: str
+    byte_size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

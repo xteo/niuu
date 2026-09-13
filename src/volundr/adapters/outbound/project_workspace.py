@@ -15,10 +15,26 @@ from volundr.domain.projects import ForgeProject, ProjectReceipt
 
 
 class GitProjectWorkspace(ProjectWorkspace):
-    def __init__(self, allowed_prefixes=(), context_bytes=8192, git_timeout=15.0, **_kwargs):
+    def __init__(
+        self,
+        allowed_prefixes=(),
+        context_bytes=8192,
+        git_timeout=15.0,
+        document_bytes=65536,
+        document_count=32,
+        **_kwargs,
+    ):
         self._prefixes = tuple(Path(p).resolve() for p in allowed_prefixes)
         self._context_bytes = context_bytes
         self._git_timeout = git_timeout
+        from volundr.adapters.outbound.project_documents import GitProjectDocumentReader
+
+        self._documents = GitProjectDocumentReader(
+            manifest_bytes=context_bytes,
+            document_bytes=document_bytes,
+            document_count=document_count,
+            git_timeout=git_timeout,
+        )
 
     def _root(self, project: ForgeProject) -> Path:
         return self._checkout_root(project.workspace_path)
@@ -236,6 +252,16 @@ class GitProjectWorkspace(ProjectWorkspace):
         # but not committed yet. Never label dirty content as the Git commit alone.
         digest = hashlib.sha256(context.encode()).hexdigest()
         return context, f"{out.decode().strip()}@sha256:{digest}"
+
+    async def documents(self, project: ForgeProject):
+        return await self._documents.index(self._root(project), project)
+
+    async def read_document(
+        self, project: ForgeProject, document_id: str, expected_revision: str | None = None
+    ):
+        return await self._documents.read(
+            self._root(project), project, document_id, expected_revision
+        )
 
     async def archive_receipt(self, project: ForgeProject, receipt: ProjectReceipt) -> None:
         root = self._root(project)
