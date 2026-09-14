@@ -27,7 +27,13 @@ The parent native thread is `01a09fd1-38e6-7b13-84c0-bbf0df249a47`.
 Earlier read-only native identity evidence is preserved in
 [native read results](../codex-native-agent-ui-20260914/native-read-results.json).
 Repeated SubagentStart/tool calls are attempts on reusable agents, not automatically
-new agent identities. Second-phase follow-up status is recorded in the task plan.
+new agent identities. Both second-phase follow-ups completed and their results were
+inspected: Laplace supplied official long-session examples and pinned NTM controller
+evidence; Gibbs supplied public Codex policy/message/reload and cross-task sources.
+Parent independently checked the selector, message dispatch, reload, NTM controller
+and restore code, and retrieved the official cross-task PR descriptions. No native
+children remain doing this research; completion callbacks are recorded in Forge's
+session history. No additional child agents were launched.
 
 ## Tests actually executed
 
@@ -67,6 +73,21 @@ It is not a verified property of an existing live Claude session.
 Effective runtime verification is strongest for this runner's Codex 0.154.0.
 Claude PATH version is child-reported and not a live-launcher qualification.
 Other current installed effective runtimes are explicitly unverified.
+
+The effective schema's ignored `multiAgentMode` field was an important correction
+to the earlier audit. [Extracted mode contract](codex-mode-contract.json) preserves
+the field-level deprecation alongside the retained enum. The matching public source
+was checked at `rust-v0.154.0`; tag match is not binary identity or proof of effective
+private model-catalog overrides.
+
+[Machine-readable comparison](capability-matrix.json) is a research classification,
+not a claimed current Skuld endpoint response. [Document checks](document-checks.json)
+record JSON/link/schema consistency, not native runtime acceptance.
+
+Document validation checked five Markdown artifacts, 26 local links, six capability
+rows, 20 downloaded-source hashes and the field-level mode deprecation, with no
+errors. A final cross-artifact edit also corrects the superseded first audit's
+policy table. Final Git checks and secret scan apply only to this runner's branch.
 
 ## Remaining qualification
 

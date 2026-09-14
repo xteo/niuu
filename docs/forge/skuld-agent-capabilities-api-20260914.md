@@ -48,6 +48,13 @@ Absence from PATH is not evidence that a configured absolute-path launcher is ab
 Public sources are linked near claims; source hashes, test results and qualification
 limits are in the [evidence record](evidence/skuld-cross-harness-20260914/README.md).
 
+**Codex mode correction:** the effective 0.154.0 schema retains a `MultiAgentMode`
+type, but marks `TurnStartParams.multiAgentMode` deprecated and ignored, directing
+clients to `effort:"ultra"` for proactive delegation. Do not expose the retained
+enum as an independently functioning control. Plan/Default remains a separate
+mode. The [extracted contract](evidence/skuld-cross-harness-20260914/codex-mode-contract.json)
+corrects the earlier audit's interpretation; no runtime setting was changed.
+
 ## Shared language
 
 | Term | Common meaning | Must remain distinct from |
@@ -63,6 +70,7 @@ limits are in the [evidence record](evidence/skuld-cross-harness-20260914/README
 | Task | Identified work item when the source provides such an object | A plan step without stable identity or a background shell job |
 | Goal | Persisted objective with its own lifecycle where provided | The next queued user message |
 | Submission | A particular input with identity, target and delivery policy | Its text or the eventual work result |
+| Native cross-task reference | A client-authorized reference to another runtime conversation | Checklist task ID or membership in the native child tree |
 | Message | Communication from a known actor to a target | Human authorization or necessarily a new task |
 | Result | Runtime outcome plus available artifacts/evidence | Independently reviewed acceptance |
 
@@ -101,7 +109,7 @@ these distinctions rather than collapsing them into “send prompt.”
 |---|---|---|---|---|
 | **Claude/tmux** | Native Plan Mode; separate plan approval/permissions | `TaskCreate/Get/List/Update` with IDs; team ownership/dependencies; legacy `TodoWrite` | Tasks can persist and survive compaction. Busy composer messages may enter the **same turn** after tools | Task tools are model/config-dependent in recent versions; newer models including Opus 5 do not get them by default [C5][C6] |
 | **Codex** | Native Plan/Default collaboration modes | `turn/plan/updated` steps/status; plan-text item; separate persistent thread goal | Experimental `thread/queue/*` add/list/update/delete/reorder/start; crash/dispatch semantics not established by schema | Progress steps have no native task IDs/assignees/dependencies; no generic team task-board API found [O1] |
-| **Grok** | Native plan mode and restricted plan child type | ACP plan entries with content, priority and status | Vendor documents resumable sessions and separate background workflows; future-input details are operation-specific | Parent Plan Mode does not itself edit-gate children or make every shell command read-only [G4][G5] |
+| **Grok** | Native plan mode and restricted plan child type | ACP plan entries with content, priority and status | Vendor documents resumable sessions and separate background workflows; future-input details are operation-specific | Parent Plan Mode does not itself edit-gate children or make every shell command read-only [G4][G5][G6] |
 | **Muse** | A distinct planning-mode API was not established; do not relabel approval policy as such | Native todo snapshots and goal state; todo entries have text/status/activeForm, **not stable IDs in inspected schema** | `turn/start ifBusy:queue|steer|replace`; snapshot queued turns; exact `turn/unqueue`; vendor documents durable acknowledgements | Snapshot revision is explicitly diagnostic, not an ordering guard; queue reorder/task assignment not established [M1][M2] |
 | **Pi** | E: official plan-mode example, not core feature | Example extracts plan steps and completion markers, persists extension state; not a native shared task board | Core `steer` versus `follow_up`; session JSONL history; pending-queue crash durability U | Current steering boundary is after current assistant tool calls, before next model call; older docs differ [P1][P2][P4] |
 | **OpenCode** *(supplementary)* | Native Plan role with permission restrictions | Native session todo read API | Persisted sessions; async prompts; durable reorderable future-objective queue U | Todo capability is role-dependent; not all child roles have it [OC1][OC2] |
@@ -121,6 +129,13 @@ provides single/parallel/chain work with bounded concurrency; the plan example u
 text extraction and completion markers with persisted extension state. Those are
 real example implementations, but not installed capabilities of every Pi session.
 Their metadata must identify the extension and version ([P3][P4]).
+
+Grok also has a distinct native workflow layer: phased background agent runs,
+saved progress, per-agent visibility and agent-count budgets. The vendor describes
+pause/resume without repeating finished work and a `/workflows` view. Treat that as
+a native workflow capability to expose—not proof that ACP's ordinary plan entries
+are executable workflows, and not a reason to install a second workflow engine.
+Published scale/budget claims are not benchmarks from this audit ([G6]).
 
 ## What Skuld actually exposes at the pinned source
 
@@ -203,6 +218,7 @@ through the full host route, not only a broker-local URL.
 | `GET /plans?agent_id=&kind=` | Proposed-plan text or progress snapshot, source revision and native scope |
 | `GET /tasks?agent_id=&owner_id=&state=` | Actual task objects where supported, with source identity and dependencies |
 | `GET /goals?agent_id=` | Native objectives and lifecycle, separately from plans |
+| `GET /workflow-runs?agent_id=` | Optional native workflow phases, budgets and child membership; unsupported explicitly where absent |
 | `GET /submissions?agent_id=&state=` | Input admissions, queued work, consumption and disposition |
 | `GET /operations/{id}` | Control outcome, acknowledgement level and target-state evidence |
 | `GET /events?after=&agent_id=` | Cursor-based SSE or equivalent existing WS subscription; gap reported explicitly |
@@ -234,8 +250,9 @@ Each operation needs more than a transport boolean:
   "native_support": "supported",
   "enabled": true,
   "adapter_support": "not_implemented",
-  "control_path": "parent_mediated",
+  "control_path": "native_rpc",
   "target_eligible": false,
+  "available_alternatives": ["parent_mediated_request"],
   "qualification": "read_only_observed",
   "reason": "Native child cannot accept direct input",
   "applies_at": "runtime_defined_boundary",
@@ -263,6 +280,7 @@ Do not report parent-mediated model requests as deterministic direct RPC control
 | `POST /tasks`; `PUT /tasks/{id}` | Native-backed task CRUD when exposed; creation/assignment/status change is not execution or evidence acceptance |
 | `POST /plans/{id}/operations` | Request revision/implementation if supported; a read-only plan snapshot is not directly editable task data |
 | `POST /goals/{id}/operations` | Native goal actions when available, retaining paused/blocked/limited states |
+| `POST /workflow-runs/{id}/operations` | Advertised native pause/resume/stop actions, never implicit execution of a displayed checklist |
 | `POST /controls/{id}/responses` | Answer the exact child approval/question; no promotion of agent text into user consent |
 | `POST /native-operations` | Advertised, schema-validated namespaced operations for genuine runtime-specific features, not unrestricted JSON-RPC tunneling |
 
@@ -278,6 +296,13 @@ budget denied and delivery uncertainty. Stable rejection codes are better than a
 silent control downgrade. Duplicate same-ID requests must return the original
 receipt or conflict on changed payload. Equal text with different request IDs is
 two different requests; do not content-deduplicate it.
+
+Codex also has TUI-provided cross-task tools built on App Server thread operations,
+separate from its nested child registry. Discover this as `native_cross_task_access`
+with an explicit authorized scope; use typed namespaced operations for additional
+client-specific actions. Do not overload checklist `/tasks` with conversation
+management or assume these tools exist in a headless App Server connection.
+See the [second-phase finding](codex-collaboration-workflows-20260914.md#cross-task-tools-are-another-native-client-surface).
 
 ### Native routing examples
 
@@ -379,6 +404,7 @@ neither is proof of an arbitrary installed runtime's enabled capabilities.
 - **[G3]** xAI, [feature-gated child messaging, pinned source](https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs).
 - **[G4]** xAI, [Plan Mode](https://docs.x.ai/build/features/plan-mode).
 - **[G5]** xAI, [Headless sessions and ACP](https://docs.x.ai/build/cli/headless-scripting).
+- **[G6]** xAI, [Workflows in Grok Build](https://x.ai/news/workflows), July 23, 2026.
 - **[M1]** Meta, [MSP declarations, pinned source](https://github.com/meta-models/muse-code-sdk/blob/fbce769ccb75ab971d00e01a00fe076de4c773fc/schema/msp/msp.d.ts), especially child controls 1275–1325, snapshots 1240–1250, todo 1339–1359 and turns 1527–1611.
 - **[M2]** Meta, [SDK/runtime changelog, pinned source](https://github.com/meta-models/muse-code-sdk/blob/fbce769ccb75ab971d00e01a00fe076de4c773fc/CHANGELOG.md#L195-L208).
 - **[P1]** Pi maintainers, [Coding-agent README](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
@@ -388,7 +414,7 @@ neither is proof of an arbitrary installed runtime's enabled capabilities.
 - **[OC1]** OpenCode, [Agents and roles](https://opencode.ai/docs/agents).
 - **[OC2]** OpenCode, [HTTP server API](https://opencode.ai/docs/server).
 
-Second-phase Codex workflow research is in progress; its document will be linked here when ready.
+Second phase: [Codex collaboration and long-session research](codex-collaboration-workflows-20260914.md).
 
 [C1]: https://code.claude.com/docs/en/subagents
 [C2]: https://code.claude.com/docs/en/agent-teams
@@ -403,6 +429,7 @@ Second-phase Codex workflow research is in progress; its document will be linked
 [G3]: https://github.com/xai-org/grok-build/blob/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs
 [G4]: https://docs.x.ai/build/features/plan-mode
 [G5]: https://docs.x.ai/build/cli/headless-scripting
+[G6]: https://x.ai/news/workflows
 [M1]: https://github.com/meta-models/muse-code-sdk/blob/fbce769ccb75ab971d00e01a00fe076de4c773fc/schema/msp/msp.d.ts
 [M2]: https://github.com/meta-models/muse-code-sdk/blob/fbce769ccb75ab971d00e01a00fe076de4c773fc/CHANGELOG.md#L195-L208
 [P1]: https://github.com/earendil-works/pi/tree/main/packages/coding-agent

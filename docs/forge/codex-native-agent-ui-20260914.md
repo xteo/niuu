@@ -36,10 +36,15 @@ These are existing client surfaces, not a claim that all clients expose identica
 controls. [Official subagent controls](https://learn.chatgpt.com/docs/agent-configuration/subagents#managing-subagents).
 
 Ultra's proactive delegation concerns **when Codex chooses to delegate**, not a
-different agent-tree protocol. Keep reasoning effort and delegation policy distinct:
-the installed experimental schema has `multiAgentMode` values `explicitRequestOnly`,
-`proactive`, or custom instructions, separately from `effort`. Do not infer native
-policy solely from a frontend's “Ultra” label. No mode settings were changed here.
+different agent-tree protocol. **Correction from the second-phase audit:** the
+installed schema retains `MultiAgentMode` values `explicitRequestOnly`,
+`proactive`, or custom instructions, but the **turn-start field is deprecated and
+ignored**. Its description directs clients to `effort: "ultra"` for proactive
+multi-agent behavior. The retained enum is not proof of an independently effective
+switch. Plan/Default mode is still a separate concept. Verify effective version,
+model-supported effort and applicable instructions rather than infer behavior from
+a UI label. No mode settings were changed here. See the
+[extracted effective contract](evidence/skuld-cross-harness-20260914/codex-mode-contract.json).
 
 ## 1. List the agents and identify which are running
 

@@ -22,8 +22,8 @@ because it is also registered; its Build/Plan roles are not separate harnesses.
 | R4 | Pi, OpenCode and effective Codex baseline | Parent | completed | — | Primary sources and version-qualified evidence |
 | R5 | Agent and planning comparison matrices | Parent | completed | R1–R4 | Native/projected/unknown distinctions in comparison report |
 | R6 | Common vocabulary, proposed API and acceptance matrix | Parent | completed | R5 | First design draft, not approved implementation |
-| R7 | Codex long sessions, supervisor/tmux patterns, Ultra | Parent with two bounded child follow-ups | running | R6 | Separate second-phase report; facts vs inference |
-| R8 | Validate citations/contracts, commit/push and hand off | Parent | pending | R6–R7 | Documents, validation output, coordinator receipt |
+| R7 | Codex long sessions, supervisor/tmux patterns, Ultra | Parent with two bounded child follow-ups | completed | R6 | Public selector/message/reload sources, official long-session examples and practitioner source inspected |
+| R8 | Validate citations/contracts, commit/push and hand off | Parent | running | R6–R7 | Documents, validation output, coordinator receipt |
 
 This Markdown task register is a durable research checklist, not a background
 scheduler. The parent actively executes and updates it. Runtime completion is
