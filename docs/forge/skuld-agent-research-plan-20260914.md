@@ -23,7 +23,7 @@ because it is also registered; its Build/Plan roles are not separate harnesses.
 | R5 | Agent and planning comparison matrices | Parent | completed | R1–R4 | Native/projected/unknown distinctions in comparison report |
 | R6 | Common vocabulary, proposed API and acceptance matrix | Parent | completed | R5 | First design draft, not approved implementation |
 | R7 | Codex long sessions, supervisor/tmux patterns, Ultra | Parent with two bounded child follow-ups | completed | R6 | Public selector/message/reload sources, official long-session examples and practitioner source inspected |
-| R8 | Validate citations/contracts, commit/push and hand off | Parent | running | R6–R7 | Documents, validation output, coordinator receipt |
+| R8 | Validate citations/contracts, commit/push and hand off | Parent | completed | R6–R7 | Reports pushed at `d476938a`; matching saved receipt response; non-dry-run OpenClaw message ID |
 
 This Markdown task register is a durable research checklist, not a background
 scheduler. The parent actively executes and updates it. Runtime completion is
@@ -54,3 +54,20 @@ Source base: `21bb0de6ec0ec467865382dd99640cf37b6cffdb`; prior audit `b67d95c6`.
 Runner: `thor:0a713405-79b2-566c-a953-802e3a080c49`.
 Supervisor: `thor:8f20102d-6da7-58aa-98c2-e0bce2deab97`.
 Session remains open for direct iteration after the research deliverables.
+
+## Outcome
+
+Both research phases are complete as research/design, not implementation or product
+acceptance. [Comparison and API proposal](skuld-agent-capabilities-api-20260914.md)
+and [Codex workflow study](codex-collaboration-workflows-20260914.md) are available
+as in-session full host-path links. Both existing children finished; key findings
+were inspected. No orphan research, extra Forge sessions or fanout remain.
+
+Final coordinator handoff receipt is saved privately before delivery under
+`.local/audit/cross-harness-final-receipt.json`, with the matching response.
+OpenClaw completion milestone was delivered with a returned message ID and
+`dryRun:false`; no new hourly schedule. Delivery is not coordinator acceptance.
+
+Pending user iteration: API vocabulary, capability honesty, read-only snapshot
+contract, then separately authorized adapter/UI work and live qualification.
+The Ultra field deprecation correction is reflected in both earlier reports.
