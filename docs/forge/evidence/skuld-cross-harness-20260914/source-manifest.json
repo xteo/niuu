@@ -1,0 +1,90 @@
+[
+  {
+    "name": "pi-rpc",
+    "requested_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/rpc.md",
+    "final_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/rpc.md",
+    "sha256": "15fcd26bee72777b373fd5f2edd77091a01cadd4de95e48b08422ced0552a28d",
+    "bytes": 42698,
+    "retrieved_at": "2026-09-14T22:48:55.922009+00:00"
+  },
+  {
+    "name": "pi-readme",
+    "requested_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/README.md",
+    "final_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/README.md",
+    "sha256": "b5daa09877da34d122818e03436b51755bc1b5044ae8ab810df63f02888f1ebe",
+    "bytes": 33107,
+    "retrieved_at": "2026-09-14T22:48:56.095572+00:00"
+  },
+  {
+    "name": "pi-subagent-example",
+    "requested_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/examples/extensions/subagent/README.md",
+    "final_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/examples/extensions/subagent/README.md",
+    "sha256": "6a888330bf974657751e09f5d375a9039872d59d6606fc217c5105c7eca51b1a",
+    "bytes": 6298,
+    "retrieved_at": "2026-09-14T22:48:56.310388+00:00"
+  },
+  {
+    "name": "pi-plan-example",
+    "requested_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/examples/extensions/plan-mode/README.md",
+    "final_url": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/examples/extensions/plan-mode/README.md",
+    "sha256": "1ff8d611b8fbafef4ca1e3dbc72136fbcc166461b69f859b5e961b15147bff39",
+    "bytes": 2009,
+    "retrieved_at": "2026-09-14T22:48:56.507928+00:00"
+  },
+  {
+    "name": "claude-teams",
+    "requested_url": "https://code.claude.com/docs/en/agent-teams.md",
+    "final_url": "https://code.claude.com/docs/en/agent-teams.md",
+    "sha256": "5b0e96d7dd9d36179705b2ebb99af2ff13cb9d902c15944a816285d5110e62bc",
+    "bytes": 41274,
+    "retrieved_at": "2026-09-14T22:48:56.689732+00:00"
+  },
+  {
+    "name": "claude-tasks",
+    "requested_url": "https://code.claude.com/docs/en/agent-sdk/todo-tracking.md",
+    "final_url": "https://code.claude.com/docs/en/agent-sdk/todo-tracking.md",
+    "sha256": "62c37c4a0e0c113eb21600c9b532e06be7349b7611996dfe9bc09ca01b83e69f",
+    "bytes": 19339,
+    "retrieved_at": "2026-09-14T22:48:56.844561+00:00"
+  },
+  {
+    "name": "claude-hooks",
+    "requested_url": "https://code.claude.com/docs/en/hooks.md",
+    "final_url": "https://code.claude.com/docs/en/hooks.md",
+    "sha256": "9611fc034105246f293245d3938daa0f1042911f0cd15653e9648a3d3d7e851d",
+    "bytes": 322622,
+    "retrieved_at": "2026-09-14T22:48:57.047602+00:00"
+  },
+  {
+    "name": "grok-task",
+    "requested_url": "https://raw.githubusercontent.com/xai-org/grok-build/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/task.rs",
+    "final_url": "https://raw.githubusercontent.com/xai-org/grok-build/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/task.rs",
+    "sha256": "8f302dc0ee1534d0b12d74c993b675240cea1b706eb8c13f57995d6c186e9ca5",
+    "bytes": 35032,
+    "retrieved_at": "2026-09-14T22:49:31.647735+00:00"
+  },
+  {
+    "name": "grok-message",
+    "requested_url": "https://raw.githubusercontent.com/xai-org/grok-build/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs",
+    "final_url": "https://raw.githubusercontent.com/xai-org/grok-build/37949780c144e37df692e3d669051a21fec24f20/crates/codegen/xai-grok-shell/src/extensions/subagent_message.rs",
+    "sha256": "71eb1fb57aa1cc0296f01ca1de061e0221eb699c3fdad2a027cc7c6e1b0df6c6",
+    "bytes": 5211,
+    "retrieved_at": "2026-09-14T22:49:31.666320+00:00"
+  },
+  {
+    "name": "muse-msp",
+    "requested_url": "https://raw.githubusercontent.com/meta-models/muse-code-sdk/fbce769ccb75ab971d00e01a00fe076de4c773fc/schema/msp/msp.d.ts",
+    "final_url": "https://raw.githubusercontent.com/meta-models/muse-code-sdk/fbce769ccb75ab971d00e01a00fe076de4c773fc/schema/msp/msp.d.ts",
+    "sha256": "3ecfe349a8f76d934318c580c19ed6e120deaf834a8aa83578f54d09297134e8",
+    "bytes": 103484,
+    "retrieved_at": "2026-09-14T22:49:31.694689+00:00"
+  },
+  {
+    "name": "muse-changelog",
+    "requested_url": "https://raw.githubusercontent.com/meta-models/muse-code-sdk/fbce769ccb75ab971d00e01a00fe076de4c773fc/CHANGELOG.md",
+    "final_url": "https://raw.githubusercontent.com/meta-models/muse-code-sdk/fbce769ccb75ab971d00e01a00fe076de4c773fc/CHANGELOG.md",
+    "sha256": "cd3c5f31ec196a2bdfe5186550f64802c6fc7366ca08164ff332937fa125f294",
+    "bytes": 34472,
+    "retrieved_at": "2026-09-14T22:49:31.716417+00:00"
+  }
+]
