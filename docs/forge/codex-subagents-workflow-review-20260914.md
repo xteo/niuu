@@ -2,6 +2,12 @@
 
 **Initial review, 14 September 2026. Proposal, not an implementation or deployment.**
 
+**Scope correction:** the user subsequently clarified that the objective is to
+understand and expose Codex's existing native subagents/APIs, not design another
+workflow. Read [the focused native agent/frontend review](codex-native-agent-ui-20260914.md)
+for the current answer, including live direct-input capability checks. Workflow
+proposals below are historical context, not the current implementation objective.
+
 ## Recommendation
 
 Use bounded native Codex children now for independent read/review work, retain
