@@ -2,6 +2,24 @@
 
 14 September 2026, after the initial review.
 
+## Authoritative clarification — full host-path Markdown links
+
+The user rejected packaging the document as a raw session-download URL. The desired
+mechanism is a Markdown link whose target is the **full absolute path on the remote
+host**; Lexi resolves/opens that file through Forge. Use this format in session:
+
+```markdown
+[Open the Markdown report](/home/thor/repos/worktrees/niuu-codex-subagents-20260914/docs/forge/codex-subagents-workflow-review-20260914.md)
+```
+
+This supersedes the attachment-card/download-URL interpretation below. Prefer the
+full host-path link for report delivery; do not substitute GitHub or hand-built
+HTTP API URLs. The earlier staging failure remains a separate observation, not a
+blocker to this requested link format. The user-facing path link has been provided;
+opening it on the user's device has not been independently observed.
+
+## Earlier interpretation and attempted delivery (superseded)
+
 The user requested the Markdown directly in this session as a remotely openable
 document using normal local review, rather than a GitHub link. **Prefer in-session
 documents for future deliverables.** Git remains durable engineering evidence,
