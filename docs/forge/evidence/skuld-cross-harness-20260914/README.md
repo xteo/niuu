@@ -84,10 +84,14 @@ private model-catalog overrides.
 not a claimed current Skuld endpoint response. [Document checks](document-checks.json)
 record JSON/link/schema consistency, not native runtime acceptance.
 
-Document validation checked five Markdown artifacts, 26 local links, six capability
+Document validation checked Markdown artifacts and local links, six capability
 rows, 20 downloaded-source hashes and the field-level mode deprecation, with no
-errors. A final cross-artifact edit also corrects the superseded first audit's
-policy table. Final Git checks and secret scan apply only to this runner's branch.
+errors; exact counts/timestamp are in the JSON record. The superseded first audit's
+policy table is corrected too. Final Git checks and secret scan apply only to this
+runner's branch. Completion delivery evidence is private under
+`.local/audit/cross-harness-final-{receipt,notification}-response.json`; the receipt
+identifier matched and notification had `dryRun:false` with a returned message ID.
+Delivery is not coordinator acceptance or authority to implement the proposal.
 
 ## Remaining qualification
 
