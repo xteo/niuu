@@ -1,3 +1,5 @@
+import { useLazyToolDetail } from '../HistoryDetailsContext';
+import { ConversationLink } from '../ConversationResources';
 import { useState } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { cn } from '../../../utils/cn';
@@ -10,6 +12,7 @@ const MAX_OUTPUT_LINES = 20;
 
 function extractPreview(block: ToolUseBlock): string {
   const { name, input } = block;
+  if (input?._elided_input) return String(input.preview ?? '');
   switch (name) {
     case 'Bash':
       return (String(input.command ?? '').split('\n')[0] ?? '').slice(0, 80);
@@ -42,7 +45,12 @@ interface ToolDetailProps {
 function ToolDetail({ block, result }: ToolDetailProps) {
   const [showFull, setShowFull] = useState(false);
   const { name, input } = block;
-  const output = result?.content ?? '';
+  const output =
+    typeof result?.content === 'string'
+      ? result.content
+      : result?.content == null
+        ? ''
+        : JSON.stringify(result.content, null, 2);
   const outputLines = output.split('\n');
   const isTruncated = outputLines.length > MAX_OUTPUT_LINES && !showFull;
   const displayedOutput = isTruncated
@@ -80,7 +88,11 @@ function ToolDetail({ block, result }: ToolDetailProps) {
   if (name === 'Edit') {
     return (
       <div className="niuu-chat-tool-detail">
-        <p className="niuu-chat-tool-filepath">{String(input.file_path ?? input.path ?? '')}</p>
+        <p className="niuu-chat-tool-filepath">
+          <ConversationLink href={String(input.file_path ?? input.path ?? '')}>
+            {String(input.file_path ?? input.path ?? '')}
+          </ConversationLink>
+        </p>
         {input.old_string != null && (
           <pre className="niuu-chat-tool-diff niuu-chat-tool-diff--old">
             {String(input.old_string)}
@@ -98,7 +110,11 @@ function ToolDetail({ block, result }: ToolDetailProps) {
   if (name === 'Write') {
     return (
       <div className="niuu-chat-tool-detail">
-        <p className="niuu-chat-tool-filepath">{String(input.file_path ?? input.path ?? '')}</p>
+        <p className="niuu-chat-tool-filepath">
+          <ConversationLink href={String(input.file_path ?? input.path ?? '')}>
+            {String(input.file_path ?? input.path ?? '')}
+          </ConversationLink>
+        </p>
         {input.content != null && (
           <pre className="niuu-chat-tool-output-text">{String(input.content).slice(0, 200)}</pre>
         )}
@@ -109,7 +125,11 @@ function ToolDetail({ block, result }: ToolDetailProps) {
   if (name === 'Read') {
     return (
       <div className="niuu-chat-tool-detail">
-        <p className="niuu-chat-tool-filepath">{String(input.file_path ?? input.path ?? '')}</p>
+        <p className="niuu-chat-tool-filepath">
+          <ConversationLink href={String(input.file_path ?? input.path ?? '')}>
+            {String(input.file_path ?? input.path ?? '')}
+          </ConversationLink>
+        </p>
         {output && (
           <div className="niuu-chat-tool-output">
             <pre className="niuu-chat-tool-output-text">{displayedOutput}</pre>
@@ -165,6 +185,7 @@ interface ToolBlockProps {
 
 export function ToolBlock({ block, result, defaultOpen = false }: ToolBlockProps) {
   const [isOpen, setIsOpen] = useState(defaultOpen);
+  const detail = useLazyToolDetail(block, result, isOpen);
   const label = getToolLabel(block.name);
   const category = getToolCategory(block.name);
   const preview = extractPreview(block);
@@ -179,6 +200,16 @@ export function ToolBlock({ block, result, defaultOpen = false }: ToolBlockProps
         className="niuu-chat-tool-header"
         onClick={() => setIsOpen((prev) => !prev)}
         aria-expanded={isOpen}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowRight') {
+            event.preventDefault();
+            setIsOpen(true);
+          }
+          if (event.key === 'ArrowLeft' || event.key === 'Escape') {
+            event.preventDefault();
+            setIsOpen(false);
+          }
+        }}
       >
         <ToolIcon toolName={block.name} className="niuu-chat-tool-icon" />
         <span className="niuu-chat-tool-label">{label}</span>
@@ -191,7 +222,21 @@ export function ToolBlock({ block, result, defaultOpen = false }: ToolBlockProps
           )}
         </span>
       </button>
-      {isOpen && <ToolDetail block={block} result={result} />}
+      {isOpen &&
+        (detail.error ? (
+          <div className="niuu-chat-tool-detail" role="alert">
+            {detail.error}{' '}
+            <button type="button" className="niuu-chat-tool-show-more" onClick={detail.retry}>
+              Try again
+            </button>
+          </div>
+        ) : detail.loading ? (
+          <div className="niuu-chat-tool-detail" role="status">
+            Loading tool details…
+          </div>
+        ) : (
+          <ToolDetail block={detail.block} result={detail.result} />
+        ))}
     </div>
   );
 }

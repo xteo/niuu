@@ -71,8 +71,8 @@ describe('AssistantMessage', () => {
     expect(screen.getByTestId('assistant-message')).toBeInTheDocument();
   });
 
-  it('shows model badge and token info', () => {
-    render(<AssistantMessage message={assistantMsg} />);
+  it('shows model badge and token info when enabled', () => {
+    render(<AssistantMessage message={assistantMsg} showTokenUsage />);
     expect(screen.getByText('claude-sonnet')).toBeInTheDocument();
     expect(screen.getByText(/tok/)).toBeInTheDocument();
   });
@@ -85,6 +85,11 @@ describe('AssistantMessage', () => {
     const copyBtn = screen.getAllByRole('button').find((b) => b.title === 'Copy');
     if (copyBtn) fireEvent.click(copyBtn);
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('Hello user');
+  });
+
+  it('only shows Copy when message actions have no integration handlers', () => {
+    render(<AssistantMessage message={assistantMsg} />);
+    expect(screen.getAllByRole('button').map((button) => button.title)).toEqual(['Copy']);
   });
 
   it('calls onRegenerate with message id', () => {
@@ -203,4 +208,15 @@ describe('SystemMessage', () => {
     expect(screen.getByTestId('system-message')).toBeInTheDocument();
     expect(screen.getByText('Session started')).toBeInTheDocument();
   });
+});
+
+it('hides usage by default and rounds counts with a spaced arrow when enabled', () => {
+  const message = {
+    ...assistantMsg,
+    metadata: { usage: { astra: { inputTokens: 150344, outputTokens: 234 } } },
+  };
+  const view = render(<AssistantMessage message={message} />);
+  expect(screen.queryByText(/tokens/)).not.toBeInTheDocument();
+  view.rerender(<AssistantMessage message={message} showTokenUsage />);
+  expect(screen.getByText('150k → 234 tokens')).toBeInTheDocument();
 });

@@ -55,6 +55,63 @@ function makeClient() {
   };
 }
 
+it('renames through the Forge PUT contract and normalizes the returned session', async () => {
+  const client = makeClient();
+  client.put.mockResolvedValue({ id: 'sess-1', name: 'review-renamed', status: 'running' });
+  const updated = await buildVolundrHttpAdapter(client).updateSession('sess-1', {
+    name: 'review-renamed',
+  });
+  expect(client.put).toHaveBeenCalledExactlyOnceWith('/sessions/sess-1', {
+    name: 'review-renamed',
+  });
+  expect(client.patch).not.toHaveBeenCalled();
+  expect(updated).toMatchObject({ id: 'sess-1', name: 'review-renamed', status: 'running' });
+});
+
+it('assigns a project from a different host while keeping the session owner selector', async () => {
+  const client = makeClient();
+  const service = buildVolundrHttpAdapter(client);
+  client.get.mockResolvedValue({ session_id: 'worker', revision: 0, coordination: null });
+  expect(await service.getSessionProject('worker', { instanceId: 'thor' })).toMatchObject({
+    projectId: null,
+    revision: 0,
+  });
+  expect(client.get).toHaveBeenLastCalledWith('/sessions/worker/project?instance_id=thor', {
+    signal: undefined,
+  });
+  client.put.mockResolvedValue({
+    session_id: 'worker',
+    revision: 1,
+    coordination: { project_id: 'kit', role: 'worker' },
+  });
+  expect(
+    await service.assignSessionProject(
+      'worker',
+      { projectId: 'kit', projectInstanceId: 'build', expectedRevision: 0 },
+      { instanceId: 'thor' },
+    ),
+  ).toMatchObject({ projectId: 'kit', revision: 1 });
+  expect(client.put).toHaveBeenLastCalledWith('/sessions/worker/project?instance_id=thor', {
+    project_id: 'kit',
+    project_instance_id: 'build',
+    expected_revision: 0,
+  });
+  client.get.mockResolvedValue([]);
+  const signal = new AbortController().signal;
+  await service.getProjects({ instanceId: 'build', signal });
+  expect(client.get).toHaveBeenLastCalledWith('/projects?instance_id=build', { signal });
+  client.get.mockResolvedValue({});
+  await expect(service.getSessionProject('worker')).rejects.toThrow('versioned project assignment');
+  client.put.mockRejectedValue(new Error('Project host unavailable'));
+  await expect(
+    service.assignSessionProject('worker', {
+      projectId: 'kit',
+      projectInstanceId: 'build',
+      expectedRevision: 0,
+    }),
+  ).rejects.toThrow('Project host unavailable');
+});
+
 function makeClientWithBase(basePath: string) {
   return {
     ...makeClient(),
@@ -2407,4 +2464,164 @@ describe('buildVolundrHttpAdapter — full method sweep', () => {
     expect(client.post).toHaveBeenCalled();
     expect(client.delete).toHaveBeenCalled();
   });
+});
+
+describe('session resource byte downloads', () => {
+  it('preserves bytes, bearer auth, escaped file identifiers and abort signals', async () => {
+    const fetchImpl = vi.fn().mockImplementation(
+      async () =>
+        new Response(new Uint8Array([0, 255, 13, 10]), {
+          headers: { 'Content-Type': 'image/png' },
+        }),
+    );
+    const fs = buildVolundrFileSystemHttpAdapter({
+      baseUrl: 'https://thor.test/api/v1/forge',
+      fetchImpl,
+    });
+    const signal = new AbortController().signal;
+    const file = await fs.downloadFile!('session-1', '/workspace/docs/a b.png', signal);
+    expect(new Uint8Array(await file.arrayBuffer())).toEqual(new Uint8Array([0, 255, 13, 10]));
+    expect(file.type).toBe('image/png');
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe(
+      'https://thor.test/api/v1/forge/sessions/session-1/files/download?root=workspace&path=docs%2Fa+b.png',
+    );
+    expect(fetchImpl.mock.calls[0]?.[1].signal).toBe(signal);
+    expect(fetchImpl.mock.calls[0]?.[1].headers.get('Authorization')).toBe('Bearer token-123');
+    await fs.downloadPresentedFile!('session-1', 'id/with spaces', signal);
+    expect(fetchImpl.mock.calls[1]?.[0]).toBe(
+      'https://thor.test/api/v1/forge/sessions/session-1/files/presented/id%2Fwith%20spaces',
+    );
+  });
+  it('propagates failed or cancelled downloads', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('File not found', { status: 404 }))
+      .mockRejectedValueOnce(new DOMException('Cancelled', 'AbortError'));
+    const fs = buildVolundrFileSystemHttpAdapter({
+      baseUrl: 'https://thor.test/api/v1/forge',
+      fetchImpl,
+    });
+    await expect(fs.downloadFile!('s', '/workspace/missing')).rejects.toThrow();
+    await expect(fs.downloadPresentedFile!('s', 'missing')).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+  });
+});
+
+describe('Forge project grouping contract', () => {
+  it('loads projects from Forge and preserves coordination and parent references on sessions', async () => {
+    const client = makeClient();
+    const project = { id: 'lexi', name: 'Lexi', slug: 'lexi', status: 'active' };
+    client.get.mockResolvedValue([project]);
+    const service = buildVolundrHttpAdapter(client);
+    expect(await service.getProjects()).toEqual([project]);
+    expect(client.get).toHaveBeenCalledWith('/projects');
+    const normalized = __testables.normalizeSession({
+      id: 'worker',
+      name: 'iOS',
+      source: { type: 'git', repo: 'lexi', branch: 'main' },
+      status: 'running',
+      model: 'astra',
+      coordination: {
+        project_id: 'lexi',
+        role: 'worker',
+        parent: { instance_id: 'thor', session_id: 'coordinator' },
+      },
+    });
+    expect(normalized.coordination).toEqual({
+      projectId: 'lexi',
+      role: 'worker',
+      parent: { instanceId: 'thor', sessionId: 'coordinator' },
+    });
+    client.get.mockRejectedValue(new Error('host offline'));
+    await expect(service.getProjects()).rejects.toThrow('host offline');
+  });
+});
+
+it('isolates host inventory reads, preserves other cached hosts, and routes detail to its owner', async () => {
+  const client = makeClient();
+  const payload = (id: string, instance: string) => ({
+    id,
+    name: id,
+    instance_id: instance,
+    status: 'running',
+    source: { type: 'local_mount', local_path: '/workspace' },
+  });
+  client.get.mockImplementation(async (path: string) =>
+    path.startsWith('/sessions/a?')
+      ? payload('a', 'thor')
+      : path.includes('instance_id=thor')
+        ? [payload('a', 'thor')]
+        : path.includes('instance_id=build')
+          ? [payload('b', 'build')]
+          : [],
+  );
+  const service = buildVolundrHttpAdapter(client);
+  const controller = new AbortController();
+  await service.getSessions({ instanceId: 'thor', signal: controller.signal });
+  await service.getSessions({ instanceId: 'build' });
+  expect(client.get).toHaveBeenCalledWith('/sessions?instance_id=thor', {
+    signal: controller.signal,
+  });
+  await service.getSession('a');
+  expect(client.get).toHaveBeenCalledWith('/sessions/a?instance_id=thor');
+  await service.listArchivedSessions({ instanceId: 'build', signal: controller.signal });
+  expect(client.get).toHaveBeenCalledWith('/sessions?status=archived&instance_id=build', {
+    signal: controller.signal,
+  });
+});
+
+it('routes archived detail directly to its host and removes obsolete archive owners on refresh', async () => {
+  const client = makeClient();
+  const archived = {
+    id: 'old',
+    name: 'Archived',
+    instance_id: 'thor',
+    status: 'archived',
+    source: { type: 'local_mount', local_path: '/workspace' },
+  };
+  client.get.mockResolvedValue([archived]);
+  const service = buildVolundrHttpAdapter(client);
+  await service.listArchivedSessions({ instanceId: 'thor' });
+  client.get.mockResolvedValue(null);
+  await service.getSession('old');
+  expect(client.get).toHaveBeenLastCalledWith('/sessions/old?instance_id=thor');
+  client.get.mockResolvedValue([]);
+  await service.listArchivedSessions({ instanceId: 'build' });
+  await service.listArchivedSessions({ instanceId: 'thor' });
+  client.get.mockResolvedValue(null);
+  await service.getSession('old');
+  expect(client.get).toHaveBeenLastCalledWith('/sessions/old');
+});
+
+it('scopes metrics and resources, forwards cancellation, and rejects gateways that ignore the host', async () => {
+  const client = makeClient();
+  const service = buildVolundrHttpAdapter(client);
+  const signal = new AbortController().signal;
+  client.get.mockResolvedValue({ instance_id: 'thor', tokens_today: 123 });
+  await expect(service.getStats({ instanceId: 'thor', signal })).resolves.toMatchObject({
+    tokensToday: 123,
+  });
+  expect(client.get).toHaveBeenLastCalledWith('/stats?instance_id=thor', { signal });
+  client.get.mockResolvedValue({ instances: [{ id: 'thor' }], nodes: [] });
+  await expect(service.getClusterResources({ instanceId: 'thor', signal })).resolves.toMatchObject({
+    nodes: [],
+  });
+  expect(client.get).toHaveBeenLastCalledWith('/cluster/resources?instance_id=thor', { signal });
+  client.get.mockResolvedValue({ tokens_today: 999, instances: [{ id: 'thor' }, { id: 'build' }] });
+  await expect(service.getStats({ instanceId: 'thor' })).rejects.toThrow(
+    'Update the Forge gateway',
+  );
+  await expect(service.getClusterResources({ instanceId: 'thor' })).rejects.toThrow(
+    'Update the Forge gateway',
+  );
+  client.get.mockResolvedValue({ instances: [{ id: 'build' }] });
+  await expect(service.getClusterResources({ instanceId: 'thor' })).rejects.toThrow(
+    'Update the Forge gateway',
+  );
+  client.get.mockResolvedValue({ tokens_today: 5 });
+  await expect(service.getStats({ signal })).resolves.toMatchObject({ tokensToday: 5 });
+  expect(client.get).toHaveBeenLastCalledWith('/stats', { signal });
+  await service.getClusterResources({ signal });
+  expect(client.get).toHaveBeenLastCalledWith('/cluster/resources', { signal });
 });

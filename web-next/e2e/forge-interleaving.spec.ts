@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { test, expect, type WebSocketRoute } from '@playwright/test';
 
 // Every network operation is intercepted: this exercises the actual app, HTTP adapter, socket
@@ -17,19 +18,26 @@ test('native text/tool anchors survive live completion, snapshot repair and lega
     last_active: '2026-09-08T21:00:00Z',
     activity_state: 'active',
   };
-  await page.route('**/config.json', async (route) => {
-    const response = await route.fetch();
-    const config = await response.json();
+  await page.route(/\/config(?:\.live)?\.json$/, async (route) => {
+    const config = JSON.parse(
+      readFileSync(new URL('../apps/niuu/public/config.json', import.meta.url), 'utf8'),
+    );
     config.services.forge = { mode: 'http', baseUrl: `${origin}/api/v1/forge` };
     config.services.volundr = { mode: 'http', baseUrl: `${origin}/api/v1/volundr` };
     await route.fulfill({ json: config });
   });
+  let history: object[] = [];
+  let revision = 'initial';
   await page.route(`${origin}/**`, (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/instances'))
+      return route.fulfill({
+        json: [{ id: 'fixture', name: 'Fixture', kind: 'volundr', enabled: true, baseUrl: origin }],
+      });
     const json = path.includes('/features/modules')
       ? [{ key: 'chat', scope: 'session', enabled: true, label: 'Chat', order: 0 }]
-      : path.endsWith('/api/conversation/history')
-        ? { turns: [] }
+      : path.endsWith('/api/conversation/history') || path.endsWith('/conversation')
+        ? { turns: history, projection_revision: revision }
         : path.endsWith(`/sessions/${session.id}`)
           ? session
           : path.endsWith('/sessions')
@@ -45,11 +53,11 @@ test('native text/tool anchors survive live completion, snapshot repair and lega
   });
   let socket: WebSocketRoute | undefined;
   await page.routeWebSocket('ws://forge-interleaving.invalid/**', (ws) => {
-    if (ws.url().endsWith('/session')) socket = ws;
+    if (new URL(ws.url()).pathname.endsWith('/session')) socket = ws;
   });
   await page.goto(`/volundr/session/${session.id}`);
   await page.locator('#tab-chat').click();
-  await page.getByRole('button', { name: 'Show tool calls and results' }).click();
+  await expect(page.getByRole('button', { name: 'Hide tool calls and results' })).toBeVisible();
   await expect.poll(() => Boolean(socket)).toBe(true);
   const send = (frame: object) => socket!.send(JSON.stringify(frame));
   const text = (id: string, value: string, phase: string) => ({
@@ -99,36 +107,32 @@ test('native text/tool anchors survive live completion, snapshot repair and lega
       ),
     );
   expect(order).toEqual(['a', 'tool', 'b']);
-  send({
-    type: 'conversation_history',
-    projection_revision: 'repaired-2',
-    turns: [
-      {
-        id: 'canonical',
-        role: 'assistant',
-        content: `${a.text}\n\n${b.text}`,
-        parts: [a, tool, b, { type: 'tool_result', tool_use_id: 'command', content: 'captured' }],
-        created_at: '2026-09-08T00:00:00Z',
-      },
-    ],
-  });
+  revision = 'repaired-2';
+  history = [
+    {
+      id: 'canonical',
+      role: 'assistant',
+      content: `${a.text}\n\n${b.text}`,
+      parts: [a, tool, b, { type: 'tool_result', tool_use_id: 'command', content: 'captured' }],
+      created_at: '2026-09-08T00:00:00Z',
+    },
+  ];
+  send({ type: 'history_gap', code: 'snapshot_race' });
   await expect(before).toHaveCount(1);
   await expect(before).toHaveAttribute('data-observed-anchor', 'retained');
   await expect(final).toHaveAttribute('data-text-phase', 'final_answer');
   await page.screenshot({ path: testInfo.outputPath('structured-replay.png'), fullPage: true });
-  send({
-    type: 'conversation_history',
-    projection_revision: 'legacy',
-    turns: [
-      {
-        id: 'canonical',
-        role: 'assistant',
-        content: 'Legacy prose remains readable once.',
-        parts: [tool],
-        created_at: '2026-09-08T00:00:00Z',
-      },
-    ],
-  });
+  revision = 'legacy';
+  history = [
+    {
+      id: 'canonical',
+      role: 'assistant',
+      content: 'Legacy prose remains readable once.',
+      parts: [tool],
+      created_at: '2026-09-08T00:00:00Z',
+    },
+  ];
+  send({ type: 'history_gap', code: 'snapshot_race' });
   await expect(page.getByText('Legacy prose remains readable once.', { exact: true })).toHaveCount(
     1,
   );

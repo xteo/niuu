@@ -1,7 +1,7 @@
+import { AccountControls } from './AccountControls';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
-import { ThemeProvider } from '@niuulabs/design-tokens';
 import {
   ConfigProvider,
   FeatureCatalogProvider,
@@ -100,14 +100,7 @@ function AppInner() {
                   a live backend will report unavailable instead of showing demo data.
                 </div>
               ) : null}
-              <Shell
-                plugins={plugins}
-                brand={
-                  <span className="niuu:inline-flex niuu:items-center niuu:justify-center niuu:text-sky-300">
-                    <LogoKnot size={22} stroke={1.8} />
-                  </span>
-                }
-              />
+              <ApplicationShell />
             </div>
           </FeatureCatalogProvider>
         </ServicesProvider>
@@ -188,12 +181,10 @@ export function App() {
 
   return (
     <ConfigProvider value={state.config}>
-      <ThemeProvider theme="ice">
-        <QueryClientProvider client={queryClient}>
-          <AppInner />
-          <ReactQueryDevtools initialIsOpen={false} />
-        </QueryClientProvider>
-      </ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <AppInner />
+        <ReactQueryDevtools initialIsOpen={false} />
+      </QueryClientProvider>
     </ConfigProvider>
   );
 }
@@ -235,4 +226,32 @@ function AuthGate({ children }: { children: ReactNode }) {
   }
 
   return <>{children}</>;
+}
+
+function ApplicationShell() {
+  const { enabled, logout } = useAuth();
+  const [disconnected, setDisconnected] = useState(false);
+  if (disconnected)
+    return (
+      <div className="niuu-disconnected">
+        <h1>Disconnected</h1>
+        <p>Your sessions continue running on their Forge hosts.</p>
+        <button type="button" onClick={() => setDisconnected(false)}>
+          Reconnect
+        </button>
+      </div>
+    );
+  return (
+    <Shell
+      topbarContent={
+        <AccountControls onDisconnect={() => (enabled ? logout() : setDisconnected(true))} />
+      }
+      plugins={plugins}
+      brand={
+        <span className="niuu:inline-flex niuu:items-center niuu:justify-center niuu:text-sky-300">
+          <LogoKnot size={22} stroke={1.8} />
+        </span>
+      }
+    />
+  );
 }

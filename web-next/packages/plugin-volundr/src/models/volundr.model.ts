@@ -156,7 +156,30 @@ export interface ProjectRepoMapping {
 // Session
 // ---------------------------------------------------------------------------
 
+export interface ForgeProject {
+  id: string;
+  name: string;
+  slug: string;
+  status: 'active' | 'archived';
+  instance_id?: string;
+  instance_name?: string;
+  workspace_path?: string;
+}
+export interface SessionProjectMembership {
+  sessionId: string;
+  revision: number;
+  projectId: string | null;
+  role?: string;
+}
+export interface SessionCoordination {
+  projectId: string;
+  role: string;
+  parent?: { instanceId: string; sessionId: string } | null;
+}
+
 export interface VolundrSession {
+  sessionDefinition?: string;
+  coordination?: SessionCoordination;
   id: string;
   name: string;
   source: SessionSource;
@@ -255,6 +278,7 @@ export interface VolundrTarget {
   slug: string;
   name: string;
   baseUrl: string;
+  config?: Record<string, unknown>;
   enabled: boolean;
   isDefault: boolean;
   visibility?: string;

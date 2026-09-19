@@ -92,11 +92,42 @@ interface FileEntryPayload {
   size?: number;
 }
 
+interface SessionProjectPayload {
+  session_id: string;
+  revision: number;
+  coordination: { project_id: string; role: string } | null;
+}
+
+function sessionProjectPath(id: string, instanceId?: string): string {
+  return `/sessions/${encodeURIComponent(id)}/project${instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : ''}`;
+}
+
+function normalizeSessionProject(payload: SessionProjectPayload) {
+  if (!Number.isInteger(payload.revision) || payload.revision < 0) {
+    throw new Error(
+      'This Forge host does not support versioned project assignment. Update it first.',
+    );
+  }
+  return {
+    sessionId: payload.session_id,
+    revision: payload.revision,
+    projectId: payload.coordination?.project_id ?? null,
+    role: payload.coordination?.role,
+  };
+}
+
 interface FileListPayload {
   entries: FileEntryPayload[];
 }
 
 type SessionPayload = {
+  session_definition?: string | null;
+  sessionDefinition?: string;
+  coordination?: {
+    project_id: string;
+    role: string;
+    parent?: { instance_id: string; session_id: string } | null;
+  } | null;
   id: string;
   name: string;
   source: VolundrSession['source'];
@@ -160,6 +191,8 @@ type ExternalSessionPayload = {
 };
 
 type StatsPayload = {
+  instance_id?: string;
+  instanceId?: string;
   activeSessions?: number;
   active_sessions?: number;
   totalSessions?: number;
@@ -368,6 +401,7 @@ type SharedRepoPayload = {
 type SharedRepoResponse = Record<string, SharedRepoPayload[]>;
 
 type InstanceTargetPayload = {
+  config?: Record<string, unknown>;
   id: string;
   slug: string;
   name: string;
@@ -491,9 +525,24 @@ function normalizeSession(session: SessionPayload): VolundrSession {
   return {
     id: session.id,
     name: session.name,
+    ...(session.coordination
+      ? {
+          coordination: {
+            projectId: session.coordination.project_id,
+            role: session.coordination.role,
+            parent: session.coordination.parent
+              ? {
+                  instanceId: session.coordination.parent.instance_id,
+                  sessionId: session.coordination.parent.session_id,
+                }
+              : null,
+          },
+        }
+      : {}),
     source: session.source,
     status: session.status,
     model: session.model,
+    sessionDefinition: session.sessionDefinition ?? session.session_definition ?? undefined,
     personaName: session.personaName ?? session.persona_name ?? undefined,
     lastActive: toEpochMs(session.lastActive ?? session.last_active),
     messageCount: session.messageCount ?? session.message_count ?? 0,
@@ -547,6 +596,7 @@ function normalizeTarget(payload: InstanceTargetPayload): VolundrTarget {
     isDefault: payload.isDefault ?? payload.is_default ?? false,
     visibility: payload.visibility,
     tags: payload.tags ?? [],
+    ...(payload.config ? { config: payload.config } : {}),
   };
 }
 
@@ -1119,6 +1169,32 @@ export function buildVolundrFileSystemHttpAdapter(options: {
       return response.text();
     },
 
+    async downloadFile(sessionId: string, path: string, signal?: AbortSignal): Promise<Blob> {
+      const { root, relativePath } = splitSessionPath(path);
+      const params = new URLSearchParams({ root, path: relativePath });
+      const response = await ensureOk(
+        await fetchImpl(`${sessionApi(sessionId)}/files/download?${params}`, {
+          headers: withAuthHeaders(),
+          signal,
+        }),
+      );
+      return response.blob();
+    },
+
+    async downloadPresentedFile(
+      sessionId: string,
+      fileId: string,
+      signal?: AbortSignal,
+    ): Promise<Blob> {
+      const response = await ensureOk(
+        await fetchImpl(`${sessionApi(sessionId)}/files/presented/${encodeURIComponent(fileId)}`, {
+          headers: withAuthHeaders(),
+          signal,
+        }),
+      );
+      return response.blob();
+    },
+
     async writeFile(sessionId: string, path: string, content: string): Promise<void> {
       const { root, relativePath } = splitSessionPath(path);
       const segments = relativePath.split('/').filter(Boolean);
@@ -1201,6 +1277,7 @@ export function buildVolundrHttpAdapter(
   const messageSubscribers = new Map<string, PollingConnection<VolundrMessage>>();
   const logSubscribers = new Map<string, PollingConnection<VolundrLog>>();
   const sessionCache = new Map<string, VolundrSession>();
+  const archivedSessionOwners = new Map<string, string>();
   const chronicleCache = new Map<string, SessionChronicle>();
   let statsCache: VolundrStats | null = null;
   let streamHandle: EventStreamHandle | null = null;
@@ -1229,15 +1306,34 @@ export function buildVolundrHttpAdapter(
     for (const session of sessions) sessionCache.set(session.id, session);
   }
 
-  async function loadSessions(endpoint: string): Promise<VolundrSession[]> {
-    const sessions = (await forgeClient.get<SessionPayload[]>(endpoint)).map(normalizeSession);
-    updateSessionCache(sessions);
+  function readSessionList(endpoint: string, signal?: AbortSignal) {
+    return signal
+      ? forgeClient.get<SessionPayload[]>(endpoint, { signal })
+      : forgeClient.get<SessionPayload[]>(endpoint);
+  }
+
+  async function loadSessions(
+    endpoint: string,
+    options?: { instanceId?: string; signal?: AbortSignal },
+  ): Promise<VolundrSession[]> {
+    const scoped = options?.instanceId
+      ? `${endpoint}${endpoint.includes('?') ? '&' : '?'}instance_id=${encodeURIComponent(options.instanceId)}`
+      : endpoint;
+    const sessions = (await readSessionList(scoped, options?.signal)).map(normalizeSession);
+    if (options?.instanceId) {
+      for (const [id, session] of sessionCache) {
+        if (session.instanceId === options.instanceId) sessionCache.delete(id);
+      }
+      for (const session of sessions) sessionCache.set(session.id, session);
+    } else updateSessionCache(sessions);
     publishSessions();
     return sessions;
   }
 
   async function loadSession(id: string): Promise<VolundrSession | null> {
-    const session = await forgeClient.get<SessionPayload | null>(`/sessions/${id}`);
+    const instanceId = sessionCache.get(id)?.instanceId ?? archivedSessionOwners.get(id);
+    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
+    const session = await forgeClient.get<SessionPayload | null>(`/sessions/${id}${suffix}`);
     if (!session) {
       sessionCache.delete(id);
       publishSessions();
@@ -1249,8 +1345,12 @@ export function buildVolundrHttpAdapter(
     return normalized;
   }
 
-  async function loadStats(): Promise<VolundrStats> {
-    statsCache = normalizeStats(await forgeClient.get<StatsPayload>('/stats'));
+  async function loadStats(signal?: AbortSignal): Promise<VolundrStats> {
+    statsCache = normalizeStats(
+      await (signal
+        ? forgeClient.get<StatsPayload>('/stats', { signal })
+        : forgeClient.get<StatsPayload>('/stats')),
+    );
     publishStats();
     return statsCache;
   }
@@ -1473,16 +1573,56 @@ export function buildVolundrHttpAdapter(
       const payload = await catalogClient.get<SessionDefinitionPayload[]>('/session-definitions');
       return payload.map(normalizeSessionDefinition);
     },
-    getSessions: () => loadSessions('/sessions'),
+    getSessions: (options) => loadSessions('/sessions', options),
     getSession: (id) => loadSession(id),
     getActiveSessions: () => loadSessions('/sessions?active=true'),
-    getStats: () => loadStats(),
+    getStats: (options) =>
+      options?.instanceId
+        ? forgeClient
+            .get<StatsPayload>(`/stats?instance_id=${encodeURIComponent(options.instanceId)}`, {
+              signal: options.signal,
+            })
+            .then((payload) => {
+              if ((payload.instance_id ?? payload.instanceId) !== options.instanceId) {
+                throw new Error(
+                  'This gateway does not support host-specific metrics. Update the Forge gateway.',
+                );
+              }
+              return normalizeStats(payload);
+            })
+        : loadStats(options?.signal),
     getRepos: async () =>
       normalizeRepoList(
         await (niuuClient ?? forgeClient).get<
           SharedRepoResponse | SharedRepoPayload[] | VolundrRepo[]
         >('/repos'),
       ),
+    getProjects: (options) =>
+      options
+        ? forgeClient.get(
+            `/projects${options?.instanceId ? `?instance_id=${encodeURIComponent(options.instanceId)}` : ''}`,
+            { signal: options?.signal },
+          )
+        : forgeClient.get('/projects'),
+    getSessionProject: async (id, options) => {
+      const payload = await forgeClient.get<SessionProjectPayload>(
+        sessionProjectPath(id, options?.instanceId),
+        { signal: options?.signal },
+      );
+      return normalizeSessionProject(payload);
+    },
+    assignSessionProject: async (id, assignment, options) => {
+      const payload = await forgeClient.put<SessionProjectPayload>(
+        sessionProjectPath(id, options?.instanceId),
+        {
+          project_id: assignment.projectId,
+          project_instance_id: assignment.projectInstanceId,
+          expected_revision: assignment.expectedRevision,
+        },
+      );
+      return normalizeSessionProject(payload);
+    },
+
     getTargets: async () => {
       const targetClient = niuuClient ?? sharedClient;
       const payload = await targetClient.get<InstanceTargetPayload[]>(
@@ -1535,7 +1675,27 @@ export function buildVolundrHttpAdapter(
     getAvailableSecrets: () => client.get<string[]>('/secrets'),
     createSecret: (name, data) =>
       client.post<{ name: string; keys: string[] }>('/secrets', { name, data }),
-    getClusterResources: () => forgeClient.get<ClusterResourceInfo>('/cluster/resources'),
+    getClusterResources: (options) =>
+      options?.instanceId
+        ? forgeClient
+            .get<ClusterResourceInfo>(
+              `/cluster/resources?instance_id=${encodeURIComponent(options.instanceId)}`,
+              { signal: options.signal },
+            )
+            .then((payload) => {
+              if (
+                payload.instances?.length !== 1 ||
+                payload.instances[0]?.id !== options.instanceId
+              ) {
+                throw new Error(
+                  'This gateway does not support host-specific resources. Update the Forge gateway.',
+                );
+              }
+              return payload;
+            })
+        : options?.signal
+          ? forgeClient.get<ClusterResourceInfo>('/cluster/resources', { signal: options.signal })
+          : forgeClient.get<ClusterResourceInfo>('/cluster/resources'),
 
     startSession: async (config) =>
       normalizeSession(
@@ -1557,7 +1717,7 @@ export function buildVolundrHttpAdapter(
     connectSession: async (config) =>
       normalizeSession(await forgeClient.post<SessionPayload>('/sessions/connect', config)),
     updateSession: (sessionId, updates) =>
-      forgeClient.patch<SessionPayload>(`/sessions/${sessionId}`, updates).then(normalizeSession),
+      forgeClient.put<SessionPayload>(`/sessions/${sessionId}`, updates).then(normalizeSession),
     stopSession: (sessionId) => forgeClient.post<void>(`/sessions/${sessionId}/stop`),
     resumeSession: (sessionId) => forgeClient.post<void>(`/sessions/${sessionId}/resume`),
     deleteSession: (sessionId, cleanup) =>
@@ -1569,10 +1729,23 @@ export function buildVolundrHttpAdapter(
     archiveStoppedSessions: () => forgeClient.post<string[]>('/sessions/archive-stopped'),
     restoreSession: (sessionId) =>
       forgeClient.patch<void>(`/sessions/${sessionId}/restore`, undefined),
-    listArchivedSessions: () =>
-      forgeClient
-        .get<SessionPayload[]>('/sessions?status=archived')
-        .then((sessions) => sessions.map(normalizeSession)),
+    listArchivedSessions: async (options) => {
+      const sessions = (
+        await readSessionList(
+          `/sessions?status=archived${options?.instanceId ? `&instance_id=${encodeURIComponent(options.instanceId)}` : ''}`,
+          options?.signal,
+        )
+      ).map(normalizeSession);
+      if (options?.instanceId) {
+        for (const [id, owner] of archivedSessionOwners) {
+          if (owner === options.instanceId) archivedSessionOwners.delete(id);
+        }
+      } else archivedSessionOwners.clear();
+      for (const session of sessions) {
+        if (session.instanceId) archivedSessionOwners.set(session.id, session.instanceId);
+      }
+      return sessions;
+    },
 
     listExternalSessions: () =>
       forgeClient

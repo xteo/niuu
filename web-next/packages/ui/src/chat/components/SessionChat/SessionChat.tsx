@@ -4,6 +4,7 @@ import {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   type FormEvent,
   type ReactNode,
 } from 'react';
@@ -17,8 +18,10 @@ import {
   EyeOff,
   Trash2Icon,
 } from 'lucide-react';
+import { LoadingState } from '../../../data/states/LoadingState';
+import { ErrorState } from '../../../data/states/ErrorState';
 import { cn } from '../../../utils/cn';
-import { useRoomState } from '../../hooks/useRoomState';
+import { hideToolParts, useRoomState } from '../../hooks/useRoomState';
 import {
   UserMessage,
   AssistantMessage,
@@ -52,10 +55,11 @@ import type {
 } from '../../types';
 import type { FileAttachment } from '../../hooks/useFileAttachments';
 import type { SlashCommand } from '../../utils/slashCommands';
+import { ToolImageProvider } from '../ToolImages';
+import { HistoryDetailsContext } from '../HistoryDetailsContext';
 import './SessionChat.css';
 
 const SCROLL_THRESHOLD = 150;
-const SCROLL_LOCK_MS = 500;
 
 const THINKING_PRESETS = [
   { label: '4K', value: 4096 },
@@ -259,6 +263,12 @@ export interface SessionChatProps {
   connected?: boolean;
   /** Whether history has been loaded */
   historyLoaded?: boolean;
+  historyError?: string | null;
+  onRetryHistory?: () => void;
+  hasOlderHistory?: boolean;
+  loadingOlderHistory?: boolean;
+  olderHistoryError?: string | null;
+  onLoadOlderHistory?: () => Promise<void>;
   /** Room participants map (peerId → meta) */
   participants?: ReadonlyMap<string, RoomParticipant>;
   /** Mesh events for the cascade panel */
@@ -283,6 +293,8 @@ export interface SessionChatProps {
   className?: string;
   /** Show the built-in toolbar row. */
   showToolbar?: boolean;
+  /** Token counts are opt-in to keep the conversation uncluttered. */
+  showTokenUsage?: boolean;
   /** Hide the built-in internal visibility toggle when the page owns it externally. */
   showInternalToggle?: boolean;
   /** Controlled internal visibility state for external toolbar integrations. */
@@ -337,6 +349,12 @@ export function SessionChat({
   streamingModel,
   connected = false,
   historyLoaded = true,
+  historyError,
+  onRetryHistory,
+  hasOlderHistory = false,
+  loadingOlderHistory = false,
+  olderHistoryError,
+  onLoadOlderHistory,
   participants = new Map(),
   meshEvents = [],
   agentEvents = new Map(),
@@ -349,6 +367,7 @@ export function SessionChat({
   sessionName = 'Session',
   className,
   showToolbar = true,
+  showTokenUsage = false,
   showInternalToggle = true,
   internalVisibility,
   eventRouting = false,
@@ -380,19 +399,20 @@ export function SessionChat({
     visibleMessages,
     collapsedThreads,
     toggleThread,
-  } = useRoomState(messages, participants);
+  } = useRoomState(messages, participants, internalVisibility ?? false);
 
   useEffect(() => {
     if (internalVisibility === undefined) return;
     setShowInternal(internalVisibility);
   }, [internalVisibility, setShowInternal]);
 
-  const toggleInternal = useCallback(() => {
-    toggleInternalLocal();
-    if (onSetInternalVisibility) {
-      onSetInternalVisibility(!showInternal);
-    }
-  }, [toggleInternalLocal, onSetInternalVisibility, showInternal]);
+  // Tool visibility is presentation-only. Keep receiving tool results so images
+  // can enter the conversation even while their execution details are hidden.
+  // useRoomState still applies room participant/internal-message visibility.
+  useEffect(() => {
+    if (connected) onSetInternalVisibility?.(true);
+  }, [connected, onSetInternalVisibility]);
+  const toggleInternal = toggleInternalLocal;
 
   const [modelInput, setModelInput] = useState('');
   const [showModelInput, setShowModelInput] = useState(false);
@@ -407,9 +427,37 @@ export function SessionChat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
+  const olderPendingRef = useRef(false);
+  const prependAnchorRef = useRef<{ id: string; top: number; firstId?: string } | null>(null);
+  const loadOlder = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (
+      !el ||
+      !onLoadOlderHistory ||
+      !hasOlderHistory ||
+      olderPendingRef.current ||
+      loadingOlderHistory
+    )
+      return;
+    const top = el.getBoundingClientRect().top;
+    const anchor = Array.from(el.querySelectorAll<HTMLElement>('[data-history-id]')).find(
+      (row) => row.getBoundingClientRect().bottom > top,
+    );
+    if (anchor)
+      prependAnchorRef.current = {
+        id: anchor.dataset.historyId!,
+        top: anchor.getBoundingClientRect().top,
+        firstId: visibleMessages[0]?.id,
+      };
+    isNearBottomRef.current = false;
+    olderPendingRef.current = true;
+    void onLoadOlderHistory().finally(() => {
+      olderPendingRef.current = false;
+    });
+  }, [hasOlderHistory, loadingOlderHistory, onLoadOlderHistory, visibleMessages]);
   const userSentRef = useRef(false);
   const prevMessageCountRef = useRef(0);
-  const scrollLockUntilRef = useRef(0);
+  const initialScrollRef = useRef<string | null | undefined>(undefined);
 
   const participantsMap = useMemo<Map<string, RoomParticipant>>(() => {
     const map = new Map<string, RoomParticipant>();
@@ -528,53 +576,89 @@ export function SessionChat({
     return result;
   }, [visibleMessages, isRoomMode, showInternal]);
 
+  const hasRunningAssistantMessage = visibleMessages.some(
+    (message) => message.role === 'assistant' && message.status === 'running',
+  );
+  const isStreaming =
+    !hasRunningAssistantMessage &&
+    (!!streamingContent || (streamingParts && streamingParts.length > 0));
+
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
-    messagesEndRef.current?.scrollIntoView?.({ behavior });
+    const container = scrollContainerRef.current;
+    if (container) {
+      if (behavior === 'smooth' && container.scrollTo)
+        container.scrollTo({ top: container.scrollHeight, behavior });
+      else container.scrollTop = container.scrollHeight;
+    }
     setNewMessageCount(0);
   }, []);
+
+  // Place the hydrated transcript before the browser paints it, without traversing its history.
+  useLayoutEffect(() => {
+    if (!historyLoaded) {
+      initialScrollRef.current = undefined;
+      return;
+    }
+    const container = scrollContainerRef.current;
+    if (!container || initialScrollRef.current === chatEndpoint) return;
+    container.scrollTop = container.scrollHeight;
+    isNearBottomRef.current = true;
+    prevMessageCountRef.current = visibleMessages.length;
+    initialScrollRef.current = chatEndpoint;
+  }, [historyLoaded, chatEndpoint, visibleMessages.length, streamingContent, streamingParts]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
+    let lastTop = el.scrollTop;
     const handleScroll = () => {
-      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      isNearBottomRef.current = distanceFromBottom <= SCROLL_THRESHOLD;
-      setShowScrollBtn(distanceFromBottom > SCROLL_THRESHOLD * 2);
+      const scrollingUp = el.scrollTop < lastTop;
+      lastTop = el.scrollTop;
+      if (scrollingUp && el.scrollTop <= SCROLL_THRESHOLD && !olderHistoryError && !historyError)
+        loadOlder();
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      isNearBottomRef.current = distance <= SCROLL_THRESHOLD;
+      setShowScrollBtn(distance > SCROLL_THRESHOLD * 2);
       if (isNearBottomRef.current) setNewMessageCount(0);
     };
     el.addEventListener('scroll', handleScroll, { passive: true });
-    let prevHeight = el.scrollHeight;
-    const resizeObserver = new ResizeObserver(() => {
-      const newHeight = el.scrollHeight;
-      if (newHeight !== prevHeight) {
-        prevHeight = newHeight;
-        scrollLockUntilRef.current = Date.now() + SCROLL_LOCK_MS;
-      }
+    // Observe content too: images, code highlighting and streamed text can grow without resizing
+    // the scroll viewport. Preserve a reader's position once they have scrolled away from the end.
+    const observer = new ResizeObserver(() => {
+      if (isNearBottomRef.current) el.scrollTop = el.scrollHeight;
     });
-    resizeObserver.observe(el);
+    observer.observe(el);
+    if (el.firstElementChild) observer.observe(el.firstElementChild);
     return () => {
       el.removeEventListener('scroll', handleScroll);
-      resizeObserver.disconnect();
+      observer.disconnect();
     };
-  }, [hasConversation]);
+  }, [hasConversation, isStreaming, historyLoaded, loadOlder, olderHistoryError, historyError]);
 
-  useEffect(() => {
-    const messageCount = visibleMessages.length;
-    const countDelta = messageCount - prevMessageCountRef.current;
-    prevMessageCountRef.current = messageCount;
-    if (userSentRef.current) {
+  useLayoutEffect(() => {
+    if (!historyLoaded) return;
+    const anchor = prependAnchorRef.current;
+    if (anchor && visibleMessages[0]?.id !== anchor.firstId) {
+      const el = scrollContainerRef.current;
+      const row = Array.from(el?.querySelectorAll<HTMLElement>('[data-history-id]') ?? []).find(
+        (item) => item.dataset.historyId === anchor.id,
+      );
+      if (el && row) el.scrollTop += row.getBoundingClientRect().top - anchor.top;
+      prependAnchorRef.current = null;
+      prevMessageCountRef.current = visibleMessages.length;
+      return;
+    }
+    if (!loadingOlderHistory && !olderPendingRef.current) prependAnchorRef.current = null;
+    const countDelta = visibleMessages.length - prevMessageCountRef.current;
+    prevMessageCountRef.current = visibleMessages.length;
+    if (userSentRef.current || (countDelta !== 0 && isNearBottomRef.current)) {
       userSentRef.current = false;
-      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' });
+      const el = scrollContainerRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
       return;
     }
-    if (countDelta === 0) return;
-    if (Date.now() < scrollLockUntilRef.current) return;
-    if (isNearBottomRef.current) {
-      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' });
-      return;
-    }
-    setNewMessageCount((prev) => prev + countDelta);
-  }, [visibleMessages.length]);
+    if (countDelta > 0) setNewMessageCount((prev) => prev + countDelta);
+  }, [visibleMessages, historyLoaded, loadingOlderHistory]);
 
   useEffect(() => {
     onMessageCountChange?.(visibleMessages.length);
@@ -661,55 +745,32 @@ export function SessionChat({
     [onCopy],
   );
 
-  const handleRegenerate = useCallback(
-    (messageId: string) => {
-      if (onRegenerate) {
-        onRegenerate(messageId);
-        return;
-      }
-      const idx = messages.findIndex((m) => m.id === messageId);
-      if (idx < 0) return;
-      for (let i = idx - 1; i >= 0; i--) {
-        const m = messages[i];
-        if (m && m.role === 'user') {
-          onSend(m.content, []);
-          return;
-        }
-      }
-    },
-    [messages, onRegenerate, onSend],
-  );
-
-  const handleBookmark = useCallback(
-    (id: string, bookmarked: boolean) => {
-      if (onBookmark) {
-        onBookmark(id, bookmarked);
-        return;
-      }
-      const key = `bookmark:${id}`;
-      try {
-        if (bookmarked) {
-          localStorage.setItem(key, '1');
-        } else {
-          localStorage.removeItem(key);
-        }
-      } catch {
-        // localStorage may not be available
-      }
-    },
-    [onBookmark],
-  );
-
   const hasSidebar = Array.from(participants.values()).some(
     (participant) => participant.participantType === 'ravn',
   );
   const showRightPanel = effectiveRightPanelMode !== null;
-  const hasRunningAssistantMessage = visibleMessages.some(
-    (message) => message.role === 'assistant' && message.status === 'running',
-  );
-  const isStreaming =
-    !hasRunningAssistantMessage &&
-    (!!streamingContent || (streamingParts && streamingParts.length > 0));
+
+  if (!historyLoaded) {
+    return (
+      <div className={cn('niuu-chat-session-loading', className)} data-testid="history-loading">
+        {historyError ? (
+          <ErrorState
+            title="Could not load conversation"
+            message={historyError}
+            action={
+              onRetryHistory && (
+                <button type="button" className="niuu-chat-retry" onClick={onRetryHistory}>
+                  Try again
+                </button>
+              )
+            }
+          />
+        ) : (
+          <LoadingState label="Loading conversation…" />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -871,102 +932,142 @@ export function SessionChat({
           </div>
         )}
 
-        {/* ── History loading ── */}
-        {!historyLoaded && connected && (
-          <div className="niuu-chat-history-loading" data-testid="history-loading">
-            Loading conversation...
+        {historyError && (
+          <div className="niuu-chat-history-status" role="alert">
+            {historyError}{' '}
+            <button className="niuu-chat-retry" onClick={onRetryHistory}>
+              Try again
+            </button>
           </div>
         )}
-
         {/* ── Messages ── */}
-        {hasConversation || isStreaming ? (
+        {hasConversation || isStreaming || hasOlderHistory ? (
           <div className="niuu-chat-messages-container" ref={scrollContainerRef}>
-            <div className="niuu-chat-messages-inner">
-              {renderedGroups.map((group) => {
-                if (group.type === 'thread') {
-                  return (
-                    <ThreadGroup
-                      key={group.threadId}
-                      messages={group.messages}
-                      isCollapsed={collapsedThreads.has(group.threadId)}
-                      onToggle={() => toggleThread(group.threadId)}
-                    />
-                  );
-                }
-
-                const msg = group.message;
-                if (msg.metadata?.messageType === 'system') {
-                  return <SystemMessage key={messageRenderKey(msg)} message={msg} />;
-                }
-
-                if ((isRoomMode && msg.participant) || isRoomSession) {
-                  return (
-                    <div
-                      key={messageRenderKey(msg)}
-                      id={`msg-${msg.id}`}
-                      data-highlighted={highlightedMsgId === msg.id || undefined}
-                    >
-                      <RoomMessage
-                        message={msg}
-                        onSelectAgent={handleSelectAgent}
-                        selectedAgentId={selectedAgentId}
-                        onShowDetail={msg.participant ? handleShowDetail : undefined}
-                        onCopy={handleCopy}
-                        onRegenerate={handleRegenerate}
-                        onBookmark={handleBookmark}
-                        bookmarked={(() => {
-                          try {
-                            return localStorage.getItem(`bookmark:${msg.id}`) === '1';
-                          } catch {
-                            return false;
-                          }
-                        })()}
-                      />
+            <HistoryDetailsContext.Provider value={chatEndpoint}>
+              <ToolImageProvider endpoint={chatEndpoint}>
+                <div className="niuu-chat-messages-inner">
+                  {(hasOlderHistory || loadingOlderHistory || olderHistoryError) && (
+                    <div className="niuu-chat-history-status">
+                      {olderHistoryError && <p role="alert">{olderHistoryError}</p>}
+                      <button
+                        type="button"
+                        className="niuu-chat-retry"
+                        disabled={loadingOlderHistory}
+                        onClick={loadOlder}
+                      >
+                        {loadingOlderHistory
+                          ? 'Loading earlier messages…'
+                          : olderHistoryError
+                            ? 'Retry earlier messages'
+                            : 'Load earlier messages'}
+                      </button>
                     </div>
-                  );
-                }
-
-                if (msg.role === 'user') {
-                  return <UserMessage key={messageRenderKey(msg)} message={msg} />;
-                }
-                if (msg.status === 'running' && !hasNativeMessageParts(msg.parts)) {
-                  return (
-                    <StreamingMessage
-                      key={messageRenderKey(msg)}
-                      content={msg.content}
-                      parts={msg.parts}
-                    />
-                  );
-                }
-                return (
-                  <AssistantMessage
-                    key={messageRenderKey(msg)}
-                    message={msg}
-                    onCopy={handleCopy}
-                    onRegenerate={handleRegenerate}
-                    onBookmark={handleBookmark}
-                    bookmarked={(() => {
-                      try {
-                        return localStorage.getItem(`bookmark:${msg.id}`) === '1';
-                      } catch {
-                        return false;
+                  )}
+                  {renderedGroups
+                    .map((group) => {
+                      if (group.type === 'thread') {
+                        return (
+                          <ThreadGroup
+                            key={group.threadId}
+                            messages={group.messages}
+                            isCollapsed={collapsedThreads.has(group.threadId)}
+                            onToggle={() => toggleThread(group.threadId)}
+                          />
+                        );
                       }
-                    })()}
-                  />
-                );
-              })}
 
-              {/* Streaming indicator */}
-              {isStreaming && (
-                <StreamingMessage
-                  content={streamingContent ?? ''}
-                  parts={streamingParts}
-                  model={streamingModel}
-                />
-              )}
+                      const msg = group.message;
+                      if (msg.metadata?.messageType === 'system') {
+                        return <SystemMessage key={messageRenderKey(msg)} message={msg} />;
+                      }
 
-              <div ref={messagesEndRef} />
-            </div>
+                      if ((isRoomMode && msg.participant) || isRoomSession) {
+                        return (
+                          <div
+                            key={messageRenderKey(msg)}
+                            id={`msg-${msg.id}`}
+                            data-highlighted={highlightedMsgId === msg.id || undefined}
+                          >
+                            <RoomMessage
+                              message={msg}
+                              onSelectAgent={handleSelectAgent}
+                              selectedAgentId={selectedAgentId}
+                              onShowDetail={msg.participant ? handleShowDetail : undefined}
+                              onCopy={handleCopy}
+                              onRegenerate={onRegenerate}
+                              onBookmark={onBookmark}
+                              bookmarked={(() => {
+                                try {
+                                  return localStorage.getItem(`bookmark:${msg.id}`) === '1';
+                                } catch {
+                                  return false;
+                                }
+                              })()}
+                            />
+                          </div>
+                        );
+                      }
+
+                      if (msg.role === 'user') {
+                        return <UserMessage key={messageRenderKey(msg)} message={msg} />;
+                      }
+                      if (msg.status === 'running' && !hasNativeMessageParts(msg.parts)) {
+                        return (
+                          <StreamingMessage
+                            key={messageRenderKey(msg)}
+                            content={msg.content}
+                            parts={msg.parts}
+                          />
+                        );
+                      }
+                      return (
+                        <AssistantMessage
+                          key={messageRenderKey(msg)}
+                          message={msg}
+                          showTokenUsage={showTokenUsage}
+                          onCopy={handleCopy}
+                          onRegenerate={onRegenerate}
+                          onBookmark={onBookmark}
+                          bookmarked={(() => {
+                            try {
+                              return localStorage.getItem(`bookmark:${msg.id}`) === '1';
+                            } catch {
+                              return false;
+                            }
+                          })()}
+                        />
+                      );
+                    })
+                    .map((element, index) => {
+                      const group = renderedGroups[index]!;
+                      const id = group.type === 'single' ? group.message.id : group.threadId;
+                      return (
+                        <div
+                          key={group.type === 'single' ? messageRenderKey(group.message) : id}
+                          data-history-id={id}
+                        >
+                          {element}
+                        </div>
+                      );
+                    })}
+
+                  {/* Streaming indicator */}
+                  {isStreaming && (
+                    <StreamingMessage
+                      content={streamingContent ?? ''}
+                      parts={
+                        showInternal
+                          ? streamingParts
+                          : streamingParts && hideToolParts(streamingParts)
+                      }
+                      model={streamingModel}
+                    />
+                  )}
+
+                  <div ref={messagesEndRef} />
+                </div>
+              </ToolImageProvider>
+            </HistoryDetailsContext.Provider>
 
             {showScrollBtn && (
               <button
