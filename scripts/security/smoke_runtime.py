@@ -119,6 +119,10 @@ def main() -> None:
             }
             config_path = work / "config.json"
             config_path.write_text(json.dumps(config))  # JSON is valid YAML.
+            # The parent directory remains 0700 on the host. The single mounted
+            # test file must be readable by the image's non-root UID even when
+            # the invoking audit shell has umask 077.
+            config_path.chmod(0o644)
             docker(
                 "run",
                 "-d",
@@ -142,6 +146,9 @@ def main() -> None:
                         health = json.load(response)
                     break
                 except (OSError, urllib.error.URLError):
+                    state = json.loads(docker("inspect", api).stdout)[0]["State"]
+                    if not state["Running"]:
+                        raise RuntimeError("Forge image exited before becoming healthy") from None
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Forge image did not become healthy") from None
                     time.sleep(1)

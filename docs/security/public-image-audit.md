@@ -9,7 +9,7 @@ A fresh unauthenticated mirror contained 1,540 reachable commits, including publ
 branches, tags and pull-request refs. TruffleHog 3.97.5 and Gitleaks 8.30.1 scanned
 history with offline detectors. Credential candidates were not sent to providers
 for verification. The audit also inspected tracked configuration, live-data
-fixtures, deployment notes, image metadata and screenshot text.
+fixtures, deployment notes, commit messages, image metadata and OCR from all 147 historical screenshot/image blobs.
 
 Gitleaks reported 32 historical occurrences; TruffleHog reported 98. Review found
 inert test/example values, a test-only signing key, and detector false positives
@@ -42,6 +42,21 @@ Raw scanner reports and the pre-curation snapshot stay outside the repository.
 - Images receive immutable source identity as package data. Node configuration,
   credentials, user data and workspaces are supplied only at runtime.
 
+## Validation
+
+The complete backend suite passed 20,003 tests at 86.65% coverage. Focused
+container/host routing checks passed after fixing the version route and removing
+a Python 3.14 warning in WebSocket cleanup. The local ARM64 build passed installed
+identity/migration/UI checks and an isolated PostgreSQL-backed boot covering
+Forge version, sessions, Guild instances, user credentials, runtime config and
+the Völundr page. No live node or session was used for this test.
+
+The layer scanner's 21 local findings were reviewed as package checksums,
+documentation URLs/sample DSNs and a Python identifier. The publication gate
+allows only those exact detector/path/value-hash combinations; new findings
+block publication. Native CI repeats packaging and runtime checks on amd64 and
+arm64 before promoting a public multi-architecture tag.
+
 ## Historical privacy remediation
 
 An ordinary cleanup commit does **not** erase earlier public copies. Earlier refs
@@ -49,7 +64,7 @@ also contain raw conversation captures under `.skuld/`, an older full gateway
 capture, old versions of live web configuration, and the removed screenshots.
 They remain accessible until a separately coordinated history cleanup occurs.
 
-The private audit inventory identifies the affected blobs and refs. The proposed
+A private rewrite preview identifies 27 affected branch refs, 5 tags and 5 PR refs. It has not been pushed. The private audit inventory identifies the affected blobs and refs. The proposed
 cleanup removes raw runtime captures and the identified images throughout public
 history, sanitizes old host/path identifiers and preserves the current sanitized
 protocol fixture. Rewriting published branches and tags changes commit IDs and
