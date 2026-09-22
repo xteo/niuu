@@ -51,8 +51,10 @@ identity/migration/UI checks and an isolated PostgreSQL-backed boot covering
 Forge version, sessions, Guild instances, user credentials, runtime config and
 the Völundr page. No live node or session was used for this test.
 
-The layer scanner's 21 local findings were reviewed as package checksums,
-documentation URLs/sample DSNs and a Python identifier. The publication gate
+The layer scanner's 21 local ARM64 findings were reviewed as package checksums,
+documentation URLs/sample DSNs and a Python identifier. AMD64 added one libc file
+checksum, independently verified against the pinned official Python base image.
+The publication gate
 allows only those exact detector/path/value-hash combinations; new findings
 block publication. Native CI repeats packaging and runtime checks on amd64 and
 arm64 before promoting a public multi-architecture tag.
