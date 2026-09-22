@@ -132,6 +132,8 @@ def main() -> None:
                 "--env-file",
                 str(client_env),
                 "-e",
+                "NIUU_DATABASE_MODE=external",
+                "-e",
                 "DATABASE__HOST=postgres",
                 "-e",
                 "DATABASE__USER=postgres",

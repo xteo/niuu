@@ -18,7 +18,7 @@ assert identity['source_sha256'] != hashlib.sha256(b'').hexdigest()
 assert list(migration_dir().glob('*.up.sql'))
 if MODE == 'niuu':
     assert (web_dist_dir() / 'index.html').is_file()
-assert not (web_dist_dir() / 'config.live.json').exists()
+    assert not (web_dist_dir() / 'config.live.json').exists()
 assert not Path('/app/.git').exists()
 assert not Path('/app/config.yaml').exists()
 from niuu.app import build_root_app
