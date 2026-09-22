@@ -1,11 +1,23 @@
 """The container composes the real host without managing host infrastructure."""
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from cli.config import CLISettings
 from niuu import container
+
+
+@pytest.fixture(autouse=True)
+def isolated_host_environment(monkeypatch):
+    for key, default in {
+        "NIUU_SERVER_HOST": "127.0.0.1",
+        "NIUU_SERVER_PUBLIC_HOST": "127.0.0.1",
+        "NIUU_SERVER_PORT": "8080",
+        "VOLUNDR__URL": "http://127.0.0.1:8080",
+    }.items():
+        monkeypatch.setenv(key, os.environ.get(key, default))
 
 
 def test_container_passes_config_and_public_origin_to_root(monkeypatch):
@@ -27,6 +39,13 @@ def test_container_passes_config_and_public_origin_to_root(monkeypatch):
         port=8080,
         public_host="https://forge.example.net",
     )
+    from volundr.config import Settings
+
+    plugin_settings = Settings()
+    assert plugin_settings.server_public_host == "https://forge.example.net"
+    assert plugin_settings.server_host == "0.0.0.0"
+    assert plugin_settings.server_port == 8080
+    assert os.environ["VOLUNDR__URL"] == "http://127.0.0.1:8080"
 
 
 def test_container_rejects_embedded_database_mode(monkeypatch):

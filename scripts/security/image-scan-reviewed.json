@@ -121,6 +121,12 @@
   },
   {
     "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc6:amd64.md5sums",
+    "sha256": "2e745269d2a106a0f21383c2dfd3ea2a98373f258b8e5ba2ae6f1fc032ad1d39",
+    "reason": "Public libc6 file checksum in pinned official Python amd64 base; verified against dpkg metadata"
+  },
+  {
+    "detector": "Box",
     "path": "/var/lib/dpkg/info/libc6:arm64.md5sums",
     "sha256": "31600501c867b16b696640e202ca656a6293b774d8c2afd84e44162609725bde",
     "reason": "Package checksum metadata misidentified as a token"
