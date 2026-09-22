@@ -130,5 +130,317 @@
     "path": "/var/lib/dpkg/info/libc6:arm64.md5sums",
     "sha256": "31600501c867b16b696640e202ca656a6293b774d8c2afd84e44162609725bde",
     "reason": "Package checksum metadata misidentified as a token"
+  },
+  {
+    "detector": "Box",
+    "path": "/usr/bin/glab",
+    "sha256": "f969f6d51c2050cfb5c573c09e04588ea30209a9f8f7292971aa36b4cd2f7a8f",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Box",
+    "path": "/usr/lib/aarch64-linux-gnu/libgnutls.so.30.41.1",
+    "sha256": "9756474ad1dca77cda335226593e50559ea321f26fb8a2ef91b0643296812070",
+    "reason": "Public GnuTLS library embedded self-test key fragment, identical across architectures."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc-gconv-modules-extra:arm64.md5sums",
+    "sha256": "06bac6e07f33eeae32a8a4b02be816268b25c4bf95c65fcc7fa445eb53829d0d",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libperl5.40:arm64.md5sums",
+    "sha256": "294882f28a4037c15295c6d45146de9170729c182d1ccfb8dc0442c0de89c2c4",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libpython3.14-stdlib:arm64.md5sums",
+    "sha256": "a1af5380e2634ae5006253cc1f1581d9e0274183222fbe16f582550d5db184a8",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/nodejs.md5sums",
+    "sha256": "0fab400258b6c2a5519362b506c5d48ff4d1f2ade315eec1051be862a97828f1",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/nodejs.md5sums",
+    "sha256": "4e6890a511f57489943a8f5de85adc3062147432f5a08f77712c807f89544030",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/perl-modules-5.40.md5sums",
+    "sha256": "ad6553b2f8bc4d35acf6694b21ee74c188797334d4982604d3f50a627fd02fc5",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/vim-runtime.md5sums",
+    "sha256": "7dc48e118e1620b56ccdcfc4139976e5bec32177f8bcb7a47045aa77d8451f38",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "GCP",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/google-auth-library/README.md",
+    "sha256": "25bedd0d4c50b578202bae96edfb4602bc182b146a2eb691d8a73272e491cea3",
+    "reason": "google-auth-library README template client_email with your-private-key/client-id placeholders."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "123b5251ef11ac861537cb37865f153478fa92afc0c5fb6865746fffe4520181",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "1797be5a6e5217fc7476b611433aa396cd8abed90382341a4b3ac7ff3399732f",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "2332845443d64770d9bb904dc749ad5a1ab697d5e7a471b21395b2894d62d35e",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "248cfd1bbe2b822cb59c8ccab78e14aa3323fda03a7ee62a95b9c59e8f7d1c47",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "28d21c379be6ec78d4b706b72cc573a940bac84a17a00ec0a819563d532f00fd",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "35281ed51762fa3d7beb8e4c886e9989ab1eee46d76b862b9a74f67b97e334cc",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "359edf9b2c9349dc8cffaa7a63a48b417796197e632d1eba7c725ba1ecdd1ca4",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "38393116d672022040c2478800295f3dc2d5b8eb31a639df486d19997ccfedd9",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "4337f5ed13a62eabac9cabbd1cb2a40d6b9222404f7b791eed47ab5cd371c987",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "457b6524481a96b99215f051940d989df2855e67323aed818d4ddd2b9f55fb62",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "45b3cad528cfe61294e0807d997f008cae01b4f49d5f5862bec95c69559cafac",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "4ca5f69112d4adf3c86cd07af9e0da0c76c1541ebb26ebe2290ce69f7a9afcd6",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "59b18fd326d1264fa0a062b2ce6b60c1186fa7c6e64626802f6492796136c057",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "5bdbd1b5bd16145ae60956f98a023b4e5f24afc464f8326a58f105076741b929",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "5cde8764b939d164cee4849444150bfa0523fa54e84ac2ecd3e58a9cd0a1ec0e",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "625b55f759f081403efbecd2891eb8b5e5c16fc1cdaee90ebfb9855668e5fbc9",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "752b9fcd7df0fd6b42015f15e2d8e516d1745d9229b6f7ab9d8cc56f30ed3f97",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "77250ed0776255016a3c7c19f70b22f119aa34c3ba288f1593b7f4e926b6b151",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "7a92b1fc13ee625058d57d48c5e694d612c3ca69c52e91e377d021982c991dc0",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "7b16171c6d05cad51e05acfdd054c90d588e2fd4f018bc6aa7219e160a686fd7",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "abc118ae151120b540f8717fe25a784eb1b132b75d1c61a40c473275a796787f",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "b7c1be2042af759fc1e295855b5632e7f7a33e77307c7afab756e276ac91ad1f",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "c0a3780f833e949ca7744a41ae37c7853068dce27d3e3a3dee153dd33ab3cd55",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "d7d2279e829bad564f2727d6ad2b4f7f916005ba0ee6a0bf470d4d2c02a02947",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "dcc208f629952f294571c7baa0d1d637f338a1724d074d1c4a7bb31cdac1ceb8",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "df3147808fa4a2d32336af21f73379ff20cfca101d4a4ab3e1a1a79c05839f06",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "e758e6752b2b99a0c32c3d51ca3a008ba80ca17c3baae474ae9a242808922dce",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "e8fcefe93570c4185b15c6806979497339a81bd84c661d9f1392500a77ba07c3",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "fd6042eef8fa6142f7edf10dff18a832c523da8ee827fa559be0af675d306a7c",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/var/lib/dpkg/status",
+    "sha256": "714b20af8aec6c80a38e7719076214c20e4a5bfd2e12dba1733c9a5d2ff9a262",
+    "reason": "GitLab package maintainer contact address, not a token."
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/@types/node/http.d.ts",
+    "sha256": "e1892fbff88509b681babfcf07bf4ac0423127bc4a19d3ac0311ee623cb27700",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/@types/node/https.d.ts",
+    "sha256": "e04cf0cad2f92d4022b44847b084419dc395f8c6830516a92b55d9c2ea8fe64d",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/@types/node/url.d.ts",
+    "sha256": "59f60bbeaca263cdb792b614d0eb0aa57e9ce25c7149ec58b9b3c388cdeb5c45",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/@types/node/url.d.ts",
+    "sha256": "6fba4d32c303a6da837fee9e2a1fa5083f4e24388997491074ac8984886cbf73",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/skuld-tools/node_modules/@earendil-works/pi-coding-agent/node_modules/@types/node/url.d.ts",
+    "sha256": "e04cf0cad2f92d4022b44847b084419dc395f8c6830516a92b55d9c2ea8fe64d",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/usr/share/perl/5.40.1/HTTP/Tiny.pm",
+    "sha256": "3ddcb26257b8a0c4434731bd87c34e0c1085ef9f886a82992c83535563a6cb16",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "URI",
+    "path": "/usr/share/perl/5.40.1/HTTP/Tiny.pm",
+    "sha256": "51af07b5ec195029db96337e0777dd064b8b54e68d4d3a1f9dab915c570a925b",
+    "reason": "Dependency documentation example URL; reviewed in Node type declarations or Perl HTTP::Tiny POD."
+  },
+  {
+    "detector": "Box",
+    "path": "/usr/lib/x86_64-linux-gnu/libgnutls.so.30.41.1",
+    "sha256": "9756474ad1dca77cda335226593e50559ea321f26fb8a2ef91b0643296812070",
+    "reason": "Public GnuTLS library embedded self-test key fragment, identical across architectures."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc-gconv-modules-extra:amd64.md5sums",
+    "sha256": "7b5a2074d6d782b5f3f4dcd2c57013173258754499e70420f2f50054b47755cc",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libperl5.40:amd64.md5sums",
+    "sha256": "294882f28a4037c15295c6d45146de9170729c182d1ccfb8dc0442c0de89c2c4",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libpython3.14-stdlib:amd64.md5sums",
+    "sha256": "a1af5380e2634ae5006253cc1f1581d9e0274183222fbe16f582550d5db184a8",
+    "reason": "Published Ubuntu/Node package MD5 checksum, checked against package control metadata."
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/usr/bin/glab",
+    "sha256": "765f9e1758f405254ae151df10ee63e94aafe78fe5dc9d780bf8423ae5d02774",
+    "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
   }
 ]

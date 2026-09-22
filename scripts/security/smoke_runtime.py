@@ -134,6 +134,8 @@ def main() -> None:
                 "-e",
                 "NIUU_DATABASE_MODE=external",
                 "-e",
+                'RESIDENT_RUNTIMES={"controllers":[],"session_controllers":[],"profiles":[]}',
+                "-e",
                 "DATABASE__HOST=postgres",
                 "-e",
                 "DATABASE__USER=postgres",
@@ -188,7 +190,11 @@ def main() -> None:
         logs = Path(tempfile.mkdtemp(prefix=prefix + "-logs-"))
         for name in (db, api):
             result = docker("logs", name, check=False)
-            (logs / (name + ".log")).write_text(result.stdout + result.stderr)
+            content = (result.stdout + result.stderr).replace(password, "[test credential]")
+            (logs / (name + ".log")).write_text(content)
+            # This isolated test has no operator config or provider credentials.
+            # Keep diagnostics useful on disposable CI runners as well.
+            print(f"{name} startup diagnostics:\n" + "\n".join(content.splitlines()[-80:]))
         print(f"Isolated smoke logs: {logs}")
         raise
     finally:
