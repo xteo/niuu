@@ -62,6 +62,7 @@ class VolundrPlugin(ServicePlugin):
                 prefixes=(
                     "/api/v1/forge/admin",
                     "/api/v1/forge/settings",
+                    "/api/v1/forge/version",
                 ),
                 description=(
                     "Administrative routes for Forge host settings and global workspace management."

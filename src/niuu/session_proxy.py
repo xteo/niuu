@@ -419,9 +419,9 @@ async def _proxy_ws(
                     if confirmed_dead
                     else "Session is starting; retry",
                 )
-            return
-        with suppress(Exception):
-            await websocket.close()
+        else:
+            with suppress(Exception):
+                await websocket.close()
 
 
 def get_skuld_registry() -> SkuldPortRegistry | None:

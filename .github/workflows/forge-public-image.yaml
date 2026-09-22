@@ -70,6 +70,10 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
         run: python3 scripts/security/smoke_image.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA"
+      - name: Boot isolated Forge and Guild
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/smoke_runtime.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA"
       - run: python3 scripts/security/install_scanners.py "$RUNNER_TEMP/scanners"
       - name: Scan image layers before publication
         env:
