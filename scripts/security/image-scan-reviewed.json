@@ -442,5 +442,137 @@
     "path": "/usr/bin/glab",
     "sha256": "765f9e1758f405254ae151df10ee63e94aafe78fe5dc9d780bf8423ae5d02774",
     "reason": "GitLab CLI 1.117.0 compiled Go symbols/help paths; Box match decodes inside the bundled TrueType font."
+  },
+  {
+    "detector": "Box",
+    "path": "/usr/lib/aarch64-linux-gnu/libgnutls.so.30.40.3",
+    "sha256": "9756474ad1dca77cda335226593e50559ea321f26fb8a2ef91b0643296812070",
+    "reason": "Public GnuTLS library embedded self-test key fragment, identical to reviewed Ubuntu builds."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc6:arm64.md5sums",
+    "sha256": "b0761486ed642b8303c261f01e3b867989df908608b850fc3a3aa6d5abde7b29",
+    "reason": "Debian libc package MD5 checksum for the ISO_11548-1 converter."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "5bea9888dca190f737bf097b68943bbd656f54cdc24c0bc6f49d1854177e89c4",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "e1e789b88120f81b1320612569a5e4dd1ed86740ec0f87b3438f6cc3a95eab61",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "63f7cd9c444bfa9897a464fa2942c39d4b24dcc573747620bb48a72836e6cc0d",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "d9b32f206f24d5a6244d29cba071adf94cb237dff8142eb046d1e250db037ae6",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "14acfdd74308d90a1efe99c6684705e5ea2a55ad37728219f3207b9d44d9a247",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "8e07b1d86ee458f7e4296171b81ef818e8b3434afe5de81fc2498d1e3bc66105",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "bd7f4a11efa92f56fba9ebf16ad88c74170905393ed6ddcb6120656c9711dc0a",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "d074a118d8de01f00838ab3c92b7892a13e05e4ca8709b9b79370d76f7c817a7",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "76fab54b5ace44e362b0bd456c4b7f469362a1aab9ee5721603c81844215bd9a",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Getresponse",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "cb4eace1f09b6ae1e5161126ff556bf8914e27a60e561ac4d1b20326057b4ced",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "99cc1bfecd663f4a7ab0690ecc0b1574653cf0ccf92f4196c9a6d9f997b92e2b",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "52e54de16bebec7f6dc1891c2d1bdc85e81f105c17fcc8ec76728b35d86436fc",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "421f3b287ded9da0c0380fc94485502f8d50c468e776144784520b68975c0926",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "9060cb539421df0b1beb2ddc3afeeeaf5a1f5dc3fcc6390a298bb3e1dc8287a4",
+    "reason": "Pinned Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "302fad2dd98760d13675441d6ddb597acc5ff2de25cd9c040559aabdcecb21c4",
+    "reason": "Pinned AMD64 Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Getresponse",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "6a5e51c82ebae6554f0d6bdb295e016581d49caf8c99e3fa30236f2bf5837d41",
+    "reason": "Pinned AMD64 Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "9f8d53e213de526d454cfe3f54f24c59b1d394e613e6a153f496bc0a046d062b",
+    "reason": "Pinned AMD64 Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/switchyard_rust/_switchyard_rust.abi3.so",
+    "sha256": "1d242f0c17f4e67bd1c54e21871a223bb702fca76a203dab68576b01cad48c0a",
+    "reason": "Pinned AMD64 Switchyard wheel: LLVM anonymous symbol hash in compiled Rust symbol table."
+  },
+  {
+    "detector": "Box",
+    "path": "/usr/lib/x86_64-linux-gnu/libgnutls.so.30.40.3",
+    "sha256": "9756474ad1dca77cda335226593e50559ea321f26fb8a2ef91b0643296812070",
+    "reason": "Public GnuTLS library embedded self-test key fragment, identical across architectures."
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc6:amd64.md5sums",
+    "sha256": "55f1ab5d47e7f59227bb12f5200544fcf55ac950f45d78275b2ee01541094a2f",
+    "reason": "Debian AMD64 libc package MD5 checksum for the ISO_11548-1 converter."
   }
 ]
