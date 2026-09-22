@@ -70,7 +70,7 @@ export function compactSourceParts(value: string): { label: string; branch?: str
   return { label: shortenRepoLabel(value) };
 }
 
-/** Collapse a leading "/home/<user>/" (incl. literal "/home/thor/") to "~/". */
+/** Collapse a leading "/home/<user>/" (incl. literal "/home/operator/") to "~/". */
 function homeToTilde(value: string): string {
   return value.replace(/^\/(?:home|Users)\/[^/]+\//, '~/');
 }

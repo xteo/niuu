@@ -30,9 +30,9 @@ refresh occurred.
 ## Web and runtime visibility
 
 Thor's static UI is published at
-[the existing Tailscale URL](https://thor.tail737f2a.ts.net:3001/volundr/).
+[the existing Tailscale URL](https://forge.example.net:3001/volundr/).
 Nginx was gracefully reloaded with the `636017fb` assets and existing runtime
-configuration. Its Build upstream now uses the current `100.117.154.99` address.
+configuration. Its Build upstream now uses the current `198.51.100.15` address.
 A live browser check showed the running broker's old build and available API
 source in the new **Runtime update available** popover, with no page errors.
 
@@ -84,7 +84,7 @@ The native companion is pushed to
 at `c5ec528e`, with 366 tests passed. No iOS build number or Apple release changed.
 
 Private process manifests, backup inventories, replay hashes and coordinator
-receipts are under `/home/thor/.local/share/niuu/rollouts/forge-guild-20260922/`, with
+receipts are under `/home/operator/.local/share/niuu/rollouts/forge-guild-20260922/`, with
 corresponding evidence on each operated node. No finite sampled replay check proves
 every unflushed frame or physical iOS reconnection. Build-Kit has no inactive
 history samples; its acceptance uses retained live-history and database prefixes.
@@ -92,3 +92,5 @@ history samples; its acceptance uses retained live-history and database prefixes
 The [Forge MCP/skills/notification proposal](mcp-skills-notifications-design.md)
 and container fleet proposal are designs. No new MCP service, notification feed,
 GBrain deployment or container publication is claimed by this release.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

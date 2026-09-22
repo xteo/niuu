@@ -16,7 +16,7 @@ test('runtime inspection shows loading, version mismatch and retry without resta
     status: 'running',
     activity_state: 'idle',
     model: 'gpt-6-astra',
-    source: { type: 'local_mount', local_path: '/home/horde' },
+    source: { type: 'local_mount', local_path: '/home/worker' },
     created_at: '2026-09-22T00:00:00Z',
   };
   let release!: () => void;

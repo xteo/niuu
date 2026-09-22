@@ -86,8 +86,8 @@ class TestTurnTranslation:
             "id": "t1",
             "role": "user",
             "content": "who is here?",
-            "participant_id": "human:damien",
-            "participant_meta": {"participant_type": "human", "display_name": "Damien"},
+            "participant_id": "human:user",
+            "participant_meta": {"participant_type": "human", "display_name": "user"},
         }
 
         message = room.turn_to_message(turn)
@@ -118,13 +118,13 @@ class TestTurnTranslation:
 
 
 class TestMentionResolution:
-    PEERS = {"travis", "neo", "human:damien"}
+    PEERS = {"travis", "neo", "human:user"}
 
     def test_a_handle_resolves(self) -> None:
         assert room._resolve_mentions("@neo check the port", self.PEERS) == ["neo"]
 
     def test_a_human_answers_to_their_bare_name(self) -> None:
-        assert room._resolve_mentions("@damien look", self.PEERS) == ["human:damien"]
+        assert room._resolve_mentions("@user look", self.PEERS) == ["human:user"]
 
     def test_an_unknown_handle_is_not_a_recipient(self) -> None:
         assert room._resolve_mentions("@nobody hello", self.PEERS) == []

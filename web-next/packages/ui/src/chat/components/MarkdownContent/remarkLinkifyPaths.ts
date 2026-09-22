@@ -3,7 +3,7 @@
  * remark plugin: turn bare file-path references in prose into links.
  *
  * Coding agents mention files inline ("see src/App.tsx" / "edit ./styles/x.css" /
- * "open CLAUDE.md" / "wrote /home/thor/notes.md") without markdown link syntax.
+ * "open CLAUDE.md" / "wrote /home/operator/notes.md") without markdown link syntax.
  * This walks the mdast and wraps path-like tokens in `link` nodes so the app's
  * `<a>` renderer (which knows the workspace root) can open them in the file
  * viewer. Two tiers, tuned against real coding-session transcripts:

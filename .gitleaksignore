@@ -1,0 +1,16 @@
+# Exact current-tree findings reviewed 2026-09-22: inert test literals,
+# generated-key factory, environment-variable name, and chart secret path.
+# No detector or directory is excluded. Historical audit is separate.
+charts/bifrost/values.yaml:generic-api-key:341
+scripts/ravn-mesh-e2e.sh:generic-api-key:195
+tests/ravn/unit/test_hooks.py:generic-api-key:311
+tests/ravn/unit/test_hooks.py:generic-api-key:597
+tests/test_bifrost/test_config.py:generic-api-key:19
+tests/test_integration_registry.py:generic-api-key:167
+tests/test_integration_registry.py:generic-api-key:212
+tests/test_niuu/test_memory_token_issuer.py:generic-api-key:12
+tests/test_niuu/test_memory_token_issuer.py:generic-api-key:13
+tests/test_niuu/test_keycloak_token_issuer.py:generic-api-key:18
+tests/test_ravn/openclaw_handshake.py:generic-api-key:117
+tests/test_niuu/test_pat_revocation_middleware.py:generic-api-key:15
+tests/test_niuu/test_rest_instances.py:generic-api-key:540

@@ -6,6 +6,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from niuu.packaged_build import packaged_build
+
 
 class BuildIdentitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="NIUU_BUILD_")
@@ -17,6 +19,14 @@ GIT_IDENTITY_TIMEOUT_SECONDS = 5
 
 
 def build_identity() -> dict[str, str | bool]:
+    manifest = packaged_build()
+    if manifest is not None:
+        return {
+            "revision": manifest.revision,
+            "build": manifest.version,
+            "source_sha256": manifest.source_sha256,
+            "dirty": False,
+        }
     root = Path(__file__).resolve().parents[2]
     settings = BuildIdentitySettings()
     revision = settings.revision

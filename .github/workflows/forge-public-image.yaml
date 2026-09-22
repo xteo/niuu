@@ -1,0 +1,122 @@
+name: Public Forge images
+
+on:
+  push:
+    branches: [forge/ux-cleanup]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-public-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: github.repository == 'xteo/niuu'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/security/install_scanners.py "$RUNNER_TEMP/scanners"
+      - name: Check public source snapshot
+        run: |
+          python3 scripts/security/check_public_tree.py
+          mkdir "$RUNNER_TEMP/public-source"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/public-source"
+          cd "$RUNNER_TEMP/public-source"
+          "$RUNNER_TEMP/scanners/gitleaks" dir --redact=100 --no-banner .
+
+  build:
+    needs: audit
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+        container: [niuu, skuld]
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/xteo/${{ matrix.container }}
+      TAG: forge-ux-cleanup-sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Build upstream Docker recipe before publication
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: containers/${{ matrix.container }}/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.platform }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+            APP_VERSION=forge-ux-cleanup-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/xteo/niuu
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: |
+            type=registry,ref=ghcr.io/niuulabs/${{ matrix.container }}:buildcache-${{ matrix.platform }}
+            type=gha,scope=cleanup-${{ matrix.container }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=cleanup-${{ matrix.container }}-${{ matrix.platform }}
+          provenance: false
+      - name: Verify installed identity and artifacts
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          KIND: ${{ matrix.container }}
+        run: python3 scripts/security/smoke_image.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA" --kind "$KIND"
+      - name: Boot isolated Forge and Guild using upstream CLI
+        if: matrix.container == 'niuu'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/smoke_runtime.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA"
+      - run: python3 scripts/security/install_scanners.py "$RUNNER_TEMP/scanners"
+      - name: Scan all image layers before publication
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/scan_image.py "$IMAGE:$TAG-$PLATFORM" --scanner "$RUNNER_TEMP/scanners/trufflehog"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified architecture
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: docker push "$IMAGE:$TAG-$PLATFORM"
+
+  promote:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the verified image pair
+        env:
+          TAG: forge-ux-cleanup-sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for name in niuu skuld; do
+            IMAGE="ghcr.io/xteo/$name"
+            docker buildx imagetools create --tag "$IMAGE:$TAG" --tag "$IMAGE:forge-ux-cleanup" \
+              "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+            ANON_CONFIG=$(mktemp -d)
+            DOCKER_CONFIG="$ANON_CONFIG" docker manifest inspect "$IMAGE:$TAG" > manifest.json
+            python3 -c 'import json; d=json.load(open("manifest.json")); assert {m["platform"]["architecture"] for m in d["manifests"]} == {"amd64", "arm64"}'
+            docker buildx imagetools inspect "$IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+          done

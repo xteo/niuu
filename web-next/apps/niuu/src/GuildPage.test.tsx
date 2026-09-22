@@ -38,7 +38,7 @@ const node: InstanceRecord = {
   tags: ['build'],
   config: {
     transport: 'remote',
-    defaultFolder: '/home/build',
+    defaultFolder: '/home/worker',
     credentialBinding: { scope: 'tenant', name: 'forge' },
     capabilities: ['sessions'],
   },
@@ -118,7 +118,7 @@ describe('Guild node management', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Edit settings' }));
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Build Kit' } });
     fireEvent.change(screen.getByLabelText(/^Server URL/), {
-      target: { value: 'http://100.90.20.64:8080/' },
+      target: { value: 'http://198.51.100.11:8080/' },
     });
     fireEvent.change(screen.getByLabelText('Default local folder'), { target: { value: '/work' } });
     fireEvent.change(screen.getByLabelText('Tags'), { target: { value: 'build, fast fast' } });
@@ -131,7 +131,7 @@ describe('Guild node management', () => {
         body: {
           name: 'Build Kit',
           slug: 'build-kit',
-          baseUrl: 'http://100.90.20.64:8080',
+          baseUrl: 'http://198.51.100.11:8080',
           enabled: true,
           isDefault: false,
           tags: ['build', 'fast'],

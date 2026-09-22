@@ -65,6 +65,12 @@ COPY pyproject.toml uv.lock README.md /app/
 RUN uv sync --frozen --no-dev --no-editable --no-install-project --extra cli --extra k8s --extra nats \
     --extra openshell --extra otel --extra switchyard --no-install-package nemo-switchyard
 COPY src/ /app/src/
+COPY scripts/build_manifest.py /app/scripts/build_manifest.py
+ARG BUILD_REVISION
+ARG BUILD_REF=dev
+ARG APP_VERSION=dev
+RUN if [ -n "$BUILD_REVISION" ]; then python3 scripts/build_manifest.py \
+    --revision "$BUILD_REVISION" --ref "$BUILD_REF" --version "$APP_VERSION"; fi
 RUN uv sync --frozen --no-dev --no-editable --extra cli --extra k8s --extra nats --extra openshell \
     --extra otel --extra switchyard --no-install-package nemo-switchyard \
     && mkdir -p /dist-root/data/mimir

@@ -11,40 +11,40 @@ async function fixture(page: Page, failLaunch = false) {
       id: 'thor',
       slug: 'local',
       name: 'Thor',
-      baseUrl: 'http://100.66.123.128:8080',
+      baseUrl: 'http://198.51.100.10:8080',
       enabled: true,
       isDefault: true,
-      config: { transport: 'embedded', defaultFolder: '/home/thor/repos/niuu' },
+      config: { transport: 'embedded', defaultFolder: '/home/operator/repos/niuu' },
       tags: [],
     },
     {
       id: 'spark',
       slug: 'spark',
       name: 'Spark',
-      baseUrl: 'http://100.127.141.74:8080',
+      baseUrl: 'http://198.51.100.12:8080',
       enabled: true,
       isDefault: false,
-      config: { defaultFolder: '/home/xteo/repos' },
+      config: { defaultFolder: '/home/operator/repos' },
       tags: [],
     },
     {
       id: 'build',
       slug: 'build',
       name: 'Build',
-      baseUrl: 'http://100.81.183.4:8080',
+      baseUrl: 'http://198.51.100.13:8080',
       enabled: true,
       isDefault: false,
-      config: { defaultFolder: '/home/horde' },
+      config: { defaultFolder: '/home/worker' },
       tags: [],
     },
     {
       id: 'build-bro',
       slug: 'build-bro',
       name: 'Build Bro',
-      baseUrl: 'http://100.115.8.110:8080',
+      baseUrl: 'http://198.51.100.14:8080',
       enabled: true,
       isDefault: false,
-      config: { defaultFolder: '/home/horde' },
+      config: { defaultFolder: '/home/worker' },
       tags: [],
     },
   ];
@@ -148,7 +148,7 @@ async function fixture(page: Page, failLaunch = false) {
           name: 'Review',
           model: 'gpt-6-astra',
           status: 'starting',
-          source: { type: 'local_mount', local_path: '/home/thor/repos/niuu' },
+          source: { type: 'local_mount', local_path: '/home/operator/repos/niuu' },
         },
       });
     return route.fulfill({ json: [] });
@@ -172,7 +172,7 @@ test('Claude and Codex quick launch submits the native contract with optional re
   await page.getByRole('button', { name: /^Codex/ }).click();
   await expect(page.getByLabel('Model', { exact: true })).toHaveValue('gpt-6-astra');
   await page.getByLabel('Forge', { exact: true }).selectOption('spark');
-  await expect(page.getByLabel('Working folder')).toHaveValue('/home/xteo/repos');
+  await expect(page.getByLabel('Working folder')).toHaveValue('/home/operator/repos');
   await page.getByLabel('Effort', { exact: true }).selectOption('ultra');
   await page.getByRole('button', { name: 'Launch Codex', exact: true }).click();
   await expect.poll(() => calls.length).toBe(1);
@@ -181,7 +181,7 @@ test('Claude and Codex quick launch submits the native contract with optional re
     model: 'gpt-6-astra',
     instance_id: 'spark',
     workload_config: { reasoningEffort: 'ultra' },
-    source: { type: 'local_mount', local_path: '/home/xteo/repos' },
+    source: { type: 'local_mount', local_path: '/home/operator/repos' },
   });
   expect(calls[0]!.body).not.toHaveProperty('resource_config');
   expect(calls[0]!.body).not.toHaveProperty('launch_spec');
@@ -194,7 +194,7 @@ test('Git selection, errors, and the legacy runtime remain explicit choices', as
   await expect(page.getByRole('button', { name: 'Launch Claude', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Launch Claude', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('Forge is offline');
-  await expect(page.getByLabel('Working folder')).toHaveValue('/home/thor/repos/niuu');
+  await expect(page.getByLabel('Working folder')).toHaveValue('/home/operator/repos/niuu');
   expect(calls).toHaveLength(1);
   await page.getByLabel('Workspace source').selectOption('git');
   await page

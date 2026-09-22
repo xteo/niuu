@@ -19,7 +19,7 @@ const parts = [
   {
     type: 'text',
     id: 'after',
-    text: 'See the [website](https://preview.example.test/site) and [remote guide](https://preview.example.test/docs/guide.md). Open the [image reference](https://images.example.test/reference.png?revision=2) and the [local image](./diagram.svg). Open the [review notes](/home/thor/review/docs/review.md) or the [missing file](./missing.md).\n\n![Diagram](./diagram.svg)',
+    text: 'See the [website](https://preview.example.test/site) and [remote guide](https://preview.example.test/docs/guide.md). Open the [image reference](https://images.example.test/reference.png?revision=2) and the [local image](./diagram.svg). Open the [review notes](/home/operator/review/docs/review.md) or the [missing file](./missing.md).\n\n![Diagram](./diagram.svg)',
     complete: true,
   },
   {
@@ -65,7 +65,7 @@ async function fixture(page: Page, rich = false) {
           parent: session.id === 'idle' ? { instance_id: 'thor', session_id: 'review' } : null,
         }
       : undefined,
-    source: { type: 'local_mount', local_path: '/home/thor/review' },
+    source: { type: 'local_mount', local_path: '/home/operator/review' },
     created_at: '2026-09-16T00:00:00Z',
     last_active: '2026-09-16T10:00:00Z',
     chat_endpoint: `${origin.replace('http:', 'ws:')}/s/${session.id}/session`,
@@ -122,7 +122,7 @@ async function fixture(page: Page, rich = false) {
             harness: 'claude',
             external_id: 'cli-claude',
             title: 'Review notes',
-            workspace_path: '/home/thor/review',
+            workspace_path: '/home/operator/review',
             workspace_exists: true,
             workspace_allowed: true,
           },
@@ -131,7 +131,7 @@ async function fixture(page: Page, rich = false) {
             harness: 'codex',
             external_id: 'cli-codex',
             title: 'iOS improvements',
-            workspace_path: '/home/thor/lexi',
+            workspace_path: '/home/operator/lexi',
             workspace_exists: true,
             workspace_allowed: true,
           },
@@ -659,7 +659,7 @@ test('session rows align name and state above agent, host, folder and age with o
   await expect(row.locator('.forge-session-row__source')).toHaveText('~/review');
   await expect(row.locator('.forge-session-row__source')).toHaveAttribute(
     'title',
-    '/home/thor/review',
+    '/home/operator/review',
   );
   const claude = page.getByTestId('pod-entry-idle').locator('.forge-session-harness');
   await expect(claude).toHaveText('Claude');
@@ -803,7 +803,7 @@ test('keeps Markdown link previews in one viewport and reveals target tooltips',
   await page.keyboard.press('Escape');
   await page.getByRole('button', { name: 'Session workspace details' }).click();
   await expect(
-    page.getByRole('dialog').getByText('/home/thor/review', { exact: true }),
+    page.getByRole('dialog').getByText('/home/operator/review', { exact: true }),
   ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Copy session ID' })).toBeVisible();
   await expect(page.getByTestId('session-model')).toHaveText('GPT-6 Astra');

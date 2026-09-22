@@ -85,10 +85,10 @@ recovers missed hints. iOS fetches the affected small projection, not the whole 
   loss/reconnect and manual UI acceptance remain pending. No rollout is implied.
 
 Local evidence:
-`/home/thor/repos/worktrees/niuu-lexi-session-unread-20260920/.local/unread-state-20260920/`
+`/home/operator/repos/worktrees/niuu-lexi-session-unread-20260920/.local/unread-state-20260920/`
 (`regression-final.log`, `read-state-coverage-final.json`, `lint-final.log`).
 Paired iOS worktree:
-`/home/thor/repos/worktrees/lexi-ios-chat-voice-ux-20260916`.
+`/home/operator/repos/worktrees/lexi-ios-chat-voice-ux-20260916`.
 
 Worker `thor:c8103dc7-a834-5e32-a06d-1a98d7a8e2b5`; parent
 `thor:8f20102d-6da7-58aa-98c2-e0bce2deab97`. This is a worker implementation record,

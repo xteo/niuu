@@ -113,7 +113,7 @@ class OpenClawGateway:
         self._room_clients: dict[str, openclaw_room.RoomClient] = {}
         #: Human seat used when a device posts into a room. One identity for the operator, so a
         #: message sent from the phone is the same participant as one sent from a terminal.
-        self._room_identity = str(getattr(config, "room_participant_id", "") or "human:damien")
+        self._room_identity = str(getattr(config, "room_participant_id", "") or "human:user")
         #: Last turn id relayed per room, so the poller emits each turn exactly once.
         self._room_cursor: dict[str, str] = {}
         self._room_poller: asyncio.Task[None] | None = None
@@ -243,7 +243,7 @@ class OpenClawGateway:
 
         Ravn's ``get_or_create_session`` has no ownership check, and Telegram
         shares the same :class:`RavnGateway`. Without this allowlist a phone
-        could pass ``telegram:8572736034`` and inject a turn into Damien's real
+        could pass ``telegram:1234567890`` and inject a turn into user's real
         thread, appending to its history.
         """
         if not isinstance(key, str):

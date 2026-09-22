@@ -618,9 +618,9 @@ class TestBrokerEnvIsolation:
     def test_the_caller_skuld_identity_is_not_inherited(self, tmp_path: Path) -> None:
         caller = {
             "PATH": "/usr/bin",
-            "HOME": "/home/thor",
+            "HOME": "/home/operator",
             "SKULD__SESSION__ID": "a620413a-a3f3-455e-95e7-11e99ca578b5",
-            "SKULD__SESSION__WORKSPACE_DIR": "/home/thor/repos/lexi-ios",
+            "SKULD__SESSION__WORKSPACE_DIR": "/home/operator/repos/lexi-ios",
             "SKULD__PORT": "9121",
             "SKULD__HOST": "127.0.0.1",
             "SKULD__TRANSPORT": "tmux-interactive",
@@ -634,16 +634,16 @@ class TestBrokerEnvIsolation:
 
     def test_ordinary_environment_still_reaches_the_broker(self, tmp_path: Path) -> None:
         """Stripping is surgical — the child still needs a PATH to run at all."""
-        caller = {"PATH": "/usr/bin", "HOME": "/home/thor", "SKULD__PORT": "9121"}
+        caller = {"PATH": "/usr/bin", "HOME": "/home/operator", "SKULD__PORT": "9121"}
 
         env = room_mod._broker_env(tmp_path / "broker.yaml", caller)
 
         assert env["PATH"] == "/usr/bin"
-        assert env["HOME"] == "/home/thor"
+        assert env["HOME"] == "/home/operator"
 
     def test_a_stale_config_pointer_cannot_survive(self, tmp_path: Path) -> None:
         """NIUU_CONFIG is always the room's own, never the caller's."""
-        caller = {"NIUU_CONFIG": "/home/thor/.ravn/rooms/other/broker.yaml"}
+        caller = {"NIUU_CONFIG": "/home/operator/.ravn/rooms/other/broker.yaml"}
 
         env = room_mod._broker_env(tmp_path / "broker.yaml", caller)
 

@@ -19,7 +19,7 @@ async function fixture(page: Page) {
       enabled: true,
       isDefault: false,
       config: {
-        defaultFolder: '/home/build',
+        defaultFolder: '/home/worker',
         transport: 'remote',
         credentialBinding: { scope: 'tenant', name: 'forge' },
       },
@@ -79,7 +79,7 @@ test('Guild edits a node, preserves its configuration and deletes its registrati
   const edit = page.getByRole('button', { name: 'Edit settings', exact: true });
   await edit.click();
   await page.getByLabel('Name', { exact: true }).fill('Build Kit');
-  await page.getByLabel('Server URL', { exact: false }).fill('http://100.90.20.64:8080');
+  await page.getByLabel('Server URL', { exact: false }).fill('http://198.51.100.11:8080');
   await page.getByRole('button', { name: 'Save changes' }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(
@@ -89,10 +89,10 @@ test('Guild edits a node, preserves its configuration and deletes its registrati
     method: 'PATCH',
     path: '/api/v1/niuu/instances/build-kit',
     body: {
-      baseUrl: 'http://100.90.20.64:8080',
+      baseUrl: 'http://198.51.100.11:8080',
       config: {
         transport: 'remote',
-        defaultFolder: '/home/build',
+        defaultFolder: '/home/worker',
         credentialBinding: { scope: 'tenant', name: 'forge' },
       },
     },

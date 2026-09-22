@@ -5,10 +5,10 @@ The client chooses one host and submits an absolute path to its existing checkou
 
 ```
 POST /api/v1/forge/projects/discover
-{"workspace_path":"/home/horde/projects/kit"}
+{"workspace_path":"/home/worker/projects/kit"}
 
 POST /api/v1/forge/projects/connect
-{"workspace_path":"/home/horde/projects/kit","name":"Kit"}
+{"workspace_path":"/home/worker/projects/kit","name":"Kit"}
 ```
 
 Discovery returns a validated ForgeProject without database writes. Connect repeats
@@ -42,4 +42,6 @@ The Lexi iOS companion is on `dev/project-polish` (build 2258). Thor and Spark r
 the discovery implementation at `44f85dc3`. build-bro still requires a Projects
 server upgrade before Kit can be connected; its initial revision `f44f62d5` had no
 Projects routes. Deployment evidence and rollback files are kept under
-`/home/thor/.niuu/validation/project-polish-20260912/`.
+`/home/operator/.niuu/validation/project-polish-20260912/`.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

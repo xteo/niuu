@@ -2,7 +2,7 @@
 
 import { chromium } from '@playwright/test';
 
-const base = 'http://192.168.1.106:8080/ting/research/assess-whether-adding-a-dedicated-research-center-tab-in-ting-i?config=/config.live.json';
+const base = 'http://127.0.0.1:8080/ting/research/assess-whether-adding-a-dedicated-research-center-tab-in-ting-i?config=/config.live.json';
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1600, height: 1050 } });
 await page.goto(base, { waitUntil: 'domcontentloaded', timeout: 30000 });

@@ -4,7 +4,7 @@ This document supersedes the design snapshot where it assumed one current coordi
 
 ## Durable identity and storage
 
-`xteo/project-lexi` is the first project repository, checked out on Thor at `/home/thor/projects/lexi`. Its stable UUID is `4b011f7f-87fb-4f4f-a53d-5eb4025c510f` in `project.json`. Mission, checkpoint, host preferences, source-repository bindings, accepted decisions, reusable knowledge, and curated handoffs live in Git. No coordinator session owns or defines the project's lifetime.
+`xteo/project-lexi` is the first project repository, checked out on Thor at `/home/operator/projects/lexi`. Its stable UUID is `4a9912d1-2eef-5177-b57a-75f9cca07628` in `project.json`. Mission, checkpoint, host preferences, source-repository bindings, accepted decisions, reusable knowledge, and curated handoffs live in Git. No coordinator session owns or defines the project's lifetime.
 
 PostgreSQL stores a project index on each participating Forge host, immutable session membership/parent references, dispatch deduplication records, and an append-only receipt inbox. Registrations on different hosts use the same project UUID and Git remote with their own local checkout paths. The current implementation does not clone arbitrary repositories through an HTTP request: the existing Git/SSH workflow prepares a checkout and then registers it.
 
@@ -83,3 +83,5 @@ Code commit `673b5000` is running on Thor and Spark. The complete backend suite 
 Live acceptance verified Codex coordination on Thor, Opus 5 context recovery, a Codex child on Spark, idempotent dispatch retry, replay, receipt acknowledgement/export, native stop/start/resume, and both API servers restarting without losing project state. Separate Codex coordinators recovered the project and committed their findings to its Git repository. Codex Astra with xhigh effort is the preferred driver; Claude uses Opus 5 through tmux.
 
 The iOS track passed 288 ForgeKit tests, 27 focused simulator tests, and actual project registration, coordinator launch, and cross-host child → parent → project navigation. Build 2254 source and three inspected simulator screenshots are published on `xteo/lexi-ios` branch `dev/project`. [Detailed acceptance and practical boundaries](https://github.com/xteo/lexi-ios/blob/dev/project/docs/forge/projects-acceptance-2254.md) distinguish verified behavior from remaining activity-state work and release processing. The signed release is a separate gate; consult App Store Connect evidence before claiming TestFlight availability.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

@@ -33,10 +33,10 @@ Prints the broker URL. `ravn room ls|show|start|stop|rm` manage it.
 A persona says who the Ravn is and which backend runs it. It is required —
 `ravn join` refuses to start without one. `ravn personas list` shows the
 built-ins, but they are nearly all specialists; for a general steward start
-here (`damien-steward.yaml`):
+here (`user-steward.yaml`):
 
 ```yaml
-name: damien-steward
+name: user-steward
 system_prompt_template: |
   You are a resident Ravn operating inside a durable daemon.
   Orient from the mandate, inspect memory before acting, create and advance useful work,
@@ -75,7 +75,7 @@ one field changes the character of the agent more than anything else here.
 ## 3. Put the Ravn in the room
 
 ```bash
-ravn join --persona ./damien-steward.yaml --room desk --as steward
+ravn join --persona ./user-steward.yaml --room desk --as steward
 ```
 
 Blocks until the Ravn actually registers, so a reported join is a join.

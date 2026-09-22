@@ -1,0 +1,134 @@
+[
+  {
+    "detector": "Postgres",
+    "path": "/opt/venv/lib/python3.14/site-packages/bifrost/adapters/postgres_store.py",
+    "sha256": "790d615395b17ac4ce45c4873dbf617447babb189bca57a869e390dea63e3da0",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/credentials/mount_strategies.py",
+    "sha256": "c2b2b094ff135feebbb6610aa157e80dd3af69d5c0e1c6d2723d8b04f93b0b5c",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/httpx/_urls.py",
+    "sha256": "3d6e008451b0edcc8d3524508217185561c5a2851b4379ecaeb228460d0f6f10",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/opentelemetry/semconv/_incubating/attributes/url_attributes.py",
+    "sha256": "799d94be51099a6b3b40c691fbdfea4c40227d7bed8cd612b1168e2248b20ceb",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/opentelemetry/semconv/attributes/url_attributes.py",
+    "sha256": "799d94be51099a6b3b40c691fbdfea4c40227d7bed8cd612b1168e2248b20ceb",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/opentelemetry/semconv/attributes/url_attributes.py",
+    "sha256": "cb52e475b42e59b99b31b6f1e20fe1668966e0c3079f50fb755a738262bf6257",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/opentelemetry/semconv/trace/__init__.py",
+    "sha256": "799d94be51099a6b3b40c691fbdfea4c40227d7bed8cd612b1168e2248b20ceb",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/opentelemetry/semconv/trace/__init__.py",
+    "sha256": "cb52e475b42e59b99b31b6f1e20fe1668966e0c3079f50fb755a738262bf6257",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/pydantic/networks.py",
+    "sha256": "17e3e055d530ff3071dbd968c4375f712038b33cdc2359ea613917f3ffb569c7",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/pydantic/networks.py",
+    "sha256": "90f367448a3e3f2eca8d00c1962c6f8fb95e95eb8bfcdbd5c61bb9e2a839e460",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/pydantic/networks.py",
+    "sha256": "ae7c9f95165aff0b836da5283e9c119d1c8d7ad9d169aba95874044b1b03fd55",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "Postgres",
+    "path": "/opt/venv/lib/python3.14/site-packages/ravn/adapters/checkpoint/postgres.py",
+    "sha256": "790d615395b17ac4ce45c4873dbf617447babb189bca57a869e390dea63e3da0",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "Postgres",
+    "path": "/opt/venv/lib/python3.14/site-packages/ravn/adapters/memory/migrate.py",
+    "sha256": "790d615395b17ac4ce45c4873dbf617447babb189bca57a869e390dea63e3da0",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "Box",
+    "path": "/opt/venv/lib/python3.14/site-packages/textual-8.2.8.dist-info/RECORD",
+    "sha256": "fd2471577d4a8442da1ed801a2873dc39403d9829a87e3a433ef2d9b247cff2f",
+    "reason": "Package checksum metadata misidentified as a token"
+  },
+  {
+    "detector": "URI",
+    "path": "/opt/venv/lib/python3.14/site-packages/urllib3/util/url.py",
+    "sha256": "418dd97050449f2be0d742637abe94ca693d845f3d384519f0bb040c61956931",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "Gitlab",
+    "path": "/opt/venv/lib/python3.14/site-packages/volundr/main.py",
+    "sha256": "25f15e2d7fffd039e8dabc81694f7eec5240b6528417b854bd4babda4faf29e1",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "URI",
+    "path": "/usr/local/lib/python3.14/site-packages/pip/_vendor/urllib3/util/url.py",
+    "sha256": "418dd97050449f2be0d742637abe94ca693d845f3d384519f0bb040c61956931",
+    "reason": "Public library docstring/example URL, localhost sample DSN, or Python identifier; no operational credential"
+  },
+  {
+    "detector": "RedHatPyxis",
+    "path": "/var/lib/dpkg/available",
+    "sha256": "13532a18f073b84b9799d5d4111e4d479e8a017e00a1fbc9e6bd307d29a63211",
+    "reason": "Package checksum metadata misidentified as a token"
+  },
+  {
+    "detector": "RedHatPyxis",
+    "path": "/var/lib/dpkg/available",
+    "sha256": "59a05fb26d9ffd82c19229753a0fde980dbabdb3a226d0b00e04c028481019bd",
+    "reason": "Package checksum metadata misidentified as a token"
+  },
+  {
+    "detector": "RedHatPyxis",
+    "path": "/var/lib/dpkg/available",
+    "sha256": "863f0d85b3d604a9f24183ada34b2cd19690b8ec8264a71b0afbf840b89f371f",
+    "reason": "Package checksum metadata misidentified as a token"
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc6:amd64.md5sums",
+    "sha256": "2e745269d2a106a0f21383c2dfd3ea2a98373f258b8e5ba2ae6f1fc032ad1d39",
+    "reason": "Public libc6 file checksum in pinned official Python amd64 base; verified against dpkg metadata"
+  },
+  {
+    "detector": "Box",
+    "path": "/var/lib/dpkg/info/libc6:arm64.md5sums",
+    "sha256": "31600501c867b16b696640e202ca656a6293b774d8c2afd84e44162609725bde",
+    "reason": "Package checksum metadata misidentified as a token"
+  }
+]

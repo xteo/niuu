@@ -24,3 +24,26 @@ web-next/.packed
 charts
 docs
 migrations
+
+# Local state must never enter a public build context.
+config.yaml
+bifrost.yaml
+start_platform.py
+tmp
+**/.env
+**/.env.*
+**/.npmrc
+**/.netrc
+**/.ssh
+**/.niuu
+**/.skuld
+**/.ravn
+**/auth.json
+**/config.live.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.log
+**/*.sqlite*
+**/*.db

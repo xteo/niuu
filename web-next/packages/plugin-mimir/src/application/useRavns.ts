@@ -235,7 +235,7 @@ export function toRavnBinding(warden: RavnWardenSummary): RavnBinding {
 
 export function toRavnWardenSummary(binding: RavnBinding): RavnWardenSummary {
   const installed = binding.state !== 'offline';
-  const configFile = `/Users/jozefvaneenbergen/.ravn/wardens/${binding.ravnId}/config.yaml`;
+  const configFile = `/Users/developer/.ravn/wardens/${binding.ravnId}/config.yaml`;
   return {
     id: binding.ravnId,
     name: binding.ravnId,
@@ -281,15 +281,11 @@ export function toRavnWardenSummary(binding: RavnBinding): RavnWardenSummary {
     supervisor: {
       installed,
       serviceLabel: installed ? `dev.niuu.ravn.warden.${binding.ravnId}` : '',
-      serviceFile: installed
-        ? `/Users/jozefvaneenbergen/.ravn/wardens/${binding.ravnId}/warden.plist`
-        : '',
+      serviceFile: installed ? `/Users/developer/.ravn/wardens/${binding.ravnId}/warden.plist` : '',
       configFile: installed ? configFile : '',
-      stdoutLog: installed
-        ? `/Users/jozefvaneenbergen/.ravn/wardens/${binding.ravnId}/warden.log`
-        : '',
+      stdoutLog: installed ? `/Users/developer/.ravn/wardens/${binding.ravnId}/warden.log` : '',
       stderrLog: installed
-        ? `/Users/jozefvaneenbergen/.ravn/wardens/${binding.ravnId}/warden.error.log`
+        ? `/Users/developer/.ravn/wardens/${binding.ravnId}/warden.error.log`
         : '',
       startCommand: installed ? `ravn daemon --config ${configFile}` : '',
     },

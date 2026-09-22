@@ -2,11 +2,11 @@
 
 import { chromium } from '@playwright/test';
 
-const baseUrl = process.env.RESEARCH_BASE_URL ?? 'http://192.168.1.106:8080';
+const baseUrl = process.env.RESEARCH_BASE_URL ?? 'http://127.0.0.1:8080';
 const config = process.env.RESEARCH_CONFIG ?? '/config.live.json';
 const outputDir =
   process.env.RESEARCH_OUTPUT_DIR ??
-  '/Users/jozefvaneenbergen/git/niuu/software/volundr/build/dev-run';
+  '/Users/developer/git/niuu/software/volundr/build/dev-run';
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 const question = `UI proof ${timestamp}: should research launch support tagged workflows and campaign delete?`;
 

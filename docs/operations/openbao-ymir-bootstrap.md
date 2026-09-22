@@ -50,7 +50,7 @@ For rotations, add `previous_key_id` and `previous_key`.
 
 ## Bootstrap Job
 
-Use [scripts/openbao/bootstrap.py](/Users/jozefvaneenbergen/git/niuu/software/volundr/scripts/openbao/bootstrap.py)
+Use [scripts/openbao/bootstrap.py](/Users/developer/git/niuu/software/volundr/scripts/openbao/bootstrap.py)
 from a lightweight Kubernetes `Job` or CI runner.
 
 Example bootstrap spec:

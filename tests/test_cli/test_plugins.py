@@ -78,7 +78,11 @@ class TestVolundrPlugin:
             "catalog-api",
         ]
         domains = {route_domain.name: route_domain.prefixes for route_domain in route_domains}
-        assert domains["admin-api"] == ("/api/v1/forge/admin", "/api/v1/forge/settings")
+        assert domains["admin-api"] == (
+            "/api/v1/forge/admin",
+            "/api/v1/forge/settings",
+            "/api/v1/forge/version",
+        )
         assert domains["forge-internal-api"] == ("/api/v1/internal/credentials",)
         assert domains["catalog-api"] == (
             "/api/v1/volundr/launch-specs",

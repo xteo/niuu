@@ -88,7 +88,7 @@ describe('quickLaunchName', () => {
 
   it('derives the name from the last path segment of the source', () => {
     expect(quickLaunchName('', 'https://github.com/niuulabs/volundr.git')).toBe('volundr');
-    expect(quickLaunchName('', '/home/thor/code/niuu/')).toBe('niuu');
+    expect(quickLaunchName('', '/home/operator/code/niuu/')).toBe('niuu');
   });
 
   it('falls back to a generic name when there is nothing to derive from', () => {

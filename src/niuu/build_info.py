@@ -4,9 +4,9 @@ Lets an operator confirm *which* build of the Forge API / Skuld broker is live â
 the git commit the running process was started from â€” via ``GET
 /api/v1/forge/version`` and the broker's ``system/init`` event.
 
-Computed once (cached): from git when running off a checkout, else from baked-in
+Computed once (cached): from an installed build manifest, else git or baked-in
 env vars (``NIUU_BUILD_SHA`` / ``NIUU_BUILD_REF``, set at container build time),
-else ``"unknown"``. Never raises.
+else ``"unknown"``. An invalid installed manifest raises.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from niuu.packaged_build import packaged_build
 from niuu.version import package_version
 
 VERSION = package_version()
@@ -43,13 +44,23 @@ def _git(*args: str) -> str | None:
 
 @functools.lru_cache(maxsize=1)
 def build_info() -> dict[str, object]:
-    """Best-effort identification of the running build (never raises).
+    """Identify the installed release, or a best-effort development build.
 
     Keys: ``version``, ``git_sha`` (short), ``git_sha_full``, ``git_branch``,
     ``git_dirty`` (tracked-file changes only; ignores untracked local config).
-    Env vars ``NIUU_BUILD_SHA`` / ``NIUU_BUILD_REF`` take precedence so a
+    The installed manifest takes precedence over runtime overrides. Otherwise
+    env vars ``NIUU_BUILD_SHA`` / ``NIUU_BUILD_REF`` identify a
     container image built without a ``.git`` dir still reports its build.
     """
+    manifest = packaged_build()
+    if manifest is not None:
+        return {
+            "version": VERSION,
+            "git_sha": manifest.revision[:_SHORT_SHA_LEN],
+            "git_sha_full": manifest.revision,
+            "git_branch": manifest.ref,
+            "git_dirty": False,
+        }
     sha_full = os.environ.get("NIUU_BUILD_SHA") or _git("rev-parse", "HEAD")
     branch = os.environ.get("NIUU_BUILD_REF") or _git("rev-parse", "--abbrev-ref", "HEAD")
     # --untracked-files=no: untracked local config (bifrost.yaml, etc.) is not "dirty source".

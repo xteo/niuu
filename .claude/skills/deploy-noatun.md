@@ -9,7 +9,7 @@ description: Build, push, and deploy to the noatun cluster
 
 - Docker logged into ghcr.io (`~/.docker/config.json`)
 - Kubeconfigs at `~/.kube/kubeconfigs/noatun.yaml` (cluster) and `~/.kube/kubeconfigs/local.yaml` (Fleet)
-- Infrastructure repo at `/Users/jozefvaneenbergen/git/niuu/infrastructure/infrastructure`
+- Infrastructure repo at `/Users/developer/git/niuu/infrastructure/infrastructure`
 - Helm CLI installed
 - On the correct git branch (fetch + verify HEAD before building)
 
@@ -18,7 +18,7 @@ description: Build, push, and deploy to the noatun cluster
 ALWAYS fetch and verify you're on the latest remote HEAD first:
 
 ```bash
-cd /Users/jozefvaneenbergen/git/niuu/software/volundr
+cd /Users/developer/git/niuu/software/volundr
 git fetch niuulabs feat/ting
 git checkout feat/ting
 git log --oneline -1  # verify SHA
@@ -62,7 +62,7 @@ done
 Two files need updating:
 
 ```bash
-cd /Users/jozefvaneenbergen/git/niuu/infrastructure/infrastructure
+cd /Users/developer/git/niuu/infrastructure/infrastructure
 
 # 1. Fleet chart version
 # noatun/niuu-app/helm/fleet.yaml → version: "0.0.0-ting.XXX"

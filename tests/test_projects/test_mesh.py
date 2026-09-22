@@ -90,11 +90,11 @@ def test_checkout_discovery_and_creation_route_only_to_selected_host():
         response = client().post(
             f"/api/v1/forge/projects/{operation}?instance_id=spark",
             headers=_headers(),
-            json={"workspace_path": "/home/horde/projects/kit"},
+            json={"workspace_path": "/home/worker/projects/kit"},
         )
         assert response.status_code == (201 if operation == "connect" else 200)
         assert response.json()["instance_id"] == "spark" and route.called
-        assert route.calls[0].request.content == b'{"workspace_path":"/home/horde/projects/kit"}'
+        assert route.calls[0].request.content == b'{"workspace_path":"/home/worker/projects/kit"}'
     route = respx.post("http://spark.test/api/v1/forge/projects/connect").mock(
         return_value=httpx.Response(404, json={"detail": "Not Found"})
     )

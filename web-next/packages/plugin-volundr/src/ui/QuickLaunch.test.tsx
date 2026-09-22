@@ -15,8 +15,8 @@ const hosts = [
     id: 'thor',
     name: 'Thor',
     slug: 'thor',
-    baseUrl: 'http://100.66.123.128:8080',
-    config: { defaultFolder: '/home/thor/repos' },
+    baseUrl: 'http://198.51.100.10:8080',
+    config: { defaultFolder: '/home/operator/repos' },
     enabled: true,
     isDefault: true,
     tags: [],
@@ -25,8 +25,8 @@ const hosts = [
     id: 'spark',
     name: 'Spark',
     slug: 'spark',
-    baseUrl: 'http://100.127.141.74:8080',
-    config: { defaultFolder: '/home/xteo/repos' },
+    baseUrl: 'http://198.51.100.12:8080',
+    config: { defaultFolder: '/home/operator/repos' },
     enabled: true,
     isDefault: false,
     tags: [],
@@ -110,8 +110,8 @@ describe('QuickLaunch', () => {
       integrationIds: ['claude-code-setup', 'linear-main'],
       source: {
         type: 'local_mount',
-        local_path: '/home/thor/repos',
-        paths: [{ host_path: '/home/thor/repos', mount_path: '/workspace', read_only: false }],
+        local_path: '/home/operator/repos',
+        paths: [{ host_path: '/home/operator/repos', mount_path: '/workspace', read_only: false }],
       },
       workloadConfig: { reasoningEffort: 'xhigh' },
       initialPrompt: 'Review the layout',
@@ -140,16 +140,16 @@ describe('QuickLaunch', () => {
     );
   });
   it('keeps folders on their owning hosts and uses a remembered per-host folder', async () => {
-    localStorage.setItem('niuu.forge.launch.folder.spark', '/home/xteo/review');
+    localStorage.setItem('niuu.forge.launch.folder.spark', '/home/operator/review');
     setup();
     await ready();
     fireEvent.change(screen.getByLabelText('Working folder'), {
-      target: { value: '/home/thor/custom' },
+      target: { value: '/home/operator/custom' },
     });
     fireEvent.change(screen.getByLabelText('Forge'), { target: { value: 'spark' } });
-    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/xteo/review');
+    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/operator/review');
     fireEvent.change(screen.getByLabelText('Forge'), { target: { value: 'thor' } });
-    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/thor/custom');
+    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/operator/custom');
   });
   it('does not replace an unavailable requested model with another model', async () => {
     setup({}, undefined, {
@@ -213,7 +213,7 @@ describe('QuickLaunch', () => {
     reject(new Error('Host is offline'));
     await screen.findByText('Host is offline');
     await ready();
-    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/thor/repos');
+    expect(screen.getByLabelText('Working folder')).toHaveValue('/home/operator/repos');
   });
   it('offers only Git on a Forge without local mounts and attaches the repository account', async () => {
     const { startSession } = setup({ getFeatures: async () => clusterFeatures });

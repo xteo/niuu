@@ -220,7 +220,7 @@ class TestSkuldWsProxyTransientBlip:
 
 class TestPluginApiAppCreation:
     def test_plugin_api_base_url_uses_configured_host(self) -> None:
-        assert _plugin_api_base_url("192.168.1.106", 8080) == "http://192.168.1.106:8080"
+        assert _plugin_api_base_url("198.51.100.16", 8080) == "http://198.51.100.16:8080"
         assert _plugin_api_base_url("0.0.0.0", 18080) == "http://127.0.0.1:18080"
 
     def test_create_plugin_api_app_passes_base_url_to_opt_in_plugins(self) -> None:
@@ -1901,7 +1901,7 @@ class TestRootServerStartStop:
         server = RootServer(
             registry=registry,
             host="0.0.0.0",
-            public_host="100.66.123.128",
+            public_host="198.51.100.10",
             port=18080,
         )
 
@@ -1918,7 +1918,7 @@ class TestRootServerStartStop:
         ):
             await server.start()
             assert os.environ["NIUU_SERVER_HOST"] == "0.0.0.0"
-            assert os.environ["NIUU_SERVER_PUBLIC_HOST"] == "100.66.123.128"
+            assert os.environ["NIUU_SERVER_PUBLIC_HOST"] == "198.51.100.10"
 
     @pytest.mark.asyncio
     async def test_stop_shuts_down_server_and_db(self) -> None:

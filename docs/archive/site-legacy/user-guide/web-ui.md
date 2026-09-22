@@ -48,7 +48,6 @@ Once a session is running, open it to access the workspace tabs:
 <div class="screenshot-gallery" markdown>
 
 <figure markdown>
-![Session workspace](../images/session-workspace.png)
 <figcaption>Session workspace with tabs</figcaption>
 </figure>
 

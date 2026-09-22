@@ -349,7 +349,7 @@ class TestChatRoundTrip:
                 assert len(hist) >= 2
 
     async def test_a_foreign_session_key_is_refused(self, tmp_path) -> None:
-        """A typo'd key must not reach Damien's live Telegram thread.
+        """A typo'd key must not reach user's live Telegram thread.
 
         Ravn performs no ownership check and Telegram shares the same
         RavnGateway, so the allowlist is the only thing standing between a
@@ -359,7 +359,7 @@ class TestChatRoundTrip:
             async with FakeLexiChatClient(url=shim.url, token=TOKEN) as client:
                 resp = await client.request(
                     "chat.send",
-                    {"sessionKey": "telegram:8572736034", "message": "hello"},
+                    {"sessionKey": "telegram:1234567890", "message": "hello"},
                 )
                 assert resp["ok"] is False
                 assert resp["error"]["code"] == "NOT_FOUND"

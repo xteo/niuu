@@ -38,6 +38,12 @@ COPY pyproject.toml uv.lock README.md /app/
 # edits; only the project itself is installed after src/ is copied.
 RUN uv sync --frozen --no-dev --no-editable --no-install-project --extra otel --extra dsh
 COPY src/ /app/src/
+COPY scripts/build_manifest.py /app/scripts/build_manifest.py
+ARG BUILD_REVISION
+ARG BUILD_REF=dev
+ARG APP_VERSION=dev
+RUN if [ -n "$BUILD_REVISION" ]; then python3 scripts/build_manifest.py \
+    --revision "$BUILD_REVISION" --ref "$BUILD_REF" --version "$APP_VERSION"; fi
 RUN uv sync --frozen --no-dev --no-editable --extra otel --extra dsh
 # xds-protos also ships obsolete OpenTelemetry modules. Restore the locked
 # official package after installation so enabled OTLP exporters can start.
