@@ -47,7 +47,7 @@ Create a session with it like any other engine:
 
 ```json
 { "name": "muse-try", "model": "muse-spark-1.3", "definition": "skuldMuse",
-  "source_path": "/home/thor/repos/niuu", "prompt": "Run the test suite and fix what fails." }
+  "source_path": "/home/operator/repos/niuu", "prompt": "Run the test suite and fix what fails." }
 ```
 
 The Bifrost catalog carries the Muse Spark rows with `session_definition: skuldMuse`, so the

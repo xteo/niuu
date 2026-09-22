@@ -58,7 +58,6 @@ Give the assistant the smallest useful workspace.
 
 After launch, open the session.
 
-![Session workspace](../images/session-workspace.png)
 
 Use the session tabs to understand what Niuu keeps together:
 

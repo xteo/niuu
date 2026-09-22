@@ -58,7 +58,6 @@ cover/
 
 # Django stuff:
 *.log
-!logs/mesh-e2e-*/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -255,3 +254,12 @@ references*
 ting.yaml
 # Local Forge stability reports (JUnit, manifests, traces).
 .forge-results/
+
+# Machine-local configuration and captures never belong in a public release.
+/config.yaml
+/bifrost.yaml
+/start_platform.py
+/tmp/
+/private/
+/audit-reports/
+/src/niuu/_build.json

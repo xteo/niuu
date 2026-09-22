@@ -311,10 +311,10 @@ host's health and model catalogue checked directly:
 
 | Label     | Forge origin                 | Initial working folder  |
 | --------- | ---------------------------- | ----------------------- |
-| Thor      | `http://100.66.123.128:8080` | `/home/thor/repos/niuu` |
-| Spark     | `http://100.127.141.74:8080` | `/home/xteo/repos`      |
-| Build     | `http://100.81.183.4:8080`   | `/home/horde`           |
-| Build Bro | `http://100.115.8.110:8080`  | `/home/horde`           |
+| Thor      | `http://198.51.100.10:8080` | `/home/operator/repos/niuu` |
+| Spark     | `http://198.51.100.12:8080` | `/home/operator/repos`      |
+| Build     | `http://198.51.100.13:8080`   | `/home/worker`           |
+| Build Bro | `http://198.51.100.14:8080`  | `/home/worker`           |
 
 Thor retains its existing registry UUID, slug `local`, default status, and
 `config.transport=embedded` to avoid routing the local aggregate into itself.
@@ -323,14 +323,14 @@ normal browser identity to edit them. Its visible origin is an ordinary IP URL. 
 session proxy still point to `127.0.0.1:8080` on Thor. Names are display labels.
 
 Deployment bootstrap configuration is
-`/home/thor/.config/niuu-forge-thor/config.yaml` (`niuu.instances`); configured seed
+`/home/operator/.config/niuu-forge-thor/config.yaml` (`niuu.instances`); configured seed
 values are reapplied when the backend starts. The shared registry stores UI edits
 between reloads. If changing a seeded host permanently, update its bootstrap
 entry too. Non-seeded hosts created in the UI remain in the database.
 The UI's `/config.json` controls service base URLs, not the host list.
 
 The private HTTPS UI uses nginx in
-`/home/thor/.config/niuu-forge-web/nginx.conf`. The known HTTP Forge session
+`/home/operator/.config/niuu-forge-web/nginx.conf`. The known HTTP Forge session
 sockets are rewritten to same-origin secure proxy routes. Each `/forge-host/<slug>/`
 route forwards both session sockets and paged REST history to that host. A newly
 registered HTTP host also needs such a session proxy (or an HTTPS Forge endpoint);
@@ -348,7 +348,7 @@ registry record; it does not stop the server or its sessions. Registry and Forge
 selector caches are invalidated after successful changes.
 
 Thor's existing `build-kit` registration was corrected to
-`http://100.90.20.64:8080`; the mistaken `horde-build-kit` duplicate was removed.
+`http://198.51.100.11:8080`; the mistaken `horde-build-kit` duplicate was removed.
 Its configuration and visibility were preserved, and other registrations were
 unchanged. The UI proxy now includes `/forge-host/build-kit/`. Tailscale ping
 succeeded, but TCP connections to ports 8080 and 22 timed out from Thor during
@@ -458,3 +458,5 @@ Forge session mutation or cross-device account synchronization. Pins remain save
 if a session is temporarily unavailable; missing/deleted sessions produce no row.
 State-filter counts and stopped-session lifecycle actions retain their existing
 meaning.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

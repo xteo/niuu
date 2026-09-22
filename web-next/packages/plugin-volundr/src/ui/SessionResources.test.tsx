@@ -24,7 +24,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 function setup(
   downloadFile = vi.fn().mockResolvedValue(blob('Document content')),
-  markdown = '[Guide](/home/thor/repo/docs/guide.md)',
+  markdown = '[Guide](/home/operator/repo/docs/guide.md)',
 ) {
   const filesystem = {
     ...createMockFileSystemPort(),
@@ -34,7 +34,7 @@ function setup(
   const result = render(
     <SessionResources
       sessionId="owning-session"
-      workspace="/home/thor/repo"
+      workspace="/home/operator/repo"
       filesystem={filesystem}
     >
       <MarkdownContent content={markdown} />
@@ -130,7 +130,7 @@ describe('session file previews', () => {
   });
   it('reports an image outside the workspace instead of displaying a loading placeholder', () => {
     const download = vi.fn();
-    setup(download, '![Screenshot](/home/thor/other-worktree/screenshot.png)');
+    setup(download, '![Screenshot](/home/operator/other-worktree/screenshot.png)');
     expect(screen.getByRole('status')).toHaveTextContent(
       'Screenshot: Image is unavailable in this session’s workspace.',
     );

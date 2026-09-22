@@ -12,15 +12,15 @@ feature parity and not a deployment. It covers the owned Codex app-server adapte
 Forge controls, channel projection, history/replay, and adjacent harness boundaries.
 Native iOS UI and project instruction/provenance behavior remain separately owned.
 
-- Runner: `thor:4ab99660-05e8-52c3-90d3-85d7463ce8a2`.
-- Checkout: `/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913`.
+- Runner: `thor:2a5ebca8-019a-5291-869f-f3761aac7575`.
+- Checkout: `/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913`.
 - Starting source: `c6d80980c304f972461d9e31d36ac3aeca35cc8d`.
-- Coordinator scope confirmation: `c5d7dd4f-50f2-4ea5-b801-7db65574ad48`.
+- Coordinator scope confirmation: `7db7665e-1053-5301-a022-9f2ff784867b`.
 - Fixed Project UX integration input: `11e9e0c668747fd0af1b97463f2c238e9fb40811`.
   Its live-steering fix is `a5acb7c02a3a5d6fc2be9732e0b11fe28660a87d`.
 - The initial review excluded deployment. The user's subsequent direct instruction
   authorizes server fixes and a Thor/Spark rollout, coordinated by receipt
-  `a99f3c1a-b310-4285-8a85-75f40e56d61b`. Slash expansion is now explicitly deferred;
+  `0f328502-efba-5340-af4d-021d64cd1f65`. Slash expansion is now explicitly deferred;
   iOS remains documentation/handoff only. The status below records pre-rollout
   evidence, not a claim that either host has been upgraded.
 
@@ -155,7 +155,7 @@ start but not its send method, unintentionally launching three short real Codex
 exec turns in pytest temporary directories. They completed before targeted
 termination; matched rollouts contain no function/custom-tool-call records.
 There were provider token records. The user and coordinator were informed;
-receipt `34ec53bf-76dd-482c-bb03-a50ecb98a54f` records the correction. That run is
+receipt `dade6055-56c8-5646-89bb-de7fa99a161d` records the correction. That run is
 excluded from offline and live-acceptance evidence. Both methods are now mocked
 and the new protocol-test module forbids real subprocess launches. Do not claim
 this entire review involved zero provider calls.
@@ -297,3 +297,5 @@ Rollout preparation uses an immutable source/environment and Spark-first canary.
 Existing live Skuld gateways retain their old source until individually restarted
 at a safely coordinated boundary; root health is not evidence of their upgrade.
 No migration or dependency-lock change is in the candidate.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

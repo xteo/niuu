@@ -1,5 +1,5 @@
 {
-  "session_id": "0cf947a5-84d1-5a59-83ad-3f5b93752c17",
+  "session_id": "9ad77375-5cab-587e-a6cb-0e50966871ad",
   "candidate_commit": "650088f3e2fe234e75cd7d2578acae911290ee91",
   "candidate_source_sha256": "57446280f7a8bc81d6ae0b8215f8e8df528f0d28add876ac272bd39d3ebff000",
   "live_capture": {
@@ -93,12 +93,12 @@
     },
     "old_rows_retained": 6,
     "old_rows_missing": [
-      "2da7bb22-243a-501b-8910-11a255dd53ff",
-      "57d7a800-1a91-5154-a7a6-96c56e33f62e",
-      "7a904144-412a-5123-a8e1-e1e143218b7f",
-      "b011b311-2467-5d72-8a4f-338a006bd90d",
-      "b89c2026-bf93-54fe-9a04-7ffead651371",
-      "e97b5f55-f303-5242-a7e0-6c081e4dde25"
+      "0faace62-2bdf-51d9-983e-5f43632b76d2",
+      "a0bc2ea6-6d71-585c-a3ce-6c9aac84e81c",
+      "7d6612a2-2eda-5f03-9d9e-f226648a22cb",
+      "ea79788a-7ae5-5716-918b-78ae4d07faa5",
+      "09322b43-8971-57d4-8db2-51e29a05c5cf",
+      "59b15caa-f2d0-548d-b831-42029b1d1bac"
     ],
     "old_row_parts_changed": [],
     "incremental_seam": {
@@ -136,7 +136,7 @@
     "sessions_preserved": 14,
     "unchanged_session_turn_payloads": 13,
     "intentionally_projected_session_ids": [
-      "0cf947a5-84d1-5a59-83ad-3f5b93752c17"
+      "9ad77375-5cab-587e-a6cb-0e50966871ad"
     ],
     "before_display_rows": 59,
     "after_display_rows": 62,
@@ -153,25 +153,25 @@
       "5185": {
         "pid": 5185,
         "start_ticks": "2763",
-        "boot_id": "f14b7265-14a5-46d3-ba64-1ea25a5a3e01",
+        "boot_id": "33c0b106-5c9d-5353-b6c9-a44dfbad1005",
         "argv_sha256": "d98815c233fc5f595111c85e7c535cf214fd45021f3af9d5d7d9b29deaa71a3f"
       },
       "1044001": {
         "pid": 1044001,
         "start_ticks": "474764909",
-        "boot_id": "f14b7265-14a5-46d3-ba64-1ea25a5a3e01",
+        "boot_id": "33c0b106-5c9d-5353-b6c9-a44dfbad1005",
         "argv_sha256": "47ae0b9bb0e7f4bcf1fb05a9f5b773aeeb79067f012e8e583ac40fc3cea82c19"
       },
       "2484157": {
         "pid": 2484157,
         "start_ticks": "496566993",
-        "boot_id": "f14b7265-14a5-46d3-ba64-1ea25a5a3e01",
+        "boot_id": "33c0b106-5c9d-5353-b6c9-a44dfbad1005",
         "argv_sha256": "e618bfb5a5c5ac3e57643ec974009786141c3c551350b6386b460123de0f8908"
       },
       "5640": {
         "pid": 5640,
         "start_ticks": "11435",
-        "boot_id": "f14b7265-14a5-46d3-ba64-1ea25a5a3e01",
+        "boot_id": "33c0b106-5c9d-5353-b6c9-a44dfbad1005",
         "argv_sha256": "988c96a494b646ddd2636f2a67e8dec872ad1e8598e405c38c09d5cbaa3cb159"
       }
     },

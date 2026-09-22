@@ -22,7 +22,7 @@ async function fixture(page: Page, initiallyAssigned = false) {
     instance_id: 'thor',
     instance_name: 'Thor',
     coordination,
-    source: { type: 'local_mount', local_path: '/home/thor/code' },
+    source: { type: 'local_mount', local_path: '/home/operator/code' },
     created_at: '2026-09-19T10:00:00Z',
     last_active: '2026-09-19T10:00:00Z',
   });

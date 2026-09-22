@@ -6,9 +6,9 @@ performed by this document. It extends the
 
 ## Recommendation
 
-Build once in CI, publish private multi-architecture OCI images under `ghcr.io/xteo`,
+Build once in CI, publish public multi-architecture OCI images under `ghcr.io/xteo`,
 and promote an immutable release manifest across the Guild one node at a time.
-Nodes need a small installation/configuration bundle and registry pull credentials;
+Nodes need a small installation/configuration bundle;
 they should not need a Git checkout, Node build toolchain or Python dependency
 resolution to upgrade Forge.
 
@@ -42,17 +42,16 @@ separate contracts today, and the Dockerfiles do not bake the complete identity.
 Package a single immutable build manifest and test both `/health` and version
 endpoints in the actual image, without `.git` or a source bind mount.
 
-The inspected GitHub repository `xteo/niuu` is public. Container package visibility
-must be explicitly verified as private; it is a separate setting. The current
-operator token cannot list packages (`read:packages` is missing), so existing Xteo
-package names/access have not been verified. No credential change is needed for
-this design review.
+The source repository and the selected GHCR packages are public. Package visibility
+is independent of repository visibility; verify anonymous pulls for each release.
+Runtime credentials, host identity, databases and workspace data remain external
+to images. Registry publishing remains authenticated through CI.
 
 ## Node layout and ownership
 
 ```mermaid
 flowchart TB
-    Registry[Private Xteo registry + release manifest] --> Updater[Host node updater]
+    Registry[Public Xteo registry + release manifest] --> Updater[Host node updater]
     Guild[Guild operator workflow] --> Updater
     Updater --> API[Forge API container]
     Updater --> Web[Web container]
@@ -120,12 +119,10 @@ binary. See [Docker multi-platform builds](https://docs.docker.com/build/buildin
 Keep runtime CLI versions pinned and exercise actual Codex/Claude launch, resume,
 tools, approvals, image transport and replay against each supported platform.
 
-CI can publish through its repository-scoped GitHub token. Nodes use protected,
-read-only package credentials; do not put tokens in release manifests, chat, skill
-text or images. GHCR supports digest pulls and separately controlled package
-permissions; see [GitHub's container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
-Verify private package access before enabling publication; do not infer privacy
-from the source repository or package name.
+CI publishes through its repository-scoped GitHub token. Public images need no
+pull credentials on nodes. Never put runtime or publishing credentials in release
+manifests, chat, skill text or image layers. Verify digest pulls anonymously; see
+[GitHub's container registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
 ## Deployment operation
 
@@ -207,7 +204,7 @@ host PID ownership through a shared PID namespace.
 ## Deliverable sequence
 
 1. Package a complete Forge API composition with external databases, version
-   manifest, packaged migrations and the selected UI. Add private milestone CI
+   manifest, packaged migrations and the selected UI. Add public milestone CI
    publication, platform smoke checks and the release manifest. No fleet switch.
 2. Implement the Docker session adapter behind the existing PodManager port,
    persistent state, authenticated host runtime/updater bridge and one-node

@@ -31,8 +31,8 @@
     "branch": true,
     "repository_wide": false
   },
-  "scope_confirmation_receipt": "c5d7dd4f-50f2-4ea5-b801-7db65574ad48",
-  "test_incident_receipt": "34ec53bf-76dd-482c-bb03-a50ecb98a54f",
+  "scope_confirmation_receipt": "7db7665e-1053-5301-a022-9f2ff784867b",
+  "test_incident_receipt": "dade6055-56c8-5646-89bb-de7fa99a161d",
   "native_provider_acceptance": false,
   "ios_render_acceptance": false,
   "deployed": false,

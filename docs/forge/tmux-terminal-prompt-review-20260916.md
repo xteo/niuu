@@ -31,13 +31,13 @@ Lint/format checks cover the changed source and test file.
 At the user's request, exactly one ordinary Forge diagnostic session was launched:
 
 - Host/name: `thor`, `lexi-fable-51-tmux-prompt-diagnostic`.
-- Session: `9d4f16bb-6341-534c-bce8-14de28420aee`.
-- Parent: dedicated runtime runner `4ab99660-05e8-52c3-90d3-85d7463ce8a2`.
+- Session: `98a62943-a7e3-5c26-9ce7-0dddb616c882`.
+- Parent: dedicated runtime runner `2a5ebca8-019a-5291-869f-f3761aac7575`.
 - Requested/observed model: `claude-fable-5-1`, xhigh, Claude Code **2.1.272**.
 - Harness: `skuldClaudeInteractive`, actual tmux transport on the retained Thor
   `c6d80980` source. It does **not** contain the new key fix yet.
 - Existing owned workspace:
-  `/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/horde-tmux-prompts-20260916/fable-workspace`.
+  `/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/horde-tmux-prompts-20260916/fable-workspace`.
 
 Fresh native auth inspection used the same subscription child environment as
 Skuld: logged in through `claude.ai`/Max, with platform API-key variables absent.
@@ -118,3 +118,5 @@ Private raw evidence (including exact screens, control-state reads, key events,
 request identities and test results) is under `.local/horde-tmux-prompts-20260916/`
 in the dedicated runtime checkout. No native remote-control URLs or credentials
 are reproduced here. Existing deployment HOLD remains unchanged.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

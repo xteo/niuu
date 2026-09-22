@@ -75,14 +75,14 @@ The canaries were stopped and resumed without another user prompt. Native identi
 
 | Provider | Original Forge session | Native identity | Recovered Forge session |
 | --- | --- | --- | --- |
-| Claude tmux | `61ce3075-e06e-4f5a-b0ba-c0bcd65f10db` | `5b1b43df-de07-4f79-a704-a3327059d937` | `ed05e5c4-f140-4bba-94d3-78890cca345b` |
-| Codex Astra | `0fefb00b-5338-4282-9a8a-67d68d149828` | `01a085b8-17df-76a2-b178-457aa19747b0` | `94461a5d-e222-406f-bf1d-4950251ce2f1` |
+| Claude tmux | `e26e6596-bc21-5286-b8f6-8cc5678273b6` | `e925c9f1-c2e0-5c3b-85d3-ac83a18dcf91` | `8bf7801e-2500-5328-9dc8-6eca7319c0f6` |
+| Codex Astra | `b5381f7c-ba0e-5042-bd61-afc23ab0d45a` | `2ad3c419-ed3b-59da-9b9c-390a56b962a5` | `d784ac02-4566-59ce-b9a2-341f076dd75e` |
 
 ### iOS simulator
 
 Acceptance uses Lexi iOS main `262d897683639aab415deb0883c41f346ed2a675`, installed build 2241. The debug library SHA-256 is `28a71150d5f4e1215161cb4ed341d1be6b8aa4edfe4eaa6fc5473e550a1261f5`. No iOS source changes were needed for this reconciliation.
 
-The final checks run on iPhone 17 Pro/iOS 26.2 in a dedicated simulator device set, UDID `483954B7-2FD1-4C84-8541-4AB326555008`. The app connects to the disposable candidate through an explicit process-environment instance and SSH tunnel. Screenshots and accessibility assertions verify A → tools → B → tools → final, the recovered-history indicator, Markdown/code rendering, and Codex replay after terminating and reopening the app. There was no physical phone testing.
+The final checks run on iPhone 17 Pro/iOS 26.2 in a dedicated simulator device set, UDID `1a211fbc-7108-50ec-b314-143127c724d2`. The app connects to the disposable candidate through an explicit process-environment instance and SSH tunnel. Screenshots and accessibility assertions verify A → tools → B → tools → final, the recovered-history indicator, Markdown/code rendering, and Codex replay after terminating and reopening the app. There was no physical phone testing.
 
 ## Repeating and promoting
 
@@ -92,4 +92,6 @@ After the gates pass, fast-forward the local integration worktree to the reconci
 
 This acceptance covers local-process Forge with authenticated Claude tmux and Codex, PostgreSQL, browser regression fixtures, and iOS simulator replay. It does not certify live Grok/Muse behavior, Kubernetes deployment, production database rollout, exhaustive outage/soak testing, or physical-device behavior. Existing skips/expected failures are recorded in the backend report. Integration promotion does not claim a faultless system or deploy the production server.
 
-Private evidence is retained at `/home/thor/.niuu/validation/forge-reconcile-20260909`: pinned refs, merge inventories, test/JUnit/coverage reports, native campaign manifests, raw/public/replay comparisons, import proofs, simulator screenshots, accessibility assertions, and the publication result. Raw live captures and private remote fetch logs are not committed.
+Private evidence is retained at `/home/operator/.niuu/validation/forge-reconcile-20260909`: pinned refs, merge inventories, test/JUnit/coverage reports, native campaign manifests, raw/public/replay comparisons, import proofs, simulator screenshots, accessibility assertions, and the publication result. Raw live captures and private remote fetch logs are not committed.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

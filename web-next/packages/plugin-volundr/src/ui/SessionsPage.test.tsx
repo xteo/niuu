@@ -721,7 +721,7 @@ describe('Forge session review controls', () => {
       personaName: 'dev-user',
       state: 'running',
       clusterName: 'Thor',
-      preview: '/home/thor/repos/niuu',
+      preview: '/home/operator/repos/niuu',
     }),
     makeSession({ id: 'waiting', personaName: 'Ready for input', state: 'awaiting_input' }),
     makeSession({ id: 'idle', personaName: 'Idle session', state: 'idle' }),
@@ -747,9 +747,9 @@ describe('Forge session review controls', () => {
     expect(screen.getByTestId('pod-entry-working')).toHaveTextContent('Thor');
   });
   it.each([
-    ['/home/horde/repos/niuu', '~/repos/niuu'],
-    ['/home/horde', '~/'],
-    ['/home/horde/', '~/'],
+    ['/home/worker/repos/niuu', '~/repos/niuu'],
+    ['/home/worker', '~/'],
+    ['/home/worker/', '~/'],
     ['/workspace/niuu', '/workspace/niuu'],
     ['~/repos/niuu', '~/repos/niuu'],
     ['/home', '/home'],

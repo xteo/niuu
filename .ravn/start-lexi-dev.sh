@@ -8,10 +8,10 @@
 #
 # This is NOT Travis. Telegram is disabled in config-lexi-dev.yaml and the
 # bot-token env var is deliberately NOT sourced here, so even a config mistake
-# cannot start a second long-poller against Damien's real thread.
+# cannot start a second long-poller against user's real thread.
 set -euo pipefail
 
-cd /home/thor/repos/niuu-dev-integration
+cd "${NIUU_SOURCE_DIR:?Set NIUU_SOURCE_DIR to your Niuu checkout}"
 
 # This box exports a live Forge session's environment. SKULD__TRANSPORT_ADAPTER
 # is read by RuntimeExecutorConfig as an alias, which silently reroutes every

@@ -2,7 +2,7 @@
 // against the live dev stack. Run: node e2e/capture-mimir-evidence.mjs <baseUrl> <outDir>
 import { chromium } from '@playwright/test';
 
-const base = process.argv[2] ?? 'http://192.168.1.106:8080';
+const base = process.argv[2] ?? 'http://127.0.0.1:8080';
 const out = process.argv[3] ?? '/tmp/niu-1055-proof/ui';
 
 const browser = await chromium.launch();

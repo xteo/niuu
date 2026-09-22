@@ -15,7 +15,7 @@ The guarded cutover **passed**, without rollback:
 - Candidate: `f5d7a5e49eafd765f8daf53bdc51c95ac1949939`.
 - Python source SHA-256:
   `47dfd370523fefaabcf9189808495a942c9548d3c148203d4251ab15907c42a1`.
-- Spark source: `/home/xteo/.local/share/niuu/releases/forge-codex-ready-20260913-v2`.
+- Spark source: `/home/operator/.local/share/niuu/releases/forge-codex-ready-20260913-v2`.
 - API PID changed from `3415148` to `3522975`; new health is clean, with no failed
   plugins. Effective working directory, source environment and exact owned
   override agree with the immutable candidate.
@@ -112,12 +112,14 @@ this result is not an instruction to deploy it or to wake any owner.
 
 Curated fingerprints and observations: [deployment evidence](codex-spark-deployment-evidence-20260913.json).
 Private Spark originals are in
-`/home/xteo/.local/share/niuu/spark-release-20260913-2200/`; runner copies and
+`/home/operator/.local/share/niuu/spark-release-20260913-2200/`; runner copies and
 Thor comparisons are in its `.local/spark-release-20260913/`.
 
-The maintenance notice is receipt `2527aaf0-1270-4230-8877-e7e1895bd774`;
+The maintenance notice is receipt `5eb24590-5192-5312-bdbe-7d3e28c3799c`;
 OpenClaw message `6660` returned `payload.ok=true`, not user-read/acceptance proof.
 Completion notification `6662` also returned `payload.ok=true`, with the forced
 API stop and no-live-gateway limitation stated explicitly.
 Preparation, manifest, apply, source proof, conversations and journals have
 separate immutable filenames. Prior incident evidence remains intact.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

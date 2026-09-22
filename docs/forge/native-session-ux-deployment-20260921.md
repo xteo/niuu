@@ -7,7 +7,7 @@ The user explicitly authorized the Thor API update with a brief reconnect window
 The announced window was 03:01–03:16 UTC; guarded apply ran 03:02:17–03:02:40 UTC.
 Candidate `4d93cba69275534147f9b80f65c94e8a53c89cfc`, Python source digest
 `40f7520e43bce65dbe3ae3671aefa496cb2cdb8cf9f915ac8b12688e1f457d82`, is deployed in
-`/home/thor/.local/share/niuu/releases/forge-native-session-ux-20260921-v4`.
+`/home/operator/.local/share/niuu/releases/forge-native-session-ux-20260921-v4`.
 
 ## Preserved and checked
 
@@ -56,7 +56,7 @@ selection provides an explicit older-server option; local mode never silently
 accepts a server that ignores its scope query.
 
 Private evidence: `.local/release-20260921/` in
-`/home/thor/repos/worktrees/niuu-native-session-ux-release-20260921`:
+`/home/operator/repos/worktrees/niuu-native-session-ux-release-20260921`:
 `apply-window1.json`, `independent-readback-window1.json`, `ledger-*-window1.json`,
 `live-local-scope-readback.json`, `migration-live-readback.txt`, CI artifacts,
 `restart-proof-reuse-v4.json`, `health-observation-summary.json` and backups.
@@ -69,5 +69,7 @@ uploaded build2275, VALID, IN_BETA_TESTING, devs access and matching release not
 Native signed product is `6a49b6b508e1b4748edac16472477d34d0d8cee0`; documentation
 checkpoint `6f04885a` is separate from that artifact and from the deployed backend.
 No additional server mutation occurred for publication. Full report:
-`/home/thor/repos/worktrees/lexi-native-session-ux-release-20260921/apps/chat/docs/session-ux-2275/STATUS.md`.
+`/home/operator/repos/worktrees/lexi-native-session-ux-release-20260921/apps/chat/docs/session-ux-2275/STATUS.md`.
 Manual UI/cross-device acceptance and other-host updates remain open.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

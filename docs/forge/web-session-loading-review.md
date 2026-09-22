@@ -95,7 +95,7 @@ retain their loaded code and are preserved by the API-only release procedure.
 ## Guild-to-Volundr verification and release — September 19
 
 All five enabled Forge hosts were correctly registered in Guild. Build-Kit had
-become reachable at `http://100.90.20.64:8080`, so its missing session exposed the
+become reachable at `http://198.51.100.11:8080`, so its missing session exposed the
 same selector-forwarding defect as Build Bro and Spark. Build's older server
 accepted the forwarded selector and continued returning its two sessions.
 
@@ -145,3 +145,5 @@ The guarded live cutover preserved **47 protected processes**, **16 live gateway
 clean with no failed plugins. Existing gateway processes keep their loaded code;
 new Thor gateways use the released Claude startup handling. Dashboard static UI
 publication and the remaining gateway-level image changes are separate work.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

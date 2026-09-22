@@ -13,7 +13,7 @@ running cards after an input triggers polling. Settings/About was described as
 “latest”; exact installed-device build remains unverified. Native source reviewed
 at delivered **2.0 (2263), f9b78bd1**.
 
-Fresh test: `spark:0cf947a5-84d1-5a59-83ad-3f5b93752c17`,
+Fresh test: `spark:9ad77375-5cab-587e-a6cb-0e50966871ad`,
 `lexi-spark-codex-steering-test`. Parent verified the actual new gateway on clean
 `39da0146a2957f81f51bad54c107d7b042e55cd2`, `timeline-v3`, not merely the API.
 
@@ -159,10 +159,10 @@ The fixture and server tests do not replace these native tests or user acceptanc
 
 ## Ownership and evidence
 
-Runtime worker: `thor:4ab99660-05e8-52c3-90d3-85d7463ce8a2`.
-Coordinator: `thor:8f20102d-6da7-58aa-98c2-e0bce2deab97`.
-Prior native handoff `d40c6f9e-edbf-4aab-9bd6-a19ebc4edc57` remains outstanding.
-New diagnosis/escalation receipt `a80f1907-4da7-4ac6-b000-2d7508ba9574` explicitly
+Runtime worker: `thor:2a5ebca8-019a-5291-869f-f3761aac7575`.
+Coordinator: `thor:68095a63-8a6a-55e8-aba8-1e3566c3e346`.
+Prior native handoff `30cc5cb5-87a9-5ee0-821e-a6d880e666c8` remains outstanding.
+New diagnosis/escalation receipt `059dca7f-bd18-5c4b-9961-5456c2526735` explicitly
 asks the coordinator to assign this native work; it is not implicitly assigned to
 the concurrent chat-UX worker. OpenClaw milestone delivery: message 6681.
 
@@ -192,7 +192,7 @@ the turn-payload level under the new read projection.
 ## Spark rollout and independent readback
 
 Announced window: **10:02–10:12 UTC**; window receipt
-`cebeafbc-5f4a-4edb-ac63-a8b2dffcff89`, OpenClaw message 6683.
+`128dc353-dca2-5892-955f-d82c2e45e64d`, OpenClaw message 6683.
 Actual guarded cutover: **10:02:51.917277–10:02:56.833643 UTC**.
 Candidate `650088f3e2fe234e75cd7d2578acae911290ee91`,
 source SHA256 `57446280f7a8bc81d6ae0b8215f8e8df528f0d28add876ac272bd39d3ebff000`,
@@ -202,7 +202,7 @@ failure; **85.77%** scoped statement/branch coverage, unchanged 85% gate. Both
 source-root and host-local dependency/composition audits pass.
 
 Host release root:
-`/home/xteo/.local/share/niuu/releases/forge-codex-ready-20260914-timeline-v4`.
+`/home/operator/.local/share/niuu/releases/forge-codex-ready-20260914-timeline-v4`.
 Only `niuu-forge.service` restarted, with one new owned source-only drop-in:
 `~/.config/systemd/user/niuu-forge.service.d/zzzzzzzz-steering-timeline-v4-20260914.conf`.
 Safe rollback remains `39da0146` / timeline-v3, already containing the local-process
@@ -234,3 +234,5 @@ rewritten. Detailed sanitized evidence: [JSON](codex-live-dedup-evidence-2026091
 
 Deployed milestone OpenClaw delivery: message 6685. Notification delivery is not
 feature acceptance or proof of a native-owner assignment.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

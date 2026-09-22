@@ -96,7 +96,7 @@ mimir:
 
 permission:
   mode: workspace_write
-  workspace_root: /Users/jozefvaneenbergen/.ravn/ivaldi-local/workspace
+  workspace_root: /Users/developer/.ravn/ivaldi-local/workspace
 
 # A real single-process Sleipnir bus for resident/court/learning events. The
 # workshop source itself remains the external durable NATS JetStream above.

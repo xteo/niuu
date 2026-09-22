@@ -44,7 +44,7 @@ The only installed runtime override remaining is Spark's owned source-only
   restarted the original API. Its immediate rollback health read was too early
   and recorded connection refusal; subsequent independent readback verified the
   original source healthy. A healthy rollback did **not** restore lost processes.
-- Parent incident review `21483c5a-ca34-416f-a08f-c26085a1a1ea` confirms the split
+- Parent incident review `434fbebe-59c3-5911-bd5f-7d239cc3e778` confirms the split
   host versions and requires Thor to remain halted.
 
 ## Cause and validation gap
@@ -86,9 +86,9 @@ files changed by this runner are in the statement/branch coverage scope:
 
 | Stored session | Gateway PID | Native tmux PID | Retained Forge turns | Native CLI identity |
 | --- | --- | --- | --- | --- |
-| lexi-physics-ios-upgrade `e1bcc8ca-3870-4fca-b8e4-441c3660b5c0` | 2594685 | 2594793 | 191 | `b9e084e9-69d8-45ae-b82f-837ddcf78cef` |
-| agents-brain `c29f623f-9417-451c-a884-b921534a6f41` | 3538876 | 3538994 | 94 | `8f38aa76-b3ae-4e68-95b4-e17bb504fb75` |
-| lia-physics-gravity `f952f335-f8dd-4e60-bf62-7ff2ebc04eb2` | 3003963 | 3004029 | 34 | `1d9afa79-ff85-40d2-b5c6-cdeb2e5838ac` |
+| lexi-physics-ios-upgrade `4c61b907-4942-57a5-bf7e-cf3a369bdf46` | 2594685 | 2594793 | 191 | `dfce337e-b175-5233-b385-5b27b8fd3442` |
+| agents-brain `12b4554c-9448-5cf8-a9fa-c7170b4cee1b` | 3538876 | 3538994 | 94 | `df5f7376-fb27-52e0-9c84-062afd950463` |
+| lia-physics-gravity `02c95d86-3245-544e-ab5f-2b3571cf11f4` | 3003963 | 3004029 | 34 | `9de81b44-870c-5d5d-a813-d92718844adc` |
 
 All six PIDs are gone. Broker shutdown calls transport stop; the tmux transport
 terminates its native session. Thus reporting “only gateways affected” would be
@@ -120,7 +120,7 @@ full data durability merely from server uptime.
 
 **TLS correction:** the original probes sent plain HTTP to port 9501, a TLS
 listener. Their errors do not show an outage. Trusted
-`https://thor.tail737f2a.ts.net:9501/health` is healthy; the parent also verified it.
+`https://forge.example.net:9501/health` is healthy; the parent also verified it.
 Agent HTTP 9500 and preview HTTPS 5300 stayed healthy; preview body digest is
 unchanged. No independent service, TLS setting, database, Mini or release process
 was changed. The initial 9500 full-body hash comparison was also inappropriate
@@ -175,3 +175,5 @@ health fields, not dynamic uptime hashes.
 Evidence directory: `.local/codex-alignment-20260913/` in the isolated runner
 checkout. Curated hashes and validation summaries are linked from the [rollout
 evidence JSON](codex-rollout-evidence-20260913.json). Raw private histories and journal data are not committed.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

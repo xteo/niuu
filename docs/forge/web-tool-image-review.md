@@ -11,7 +11,7 @@ response as a Blob URL. Both routes returned the same 91,182-byte screenshot in
 the live Thor check, including the broker's `application/octet-stream` MIME type.
 
 The broken example linked the sibling UI worktree while the session workspace
-was `/home/thor/repos/niuu`. It was correctly rejected, but the component displayed
+was `/home/operator/repos/niuu`. It was correctly rejected, but the component displayed
 the image alt text with a loading icon indefinitely. Unresolvable images now show
 an explicit unavailable state; failed downloads and image decoding offer retry.
 The corrected workspace-relative `docs/site/images/landing/landing-forge.png`
@@ -125,3 +125,5 @@ endpoint.
   zoom, new images while tools are hidden, retry without automatic original fetch,
   and phone viewport containment. These are explicit HTTP/WebSocket fixtures, not
   a claim that an older live Codex runtime now preserves images.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

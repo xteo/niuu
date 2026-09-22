@@ -331,7 +331,7 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 def _resolve_mentions(body: str, peer_ids: set[str]) -> list[str]:
     """Peers addressed in *body*, in order, ignoring code spans.
 
-    A human answers to their bare name too, so ``@damien`` reaches ``human:damien``. An unknown
+    A human answers to their bare name too, so ``@user`` reaches ``human:user``. An unknown
     handle is simply not a recipient — it stays plain text rather than becoming a guess.
     """
     masked = _FENCED_RE.sub(lambda m: " " * len(m.group(0)), body)

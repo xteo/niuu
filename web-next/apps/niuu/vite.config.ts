@@ -152,7 +152,10 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
-    allowedHosts: ['thor.tail737f2a.ts.net', 'thor-host.tail737f2a.ts.net'],
+    allowedHosts:
+      process.env.NIUU_DEV_ALLOWED_HOSTS?.split(',')
+        .map((host) => host.trim())
+        .filter(Boolean) ?? [],
     proxy: {
       '/api': {
         target: apiProxyTarget,

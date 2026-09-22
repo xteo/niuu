@@ -644,9 +644,7 @@ class TestSessionServiceStart:
         pod_manager: Pods,
     ):
         """Browser-facing session URLs should prefer the configured public host."""
-        service = SessionService(
-            repository, pod_manager, public_origin="http://100.66.123.128:8080"
-        )
+        service = SessionService(repository, pod_manager, public_origin="http://198.51.100.10:8080")
         created = await service.create_session(
             name="test",
             model="claude-3-opus",
@@ -658,7 +656,7 @@ class TestSessionServiceStart:
 
         result = await service.start_session(created.id)
 
-        assert result.chat_endpoint == f"ws://100.66.123.128:8080/s/{created.id}/session"
+        assert result.chat_endpoint == f"ws://198.51.100.10:8080/s/{created.id}/session"
 
     async def test_start_stopped_session(self, repository: Repo, pod_manager: Pods):
         """Starting a stopped session works."""

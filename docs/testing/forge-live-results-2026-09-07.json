@@ -10,7 +10,7 @@
     {
       "run_id": "codex-caea76a023",
       "provider": "codex",
-      "session_id": "c01e2e67-5595-4ca5-b173-5364b5ac72b1",
+      "session_id": "b1279ef8-5b44-53eb-91ef-a5c059f11211",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -61,7 +61,7 @@
     {
       "run_id": "claude-tmux-f30b968be5",
       "provider": "claude-tmux",
-      "session_id": "158515e4-e165-4dba-a829-c44f8d310932",
+      "session_id": "249b155b-b848-55c2-9555-7979213996c0",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -112,7 +112,7 @@
     {
       "run_id": "claude-tmux-bee30f9c9d",
       "provider": "claude-tmux",
-      "session_id": "e2878c83-c547-4013-887d-93161144ad80",
+      "session_id": "6501a369-58c0-5e35-b702-2bfef735d2d7",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -163,7 +163,7 @@
     {
       "run_id": "codex-47d311efeb",
       "provider": "codex",
-      "session_id": "ce9a75db-018a-4732-be95-c4a4529043cf",
+      "session_id": "180e3d50-6b30-5c31-b1f7-f1e8ed57122e",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -304,7 +304,7 @@
     {
       "run_id": "claude-tmux-5521bc2046",
       "provider": "claude-tmux",
-      "session_id": "8fac057d-2ff2-4813-a115-30df7f6b4c2f",
+      "session_id": "1b79d6a4-1c5c-580d-abc4-75e7fd1239ec",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -456,7 +456,7 @@
     {
       "run_id": "codex-91e7907f5b",
       "provider": "codex",
-      "session_id": "661a1460-bf21-43e4-a587-9f6827250bba",
+      "session_id": "6c9d9a7d-01c5-5edd-8b7f-8ea416acb1af",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -519,7 +519,7 @@
     {
       "run_id": "claude-tmux-ad948830dc",
       "provider": "claude-tmux",
-      "session_id": "aba314d5-aafe-4487-afd1-b8306e121e6e",
+      "session_id": "70f41c72-4872-5691-bac9-25a740a11c4c",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"
@@ -609,7 +609,7 @@
     {
       "run_id": "codex-ec1e9d9723",
       "provider": "codex",
-      "session_id": "a3082046-cd8f-4f8f-ba61-1502845b963a",
+      "session_id": "4ac0e7f6-a4d4-5fb8-bc1a-bf2000219fb0",
       "passed": false,
       "errors": [
         "harvest: InvalidStatus: server rejected WebSocket connection: HTTP 403"

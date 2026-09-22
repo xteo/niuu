@@ -69,7 +69,7 @@ class TestSoleRavnResolution:
         _with_participants(
             broker,
             _participant("coder"),
-            _participant("human:damien", participant_type="human"),
+            _participant("human:user", participant_type="human"),
         )
         assert broker._sole_room_ravn_peer_id() == "coder"
 

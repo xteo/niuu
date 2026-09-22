@@ -466,7 +466,7 @@ async def test_refresh_panes_ignores_pane_already_dead_on_first_sight(tmp_path: 
 def test_parse_agent_name_extracts_from_start_command() -> None:
     parse = FakeTmuxInteractiveTransport._parse_agent_name  # noqa: SLF001
     teammate = (
-        "env CLAUDECODE=1 /home/thor/.local/share/claude/versions/2.1.200 "
+        "env CLAUDECODE=1 /home/operator/.local/share/claude/versions/2.1.200 "
         "--agent-id card-explorer@session-a27e0dba --agent-name card-explorer "
         "--team-name session-a27e0dba --agent-type Explore --model opus"
     )
@@ -487,7 +487,7 @@ async def test_pane_opened_forwards_agent_name_from_start_command(tmp_path: Path
     await transport.start()
 
     transport.pane_start_commands["%2"] = (
-        "env CLAUDECODE=1 /home/thor/.local/share/claude/versions/2.1.200 "
+        "env CLAUDECODE=1 /home/operator/.local/share/claude/versions/2.1.200 "
         "--agent-name wa-audio-explorer --team-name session-a27 --agent-type Explore"
     )
     transport.pane_lines.append("%2\t1\tmain\t0\t2.1.200\t100\t40\t0\t0\t0\t")

@@ -19,9 +19,9 @@ its restored baseline and needs separate operational review before any deploymen
 
 Both hosts have both sources and **separate copied environments**:
 
-- Thor: `/home/thor/.local/share/niuu/releases/forge-codex-ready-20260913-v2`
+- Thor: `/home/operator/.local/share/niuu/releases/forge-codex-ready-20260913-v2`
   and sibling `forge-local-preservation-c6d80980`.
-- Spark: `/home/xteo/.local/share/niuu/releases/forge-codex-ready-20260913-v2`
+- Spark: `/home/operator/.local/share/niuu/releases/forge-codex-ready-20260913-v2`
   and sibling `forge-local-preservation-c6d80980`.
 
 The rollback is the previous Thor baseline plus the isolated backend safety repair,
@@ -121,6 +121,8 @@ This package performs neither owner recovery nor gateway migration automatically
 
 Evidence: [curated release-preparation manifest](codex-release-preparation-evidence-20260913.json).
 Raw private evidence is in `.local/codex-release-preparation-20260913/` in the
-worker checkout and `/home/xteo/.local/share/niuu/release-preparation-20260913/` on
+worker checkout and `/home/operator/.local/share/niuu/release-preparation-20260913/` on
 Spark. Original incident/failed-test/earlier-preparation records remain retained,
 not overwritten by this readiness checkpoint.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

@@ -45,7 +45,7 @@ GET returns:
 
 ```json
 {
-  "session_id": "00000000-0000-0000-0000-000000000001",
+  "session_id": "a68717de-e2a9-5fd2-a5ae-f01e6fe66b63",
   "revision": 0,
   "coordination": null
 }
@@ -55,8 +55,8 @@ The facade also includes the session-owning instance's ID and name. PUT accepts:
 
 ```json
 {
-  "project_id": "dd605b70-4d95-5f10-b698-e25a1b7b3bca",
-  "project_instance_id": "be6dfc3b-3bdc-4e2e-805f-69e945038775",
+  "project_id": "84557252-94b8-5030-985b-568903fdde91",
+  "project_instance_id": "556427e0-0674-56fb-a717-22e5be1d31c5",
   "expected_revision": 0
 }
 ```
@@ -138,3 +138,5 @@ and stale-writer test is marked integration and runs in PostgreSQL CI.
 - [Guild facade](../../src/niuu/adapters/inbound/rest_volundr.py)
 - [Web editor](../../web-next/packages/plugin-volundr/src/ui/AssignSessionProject.tsx)
 - [Checkout discovery](project-checkout-discovery.md)
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

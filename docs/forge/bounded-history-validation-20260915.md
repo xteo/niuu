@@ -9,7 +9,7 @@ native runtime was restarted, adopted, modified or sent test input.
 - Source pin: `b99449cc51a7fb381fc7fc71fe43f388a3f43580`.
 - Branch: `xteo/forge-runtime-management-20260913`.
 - Changes follow `64b95f67dea0830ee809faf6fad1139b0c8e8f13` in the dedicated
-  `/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913` checkout.
+  `/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913` checkout.
 - [Wire contract and remaining limits](bounded-history-protocol-20260914.md).
 - [Machine-readable validation and private evidence checksums](bounded-history-validation-20260915.json).
 
@@ -76,3 +76,5 @@ fixed. No database schema or raw ledger was rewritten.
 
 Next: coordinator evidence review and native contract/runtime validation. No
 deployment, rollout window, or restart is authorized by this candidate handoff.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

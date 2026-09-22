@@ -22,7 +22,7 @@ test('four-host activity uses live state clocks, accepts remote SSE and ignores 
     activity_state_since: iso(-60),
     turn_started_at: i === 0 || i === 2 ? iso(-120) : null,
     model: i % 2 ? 'claude-opus-5' : 'gpt-6-astra',
-    source: { type: 'local_mount', local_path: '/home/thor/repos/niuu' },
+    source: { type: 'local_mount', local_path: '/home/operator/repos/niuu' },
     last_active: iso(0),
   }));
   let sendIdle!: () => void;

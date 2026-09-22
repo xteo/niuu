@@ -333,11 +333,11 @@ function defaultSupervisor(
   runtimeState: 'active' | 'idle' | 'offline',
   deployment: WardenSummary['deployment'] = 'launchd',
 ): WardenSummary['supervisor'] {
-  const configFile = `/Users/jozefvaneenbergen/.ravn/wardens/${id}/config.yaml`;
+  const configFile = `/Users/developer/.ravn/wardens/${id}/config.yaml`;
   const isKubernetes = deployment.startsWith('k8s');
   const serviceFile = isKubernetes
-    ? `/Users/jozefvaneenbergen/.ravn/wardens/${id}/k8s-bundle.yaml`
-    : `/Users/jozefvaneenbergen/.ravn/wardens/${id}/warden.${deployment === 'systemd' ? 'service' : 'plist'}`;
+    ? `/Users/developer/.ravn/wardens/${id}/k8s-bundle.yaml`
+    : `/Users/developer/.ravn/wardens/${id}/warden.${deployment === 'systemd' ? 'service' : 'plist'}`;
   const startCommand = isKubernetes ? deployment : `ravn daemon --config ${configFile}`;
   return {
     installed,
@@ -345,8 +345,8 @@ function defaultSupervisor(
     serviceFile: installed ? serviceFile : '',
     configFile: installed ? configFile : '',
     startCommand: installed ? startCommand : '',
-    stdoutLog: installed ? `/Users/jozefvaneenbergen/.ravn/wardens/${id}/warden.log` : '',
-    stderrLog: installed ? `/Users/jozefvaneenbergen/.ravn/wardens/${id}/warden.error.log` : '',
+    stdoutLog: installed ? `/Users/developer/.ravn/wardens/${id}/warden.log` : '',
+    stderrLog: installed ? `/Users/developer/.ravn/wardens/${id}/warden.error.log` : '',
     lastInstallAt: installed && runtimeState !== 'offline' ? '2026-04-19T02:30:00Z' : undefined,
     observation: installed
       ? {
@@ -582,7 +582,7 @@ const SEED_WARDENS: WardenSummary[] = [
     profile: 'adr-compliance',
     deployment: 'k8s-gitops',
     deploymentKwargs: {
-      repo_path: '/Users/jozefvaneenbergen/gitops/platform',
+      repo_path: '/Users/developer/gitops/platform',
       namespace: 'ravn-dev',
       manifests_subdir: 'clusters/dev/wardens',
       auto_commit: true,

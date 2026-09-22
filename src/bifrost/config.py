@@ -164,7 +164,7 @@ def _default_models() -> list[ManagedModelConfig]:
         ),
         ManagedModelConfig(
             # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
-            # (Damien, 2026-09-02). `claude-fable-5` is still served, so a client on an old
+            # (user, 2026-09-02). `claude-fable-5` is still served, so a client on an old
             # build that keeps sending it is not broken — it just no longer appears here.
             id="claude-fable-5-1",
             name="Claude Fable 5.1",
@@ -211,7 +211,7 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
-        # Astra + Sol are the only two Codex choices, Astra the default (Damien,
+        # Astra + Sol are the only two Codex choices, Astra the default (user,
         # 2026-09-05). Terra was removed with the same decision.
         ManagedModelConfig(
             id="gpt-6-astra",

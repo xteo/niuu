@@ -126,8 +126,8 @@ production boundary green.
 
 | Final capture | Raw PostgreSQL rows | Public wire frames | Full fixture replay | Mid-cursor replay |
 |---|---:|---:|---|---|
-| Claude `aba314d5-aafe-4487-afd1-b8306e121e6e` | 1,173 | 1,143 | 1,143 exact matches | 571 exact matches |
-| Codex `a3082046-cd8f-4f8f-ba61-1502845b963a` | 525 | 511 | 511 exact matches | 255 exact matches |
+| Claude `70f41c72-4872-5691-bac9-25a740a11c4c` | 1,173 | 1,143 | 1,143 exact matches | 571 exact matches |
+| Codex `4ac0e7f6-a4d4-5fb8-bc1a-bf2000219fb0` | 525 | 511 | 511 exact matches | 255 exact matches |
 
 The difference between raw rows and wire frames is the documented projection of
 synthetic reducer seeds and per-connect handshakes. No gap/conflict sentinel or
@@ -175,3 +175,5 @@ Private full bundles remain under `.forge-results/`:
 - Restart/resume, slow-client pressure, persistence outages, interruptions, and long
   soaks remain explicit follow-on live campaigns in the acceptance plan. Earlier
   deterministic fault coverage is not presented as real provider evidence for them.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.
