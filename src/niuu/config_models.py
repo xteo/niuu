@@ -104,7 +104,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             display_name="OpenAI Codex",
             description="OpenAI Codex — WebSocket protocol with streaming and tools",
             labels=["session", "codex"],
-            # Astra is the default Codex model (Damien, 2026-09-05). It was empty, which
+            # Astra is the default Codex model (user, 2026-09-05). It was empty, which
             # left the choice entirely to whatever the caller happened to pass — the app
             # always sends one, but a REST/tool launch that omitted it got no model at
             # all.
@@ -140,7 +140,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             display_name="xAI Grok Build",
             description="xAI Grok Build — Agent Client Protocol (ACP) over stdio (Scaldy pipeline)",
             labels=["session", "grok"],
-            default_model="grok-4.6",
+            default_model="grok-4.7",
             compatible_providers=["xai"],
             defaults={
                 "broker": {

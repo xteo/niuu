@@ -156,7 +156,30 @@ export interface ProjectRepoMapping {
 // Session
 // ---------------------------------------------------------------------------
 
+export interface ForgeProject {
+  id: string;
+  name: string;
+  slug: string;
+  status: 'active' | 'archived';
+  instance_id?: string;
+  instance_name?: string;
+  workspace_path?: string;
+}
+export interface SessionProjectMembership {
+  sessionId: string;
+  revision: number;
+  projectId: string | null;
+  role?: string;
+}
+export interface SessionCoordination {
+  projectId: string;
+  role: string;
+  parent?: { instanceId: string; sessionId: string } | null;
+}
+
 export interface VolundrSession {
+  sessionDefinition?: string;
+  coordination?: SessionCoordination;
   id: string;
   name: string;
   source: SessionSource;
@@ -176,7 +199,17 @@ export interface VolundrSession {
   taskType?: string;
   archivedAt?: Date;
   trackerIssue?: TrackerIssue;
-  activityState?: 'active' | 'idle' | 'tool_executing' | 'awaiting_input' | 'error' | null;
+  activityState?:
+    | 'provisioning'
+    | 'active'
+    | 'idle'
+    | 'tool_executing'
+    | 'awaiting_input'
+    | 'stopped'
+    | 'error'
+    | null;
+  activityStateSince?: string | null;
+  turnStartedAt?: string | null;
   /** True when the session is blocked waiting on the user (awaiting_input). */
   needsAttention?: boolean;
   ownerId?: string;
@@ -255,6 +288,7 @@ export interface VolundrTarget {
   slug: string;
   name: string;
   baseUrl: string;
+  config?: Record<string, unknown>;
   enabled: boolean;
   isDefault: boolean;
   visibility?: string;

@@ -8,10 +8,10 @@ the context supplied to the model then described different conversations.
 
 ## Scope and evidence
 
-- Forge session: `00e770e8-4948-4fb1-8952-8eea80ef50f3`, `lexi-ios-astra`.
+- Forge session: `b8203717-c06f-5c01-93e4-88672610acc7`, `lexi-ios-astra`.
 - Model: `gpt-6-astra`; native turn contexts record `xhigh` effort.
-- Original Codex thread: `01a07ff5-428f-7ac2-bf81-fa1d72503524`.
-- Replacement Codex thread: `01a07ff8-ba4a-79d0-b399-77b7791c93d0`.
+- Original Codex thread: `7163b58a-2a8d-544c-a3f4-d44e1026af31`.
+- Replacement Codex thread: `e9f0bdb8-ec98-527d-ad2e-4e5f63a6e2b8`.
 - Broker PID during the incident: `1827006`; there was no broker or platform
   restart between those two native thread initializations.
 - Collected the complete public event log, direct read-only PostgreSQL rows,
@@ -128,7 +128,7 @@ confirmed context split:
   Navigation, reconnect, and display timeout do not themselves stop Codex.
 
 The older stopped `lexi-ios-astra` session
-`30557c09-0e45-4a11-a31c-8a324e732a40` has a separate September 6 failure:
+`24756b14-8ebf-5c64-a48b-1463d6e2b7f5` has a separate September 6 failure:
 its native API request was rejected with HTTP 401 for missing authentication.
 That occurred before the September 7 server update and is not the null-question
 incident above.
@@ -152,7 +152,7 @@ stream. This investigation leaves the user's active session uninterrupted.
   `.forge-results/lexi-astra-regression-gate/unit-summary.json` and
   `unit-1.coverage.xml`. This is not a passing release gate.
 - Real platform Astra canary: **2/2 scenarios passed** (`workspace`,
-  `question-freeform`), session `f1536a13-c2cf-4e7d-aadc-d7860dacb92e`.
+  `question-freeform`), session `f847c70b-c02d-5591-b015-69bad5b0baf8`.
   It captured the free-text question, resolution, explicit answer, and earlier
   task recall without changing native thread identity. The test session stopped
   cleanly. Evidence: `.forge-results/lexi-astra-fix/codex-ea1823a663/`.
@@ -186,8 +186,8 @@ At the user's subsequent request, the existing external-session import API
 created and started a separate Forge session:
 
 - Name: `lexi-ios-astra-recovered`.
-- Forge ID: `b2a2aee6-f8ca-41ea-ae3a-bd9fa392c8e1`.
-- Native ID: `01a07ff5-428f-7ac2-bf81-fa1d72503524`.
+- Forge ID: `d13cb19e-0e73-56ef-8678-bb2a2df11bf3`.
+- Native ID: `7163b58a-2a8d-544c-a3f4-d44e1026af31`.
 - Origin: `codex`; model: `gpt-6-astra`.
 - Verified running status, successful iOS-facing socket connection, and native
   `system/init` identifying the original thread. The stored `cli_session_id`
@@ -237,7 +237,7 @@ Live verification on `lexi-ios-astra-recovered`:
 | iOS-sized socket test | 127,703-byte snapshot received with a 1,048,576-byte client cap |
 | Lazy tool output | Largest output fetched through the public API; content exactly matched full history |
 | Final database audit | 253 raw rows; one import marker; no duplicate canonical seeds |
-| Native resume | `cli_session_id == external_session_id == 01a07ff5-428f-7ac2-bf81-fa1d72503524` |
+| Native resume | `cli_session_id == external_session_id == 7163b58a-2a8d-544c-a3f4-d44e1026af31` |
 | Model prompts during repair | Zero |
 
 The first socket probe ran immediately after resume, before the new broker had
@@ -259,3 +259,5 @@ Private source traces, before/after database snapshots, replay payloads, process
 identities, and validation reports are retained under
 `/tmp/forge-lexi-astra-investigation/`. The repeatable test and operator workflow
 is documented in [native session recovery](forge-native-session-recovery.md).
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

@@ -28,7 +28,6 @@ The main workspace provides tabs for chat, terminal, code, diffs, chronicles, an
 
 <div class="screenshot-full" markdown>
 
-![Session workspace](../images/session-workspace.png)
 
 </div>
 

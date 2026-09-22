@@ -811,7 +811,11 @@ function toSessionState(session: VolundrSession): Session['state'] {
       if (session.needsAttention || session.activityState === 'awaiting_input')
         return 'awaiting_input';
       if (session.activityState === 'error') return 'failed';
-      return session.activityState === 'idle' ? 'idle' : 'running';
+      if (session.activityState === 'provisioning') return 'provisioning';
+      if (session.activityState === 'stopped') return 'terminated';
+      if (session.activityState === 'active' || session.activityState === 'tool_executing')
+        return 'running';
+      return session.activityState === 'idle' ? 'idle' : 'ready';
     case 'stopping':
       return 'terminating';
     case 'stopped':
@@ -880,6 +884,10 @@ function toDomainSession(session: VolundrSession): Session {
     name: session.name,
     title: session.trackerIssue?.title ?? session.name,
     personaName: session.name,
+    model: session.model,
+    sessionDefinition: session.sessionDefinition,
+    source: session.source,
+    coordination: session.coordination,
     templateId: toSessionTemplateId(session),
     clusterId: toSessionClusterId(session),
     clusterName: session.instanceName ?? session.instanceId ?? undefined,
@@ -887,6 +895,8 @@ function toDomainSession(session: VolundrSession): Session {
     startedAt,
     readyAt,
     lastActivityAt,
+    activityStateSince: session.activityStateSince,
+    turnStartedAt: session.turnStartedAt,
     terminatedAt,
     resources: EMPTY_SESSION_RESOURCES,
     env: {},
@@ -909,18 +919,22 @@ function buildSplitVolundrService(
   return {
     ...catalog,
     getFeatures: () => forge.getFeatures(),
-    getSessions: () => forge.getSessions(),
+    getSessions: (options) => forge.getSessions(options),
     getSession: (id) => forge.getSession(id),
     getActiveSessions: () => forge.getActiveSessions(),
-    getStats: () => forge.getStats(),
+    getStats: (options) => forge.getStats(options),
     getRepos: () => forge.getRepos(),
+    getProjects: (options) => forge.getProjects(options),
+    getSessionProject: (id, options) => forge.getSessionProject(id, options),
+    assignSessionProject: (id, assignment, options) =>
+      forge.assignSessionProject(id, assignment, options),
     getTargets: () => Promise.resolve(forge.getTargets?.() ?? []),
-    subscribe: (callback) => forge.subscribe(callback),
+    subscribe: (callback, options) => forge.subscribe(callback, options),
     subscribeStats: (callback) => forge.subscribeStats(callback),
     getAvailableMcpServers: () => forge.getAvailableMcpServers(),
     getAvailableSecrets: () => forge.getAvailableSecrets(),
     createSecret: (name, data) => forge.createSecret(name, data),
-    getClusterResources: () => forge.getClusterResources(),
+    getClusterResources: (options) => forge.getClusterResources(options),
     getAdminSettings: () => forge.getAdminSettings(),
     updateAdminSettings: (data) => forge.updateAdminSettings(data),
     startSession: (config) => forge.startSession(config),
@@ -934,7 +948,7 @@ function buildSplitVolundrService(
     archiveSession: (sessionId) => forge.archiveSession(sessionId),
     archiveStoppedSessions: () => forge.archiveStoppedSessions(),
     restoreSession: (sessionId) => forge.restoreSession(sessionId),
-    listArchivedSessions: () => forge.listArchivedSessions(),
+    listArchivedSessions: (options) => forge.listArchivedSessions(options),
     listExternalSessions: () => forge.listExternalSessions(),
     importExternalSession: (provider, externalId, name) =>
       forge.importExternalSession(provider, externalId, name),
@@ -973,7 +987,12 @@ async function listAllVolundrSessions(volundr: IVolundrService): Promise<Session
   return Array.from(byId.values());
 }
 
-function buildVolundrSessionStore(volundr: IVolundrService): ISessionStore {
+const DEFAULT_SESSION_LIST_TIMEOUT_MS = 8_000;
+
+function buildVolundrSessionStore(
+  volundr: IVolundrService,
+  listRequestTimeoutMs: number,
+): ISessionStore {
   return {
     async getSession(id: string) {
       const session = await volundr.getSession(id);
@@ -982,7 +1001,16 @@ function buildVolundrSessionStore(volundr: IVolundrService): ISessionStore {
       const archivedSession = archived.find((candidate: VolundrSession) => candidate.id === id);
       return archivedSession ? toDomainSession(archivedSession) : null;
     },
-    async listSessions(filters?: SessionFilters) {
+    listRequestTimeoutMs,
+    listSources: async () => (await volundr.getTargets()).map(({ id, name }) => ({ id, name })),
+    async listSessions(filters?: SessionFilters, signal?: AbortSignal) {
+      if (filters?.instanceId) {
+        const options = { instanceId: filters.instanceId, signal };
+        const sessions = filters.archivedOnly
+          ? await volundr.listArchivedSessions(options)
+          : await volundr.getSessions(options);
+        return applySessionFilters(sessions.map(toDomainSession), filters);
+      }
       return applySessionFilters(await listAllVolundrSessions(volundr), filters);
     },
     async createSession() {
@@ -995,25 +1023,9 @@ function buildVolundrSessionStore(volundr: IVolundrService): ISessionStore {
       await volundr.deleteSession(id);
     },
     subscribe(callback: (sessions: Session[]) => void) {
-      let active = true;
-      const emit = async (sessions?: VolundrSession[]) => {
-        const current = sessions?.map(toDomainSession) ?? [];
-        const archived = await volundr.listArchivedSessions().catch(() => []);
-        if (!active) return;
-        const byId = new Map<string, Session>();
-        for (const session of [...current, ...archived.map(toDomainSession)]) {
-          byId.set(session.id, session);
-        }
-        callback(Array.from(byId.values()));
-      };
-      void emit();
-      const unsubscribe = volundr.subscribe((sessions: VolundrSession[]) => {
-        void emit(sessions);
+      return volundr.subscribe((sessions) => callback(sessions.map(toDomainSession)), {
+        hydrate: false,
       });
-      return () => {
-        active = false;
-        unsubscribe();
-      };
     },
   };
 }
@@ -1250,13 +1262,11 @@ function buildClusterFromParts(
 
 function buildVolundrClusterAdapter(volundr: IVolundrService): IClusterAdapter {
   return {
-    async getClusters() {
+    async getClusters(options) {
       const [resources, sessions, rawTargets] = await Promise.all([
-        volundr
-          .getClusterResources()
-          .catch(() => ({ resourceTypes: [], nodes: [] }) as ClusterResourceRecord),
-        volundr.getSessions().catch(() => [] as VolundrSession[]),
-        Promise.resolve(volundr.getTargets?.() ?? []).catch(() => [] as VolundrTargetRecord[]),
+        volundr.getClusterResources(options),
+        volundr.getSessions(options),
+        options?.instanceId ? Promise.resolve([]) : Promise.resolve(volundr.getTargets?.() ?? []),
       ]);
 
       const nodes = (resources.nodes ?? []).map((node, index) => ({
@@ -1408,7 +1418,10 @@ export function buildServices(config: NiuuConfig): ServicesMap {
     ? buildRepoCatalogHttpAdapter(createApiClient(repoCatalogBase))
     : demoService(config, 'niuu.repos', createMockRepoCatalogService);
   const sessionStore = forgeBase
-    ? buildVolundrSessionStore(volundr)
+    ? buildVolundrSessionStore(
+        volundr,
+        config.services.forge?.sessionListTimeoutMs ?? DEFAULT_SESSION_LIST_TIMEOUT_MS,
+      )
     : demoService(config, 'volundr.sessions', createMockSessionStore);
   const clusterAdapter = forgeBase
     ? buildVolundrClusterAdapter(volundr)

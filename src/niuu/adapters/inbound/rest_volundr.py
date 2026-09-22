@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -25,13 +25,22 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp
 
 from niuu.adapters.inbound.auth import extract_principal
+from niuu.adapters.inbound.forge_session_stream import merge_events, remote_events
 from niuu.adapters.inbound.remote_urls import build_remote_url
 from niuu.adapters.inbound.ws_forge_replay import forward_replay
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.services.instances import InstanceService
+
+
+class SessionProjectAssignment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_id: UUID
+    project_instance_id: str | None = Field(default=None, min_length=1, max_length=100)
+    expected_revision: int = Field(ge=0)
 
 
 def _forward_headers(request: Request) -> dict[str, str]:
@@ -108,7 +117,11 @@ def _instance_websocket_url(instance: RegisteredInstance, path: str) -> str:
 
 
 def _query_params(request: Request) -> list[tuple[str, str]]:
-    return list(request.query_params.multi_items())
+    # The selector belongs to this gateway's registry. A downstream Forge has
+    # its own IDs; forwarding ours makes it look up a target that does not exist.
+    return [
+        (key, value) for key, value in request.query_params.multi_items() if key != "instance_id"
+    ]
 
 
 def _normalize_timestamp(value: Any) -> float:
@@ -346,6 +359,40 @@ async def _sync_persona_to_instance(
     _ensure_remote_success(synced)
 
 
+async def _local_session_instance(
+    service: InstanceService,
+    principal: Principal,
+    request: Request,
+) -> RegisteredInstance:
+    """Resolve this shell's local runtime, never a default/remote guild member.
+
+    Use the existing explicit embedded transport identity and normal visibility
+    policy. A pure registry shell has no local sessions service: that is an error,
+    not permission to silently query an arbitrary registered node.
+    """
+    local = [
+        instance
+        for instance in await _visible_instances(service, principal)
+        if _uses_embedded_transport(instance)
+    ]
+    if len(local) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Local sessions require exactly one visible, enabled embedded Forge runtime",
+        )
+    selected = request.query_params.get("instance_id")
+    if selected and selected != local[0].id:
+        raise HTTPException(422, "scope=local cannot select a different guild instance")
+    return local[0]
+
+
+def _local_session_scope(request: Request) -> bool:
+    scope = request.query_params.get("scope", "guild")
+    if scope not in {"guild", "local"}:
+        raise HTTPException(422, "Session scope must be local or guild")
+    return scope == "local"
+
+
 async def _find_session_owner(
     service: InstanceService,
     principal: Principal,
@@ -355,11 +402,12 @@ async def _find_session_owner(
     embedded_app: ASGIApp | None = None,
 ) -> tuple[RegisteredInstance, dict[str, Any]]:
     selected = request.query_params.get("instance_id")
-    instances = (
-        [await _resolve_target_instance(service, principal, selected)]
-        if selected
-        else await _visible_instances(service, principal)
-    )
+    if _local_session_scope(request):
+        instances = [await _local_session_instance(service, principal, request)]
+    elif selected:
+        instances = [await _resolve_target_instance(service, principal, selected)]
+    else:
+        instances = await _visible_instances(service, principal)
     for instance in instances:
         response = await _request_remote(
             instance,
@@ -947,12 +995,39 @@ def create_volundr_router(
     @router.get("/sessions")
     async def list_sessions(
         request: Request,
+        response: Response,
+        scope: Literal["guild", "local"] = Query(
+            default="guild", description="Guild aggregation, or only this server's embedded runtime"
+        ),
         principal: Principal = Depends(extract_principal),
     ) -> list[dict[str, Any]]:
-        instances = await _visible_instances(service, principal)
+        if scope == "local":
+            instance = await _local_session_instance(service, principal, request)
+            result = await _request_remote(
+                instance,
+                request,
+                method="GET",
+                path="/sessions",
+                params=_query_params(request),
+                embedded_app=embedded_forge_app,
+            )
+            # Unlike best-effort guild aggregation, a failed local read must not
+            # look like an empty successful list or fall through to remote nodes.
+            _ensure_remote_success(result)
+            try:
+                payload = result.json()
+            except ValueError as exc:
+                raise HTTPException(502, "Local Forge sessions response is not JSON") from exc
+            if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+                raise HTTPException(502, "Unexpected local Forge sessions response")
+            response.headers["X-Forge-Session-Scope"] = "local"
+            return [_with_instance(item, instance) for item in payload]
         selected = request.query_params.get("instance_id")
-        if selected:
-            instances = [await _resolve_target_instance(service, principal, selected)]
+        instances = (
+            [await _resolve_target_instance(service, principal, selected)]
+            if selected
+            else await _visible_instances(service, principal)
+        )
         params = _query_params(request)
         results = await asyncio.gather(
             *[
@@ -972,13 +1047,30 @@ def create_volundr_router(
         merged: dict[str, dict[str, Any]] = {}
         for instance, result in zip(instances, results, strict=False):
             if isinstance(result, Exception):
+                if selected:
+                    if isinstance(result, HTTPException):
+                        raise result
+                    raise HTTPException(
+                        status_code=502, detail="Selected Forge host is unavailable"
+                    ) from result
                 continue
             if result.status_code >= 400:
+                if selected:
+                    _ensure_remote_success(result)
                 continue
-            payload = result.json()
+            try:
+                payload = result.json()
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=502, detail="Invalid Forge session response"
+                ) from exc
             if not isinstance(payload, list):
+                if selected:
+                    raise HTTPException(status_code=502, detail="Invalid Forge session response")
                 continue
             for item in payload:
+                if selected and (not isinstance(item, dict) or not item.get("id")):
+                    raise HTTPException(status_code=502, detail="Invalid Forge session response")
                 if not isinstance(item, dict):
                     continue
                 merged[f"{instance.id}:{item.get('id') or ''}"] = _with_instance(item, instance)
@@ -995,58 +1087,53 @@ def create_volundr_router(
     @router.get("/sessions/stream")
     async def stream_sessions(
         request: Request,
+        scope: Literal["guild", "local"] = Query(default="guild"),
         principal: Principal = Depends(extract_principal),
     ) -> StreamingResponse:
-        """Proxy the backing instance's Server-Sent Events session stream.
+        """Stream a selected/default host, or opt in to every visible Guild host.
 
-        MUST be declared before GET /sessions/{session_id} — otherwise the
-        literal path "stream" is captured as a session id, the request falls
-        through to a session lookup, and the frontend's FleetStream hangs on a
-        connection that never emits an event (status frozen until a manual
-        reload). Single-instance/mini deployments stream the default backing
-        instance; fleet-wide fan-in across instances is a separate feature.
+        Remote reads deliberately omit all_instances so facade-to-facade
+        connections never recursively fan out to each other's registries.
         """
-        instance = await _resolve_target_instance(service, principal, None)
+        selected = request.query_params.get("instance_id")
+        fleet = (
+            scope != "local"
+            and request.query_params.get("all_instances") == "true"
+            and not selected
+        )
+        instances = (
+            [await _local_session_instance(service, principal, request)]
+            if scope == "local"
+            else await _visible_instances(service, principal)
+            if fleet
+            else [await _resolve_target_instance(service, principal, selected)]
+        )
         headers = _forward_headers(request)
-        embedded = _uses_embedded_transport(instance)
+        broadcaster = getattr(getattr(embedded_forge_app, "state", None), "broadcaster", None)
+        if not fleet and _uses_embedded_transport(instances[0]) and broadcaster is None:
+            raise HTTPException(status_code=503, detail="Session event stream unavailable")
 
-        # For the in-process instance, subscribe to its event bus directly.
-        # httpx's ASGITransport buffers the entire response and never returns for
-        # an infinite stream, so it cannot proxy SSE — but the embedded volundr
-        # app shares this process, so we read its broadcaster. If it is somehow
-        # unavailable, fail fast with 503 so the frontend degrades to polling
-        # (a hung 200 stream would freeze status until a manual reload).
-        broadcaster = None
-        if embedded:
-            broadcaster = getattr(getattr(embedded_forge_app, "state", None), "broadcaster", None)
-            if broadcaster is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Session event stream unavailable",
-                )
-
-        async def _proxy() -> Any:
-            if embedded:
+        async def events(instance: RegisteredInstance) -> Any:
+            if _uses_embedded_transport(instance):
+                if broadcaster is None:
+                    raise RuntimeError("Session event stream unavailable")
                 async for event in broadcaster.subscribe():
-                    if await request.is_disconnected():
-                        break
-                    yield (
-                        f"event: {event.type.value}\ndata: {json.dumps(event.data)}\n\n"
-                    ).encode()
-                return
-            url = build_remote_url(instance.base_url, "/api/v1/forge", "/sessions/stream")
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", url, headers=headers) as resp:
-                    async for chunk in resp.aiter_raw():
-                        yield chunk
+                    yield event.type.value, _with_instance(event.data, instance)
+            else:
+                url = build_remote_url(instance.base_url, "/api/v1/forge", "/sessions/stream")
+                async for name, payload in remote_events(url, headers):
+                    yield name, _with_instance(payload, instance)
 
         return StreamingResponse(
-            _proxy(),
+            merge_events(
+                {instance.id: lambda item=instance: events(item) for instance in instances}
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Forge-Session-Scope": scope,
             },
         )
 
@@ -1110,6 +1197,21 @@ def create_volundr_router(
         request: Request,
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
+        selected = request.query_params.get("instance_id")
+        if selected:
+            instance = await _resolve_target_instance(service, principal, selected)
+            response = await _request_remote(
+                instance,
+                request,
+                method="GET",
+                path="/stats",
+                embedded_app=embedded_forge_app,
+            )
+            _ensure_remote_success(response)
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=502, detail="Unexpected Forge metrics response")
+            return _with_instance(payload, instance, rebase_chat_endpoint=False)
         instances = await _visible_instances(service, principal)
         results = await asyncio.gather(
             *[
@@ -1155,6 +1257,22 @@ def create_volundr_router(
         request: Request,
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
+        selected = request.query_params.get("instance_id")
+        if selected:
+            instance = await _resolve_target_instance(service, principal, selected)
+            response = await _request_remote(
+                instance,
+                request,
+                method="GET",
+                path="/resources",
+                remote_prefix="/api/v1/volundr",
+                embedded_app=embedded_forge_app,
+            )
+            _ensure_remote_success(response)
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=502, detail="Unexpected Forge resources response")
+            return _merge_cluster_resources([payload], [instance])
         instances = await _visible_instances(service, principal)
         results = await asyncio.gather(
             *[
@@ -1279,7 +1397,13 @@ def create_volundr_router(
         request: Request,
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
-        instance = await _resolve_target_instance(service, principal, None)
+        instance = (
+            await _local_session_instance(service, principal, request)
+            if _local_session_scope(request)
+            else await _resolve_target_instance(
+                service, principal, request.query_params.get("instance_id")
+            )
+        )
         response = await _request_remote(
             instance,
             request,
@@ -1300,6 +1424,7 @@ def create_volundr_router(
             "session_events": False,
             "message_delivery": True,
             "native_history_import": True,
+            "local_session_scope": True,
         }
         return flags
 
@@ -1610,6 +1735,65 @@ def create_volundr_router(
         payload = response.json()
         return _with_instance(payload, instance) if isinstance(payload, dict) else {}
 
+    @router.get("/sessions/{session_id}/runtime-version")
+    async def get_session_runtime_version(
+        request: Request,
+        session_id: str,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/runtime-version",
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return response.json()
+
+    @router.get("/sessions/{session_id}/read-state")
+    async def get_session_read_state(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/read-state",
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return response.json()
+
+    @router.patch("/sessions/{session_id}/read-state")
+    async def change_session_read_state(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="PATCH",
+            path=f"/sessions/{session_id}/read-state",
+            json_body=body,
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return response.json()
+
     @router.patch("/sessions/{session_id}/archive")
     async def archive_session(
         request: Request,
@@ -1657,6 +1841,121 @@ def create_volundr_router(
         _ensure_remote_success(response)
         payload = response.json()
         return _with_instance(payload, instance) if isinstance(payload, dict) else {}
+
+    @router.get("/sessions/{session_id}/project")
+    async def get_session_project(
+        request: Request,
+        session_id: UUID,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, str(session_id), embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/project",
+            embedded_app=embedded_forge_app,
+        )
+        if response.status_code == 404:
+            raise HTTPException(
+                501, "Update this session's Forge host to enable project assignment"
+            )
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), instance)
+
+    @router.put("/sessions/{session_id}/project")
+    async def assign_session_project(
+        request: Request,
+        session_id: UUID,
+        data: SessionProjectAssignment,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        owner, _ = await _find_session_owner(
+            service, principal, request, str(session_id), embedded_app=embedded_forge_app
+        )
+        # Check support/revision before making a metadata replica on a worker host.
+        current = await _request_remote(
+            owner,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/project",
+            embedded_app=embedded_forge_app,
+        )
+        if current.status_code == 404:
+            raise HTTPException(
+                501, "Update this session's Forge host to enable project assignment"
+            )
+        _ensure_remote_success(current)
+        if current.json().get("revision") != data.expected_revision:
+            raise HTTPException(409, "Session project changed; reload before assigning")
+        holder = await _resolve_target_instance(
+            service, principal, data.project_instance_id or owner.id
+        )
+        path = f"/projects/{data.project_id}"
+        project_response = await _request_remote(
+            holder, request, method="GET", path=path, embedded_app=embedded_forge_app
+        )
+        _ensure_remote_success(project_response)
+        project = project_response.json()
+        if not isinstance(project, dict) or str(project.get("id")) != str(data.project_id):
+            raise HTTPException(502, "Project host returned a different project")
+        if any(
+            not isinstance(project.get(key), str) or not project[key]
+            for key in ("slug", "name", "repo_url")
+        ):
+            raise HTTPException(502, "Project host returned incomplete project metadata")
+        if project.get("status") != "active":
+            raise HTTPException(409, "Restore the archived project before assigning sessions")
+        if holder.id != owner.id:
+            existing = await _request_remote(
+                owner, request, method="GET", path=path, embedded_app=embedded_forge_app
+            )
+            if existing.status_code == 404:
+                # Existing registration is the durable membership index. Only copy
+                # public identity, never another host's checkout, scope or credentials.
+                replica = {key: project[key] for key in ("id", "slug", "name", "repo_url")}
+                replica.update(description=project.get("description", ""), workspace_path="")
+                registered = await _request_remote(
+                    owner,
+                    request,
+                    method="POST",
+                    path="/projects",
+                    json_body=replica,
+                    embedded_app=embedded_forge_app,
+                )
+                if registered.status_code != 409:
+                    _ensure_remote_success(registered)
+                # A simultaneous registration may have won; validate the actual record.
+                existing = await _request_remote(
+                    owner, request, method="GET", path=path, embedded_app=embedded_forge_app
+                )
+            _ensure_remote_success(existing)
+            local_project = existing.json()
+            if not isinstance(local_project, dict) or (
+                str(local_project.get("id")),
+                local_project.get("repo_url"),
+                local_project.get("status"),
+            ) != (
+                str(data.project_id),
+                project.get("repo_url"),
+                "active",
+            ):
+                raise HTTPException(409, "Project registration on the session host conflicts")
+        response = await _request_remote(
+            owner,
+            request,
+            method="PUT",
+            path=f"/sessions/{session_id}/project",
+            json_body={
+                "project_id": str(data.project_id),
+                "expected_revision": data.expected_revision,
+            },
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), owner)
 
     @router.put("/sessions/{session_id}")
     async def update_session(
@@ -1830,6 +2129,7 @@ def create_volundr_router(
             instance,
             request,
             method="GET",
+            params=_query_params(request),
             path=(f"/sessions/{session_id}/tool-result/{quote(tool_use_id, safe='')}/preview"),
             embedded_app=embedded_forge_app,
         )

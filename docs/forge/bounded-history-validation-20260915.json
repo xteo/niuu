@@ -1,7 +1,7 @@
 {
   "status": "isolated candidate validated; not deployed or accepted",
   "validated_at": "2026-09-15T00:30:24.963141+00:00",
-  "checkout": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913",
+  "checkout": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913",
   "branch": "xteo/forge-runtime-management-20260913",
   "source_commit": "b99449cc51a7fb381fc7fc71fe43f388a3f43580",
   "base_commit": "64b95f67dea0830ee809faf6fad1139b0c8e8f13",
@@ -43,29 +43,29 @@
     }
   },
   "owned_source_audit": {
-    "checkout": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913",
-    "python": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
+    "checkout": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913",
+    "python": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
     "pytest_sessionfinish_exitstatus": 0,
     "all_from_owned_checkout": true,
     "modules": {
-      "niuu.domain.history_control": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_control.py",
-      "niuu.domain.history_paging": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_paging.py",
-      "skuld.conversation_snapshot": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_snapshot.py",
-      "skuld.conversation_read": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_read.py",
-      "skuld.websocket_lifecycle": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/websocket_lifecycle.py",
-      "niuu.session_proxy": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/session_proxy.py",
-      "niuu.adapters.inbound.rest_volundr": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/adapters/inbound/rest_volundr.py",
-      "volundr.adapters.inbound.rest": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/inbound/rest.py",
-      "volundr.session_archive": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/session_archive.py",
-      "skuld.transports.codex_ws": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
-      "skuld.channels": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
-      "skuld.broker": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
-      "skuld.broker_api": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
-      "niuu.domain.transcript_reducer": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py",
-      "volundr.main": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/main.py",
-      "volundr.composition_builders": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/composition_builders.py",
-      "volundr.domain.ports": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/domain/ports.py",
-      "volundr.adapters.outbound.local_process": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/outbound/local_process.py"
+      "niuu.domain.history_control": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_control.py",
+      "niuu.domain.history_paging": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_paging.py",
+      "skuld.conversation_snapshot": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_snapshot.py",
+      "skuld.conversation_read": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_read.py",
+      "skuld.websocket_lifecycle": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/websocket_lifecycle.py",
+      "niuu.session_proxy": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/session_proxy.py",
+      "niuu.adapters.inbound.rest_volundr": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/adapters/inbound/rest_volundr.py",
+      "volundr.adapters.inbound.rest": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/inbound/rest.py",
+      "volundr.session_archive": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/session_archive.py",
+      "skuld.transports.codex_ws": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
+      "skuld.channels": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
+      "skuld.broker": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
+      "skuld.broker_api": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
+      "niuu.domain.transcript_reducer": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py",
+      "volundr.main": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/main.py",
+      "volundr.composition_builders": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/composition_builders.py",
+      "volundr.domain.ports": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/domain/ports.py",
+      "volundr.adapters.outbound.local_process": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/outbound/local_process.py"
     },
     "pytest_final_exitstatus": 0
   },
@@ -109,51 +109,51 @@
   },
   "evidence": [
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/full-regression-04.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/full-regression-04.log",
       "sha256": "9d17d0ad99e41a77f66ce9950ed0a8273698bde393136a915a4b3aae270ad24b"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-source-audit.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-source-audit.json",
       "sha256": "48aaa30801ad67637beece3de874b0e166b86a4542360a877c4023b7266ba78f"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-coverage.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-coverage.json",
       "sha256": "2d260f7bb0a7ad99b1d08ceef5360a39e827b807df7e9b5dcc105071eca4808c"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-coverage.rc",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/release-coverage.rc",
       "sha256": "c63bbfb19ccaf290958ef9471a32854392a103db40532f3583bc29b011674aef"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/run-release-sweep.py",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/run-release-sweep.py",
       "sha256": "37b9228804cd0e8fcd7e4b54e9a9b0d5441c122b65a3f7577545b8466a9655ac"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/bridge-cancel-red.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/bridge-cancel-red.log",
       "sha256": "a3d93f9bf678de9b39820fe861b45ec89be3b4822be125ab1af2f3e552f3d4ea"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/bridge-cancel-green.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/bridge-cancel-green.log",
       "sha256": "db1c2f8d2a8f1437b6581deba1a50556375bd579eade6b42e6a714c030f831f5"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/fixture-final-verification.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/fixture-final-verification.json",
       "sha256": "cb6e64bae94636fb27227b12ac93c20c849a101c53c05b2c94a85edc1547211a"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/actual-capture-protocol2-paging.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/actual-capture-protocol2-paging.json",
       "sha256": "46869200265fa33d30274229f53996019e9d74e0f9cc766b585caba6f1c99f82"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/final-ruff.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/final-ruff.log",
       "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/final-format.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/final-format.log",
       "sha256": "cdd24684b33e5200a213c89093e8da4cb81a0de0085a4684d20923e852610123"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/parent-rest-projection-findings.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/large-history-window-20260914/parent-rest-projection-findings.json",
       "sha256": "0b534670c65e4f8096670fb6b392a7829175feaa8e05c78bed67cacf7965d9c8"
     }
   ],

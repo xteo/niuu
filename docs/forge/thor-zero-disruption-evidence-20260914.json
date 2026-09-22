@@ -5,7 +5,7 @@
   "api_identity": {
     "pid": 61138,
     "start_ticks": "153373956",
-    "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+    "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
     "argv_sha256": "51dea4372ebf363096975342f0cc2ad54845d1a88a89321c88cbdc3b4e0a63a2"
   },
   "api_health": {
@@ -40,24 +40,24 @@
   "reload_supported": false,
   "api_listener_single_process": true,
   "spark_flow": {
-    "id": "2e6286cb-e25a-507d-ad4a-7725879eed9e",
+    "id": "35648f41-7b58-501e-9a5e-e925324efb96",
     "status": "archived",
     "archived_at": "2026-09-14T12:02:20.871167+00:00",
     "turn_count": 7,
     "turns_sha256": "1380c632f49e1117ab210ab8922377c82469cbb9d481a9428acf6966a8844ac6"
   },
   "archived_replay_samples": {
-    "7f516d0c-329d-5b94-a76c-f4d20b509d72": {
+    "de286ec3-c712-5fd5-9da1-e6f65591d44a": {
       "turn_count": 20,
       "turns_sha256": "b5d0e1dcd39f94df9179cd613f6e79a36d52eac233ece0ffe44d2e72178a5ee7"
     },
-    "6f186261-557e-50f1-9feb-4c16a13496f2": {
+    "984be8ad-fe56-57f1-9ea6-c0907e4290c7": {
       "turn_count": 96,
       "turns_sha256": "f80a55146e1a1904d1c18d120cea491c96e333431127074b5a40d9571a2fb29e"
     }
   },
   "new_research_runner": {
-    "id": "0a713405-79b2-566c-a953-802e3a080c49",
+    "id": "2d12742e-25cf-5b50-8fec-334a9edf3715",
     "status": "running",
     "activity_state": "active",
     "created_at": "2026-09-14T12:08:02.939244+00:00"
@@ -73,7 +73,7 @@
   },
   "shared_mutations": false,
   "automatic_retry_scheduled": false,
-  "native_replay_owner": "thor:ac1b685f-59c6-5434-a85a-ac4d435077a3 (UX-016 after current 2264 publication)",
+  "native_replay_owner": "thor:f657583e-9a1a-513c-ab03-cd5b135ec4e8 (UX-016 after current 2264 publication)",
   "prior_permitted_private_staging_completed_at": "2026-09-14T12:09:18.269325+00:00",
   "latest_safety_receipt_created_at": "2026-09-14T12:09:59.666996Z"
 }

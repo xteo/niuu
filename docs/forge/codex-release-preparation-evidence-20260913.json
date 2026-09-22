@@ -4,7 +4,7 @@
   "status": "prepared_not_activated",
   "self": {
     "instance_id": "thor",
-    "session_id": "4ab99660-05e8-52c3-90d3-85d7463ce8a2"
+    "session_id": "2a5ebca8-019a-5291-869f-f3761aac7575"
   },
   "candidate": {
     "revision": "f5d7a5e49eafd765f8daf53bdc51c95ac1949939",
@@ -80,11 +80,11 @@
       "live_gateways": 9,
       "protected_processes": 30,
       "archived_replay": {
-        "7f516d0c-329d-5b94-a76c-f4d20b509d72": {
+        "de286ec3-c712-5fd5-9da1-e6f65591d44a": {
           "turns": 20,
           "sha256": "b5d0e1dcd39f94df9179cd613f6e79a36d52eac233ece0ffe44d2e72178a5ee7"
         },
-        "6f186261-557e-50f1-9feb-4c16a13496f2": {
+        "984be8ad-fe56-57f1-9ea6-c0907e4290c7": {
           "turns": 96,
           "sha256": "f80a55146e1a1904d1c18d120cea491c96e333431127074b5a40d9571a2fb29e"
         }
@@ -92,7 +92,7 @@
       "api_process": {
         "pid": 61138,
         "start_ticks": "153373956",
-        "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+        "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
         "argv_sha256": "51dea4372ebf363096975342f0cc2ad54845d1a88a89321c88cbdc3b4e0a63a2"
       }
     },
@@ -103,11 +103,11 @@
       "live_gateways": 0,
       "protected_processes": 4,
       "archived_replay": {
-        "0f84a1e0-4aad-50d3-b58a-29af015bf28e": {
+        "ed2a1948-7615-5796-bb71-685b8a9e8ce6": {
           "turns": 4,
           "sha256": "1f0133fb87c364bdcdc165c74622dc40cbb2fc337b6b2c200d5042a527c2c110"
         },
-        "20165833-46bf-48ed-bbc7-8a1de29196e8": {
+        "508cc880-5d0a-547f-9237-ea64422ccc15": {
           "turns": 2,
           "sha256": "fbdee981a196e18a35f0379c1b65fbc2968948605066abb01f6b2d8f286246f9"
         }
@@ -115,7 +115,7 @@
       "api_process": {
         "pid": 3415148,
         "start_ticks": "510881365",
-        "boot_id": "f14b7265-14a5-46d3-ba64-1ea25a5a3e01",
+        "boot_id": "33c0b106-5c9d-5353-b6c9-a44dfbad1005",
         "argv_sha256": "f812e26d56a82f3906dc6f8425863eda56a6077deba4fc1497213a43c002e8ca"
       }
     }

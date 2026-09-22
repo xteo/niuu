@@ -20,7 +20,18 @@ def mock_pool():
     """Create a mock asyncpg pool."""
     pool = MagicMock()
     pool.execute = AsyncMock()
-    pool.fetchrow = AsyncMock()
+    pool.fetchrow = AsyncMock(
+        return_value={
+            "coordination": None,
+            "coordination_revision": 0,
+            "workload_config": {},
+            "activity_state": None,
+            "activity_metadata": {},
+            "activity_state_since": None,
+            "turn_started_at": None,
+            "last_active": None,
+        }
+    )
     pool.fetch = AsyncMock()
     return pool
 
@@ -218,8 +229,8 @@ class TestPostgresSessionRepositoryUpdate:
         """Test that update executes UPDATE statement."""
         await repository.update(sample_session)
 
-        mock_pool.execute.assert_called_once()
-        call_args = mock_pool.execute.call_args
+        mock_pool.fetchrow.assert_called_once()
+        call_args = mock_pool.fetchrow.call_args
         sql = call_args[0][0]
         assert "UPDATE sessions" in sql
         assert "WHERE id = $1" in sql
@@ -347,10 +358,10 @@ class TestActivityStatePersistence:
     ):
         await repository.update(awaiting_session)
 
-        call_args = mock_pool.execute.call_args[0]
+        call_args = mock_pool.fetchrow.call_args[0]
         sql = call_args[0]
-        assert "activity_state = $25" in sql
-        assert "activity_metadata = $26" in sql
+        assert "THEN $25 ELSE activity_state END" in sql
+        assert "THEN $26::jsonb ELSE activity_metadata END" in sql
         assert call_args[25] == "awaiting_input"
         assert '"request_id": "askq-1-abc"' in call_args[26]
 
@@ -433,9 +444,9 @@ class TestActivityStatePersistence:
         awaiting_session.activity_state_since = since
         await repository.update(awaiting_session)
 
-        call_args = mock_pool.execute.call_args[0]
+        call_args = mock_pool.fetchrow.call_args[0]
         sql = call_args[0]
-        assert "activity_state_since = $27" in sql
+        assert "THEN $27 ELSE activity_state_since END" in sql
         assert call_args[27] == since
 
     async def test_row_round_trips_activity_state_since(
@@ -486,8 +497,8 @@ class TestActivityStatePersistence:
         awaiting_session.turn_started_at = turn_start
         await repository.update(awaiting_session)
 
-        call_args = mock_pool.execute.call_args[0]
-        assert "turn_started_at = $29" in call_args[0]
+        call_args = mock_pool.fetchrow.call_args[0]
+        assert "THEN $29 ELSE turn_started_at END" in call_args[0]
         assert call_args[29] == turn_start
 
     async def test_row_round_trips_turn_started_at(
@@ -535,7 +546,7 @@ class TestSessionQueryArity:
                     if (
                         isinstance(call, ast.Call)
                         and isinstance(call.func, ast.Attribute)
-                        and call.func.attr == "execute"
+                        and call.func.attr in {"execute", "fetchrow"}
                     ):
                         sql = call.args[0]
                         sql_text = ast.get_source_segment(source, sql) or ""
@@ -550,3 +561,76 @@ class TestSessionQueryArity:
     def test_update_arity(self):
         placeholders, args = self._execute_arg_counts("update")
         assert placeholders == args
+
+    def test_coordination_arity(self):
+        placeholders, args = self._execute_arg_counts("update_coordination")
+        assert placeholders == args
+
+
+async def test_assignment_compares_revision_and_returns_persisted_state(
+    repository, mock_pool, sample_session, sample_row
+):
+    from volundr.domain.projects import SessionCoordination
+
+    coordination = SessionCoordination(project_id=uuid4())
+    mock_pool.fetchrow.return_value = {
+        **sample_row,
+        "coordination": coordination.model_dump_json(),
+        "coordination_revision": 1,
+    }
+    actual = await repository.update_coordination(sample_session, coordination)
+    assert actual.coordination == coordination and actual.coordination_revision == 1
+    sql, *args = mock_pool.fetchrow.call_args.args
+    assert "coordination_revision = $4" in sql
+    assert "owner_id IS NOT DISTINCT FROM $5" in sql
+    assert "tenant_id IS NOT DISTINCT FROM $6" in sql
+    assert args[0] == sample_session.id and args[3] == 0
+    mock_pool.fetchrow.return_value = None
+    assert await repository.update_coordination(sample_session, coordination) is None
+
+
+async def test_ordinary_write_returns_newer_membership_instead_of_stale_caller_copy(
+    repository, mock_pool, sample_session
+):
+    from volundr.domain.projects import SessionCoordination
+
+    coordination = SessionCoordination(project_id=uuid4())
+    mock_pool.fetchrow.return_value = {
+        "coordination": coordination.model_dump_json(),
+        "coordination_revision": 2,
+        "workload_config": {"effort": "high"},
+        "activity_state": None,
+        "activity_metadata": {},
+        "activity_state_since": None,
+        "turn_started_at": None,
+        "last_active": None,
+    }
+    stale = sample_session.model_copy(update={"workload_config": {"project_context": "old"}})
+    actual = await repository.update(stale)
+    assert actual.coordination == coordination and actual.coordination_revision == 2
+    assert actual.workload_config == {"effort": "high"}
+    sql = mock_pool.fetchrow.call_args.args[0]
+    assert "coordination =" not in sql
+    assert "CASE WHEN coordination_revision = $30" in sql
+    mock_pool.fetchrow.return_value = None
+    with pytest.raises(LookupError):
+        await repository.update(stale)
+
+
+async def test_update_returns_winning_activity_tuple(repository, mock_pool, sample_session):
+    since = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    mock_pool.fetchrow.return_value.update(
+        activity_state="idle", activity_state_since=since, turn_started_at=None, last_active=since
+    )
+    stale = sample_session.model_copy(
+        update={
+            "activity_state": SessionActivityState.ACTIVE,
+            "turn_started_at": datetime(2026, 9, 19, 11, tzinfo=UTC),
+        }
+    )
+    actual = await repository.update(stale)
+    assert actual.activity_state == SessionActivityState.IDLE
+    assert actual.activity_state_since == since and actual.turn_started_at is None
+    assert actual.last_active == since
+    sql = mock_pool.fetchrow.call_args.args[0]
+    assert sql.count("$27 >= activity_state_since") == 4

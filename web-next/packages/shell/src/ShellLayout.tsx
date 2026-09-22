@@ -1,7 +1,7 @@
 import { createElement, useCallback, useEffect, useMemo, type ReactNode } from 'react';
 import clsx from 'clsx';
 import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
-import { useConfig, type PluginCtx, type PluginDescriptor } from '@niuulabs/plugin-sdk';
+import { type PluginCtx, type PluginDescriptor } from '@niuulabs/plugin-sdk';
 import {
   LiveBadge,
   Kbd,
@@ -10,6 +10,7 @@ import {
   useCommandPalette,
   useCommandPaletteRegistry,
 } from '@niuulabs/ui';
+import { useTheme, type ThemeName } from '@niuulabs/design-tokens';
 import { useShellContext } from './ShellContext';
 import './Shell.css';
 
@@ -47,8 +48,8 @@ function RailTooltipContent({ title, subtitle }: { title: string; subtitle?: str
 }
 
 export function ShellLayout() {
-  const config = useConfig();
-  const { enabled, brand, version, ctx } = useShellContext();
+  const { theme, setTheme } = useTheme();
+  const { enabled, brand, version, ctx, topbarContent } = useShellContext();
   const router = useRouter();
   const { location } = useRouterState({ select: (s) => ({ location: s.location }) });
   const pathname = location.pathname;
@@ -102,7 +103,7 @@ export function ShellLayout() {
 
   return (
     <TooltipProvider>
-      <div className="niuu-shell" data-theme={config.theme}>
+      <div className="niuu-shell" data-theme={theme}>
         <aside className="niuu-shell__rail">
           <div className="niuu-shell__rail-brand" title="Niuu">
             {brand}
@@ -118,13 +119,14 @@ export function ShellLayout() {
                 type="button"
                 className={clsx(
                   'niuu-shell__rail-item',
+                  p.icon && 'niuu-shell__rail-item--icon',
                   active?.id === p.id && 'niuu-shell__rail-item--active',
                 )}
-                title={`${p.title} · ${p.subtitle}`}
+                title={[p.title, p.subtitle].filter(Boolean).join(' · ')}
                 aria-label={p.title}
                 onClick={() => handleSelect(p.id)}
               >
-                {p.rune}
+                {p.icon ?? p.rune}
               </button>
             </Tooltip>
           ))}
@@ -140,13 +142,14 @@ export function ShellLayout() {
                 type="button"
                 className={clsx(
                   'niuu-shell__rail-item',
+                  p.icon && 'niuu-shell__rail-item--icon',
                   active?.id === p.id && 'niuu-shell__rail-item--active',
                 )}
-                title={`${p.title} · ${p.subtitle}`}
+                title={[p.title, p.subtitle].filter(Boolean).join(' · ')}
                 aria-label={p.title}
                 onClick={() => handleSelect(p.id)}
               >
-                {p.rune}
+                {p.icon ?? p.rune}
               </button>
             </Tooltip>
           ))}
@@ -154,53 +157,64 @@ export function ShellLayout() {
         </aside>
 
         <header className="niuu-shell__topbar">
-          <div className="niuu-shell__topbar-left">
-            <div className="niuu-shell__topbar-title">
-              {active && (
-                <>
-                  <span className="niuu-shell__rune-mark">{active.rune}</span>
-                  <h1>{active.title}</h1>
+          <div className="niuu-shell__topbar-title">
+            {active && (
+              <>
+                <span className="niuu-shell__rune-mark">{active.rune}</span>
+                <h1>{active.title}</h1>
+                {active.subtitle && (
                   <span className="niuu-shell__topbar-subtitle">{active.subtitle}</span>
-                </>
-              )}
-            </div>
-            {active?.tabs && (
-              <div className="niuu-shell__tabs">
-                {active.tabs.map((t) => {
-                  const tabPath = t.path ?? `/${active.id}/${t.id}`;
-                  const isActive =
-                    active.activeTab != null
-                      ? active.activeTab === t.id
-                      : tabPath === `/${active.id}`
-                        ? pathname === tabPath
-                        : pathname === tabPath || pathname.startsWith(tabPath + '/');
-                  return (
-                    <button
-                      key={t.id}
-                      type="button"
-                      className={clsx('niuu-shell__tab', isActive && 'niuu-shell__tab--active')}
-                      data-testid={`${active.id}-tab-${t.id}`}
-                      onClick={() => {
-                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                        router.navigate({ to: tabPath as any });
-                        active.onTab?.(t.id);
-                      }}
-                    >
-                      {t.rune && <span className="niuu-shell__tab-rune">{t.rune}</span>}
-                      {t.label}
-                      {t.count != null && t.count > 0 && (
-                        <span className="niuu-shell__tab-count" data-testid={`tab-count-${t.id}`}>
-                          {t.count}
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
+                )}
+              </>
             )}
           </div>
+          {active?.tabs && (
+            <div className="niuu-shell__tabs">
+              {active.tabs.map((t) => {
+                const tabPath = t.path ?? `/${active.id}/${t.id}`;
+                const isActive =
+                  active.activeTab != null
+                    ? active.activeTab === t.id
+                    : tabPath === `/${active.id}`
+                      ? pathname === tabPath
+                      : pathname === tabPath || pathname.startsWith(tabPath + '/');
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={clsx('niuu-shell__tab', isActive && 'niuu-shell__tab--active')}
+                    data-testid={`${active.id}-tab-${t.id}`}
+                    onClick={() => {
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      router.navigate({ to: tabPath as any });
+                      active.onTab?.(t.id);
+                    }}
+                  >
+                    {t.rune && <span className="niuu-shell__tab-rune">{t.rune}</span>}
+                    <span className="niuu-shell__tab-label">{t.label}</span>
+                    {t.count != null && t.count > 0 && (
+                      <span className="niuu-shell__tab-count" data-testid={`tab-count-${t.id}`}>
+                        {t.count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <div className="niuu-shell__topbar-right">
             <PluginSlot render={active?.topbarRight ?? null} ctx={ctx} />
+            <select
+              className="niuu-shell__theme-select"
+              aria-label="Color theme"
+              value={theme}
+              onChange={(event) => setTheme(event.target.value as ThemeName)}
+            >
+              <option value="xteo">blue</option>
+              <option value="ice">Native dark</option>
+              <option value="amber">Amber</option>
+              <option value="spring">Spring</option>
+            </select>
             <LiveBadge />
             <div className="niuu-shell__topbar-sep" />
             <button
@@ -211,6 +225,7 @@ export function ShellLayout() {
             >
               <Kbd>⌘K</Kbd>
             </button>
+            {topbarContent && <div className="niuu-shell__topbar-content">{topbarContent}</div>}
           </div>
         </header>
 

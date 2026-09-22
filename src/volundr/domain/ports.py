@@ -95,6 +95,8 @@ from volundr.domain.models import (  # noqa: F401
     Workspace,
     WorkspaceStatus,
 )
+from volundr.domain.projects import SessionCoordination
+from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 __all__ = [
     "AuthorizationPort",
@@ -146,6 +148,33 @@ class SessionRepository(ABC):
     @abstractmethod
     async def update(self, session: Session) -> Session:
         """Update an existing session."""
+
+    @abstractmethod
+    async def update_coordination(
+        self, session: Session, coordination: SessionCoordination
+    ) -> Session | None:
+        """Atomically replace membership if its revision and access scope still match.
+
+        Preserve runtime fields; invalidate the old launch brief. None means conflict.
+        Ordinary updates must never overwrite this independently managed state.
+        """
+
+    @abstractmethod
+    async def get_read_states(
+        self,
+        session_ids: list[UUID],
+        user_id: str,
+    ) -> dict[UUID, SessionReadState]:
+        """Bulk per-reader inbox projection; no transcript downloads or lifecycle mutations."""
+
+    @abstractmethod
+    async def change_read_state(
+        self,
+        session_id: UUID,
+        user_id: str,
+        change: SessionReadStateChange,
+    ) -> SessionReadState:
+        """Atomically apply a revision-checked read/unread action for this reader only."""
 
     @abstractmethod
     async def list_stale_running(self, older_than: datetime) -> list[Session]:

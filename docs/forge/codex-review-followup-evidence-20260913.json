@@ -50,22 +50,22 @@
     "native_execution_acceptance": false
   },
   "source_audit": {
-    "checkout": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913",
-    "python": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
+    "checkout": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913",
+    "python": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
     "pytest_exitstatus": 0,
     "all_from_owned_checkout": true,
     "modules": {
-      "skuld.transports.codex_ws": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
-      "skuld.channels": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
-      "skuld.broker": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
-      "skuld.broker_api": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
-      "niuu.domain.transcript_reducer": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py"
+      "skuld.transports.codex_ws": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
+      "skuld.channels": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
+      "skuld.broker": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
+      "skuld.broker_api": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
+      "niuu.domain.transcript_reducer": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py"
     }
   },
   "native_provider_acceptance": false,
   "ios_render_acceptance": false,
   "deployed": false,
-  "previous_checkpoint_receipt": "cbef1d1f-8be5-48ec-a807-eb3b6581fa45",
+  "previous_checkpoint_receipt": "fc6b9ca1-ad86-5060-b4dd-87b4beafc485",
   "evidence_files": [
     {
       "local_path": ".local/codex-review-20260913/approval-before.log",

@@ -164,7 +164,7 @@ def _default_models() -> list[ManagedModelConfig]:
         ),
         ManagedModelConfig(
             # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
-            # (Damien, 2026-09-02). `claude-fable-5` is still served, so a client on an old
+            # (user, 2026-09-02). `claude-fable-5` is still served, so a client on an old
             # build that keeps sending it is not broken — it just no longer appears here.
             id="claude-fable-5-1",
             name="Claude Fable 5.1",
@@ -211,7 +211,7 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
-        # Astra + Sol are the only two Codex choices, Astra the default (Damien,
+        # Astra + Sol are the only two Codex choices, Astra the default (user,
         # 2026-09-05). Terra was removed with the same decision.
         ManagedModelConfig(
             id="gpt-6-astra",
@@ -248,8 +248,6 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
-        # Model ids MUST match `grok models` exactly — the CLI rejects an unknown id,
-        # which kills the session at its first prompt (the "grok-build" outage).
         ManagedModelConfig(
             id="gpt-5.6-terra",
             name="GPT-5.6 Terra",
@@ -264,6 +262,21 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
+        # Model ids MUST match `grok models` exactly — the CLI rejects an unknown id,
+        # which kills the session at its first prompt (the "grok-build" outage).
+        ManagedModelConfig(
+            id="grok-4.7",
+            name="Grok 4.7 (Build)",
+            vendor="xai",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#1DA1F2",
+            description="xAI Grok 4.7 agentic coding model (ACP over stdio).",
+            cost_per_million_tokens=None,
+            session_definition="skuldGrok",
+            supports_tools=True,
+            supports_thinking=True,
+        ),
         ManagedModelConfig(
             id="grok-4.6",
             name="Grok 4.6 (Build)",
@@ -271,22 +284,7 @@ def _default_models() -> list[ManagedModelConfig]:
             provider=ManagedModelProvider.CLOUD,
             tier=ManagedModelTier.FRONTIER,
             color="#1DA1F2",
-            description=(
-                "xAI Grok 4.6 agentic coding model (ACP over stdio). Served as grok-4.6-build."
-            ),
-            cost_per_million_tokens=None,
-            session_definition="skuldGrok",
-            supports_tools=True,
-            supports_thinking=True,
-        ),
-        ManagedModelConfig(
-            id="grok-4.5",
-            name="Grok 4.5 (Build)",
-            vendor="xai",
-            provider=ManagedModelProvider.CLOUD,
-            tier=ManagedModelTier.FRONTIER,
-            color="#1DA1F2",
-            description="xAI Grok 4.5 agentic coding model (ACP over stdio).",
+            description="xAI Grok 4.6 agentic coding model (ACP over stdio).",
             cost_per_million_tokens=None,
             session_definition="skuldGrok",
             supports_tools=True,

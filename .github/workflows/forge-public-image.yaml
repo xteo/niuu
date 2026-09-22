@@ -1,0 +1,118 @@
+name: Public Forge image
+
+on:
+  push:
+    branches: [forge/ux-improvement]
+    tags: ['forge-image-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-public-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: >-
+      github.repository == 'xteo/niuu' &&
+      (github.event_name == 'workflow_dispatch' ||
+       startsWith(github.ref, 'refs/tags/forge-image-') ||
+       contains(github.event.head_commit.message, '[publish-forge]'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 scripts/security/install_scanners.py "$RUNNER_TEMP/scanners"
+      - name: Check public source
+        run: |
+          python3 scripts/security/check_public_tree.py
+          "$RUNNER_TEMP/scanners/gitleaks" git --redact=100 --no-banner --log-opts=--all .
+
+  build:
+    needs: audit
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/xteo/niuu
+      TAG: forge-ux-improvement-sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build locally before publication
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: containers/forge/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}-${{ matrix.platform }}
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+            APP_VERSION=forge-ux-improvement-${{ github.sha }}
+          cache-from: type=gha,scope=forge-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=forge-${{ matrix.platform }}
+          provenance: false
+      - name: Verify installed artifact
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/smoke_image.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA"
+      - name: Boot isolated Forge and Guild
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/smoke_runtime.py "$IMAGE:$TAG-$PLATFORM" "$GITHUB_SHA"
+      - run: python3 scripts/security/install_scanners.py "$RUNNER_TEMP/scanners"
+      - name: Scan image layers before publication
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/security/scan_image.py "$IMAGE:$TAG-$PLATFORM" --scanner "$RUNNER_TEMP/scanners/trufflehog"
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified architecture
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: docker push "$IMAGE:$TAG-$PLATFORM"
+
+  promote:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      IMAGE: ghcr.io/xteo/niuu
+      TAG: forge-ux-improvement-sha-${{ github.sha }}
+    steps:
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote both verified architectures
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:$TAG" \
+            --tag "$IMAGE:forge-ux-improvement" \
+            "$IMAGE:$TAG-amd64" "$IMAGE:$TAG-arm64"
+      - name: Verify anonymous pull and report digest
+        run: |
+          ANON_CONFIG=$(mktemp -d)
+          DOCKER_CONFIG="$ANON_CONFIG" docker manifest inspect "$IMAGE:$TAG" > manifest.json
+          python3 -c 'import json; d=json.load(open("manifest.json")); assert {m["platform"]["architecture"] for m in d["manifests"]} == {"amd64", "arm64"}'
+          docker buildx imagetools inspect "$IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"

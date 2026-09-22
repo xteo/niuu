@@ -9,7 +9,7 @@ import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path as FilePath
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -37,7 +37,11 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
-from volundr.adapters.inbound.rest_projects import create_projects_router, project_result
+from volundr.adapters.inbound.rest_projects import (
+    create_projects_router,
+    create_session_projects_router,
+    project_result,
+)
 from volundr.config import PermissionAutoApprovalConfig
 from volundr.domain.history_import import (
     HistoryImportConflictError,
@@ -97,6 +101,11 @@ from volundr.domain.services import (
 )
 from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
+)
+from volundr.domain.session_read_state import (
+    SessionReadState,
+    SessionReadStateChange,
+    SessionReadStateConflictError,
 )
 from volundr.log_aggregate import aggregate_workspace_logs
 from volundr.session_archive import load_workspace_transcript
@@ -810,6 +819,8 @@ class DeviceResponse(BaseModel):
 class SessionResponse(BaseModel):
     """Response model for a session."""
 
+    read_state: SessionReadState | None = None
+
     coordination: SessionCoordination | None = None
 
     id: UUID = Field(description="Unique session identifier")
@@ -966,6 +977,7 @@ class SessionResponse(BaseModel):
     ) -> "SessionResponse":
         """Create response from domain model."""
         return cls(
+            read_state=session.read_state,
             id=session.id,
             coordination=session.coordination,
             name=session.name,
@@ -1510,6 +1522,8 @@ def create_router(
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     preview_cache: PreviewCache | None = None,
     project_service=None,
+    runtime_build: dict | None = None,
+    runtime_health_timeout: float = 3.0,
     history_max_turns: int = 15,
     history_max_bytes: int = 256 * 1024,
 ) -> APIRouter:
@@ -1530,9 +1544,8 @@ def create_router(
     @router.get("/version", tags=["Forge"])
     async def forge_version() -> dict:
         """Identify the running Forge API build (git sha / branch) so an operator
-        can confirm which version is live. Skuld brokers run from the same
-        checkout, so the same sha applies to the broker (which also reports it in
-        its ``system/init`` event)."""
+        can confirm which version is live. Existing Skuld brokers may still run an older
+        build; inspect /sessions/{id}/runtime-version for their loaded identity."""
         from niuu.build_info import build_info
 
         return {"service": "forge-api", **build_info()}
@@ -1601,6 +1614,7 @@ def create_router(
             return await _optional_principal(request, strict=_strict_identity_enabled(request))
 
         router.include_router(create_projects_router(project_service, project_principal))
+        router.include_router(create_session_projects_router(project_service, project_principal))
 
     @router.get("/feature-flags", tags=["Features"])
     async def get_feature_flags(request: Request) -> dict:
@@ -1616,7 +1630,9 @@ def create_router(
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
             "mini_mode": settings.local_mounts.mini_mode,
             "local_mounts_allowed_prefixes": settings.local_mounts.allowed_prefixes,
+            "capabilities": {"local_session_scope": True},
             "projects_enabled": project_service is not None,
+            "project_assignment_enabled": project_service is not None,
             "project_contract_version": 1 if project_service is not None else 0,
             "project_instance_id": project_service.instance_id if project_service else None,
         }
@@ -1657,6 +1673,10 @@ def create_router(
     @router.get("/sessions", response_model=list[SessionResponse], tags=["Sessions"])
     async def list_sessions(
         request: Request,
+        response: Response,
+        scope: Literal["local", "guild"] = Query(
+            default="local", description="Standalone Forge always serves its own local sessions"
+        ),
         status_filter: SessionStatus | None = Query(
             default=None, alias="status", description="Filter by session status"
         ),
@@ -1669,6 +1689,7 @@ def create_router(
         parent_instance_id: str | None = Query(default=None),
     ) -> list[SessionResponse]:
         """List all sessions. Archived sessions are excluded by default."""
+        response.headers["X-Forge-Session-Scope"] = "local"
         principal = await _optional_principal(request)
         if principal is None and _strict_identity_enabled(request):
             return []
@@ -1698,6 +1719,7 @@ def create_router(
                     or s.coordination.parent.instance_id == parent_instance_id
                 )
             ]
+        sessions = await forge.with_read_states(sessions, principal)
         return [_session_response(s) for s in sessions]
 
     @router.get(
@@ -1705,7 +1727,10 @@ def create_router(
         responses={503: {"model": ErrorResponse}},
         tags=["Sessions"],
     )
-    async def stream_sessions(request: Request) -> StreamingResponse:
+    async def stream_sessions(
+        request: Request,
+        scope: Literal["local", "guild"] = Query(default="local"),
+    ) -> StreamingResponse:
         """Stream real-time session updates via Server-Sent Events (SSE).
 
         This endpoint provides a real-time stream of session events including:
@@ -1769,6 +1794,7 @@ def create_router(
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Forge-Session-Scope": "local",
             },
         )
 
@@ -1974,7 +2000,86 @@ def create_router(
                 detail=f"Access denied to session {session_id}",
             )
 
+        session = (await forge.with_read_states([session], principal))[0]
         return _session_response(session)
+
+    @router.get("/sessions/{session_id}/runtime-version", tags=["Sessions"])
+    async def get_runtime_version(request: Request, session_id: UUID) -> dict:
+        """Inspect the loaded gateway, without restarting it or trusting stored activity."""
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        principal = await _optional_principal(request)
+        try:
+            await forge.ensure_access(session, principal)
+        except SessionAccessDeniedError:
+            raise HTTPException(status_code=403, detail="Access denied") from None
+        result = {"available": runtime_build, "current": None, "state": "unavailable"}
+        if not session.chat_endpoint:
+            result["state"] = "not_running"
+            return result
+        _, base_url = await forge.get_session_proxy_target(session_id)
+        url, headers = _http_proxy_target(_session_proxy_url(base_url, "health"))
+        if auth := request.headers.get("authorization"):
+            headers["Authorization"] = auth
+        try:
+            async with httpx.AsyncClient(timeout=runtime_health_timeout) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                health = response.json()
+            if not isinstance(health, dict) or health.get("session_id") != str(session_id):
+                raise HTTPException(
+                    status_code=502, detail="Gateway identity does not match session"
+                )
+            result["current"] = {
+                key: health.get(key) for key in ("revision", "build", "source_sha256", "dirty")
+            }
+            current_hash = health.get("source_sha256")
+            available_hash = (runtime_build or {}).get("source_sha256")
+            if current_hash and available_hash:
+                result["state"] = "current" if current_hash == available_hash else "different"
+            else:
+                result["state"] = "unknown"
+        except (httpx.HTTPError, ValueError):
+            # A failed probe is explicitly unknown, never evidence that a gateway stopped.
+            result["state"] = "unavailable"
+        return result
+
+    @router.get(
+        "/sessions/{session_id}/read-state", response_model=SessionReadState, tags=["Sessions"]
+    )
+    async def get_session_read_state(request: Request, session_id: UUID) -> SessionReadState:
+        principal = await _optional_principal(request, strict=True)
+        if principal is None:
+            raise HTTPException(status_code=401, detail="Reader identity is required")
+        try:
+            return await forge.get_read_state(session_id, principal)
+        except SessionNotFoundError:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except SessionAccessDeniedError:
+            raise HTTPException(status_code=403, detail="Access denied") from None
+
+    @router.patch(
+        "/sessions/{session_id}/read-state", response_model=SessionReadState, tags=["Sessions"]
+    )
+    async def change_session_read_state(
+        request: Request,
+        session_id: UUID,
+        change: SessionReadStateChange,
+    ) -> SessionReadState:
+        principal = await _optional_principal(request, strict=True)
+        if principal is None:
+            raise HTTPException(status_code=401, detail="Reader identity is required")
+        try:
+            return await forge.change_read_state(session_id, change, principal)
+        except SessionNotFoundError:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except SessionAccessDeniedError:
+            raise HTTPException(status_code=403, detail="Access denied") from None
+        except SessionReadStateConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
     @router.post(
         "/sessions/{session_id}/permissions/auto-approval/evaluate",
@@ -3663,6 +3768,7 @@ def create_router(
         request: Request,
         session_id: UUID = Path(description="Unique session identifier"),
         tool_use_id: str = Path(description="tool_use_id of the image result"),
+        image_index: int = Query(default=0, ge=0, description="Image within a multi-image result"),
     ) -> Response:
         """Return a scaled-down JPEG preview of an image tool_result.
 
@@ -3676,6 +3782,8 @@ def create_router(
         501 when Pillow is unavailable.
         """
         sid = str(session_id)
+        # Keep existing first-image cache keys compatible with native clients.
+        cache_key = tool_use_id if image_index == 0 else f"{tool_use_id}:image:{image_index}"
 
         def _jpeg_response(data: bytes) -> Response:
             return Response(
@@ -3684,10 +3792,10 @@ def create_router(
                 headers=dict(_PREVIEW_RESPONSE_HEADERS),
             )
 
-        cached = preview_cache.get(sid, tool_use_id)
+        cached = preview_cache.get(sid, cache_key)
         if cached is not None:
             return _jpeg_response(cached)
-        if preview_cache.is_non_image(sid, tool_use_id):
+        if preview_cache.is_non_image(sid, cache_key):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"tool_result is not an image: {tool_use_id}",
@@ -3705,7 +3813,7 @@ def create_router(
         # rebuild — the first holder pays it once (and warms the whole session);
         # the waiters wake into cache hits.
         async with preview_cache.session_lock(sid):
-            cached = preview_cache.get(sid, tool_use_id)
+            cached = preview_cache.get(sid, cache_key)
             if cached is not None:
                 return _jpeg_response(cached)
 
@@ -3725,7 +3833,7 @@ def create_router(
                             warmed,
                             _sanitize_log(session_id),
                         )
-                    cached = preview_cache.get(sid, tool_use_id)
+                    cached = preview_cache.get(sid, cache_key)
                     if cached is not None:
                         return _jpeg_response(cached)
 
@@ -3736,7 +3844,7 @@ def create_router(
                     )
 
                 try:
-                    extracted = extract_image_bytes(found.get("content"))
+                    extracted = extract_image_bytes(found.get("content"), image_index=image_index)
                 except ValueError:
                     logger.warning(
                         "Corrupt image base64 in tool_result %s (session %s)",
@@ -3745,7 +3853,7 @@ def create_router(
                     )
                     extracted = None
                 if extracted is None:
-                    preview_cache.mark_non_image(sid, tool_use_id)
+                    preview_cache.mark_non_image(sid, cache_key)
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail=f"tool_result is not an image: {tool_use_id}",
@@ -3762,7 +3870,7 @@ def create_router(
                         _sanitize_log(tool_use_id),
                         _sanitize_log(session_id),
                     )
-                    preview_cache.mark_non_image(sid, tool_use_id)
+                    preview_cache.mark_non_image(sid, cache_key)
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail=f"tool_result image is undecodable: {tool_use_id}",
@@ -3772,7 +3880,7 @@ def create_router(
                     status_code=status.HTTP_501_NOT_IMPLEMENTED,
                     detail="Preview generation unavailable: Pillow is not installed",
                 ) from None
-            preview_cache.put(sid, tool_use_id, jpeg)
+            preview_cache.put(sid, cache_key, jpeg)
             return _jpeg_response(jpeg)
 
     @router.get(

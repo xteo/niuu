@@ -241,7 +241,7 @@ describe('RavnsPage', () => {
       'dev.niuu.ravn.warden.ravn-fjolnir',
     );
     expect(screen.getByTestId('warden-observed-placement')).toHaveTextContent(
-      '/Users/jozefvaneenbergen/.ravn/wardens/ravn-fjolnir/warden.plist',
+      '/Users/developer/.ravn/wardens/ravn-fjolnir/warden.plist',
     );
   });
 
@@ -846,7 +846,7 @@ describe('RavnsPage', () => {
       profile: 'adr-compliance',
       deployment: 'k8s-gitops',
       deploymentKwargs: {
-        repo_path: '/Users/jozefvaneenbergen/gitops/platform',
+        repo_path: '/Users/developer/gitops/platform',
         namespace: 'ravn-dev',
         manifests_subdir: 'clusters/dev/wardens',
         auto_commit: true,
@@ -874,8 +874,8 @@ describe('RavnsPage', () => {
       supervisor: {
         installed: true,
         serviceLabel: 'dev-niuu-ravn-warden-ravn-vor',
-        serviceFile: '/Users/jozefvaneenbergen/gitops/platform/clusters/dev/wardens/ravn-vor.yaml',
-        configFile: '/Users/jozefvaneenbergen/.ravn/wardens/ravn-vor/config.yaml',
+        serviceFile: '/Users/developer/gitops/platform/clusters/dev/wardens/ravn-vor.yaml',
+        configFile: '/Users/developer/.ravn/wardens/ravn-vor/config.yaml',
         startCommand: 'k8s-gitops',
         lastInstallAt: '2026-04-19T02:30:00Z',
       },
@@ -896,7 +896,7 @@ describe('RavnsPage', () => {
 
     expect(screen.getByTestId('warden-observed-placement')).toHaveTextContent('ravn-dev');
     expect(screen.getByTestId('warden-observed-placement')).toHaveTextContent(
-      '/Users/jozefvaneenbergen/gitops/platform',
+      '/Users/developer/gitops/platform',
     );
     expect(screen.getByTestId('warden-observed-placement')).toHaveTextContent(
       'clusters/dev/wardens/ravn-vor.yaml',

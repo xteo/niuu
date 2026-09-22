@@ -1985,7 +1985,7 @@ class TestStartStop:
     ) -> None:
         """Browser-facing session endpoints should use NIUU_SERVER_PUBLIC_HOST when set."""
         manager._server_host = "0.0.0.0"
-        manager._server_public_host = "100.66.123.128"
+        manager._server_public_host = "198.51.100.10"
 
         with (
             _mock_provision(manager),
@@ -1993,7 +1993,7 @@ class TestStartStop:
         ):
             result = await manager.start(git_session, default_spec)
 
-        assert result.chat_endpoint == f"ws://100.66.123.128:8080/s/{git_session.id}/session"
+        assert result.chat_endpoint == f"ws://198.51.100.10:8080/s/{git_session.id}/session"
 
     async def test_set_skuld_registry_rehydrates_running_sessions(
         self,
@@ -2778,7 +2778,7 @@ class TestLocalFlockMeshMode:
         git_session: Session,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        manager._server_host = "192.168.1.106"
+        manager._server_host = "198.51.100.16"
 
         workspace = tmp_workspaces / "session-with-platform-gateway"
         repo_workspace = workspace / "repo"
@@ -2826,5 +2826,5 @@ class TestLocalFlockMeshMode:
 
         node_config = yaml.safe_load((flock_dir / "node-reviewer.yaml").read_text(encoding="utf-8"))
         assert node_config["gateway"]["platform"]["enabled"] is True
-        assert node_config["gateway"]["platform"]["base_url"] == "http://192.168.1.106:8080"
+        assert node_config["gateway"]["platform"]["base_url"] == "http://198.51.100.16:8080"
         assert node_config["permission"]["workspace_root"] == str(repo_workspace)

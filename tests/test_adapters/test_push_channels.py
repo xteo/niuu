@@ -3,6 +3,10 @@
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
+# Generate a throwaway key for each test process; no private PEM is committed.
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
 from volundr.adapters.outbound.push_channels import (
     ApnsNotificationChannel,
     LoggingNotificationChannel,
@@ -10,12 +14,15 @@ from volundr.adapters.outbound.push_channels import (
 )
 from volundr.domain.models import DevicePlatform, DeviceToken, PushMessage
 
-# A throwaway EC P-256 private key (test-only) for the APNs ES256 JWT path.
-_TEST_P8 = """-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg47BWBTYgy58QhfDc
-2xxgtw2Vfi5RDO+VdInPdZFFLOmhRANCAAS4PbtpY+C7NQWBP/f6iAHllY4povbT
-xdaWFHucGzVFS+6FcW6Q1C6VqyYnpS48MBB/4EGS5QGUh8jRKW9zw6qK
------END PRIVATE KEY-----"""
+_TEST_P8 = (
+    ec.generate_private_key(ec.SECP256R1())
+    .private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    .decode()
+)
 
 
 def _message() -> PushMessage:

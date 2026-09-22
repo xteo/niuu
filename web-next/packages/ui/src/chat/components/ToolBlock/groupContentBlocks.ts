@@ -1,3 +1,4 @@
+import { toolImages, type ToolImage } from '../../toolImages';
 export interface ToolUseBlock {
   type: 'tool_use';
   id: string;
@@ -8,7 +9,15 @@ export interface ToolUseBlock {
 export interface ToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
-  content?: string;
+  content?: unknown;
+  is_error?: boolean;
+  is_image?: boolean;
+  mime_type?: string;
+  img_w?: number;
+  img_h?: number;
+  image_previews?: Array<{ index: number; mime_type?: string; img_w?: number; img_h?: number }>;
+  truncated?: boolean;
+  preview?: string;
 }
 
 export interface TextBlock {
@@ -24,6 +33,8 @@ export interface TextBlock {
 export type ContentBlock = ToolUseBlock | ToolResultBlock | TextBlock | { type: string };
 
 export type GroupedContent =
+  | { kind: 'image'; image: ToolImage }
+  | { kind: 'separator'; id?: string }
   | ({ kind: 'text' } & Omit<TextBlock, 'type'>)
   | { kind: 'single'; block: ToolUseBlock; result?: ToolResultBlock }
   | {
@@ -32,7 +43,7 @@ export type GroupedContent =
       blocks: Array<{ block: ToolUseBlock; result?: ToolResultBlock }>;
     };
 
-export function groupContentBlocks(blocks: ContentBlock[]): GroupedContent[] {
+export function groupContentBlocks(blocks: ContentBlock[], hierarchical = false): GroupedContent[] {
   // Build a lookup from tool_use_id → tool_result for id-based matching
   const resultMap = new Map<string, ToolResultBlock>();
   for (const b of blocks) {
@@ -42,6 +53,15 @@ export function groupContentBlocks(blocks: ContentBlock[]): GroupedContent[] {
     }
   }
 
+  const uses = new Map(
+    blocks
+      .filter((block): block is ToolUseBlock => block.type === 'tool_use')
+      .map((block) => [block.id, block]),
+  );
+  const images = new Map(
+    [...resultMap].map(([id, result]) => [id, toolImages(result, uses.get(id))]),
+  );
+  const emittedImages = new Set<string>();
   const result: GroupedContent[] = [];
   let i = 0;
 
@@ -52,9 +72,31 @@ export function groupContentBlocks(blocks: ContentBlock[]): GroupedContent[] {
       continue;
     }
 
+    if (block.type === 'tool_separator') {
+      result.push({ kind: 'separator', id: (block as { id?: string }).id });
+      i++;
+      continue;
+    }
+
     if (block.type === 'text') {
       const { type: _type, ...text } = block as TextBlock;
       result.push({ kind: 'text', ...text });
+      i++;
+      continue;
+    }
+
+    const imageId =
+      block.type === 'tool_use'
+        ? (block as ToolUseBlock).id
+        : block.type === 'tool_result'
+          ? (block as ToolResultBlock).tool_use_id
+          : undefined;
+    const imageItems = imageId ? images.get(imageId) : undefined;
+    if (imageId && imageItems?.length) {
+      if (!emittedImages.has(imageId)) {
+        result.push(...imageItems.map((image) => ({ kind: 'image' as const, image })));
+        emittedImages.add(imageId);
+      }
       i++;
       continue;
     }
@@ -81,7 +123,11 @@ export function groupContentBlocks(blocks: ContentBlock[]): GroupedContent[] {
         }
         break;
       }
-      if (blk.type !== 'tool_use' || (blk as ToolUseBlock).name !== toolName) break;
+      if (blk.type !== 'tool_use') break;
+      if (images.get((blk as ToolUseBlock).id)?.length) break;
+      if (!hierarchical && (blk as ToolUseBlock).name !== toolName) break;
+      if (j !== i && isPresentedFileTool((blk as ToolUseBlock).name)) break;
+      if (j !== i && isPresentedFileTool(toolName)) break;
       const tb = blk as ToolUseBlock;
       group.push({ block: tb, result: resultMap.get(tb.id) });
       j++;
@@ -97,4 +143,8 @@ export function groupContentBlocks(blocks: ContentBlock[]): GroupedContent[] {
   }
 
   return result;
+}
+
+export function isPresentedFileTool(name: string): boolean {
+  return ['present_file', 'senduserfile'].includes(name.toLowerCase());
 }

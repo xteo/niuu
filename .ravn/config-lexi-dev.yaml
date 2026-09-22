@@ -2,7 +2,7 @@
 #
 # This is the iteration target for the Ravn -> OpenClaw adapter (Phases 0-2).
 # It exists so that the live Travis on 127.0.0.1:7477 — which is wired to
-# Damien's real Telegram thread and holds RAM-only session history — is never
+# user's real Telegram thread and holds RAM-only session history — is never
 # the thing we restart while developing.
 #
 # Differences from ~/.ravn/config.yaml, and why:
@@ -61,11 +61,11 @@ skills:
 # would let a captured test turn edit the repo. Pin it to a scratch tree so the
 # blast radius of any dev turn is a throwaway directory.
 permission:
-  workspace_root: /home/thor/.ravn-dev/workspace
+  workspace_root: ~/.ravn-dev/workspace
 
 tools:
   bash:
-    workspace_root: /home/thor/.ravn-dev/workspace
+    workspace_root: ~/.ravn-dev/workspace
 
 context_management:
   prompt_cache_dir: ~/.ravn-dev/prompt_cache

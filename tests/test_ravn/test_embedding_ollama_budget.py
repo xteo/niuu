@@ -156,7 +156,7 @@ class TestIndexSurvivesAFailedEmbedding:
     async def test_recall_degrades_to_keywords_when_the_query_cannot_be_embedded(
         self, tmp_path: Any
     ) -> None:
-        """The turn-path failure Damien hit: recall runs before the agent answers.
+        """The turn-path failure user hit: recall runs before the agent answers.
 
         A raised embedding error here meant the agent produced nothing at all. Keyword results are
         a worse answer than hybrid ones and an enormously better one than silence.

@@ -43,7 +43,7 @@ must not be imported as a final answer. Public text extraction now excludes
 that control form and foreign-thread events.
 
 Private source evidence remains outside git under
-`/home/thor/.niuu/validation/forge-interleaving-review-20260908`. Its immutable
+`/home/operator/.niuu/validation/forge-interleaving-review-20260908`. Its immutable
 manifest SHA-256 is
 `8069d4b0db68b4eba064d57002ab4d3a4ed16e184bb18c236c25798a08c4d2eb`.
 No private native analysis is included in the public fixtures or repair output.
@@ -277,13 +277,13 @@ candidate production browser build also passed. The API server's root remains
 404 as before; this release does not introduce another browser hosting service.
 
 Frozen private backend evidence is under
-`/home/thor/.niuu/validation/forge-interleaving-20260908/backend-release-20260908T2252Z`.
+`/home/operator/.niuu/validation/forge-interleaving-20260908/backend-release-20260908T2252Z`.
 Its 1,009-file manifest SHA-256 is
 `cdae7ac3494dae94d47d8fb365c605217d575c02520f2ad3825d029f641c0ba2`.
 All six pre-release and immediate pre-stop backups are under
-`/home/thor/.niuu/backups/forge-interleaving-20260908`. Source and release tag are
+`/home/operator/.niuu/backups/forge-interleaving-20260908`. Source and release tag are
 pushed to the project repository. The browser/simulator evidence already frozen
-under `/home/thor/.niuu/validation/forge-interleaving-20260908/` distinguishes
+under `/home/operator/.niuu/validation/forge-interleaving-20260908/` distinguishes
 actual native live layout, exact captured-trace playback, and normal-origin
 completed/reopened history checks.
 
@@ -291,8 +291,8 @@ completed/reopened history checks.
 
 At 2026-09-08 22:53:04 UTC, App Store Connect reports build 2241 as `VALID` and
 `IN_BETA_TESTING` on both platforms, attached to the existing internal testing
-group. iOS build ID is `a7350a78-0bf2-4880-a513-a00c73e1e4df`; macOS build ID is
-`4e97b627-35e1-4d61-b8a5-cef41113c960`. The immutable `lexi-build-2241` tag pins
+group. iOS build ID is `045fa932-d3f7-5937-9466-367820da0fd8`; macOS build ID is
+`a863cde4-9768-55d7-baf7-dad708f6178c`. The immutable `lexi-build-2241` tag pins
 app source `20273018d831d2522f8b91594345a93739dbdc1a`.
 
 Both archives, exports and Apple validation passed. All 579 compiled source
@@ -322,3 +322,5 @@ review task, a user can additionally request:
 Apply this as a task preference through the existing prompt/configuration
 surface. Do not replace the provider's complete base instructions or infer
 missing message boundaries from Markdown.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

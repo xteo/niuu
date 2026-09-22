@@ -56,29 +56,29 @@
     }
   },
   "owned_source_audit": {
-    "checkout": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913",
-    "python": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
+    "checkout": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913",
+    "python": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.venv/bin/python",
     "pytest_sessionfinish_exitstatus": 0,
     "all_from_owned_checkout": true,
     "modules": {
-      "niuu.domain.history_control": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_control.py",
-      "niuu.domain.history_paging": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_paging.py",
-      "skuld.conversation_snapshot": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_snapshot.py",
-      "skuld.conversation_read": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_read.py",
-      "skuld.websocket_lifecycle": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/websocket_lifecycle.py",
-      "niuu.session_proxy": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/session_proxy.py",
-      "niuu.adapters.inbound.rest_volundr": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/adapters/inbound/rest_volundr.py",
-      "volundr.adapters.inbound.rest": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/inbound/rest.py",
-      "volundr.session_archive": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/session_archive.py",
-      "skuld.transports.codex_ws": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
-      "skuld.channels": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
-      "skuld.broker": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
-      "skuld.broker_api": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
-      "niuu.domain.transcript_reducer": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py",
-      "volundr.main": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/main.py",
-      "volundr.composition_builders": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/composition_builders.py",
-      "volundr.domain.ports": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/domain/ports.py",
-      "volundr.adapters.outbound.local_process": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/outbound/local_process.py"
+      "niuu.domain.history_control": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_control.py",
+      "niuu.domain.history_paging": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/history_paging.py",
+      "skuld.conversation_snapshot": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_snapshot.py",
+      "skuld.conversation_read": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/conversation_read.py",
+      "skuld.websocket_lifecycle": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/websocket_lifecycle.py",
+      "niuu.session_proxy": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/session_proxy.py",
+      "niuu.adapters.inbound.rest_volundr": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/adapters/inbound/rest_volundr.py",
+      "volundr.adapters.inbound.rest": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/inbound/rest.py",
+      "volundr.session_archive": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/session_archive.py",
+      "skuld.transports.codex_ws": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/transports/codex_ws.py",
+      "skuld.channels": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/channels.py",
+      "skuld.broker": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker.py",
+      "skuld.broker_api": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/skuld/broker_api.py",
+      "niuu.domain.transcript_reducer": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/niuu/domain/transcript_reducer.py",
+      "volundr.main": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/main.py",
+      "volundr.composition_builders": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/composition_builders.py",
+      "volundr.domain.ports": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/domain/ports.py",
+      "volundr.adapters.outbound.local_process": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/src/volundr/adapters/outbound/local_process.py"
     },
     "pytest_final_exitstatus": 0
   },
@@ -188,63 +188,63 @@
   ],
   "private_evidence": [
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/full-regression.log",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/full-regression.log",
       "sha256": "349a31ffaae8a0b62255e1f9a7f66af6deb682060fa4e980d9352e1563612fdd"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/full-regression.exit",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/full-regression.exit",
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-coverage.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-coverage.json",
       "sha256": "6c3c05bf17fade8b2a2e4323affb712964840247c428b9132e15aa50951b840a"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-source-audit.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-source-audit.json",
       "sha256": "48aaa30801ad67637beece3de874b0e166b86a4542360a877c4023b7266ba78f"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/lint-results.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/lint-results.json",
       "sha256": "c3aef6642099cef67c76343e2a5610850f2b583d912100f01f62186b69bc9d76"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-index.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-index.json",
       "sha256": "19680690f82361a6675e319d3b9188b191bb44ee17e4f639f9d4d7992e438638"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-running.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-running.json",
       "sha256": "4fdc2072839d37f85ce22522d6686c7044761a849f810bb5d399232214ca40c3"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-stopped.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-stopped.json",
       "sha256": "de0fe3aaa4e76de792a53a04a1b5059eb894f61ecdca979aef7b30eb48dca8cc"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-archived.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-archived.json",
       "sha256": "f1f4fad4611ddea2a535977982f140c5d1b987624cf68633ca8c1b3119532ba3"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-failed.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/restart-proof-failed.json",
       "sha256": "7b287c440c2aa0bb071bc9afec03899c109b7b5bfd16854d9b814428d9fca46b"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/fetch.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/fetch.json",
       "sha256": "8057fb6f2d0ee9fb7704d74fdcd8ddffb104c63b21dbdf4030ecad918392aa94"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/pre-integration.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/pre-integration.json",
       "sha256": "5961343a47d8b7069874aeb6a7ec459f3b4fa9bd4c35737b7a651e3e15ca0b36"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/run-release-sweep.py",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/run-release-sweep.py",
       "sha256": "a814454ad67d10d7399df31d0c69f7bd3463b00beaf7f431df9d06ba4a05fbf2"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-coverage.rc",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/release-coverage.rc",
       "sha256": "c63bbfb19ccaf290958ef9471a32854392a103db40532f3583bc29b011674aef"
     },
     {
-      "path": "/home/thor/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/share-scan.json",
+      "path": "/home/operator/repos/worktrees/niuu-forge-runtime-management-20260913/.local/dev-integration-review-20260916/share-scan.json",
       "sha256": "a04603a37b1b89fa8d411e467f0af3743d5018b14670b796135cae5876162744"
     }
   ]

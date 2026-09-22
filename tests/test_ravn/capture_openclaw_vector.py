@@ -5,7 +5,7 @@ Why against the running gateway and not the docs
 ------------------------------------------------
 The shim has to satisfy a server we do not own. Three sources disagree about
 what that server does: the upstream docs, the local checkout at
-``/home/thor/thirdparty/openclaw`` (2026.5.30 @ 2b5ddf8f2a), and the gateway
+``/home/operator/thirdparty/openclaw`` (2026.5.30 @ 2b5ddf8f2a), and the gateway
 actually running on this box (npm dist, per ``openclaw-gateway.service``). Only
 the last one is authoritative, because it is the one the phone talks to.
 

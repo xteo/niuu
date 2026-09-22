@@ -4,7 +4,7 @@ A project can select the ordered files included in its bounded launch snapshot:
 
 ```json
 {
-  "id": "00000000-0000-4000-8000-000000000001",
+  "id": "a5ef0d4e-7fce-5efc-a3f0-289d9ecdd383",
   "name": "Example",
   "context_files": ["PROJECT.md", "AGENTS.md", "context/CURRENT.md"]
 }
@@ -30,3 +30,5 @@ Repository instructions remain instructions, not permission grants or guarantees
 Context support is additive infrastructure, not a workflow engine or a new progress-state API. Deploy and verify a host's actual context response before relying on newly selected files. Older Forge hosts ignore the new manifest key and still send only the legacy pair; repositories must keep critical safety constraints available in those files until their hosts are upgraded. Existing snapshots require explicit normal follow-up context when behavior must change; no implicit resend or restart.
 
 Implementation tests: `tests/test_projects/test_workspace.py`, `test_projects.py`, and `tests/test_skuld/test_project_instruction_transport.py`. This branch does not deploy services or change production registration/configuration.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

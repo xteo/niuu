@@ -16,6 +16,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from niuu.packaged_build import packaged_build
 from niuu.version import package_version
 
 VERSION = package_version()
@@ -50,6 +51,15 @@ def build_info() -> dict[str, object]:
     Env vars ``NIUU_BUILD_SHA`` / ``NIUU_BUILD_REF`` take precedence so a
     container image built without a ``.git`` dir still reports its build.
     """
+    manifest = packaged_build()
+    if manifest is not None:
+        return {
+            "version": VERSION,
+            "git_sha": manifest.revision[:_SHORT_SHA_LEN],
+            "git_sha_full": manifest.revision,
+            "git_branch": manifest.ref,
+            "git_dirty": False,
+        }
     sha_full = os.environ.get("NIUU_BUILD_SHA") or _git("rev-parse", "HEAD")
     branch = os.environ.get("NIUU_BUILD_REF") or _git("rev-parse", "--abbrev-ref", "HEAD")
     # --untracked-files=no: untracked local config (bifrost.yaml, etc.) is not "dirty source".

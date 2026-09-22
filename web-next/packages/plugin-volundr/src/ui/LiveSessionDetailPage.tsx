@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { RenameSession } from './RenameSession';
+import { AssignSessionProject } from './AssignSessionProject';
+import { PinSession } from './PinSession';
+import { SessionActivityElapsed } from './SessionActivityElapsed';
 import { useNavigate } from '@tanstack/react-router';
 import { useService } from '@niuulabs/plugin-sdk';
 import { getAuthHeaders } from '@niuulabs/query';
 import {
   Dialog,
   DialogContent,
+  ConversationLink,
   ErrorState,
   LoadingState,
   SessionChat,
@@ -21,7 +26,6 @@ import {
   ChevronRight,
   Eye,
   EyeOff,
-  ExternalLink,
   FileCode2,
   FileDiff,
   FilePenLine,
@@ -63,6 +67,12 @@ import { buildPermissionAutoApprovalRequest } from './permissionAutoApproval';
 import { SessionTerminalLive } from './SessionTerminalLive';
 import { StructuredLogViewer } from './components/StructuredLogViewer';
 import './LiveSessionDetailPage.css';
+import { useSessionTabs } from './ForgeSessionSettings';
+import { useForgePreference } from './useForgePreference';
+import { SessionResources } from './SessionResources';
+import { SessionEnvironment } from './SessionEnvironment';
+import { SessionRuntimeVersion } from './SessionRuntimeVersion';
+import { sessionModelLabel } from '../domain/sessionModelLabel';
 
 export type LiveSessionTab =
   'chat' | 'terminal' | 'diffs' | 'files' | 'chronicles' | 'telemetry' | 'logs';
@@ -78,13 +88,6 @@ const ALL_TABS: Array<{ id: SessionTab; label: string; icon: typeof MessageSquar
   { id: 'telemetry', label: 'Telemetry', icon: Sparkles },
   { id: 'logs', label: 'Logs', icon: FileCode2 },
 ];
-
-const FIXED_TAB_ORDER: Partial<Record<SessionTab, number>> = {
-  diffs: 25,
-  chronicles: 50,
-  telemetry: 51,
-  logs: 60,
-};
 
 export function isSessionBooting(status: string | null | undefined): boolean {
   return status === 'starting' || status === 'provisioning';
@@ -2377,63 +2380,13 @@ function normalizeForgeBadgeLabel(value: string): string {
 }
 
 function SourceMeta({ session }: { session: VolundrSession | null | undefined }) {
-  const [branchCopied, setBranchCopied] = useState(false);
-
   if (!session?.source) return null;
-
-  if (session.source.type === 'git') {
-    const repoUrl = normalizeRepoLink(session.source);
-    const repoLabel = formatRepoLabel(session.source.repo);
-    const branch = session.source.branch ?? 'main';
-
-    return (
-      <span className="niuu-live-session__source">
-        <span className="niuu:text-text-faint" aria-hidden>
-          ›
-        </span>
-        {repoUrl ? (
-          <a
-            href={repoUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="niuu-live-session__source-link"
-            title={repoUrl}
-          >
-            {repoLabel}
-          </a>
-        ) : (
-          <span className="niuu-live-session__source-link" title={session.source.repo}>
-            {repoLabel}
-          </span>
-        )}
-        <button
-          type="button"
-          className="niuu-live-session__branch-button"
-          title={`${branchCopied ? 'Copied' : branch} · click to copy`}
-          onClick={async () => {
-            const copied = await copyText(branch);
-            setBranchCopied(copied);
-            if (copied) {
-              setTimeout(() => setBranchCopied(false), 1200);
-            }
-          }}
-        >
-          {`@${truncateMiddle(branch, 18)}`}
-        </button>
-      </span>
-    );
-  }
-
-  const path = session.source.path ?? 'local mount';
   return (
-    <span className="niuu-live-session__source">
-      <span className="niuu:text-text-faint" aria-hidden>
-        ›
-      </span>
-      <span className="niuu-live-session__source-link" title={path}>
-        {path}
-      </span>
-    </span>
+    <SessionEnvironment
+      session={session}
+      repoUrl={normalizeRepoLink(session.source)}
+      repoLabel={session.source.type === 'git' ? formatRepoLabel(session.source.repo) : undefined}
+    />
   );
 }
 
@@ -2565,16 +2518,9 @@ function TicketLink({ issue }: { issue: VolundrSession['trackerIssue'] }) {
     );
   }
   return (
-    <a
-      href={issue.url}
-      target="_blank"
-      rel="noreferrer"
-      className="niuu-live-session__ticket"
-      title={issue.identifier}
-    >
-      <span>{issue.identifier}</span>
-      <ExternalLink className="niuu:h-3.5 niuu:w-3.5" />
-    </a>
+    <span className="niuu-live-session__ticket">
+      <ConversationLink href={issue.url}>{issue.identifier}</ConversationLink>
+    </span>
   );
 }
 
@@ -3537,7 +3483,12 @@ function LiveSessionDetailPageInner({
   >(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [dismissedHumanGateIds, setDismissedHumanGateIds] = useState<Set<string>>(new Set());
-  const [showInternalMessages, setShowInternalMessages] = useState(false);
+  const [toolVisibility, setToolVisibility] = useForgePreference('tools', '1', ['0', '1']);
+  const showInternalMessages = toolVisibility === '1';
+  const [tokenVisibility] = useForgePreference('tokens', '0', ['0', '1']);
+  const showTokenUsage = tokenVisibility === '1';
+  const [detailsPreference] = useForgePreference('details', '0', ['0', '1']);
+  const showDetails = detailsPreference === '1';
   const [visibleMessageCount, setVisibleMessageCount] = useState<number | null>(null);
   const volundr = useService<IVolundrService>('volundr');
   const filesystem = useService<IFileSystemPort>('filesystem');
@@ -3548,16 +3499,6 @@ function LiveSessionDetailPageInner({
     queryKey: ['volundr', 'raw-session', sessionId],
     queryFn: () => volundr.getSession(sessionId),
     refetchInterval: 5_000,
-  });
-  const sessionFeaturesQuery = useQuery({
-    queryKey: ['volundr', 'feature-modules', 'session'],
-    queryFn: () => volundr.getFeatureModules('session'),
-    staleTime: 30_000,
-  });
-  const featurePrefsQuery = useQuery({
-    queryKey: ['volundr', 'feature-prefs', 'session'],
-    queryFn: () => volundr.getUserFeaturePreferences(),
-    staleTime: 30_000,
   });
   const liveSession = liveSessionQuery.data;
   const sessionStatus = liveSession?.status ?? null;
@@ -3621,11 +3562,6 @@ function LiveSessionDetailPageInner({
     sessionQuery.data?.clusterId,
     sessionQuery.data?.clusterName,
   ]);
-  const sessionFeatures = useMemo(
-    () => sessionFeaturesQuery.data ?? [],
-    [sessionFeaturesQuery.data],
-  );
-  const featurePrefs = useMemo(() => featurePrefsQuery.data ?? [], [featurePrefsQuery.data]);
   const transcriptTurns = useMemo(() => transcriptQuery.data?.turns ?? [], [transcriptQuery.data]);
   const replayMessages = useMemo(() => transformTurns(transcriptTurns), [transcriptTurns]);
   const replayParticipants = useMemo(
@@ -3690,7 +3626,6 @@ function LiveSessionDetailPageInner({
     };
   }, [chat.meshEvents, chat.participants, dismissedHumanGateIds, workflowGates]);
   const sessionDetail = sessionQuery.data;
-  const uptimeValue = formatElapsedSince(sessionDetail?.startedAt);
   const costValue =
     sessionDetail?.costCents != null ? formatCurrencyCents(sessionDetail.costCents) : null;
   const trailingMetric = useMemo(() => {
@@ -3714,46 +3649,13 @@ function LiveSessionDetailPageInner({
   }, [canReplayTranscript, liveSession?.messageCount, replayMessages.length, visibleMessageCount]);
   const isSessionConnected = isReady && chat.connected;
 
-  const tabs = useMemo(() => {
-    const prefMap = new Map(featurePrefs.map((pref) => [pref.featureKey, pref]));
-    const visible = ALL_TABS.filter((tab) => {
-      if (tab.id === 'diffs') return true;
-      if (tab.id === 'telemetry') return true;
-      if (tab.id === 'terminal') {
-        const pref = prefMap.get(tab.id);
-        if (pref && !pref.visible) return false;
-        const feature = sessionFeatures.find((candidate) => candidate.key === tab.id);
-        return Boolean(feature?.enabled || terminalUrl);
-      }
-      const feature = sessionFeatures.find((candidate) => candidate.key === tab.id);
-      if (!feature?.enabled) return false;
-      const pref = prefMap.get(tab.id);
-      if (pref && !pref.visible) return false;
-      return true;
-    });
-
-    visible.sort((left, right) => {
-      const leftFeature = sessionFeatures.find((feature) => feature.key === left.id);
-      const rightFeature = sessionFeatures.find((feature) => feature.key === right.id);
-      const leftPref = prefMap.get(left.id);
-      const rightPref = prefMap.get(right.id);
-      const leftOrder =
-        FIXED_TAB_ORDER[left.id] ?? (leftPref ? leftPref.sortOrder : (leftFeature?.order ?? 0));
-      const rightOrder =
-        FIXED_TAB_ORDER[right.id] ?? (rightPref ? rightPref.sortOrder : (rightFeature?.order ?? 0));
-      return leftOrder - rightOrder;
-    });
-
-    return visible;
-  }, [featurePrefs, sessionFeatures, terminalUrl]);
+  const { enabled: enabledTabs } = useSessionTabs();
+  const tabs = ALL_TABS.filter((tab) => enabledTabs.has(tab.id));
 
   const handleToggleInternalMessages = useCallback(() => {
     const next = !showInternalMessages;
-    setShowInternalMessages(next);
-    if (isReady) {
-      chat.sendSetInternalVisibility(next);
-    }
-  }, [chat, isReady, showInternalMessages]);
+    setToolVisibility(next ? '1' : '0');
+  }, [showInternalMessages, setToolVisibility]);
 
   const isFlockSession = useMemo(
     () =>
@@ -3920,26 +3822,12 @@ function LiveSessionDetailPageInner({
     }
   }
 
-  if (
-    sessionQuery.isLoading ||
-    liveSessionQuery.isLoading ||
-    sessionFeaturesQuery.isLoading ||
-    featurePrefsQuery.isLoading
-  ) {
-    return <LoadingState label="Loading session…" />;
+  if (sessionQuery.isLoading || liveSessionQuery.isLoading) {
+    return <LoadingState className="forge-session-loading" label="Loading session…" />;
   }
 
-  if (
-    sessionQuery.isError ||
-    liveSessionQuery.isError ||
-    sessionFeaturesQuery.isError ||
-    featurePrefsQuery.isError
-  ) {
-    const error =
-      sessionQuery.error ??
-      liveSessionQuery.error ??
-      sessionFeaturesQuery.error ??
-      featurePrefsQuery.error;
+  if (sessionQuery.isError || liveSessionQuery.isError) {
+    const error = sessionQuery.error ?? liveSessionQuery.error;
     return (
       <ErrorState
         title="Failed to load session"
@@ -3949,345 +3837,396 @@ function LiveSessionDetailPageInner({
   }
 
   return (
-    <div className="niuu:flex niuu:h-full niuu:flex-col" data-testid="live-session-detail-page">
-      <div className="niuu-live-session__chrome">
-        <div className="niuu-live-session__header">
-          <div className="niuu-live-session__title-group">
-            <span
-              className={cn(
-                'niuu-live-session__status-dot',
-                isSessionConnected
-                  ? 'niuu-live-session__status-dot--connected'
-                  : 'niuu-live-session__status-dot--disconnected',
-              )}
-            />
-            <div className="niuu-live-session__identity">
-              <span className="niuu-live-session__title">{sessionName}</span>
-              {sessionHandle ? (
-                <span className="niuu-live-session__handle" title={sessionHandle}>
-                  {sessionHandle}
-                </span>
-              ) : null}
-              <SessionIdChip sessionId={sessionId} />
-            </div>
-            {sessionTrackerIssue ? (
-              <>
-                <HeaderDivider />
-                <TicketLink issue={sessionTrackerIssue} />
-              </>
-            ) : null}
-            {liveSession?.source ? (
-              <>
-                <HeaderDivider />
-                <SourceMeta session={liveSession} />
-              </>
-            ) : null}
-            {forgeBadgeLabel ? (
-              <>
-                <HeaderDivider />
-                <SessionForgeBadge label={forgeBadgeLabel} />
-              </>
-            ) : null}
-            {readOnly ? (
-              <>
-                <HeaderDivider />
-                <span className="niuu-live-session__archived-badge">Archived</span>
-              </>
-            ) : null}
-          </div>
-
-          <div className="niuu-live-session__metrics-row" data-testid="session-stats">
-            <HeaderMetric label="Uptime" value={uptimeValue} />
-            <HeaderDivider />
-            <HeaderMetric label="Msgs" value={formatCount(headerMessageCount)} />
-            <HeaderDivider />
-            <HeaderMetric label="Tokens" value={formatCount(liveSession?.tokensUsed ?? 0)} />
-            {trailingMetric ? (
-              <>
-                <HeaderDivider />
-                <HeaderMetric label={trailingMetric.label} value={trailingMetric.value} />
-              </>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="niuu-live-session__tabs-row">
-          <div className="niuu-live-session__tabs" role="tablist" aria-label="Session tabs">
-            {tabs.map((tab) =>
-              (() => {
-                const TabIcon = tab.icon;
-                return (
-                  <button
-                    key={tab.id}
-                    id={`tab-${tab.id}`}
-                    role="tab"
-                    aria-selected={resolvedActiveTab === tab.id}
-                    onClick={() => {
-                      setTabWasManuallySelected(true);
-                      setActiveTab(tab.id);
-                    }}
-                    className={cn(
-                      'niuu-live-session__tab',
-                      resolvedActiveTab === tab.id && 'niuu-live-session__tab--active',
-                    )}
-                  >
-                    <TabIcon className="niuu-live-session__tab-icon" />
-                    <span>{tab.label}</span>
-                    <TabCountBadge count={tabCounts[tab.id]} />
-                  </button>
-                );
-              })(),
-            )}
-          </div>
-          <div className="niuu-live-session__toolbar">
-            <SessionToolbarButton
-              icon={showInternalMessages ? Eye : EyeOff}
-              title={
-                showInternalMessages ? 'Hide tool calls and results' : 'Show tool calls and results'
-              }
-              active={showInternalMessages}
-              onClick={handleToggleInternalMessages}
-            />
-            {canShowResendPromptToFlock && (
-              <SessionToolbarButton
-                icon={MessageCircleReply}
-                title="Resend prompt to flock"
-                onClick={chat.sendResendPrompt}
-                disabled={!canResendPromptToFlock}
+    <SessionResources
+      key={sessionId}
+      sessionId={sessionId}
+      workspace={
+        liveSession?.source.type === 'local_mount'
+          ? (liveSession.source.local_path ?? liveSession.source.path)
+          : undefined
+      }
+      filesystem={filesystem}
+    >
+      <div className="niuu:flex niuu:h-full niuu:flex-col" data-testid="live-session-detail-page">
+        <div className="niuu-live-session__chrome">
+          <div className="niuu-live-session__header">
+            <div className="niuu-live-session__title-group">
+              <span
+                className={cn(
+                  'niuu-live-session__status-dot',
+                  isSessionConnected
+                    ? 'niuu-live-session__status-dot--connected'
+                    : 'niuu-live-session__status-dot--disconnected',
+                )}
               />
-            )}
-            {liveSession &&
-              !readOnly &&
-              (liveSession.status === 'running' ? (
+              <div className="niuu-live-session__identity">
+                <span className="niuu-live-session__title">{sessionName}</span>
+                {!readOnly && liveSession && (
+                  <>
+                    <RenameSession sessionId={sessionId} name={sessionName} />
+                    <PinSession sessionId={sessionId} name={sessionName} />
+                    <AssignSessionProject
+                      sessionId={sessionId}
+                      name={sessionName}
+                      instanceId={liveSession.instanceId}
+                    />
+                  </>
+                )}
+                {showDetails && sessionHandle ? (
+                  <span className="niuu-live-session__handle" title={sessionHandle}>
+                    {sessionHandle}
+                  </span>
+                ) : null}
+                {showDetails && <SessionIdChip sessionId={sessionId} />}
+              </div>
+              {sessionTrackerIssue ? (
+                <>
+                  <HeaderDivider />
+                  <TicketLink issue={sessionTrackerIssue} />
+                </>
+              ) : null}
+              {liveSession?.source ? (
+                <>
+                  <HeaderDivider />
+                  <SourceMeta session={liveSession} />
+                  {liveSession && <SessionRuntimeVersion session={liveSession} service={volundr} />}
+                </>
+              ) : null}
+              {forgeBadgeLabel ? (
+                <>
+                  <HeaderDivider />
+                  <SessionForgeBadge label={forgeBadgeLabel} />
+                </>
+              ) : null}
+              {liveSession?.model && (
+                <>
+                  <HeaderDivider />
+                  <span
+                    className="niuu-live-session__model"
+                    title={liveSession.model}
+                    data-testid="session-model"
+                  >
+                    <Sparkles size={14} />
+                    {sessionModelLabel(liveSession.model)}
+                  </span>
+                </>
+              )}
+              {readOnly ? (
+                <>
+                  <HeaderDivider />
+                  <span className="niuu-live-session__archived-badge">Archived</span>
+                </>
+              ) : null}
+            </div>
+
+            <div className="niuu-live-session__metrics-row" data-testid="session-stats">
+              {sessionDetail && <SessionActivityElapsed session={sessionDetail} />}
+              <HeaderDivider />
+              <HeaderMetric label="Msgs" value={formatCount(headerMessageCount)} />
+              {showTokenUsage && (
+                <>
+                  <HeaderDivider />
+                  <HeaderMetric label="Tokens" value={formatCount(liveSession?.tokensUsed ?? 0)} />
+                </>
+              )}
+              {trailingMetric ? (
+                <>
+                  <HeaderDivider />
+                  <HeaderMetric label={trailingMetric.label} value={trailingMetric.value} />
+                </>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="niuu-live-session__tabs-row">
+            <div className="niuu-live-session__tabs" role="tablist" aria-label="Session tabs">
+              {tabs.map((tab) =>
+                (() => {
+                  const TabIcon = tab.icon;
+                  return (
+                    <button
+                      key={tab.id}
+                      id={`tab-${tab.id}`}
+                      role="tab"
+                      aria-selected={resolvedActiveTab === tab.id}
+                      onClick={() => {
+                        setTabWasManuallySelected(true);
+                        setActiveTab(tab.id);
+                      }}
+                      className={cn(
+                        'niuu-live-session__tab',
+                        resolvedActiveTab === tab.id && 'niuu-live-session__tab--active',
+                      )}
+                    >
+                      <TabIcon className="niuu-live-session__tab-icon" />
+                      <span>{tab.label}</span>
+                      <TabCountBadge count={tabCounts[tab.id]} />
+                    </button>
+                  );
+                })(),
+              )}
+            </div>
+            <div className="niuu-live-session__toolbar">
+              <SessionToolbarButton
+                icon={showInternalMessages ? Eye : EyeOff}
+                title={
+                  showInternalMessages
+                    ? 'Hide tool calls and results'
+                    : 'Show tool calls and results'
+                }
+                active={showInternalMessages}
+                onClick={handleToggleInternalMessages}
+              />
+              {canShowResendPromptToFlock && (
                 <SessionToolbarButton
-                  icon={Square}
-                  title="Stop session"
-                  onClick={() => void handleStopSession()}
+                  icon={MessageCircleReply}
+                  title="Resend prompt to flock"
+                  onClick={chat.sendResendPrompt}
+                  disabled={!canResendPromptToFlock}
+                />
+              )}
+              {liveSession &&
+                !readOnly &&
+                (liveSession.status === 'running' ? (
+                  <SessionToolbarButton
+                    icon={Square}
+                    title="Stop session"
+                    onClick={() => void handleStopSession()}
+                    disabled={actionBusy !== null}
+                    tone="critical"
+                  />
+                ) : liveSession.status === 'stopped' ? (
+                  <SessionToolbarButton
+                    icon={Play}
+                    title="Start session"
+                    onClick={() => void handleResumeSession()}
+                    disabled={actionBusy !== null}
+                    tone="brand"
+                  />
+                ) : liveSession.status === 'archived' ? null : (
+                  <SessionToolbarButton
+                    icon={Play}
+                    title="Start session"
+                    onClick={() => void handleResumeSession()}
+                    disabled={actionBusy !== null}
+                    tone="brand"
+                  />
+                ))}
+              {!readOnly && liveSession && liveSession.status !== 'archived' && (
+                <SessionToolbarButton
+                  icon={Archive}
+                  title="Archive session"
+                  onClick={() => void handleArchiveSession()}
+                  disabled={actionBusy !== null}
+                />
+              )}
+              {liveSession?.status === 'archived' ? (
+                <SessionToolbarButton
+                  icon={RotateCcw}
+                  title="Restore archived session"
+                  onClick={() => void handleRestoreSession()}
+                  disabled={actionBusy !== null}
+                  tone="brand"
+                />
+              ) : null}
+              {!readOnly && (
+                <SessionToolbarButton
+                  icon={Trash2}
+                  title="Delete session"
+                  onClick={() => setDeleteDialogOpen(true)}
                   disabled={actionBusy !== null}
                   tone="critical"
                 />
-              ) : liveSession.status === 'stopped' ? (
-                <SessionToolbarButton
-                  icon={Play}
-                  title="Start session"
-                  onClick={() => void handleResumeSession()}
-                  disabled={actionBusy !== null}
-                  tone="brand"
-                />
-              ) : liveSession.status === 'archived' ? null : (
-                <SessionToolbarButton
-                  icon={Play}
-                  title="Start session"
-                  onClick={() => void handleResumeSession()}
-                  disabled={actionBusy !== null}
-                  tone="brand"
-                />
-              ))}
-            {!readOnly && liveSession && liveSession.status !== 'archived' && (
-              <SessionToolbarButton
-                icon={Archive}
-                title="Archive session"
-                onClick={() => void handleArchiveSession()}
-                disabled={actionBusy !== null}
-              />
-            )}
-            {liveSession?.status === 'archived' ? (
-              <SessionToolbarButton
-                icon={RotateCcw}
-                title="Restore archived session"
-                onClick={() => void handleRestoreSession()}
-                disabled={actionBusy !== null}
-                tone="brand"
-              />
-            ) : null}
-            {!readOnly && (
-              <SessionToolbarButton
-                icon={Trash2}
-                title="Delete session"
-                onClick={() => setDeleteDialogOpen(true)}
-                disabled={actionBusy !== null}
-                tone="critical"
-              />
-            )}
+              )}
+            </div>
           </div>
         </div>
-      </div>
 
-      <div className="niuu:min-h-0 niuu:flex-1 niuu:overflow-hidden">
-        {resolvedActiveTab === 'chat' && (
-          <div role="tabpanel" className="niuu:flex niuu:h-full niuu:min-h-0 niuu:flex-col">
-            {isReady && chatEndpoint ? (
-              <>
-                {activeHumanGate && (
-                  <WorkflowHumanGateCard
-                    title={
-                      activeHumanGate.source === 'native'
-                        ? activeHumanGate.gate.label
-                        : activeHumanGate.participant.displayName ||
-                          activeHumanGate.participant.persona ||
-                          activeHumanGate.event.persona ||
-                          'Workflow gate'
-                    }
-                    summary={
-                      activeHumanGate.source === 'native'
-                        ? activeHumanGate.summary
-                        : activeHumanGate.event.summary || 'Workflow gate'
-                    }
-                    reason={
-                      activeHumanGate.source === 'native'
-                        ? activeHumanGate.reason
-                        : activeHumanGate.event.reason
-                    }
-                    recommendation={
-                      activeHumanGate.source === 'native'
-                        ? activeHumanGate.recommendation
-                        : activeHumanGate.event.recommendation
-                    }
-                    onApprove={(notes) => handleHumanGateReply('APPROVE', notes)}
-                    onRequestChanges={(notes) => handleHumanGateReply('CHANGES_REQUESTED', notes)}
+        <div className="niuu:min-h-0 niuu:flex-1 niuu:overflow-hidden">
+          {resolvedActiveTab === 'chat' && (
+            <div role="tabpanel" className="niuu:flex niuu:h-full niuu:min-h-0 niuu:flex-col">
+              {isReady && chatEndpoint ? (
+                <>
+                  {activeHumanGate && (
+                    <WorkflowHumanGateCard
+                      title={
+                        activeHumanGate.source === 'native'
+                          ? activeHumanGate.gate.label
+                          : activeHumanGate.participant.displayName ||
+                            activeHumanGate.participant.persona ||
+                            activeHumanGate.event.persona ||
+                            'Workflow gate'
+                      }
+                      summary={
+                        activeHumanGate.source === 'native'
+                          ? activeHumanGate.summary
+                          : activeHumanGate.event.summary || 'Workflow gate'
+                      }
+                      reason={
+                        activeHumanGate.source === 'native'
+                          ? activeHumanGate.reason
+                          : activeHumanGate.event.reason
+                      }
+                      recommendation={
+                        activeHumanGate.source === 'native'
+                          ? activeHumanGate.recommendation
+                          : activeHumanGate.event.recommendation
+                      }
+                      onApprove={(notes) => handleHumanGateReply('APPROVE', notes)}
+                      onRequestChanges={(notes) => handleHumanGateReply('CHANGES_REQUESTED', notes)}
+                    />
+                  )}
+                  <SessionChat
+                    className="niuu:h-full"
+                    showToolbar={false}
+                    showInternalToggle={false}
+                    internalVisibility={showInternalMessages}
+                    showTokenUsage={showTokenUsage}
+                    messages={chat.messages}
+                    streamingContent={chat.streamingContent}
+                    streamingParts={chat.streamingParts}
+                    streamingModel={chat.streamingModel}
+                    connected={chat.connected}
+                    historyLoaded={chat.historyLoaded}
+                    hasOlderHistory={chat.hasOlderHistory}
+                    loadingOlderHistory={chat.loadingOlderHistory}
+                    olderHistoryError={chat.olderHistoryError}
+                    onLoadOlderHistory={chat.loadOlderHistory}
+                    historyError={chat.historyError}
+                    onRetryHistory={chat.retryHistory}
+                    participants={chat.participants}
+                    meshEvents={chat.meshEvents}
+                    agentEvents={chat.agentEvents}
+                    pendingPermissions={chat.pendingPermissions}
+                    availableCommands={chat.availableCommands}
+                    capabilities={chat.capabilities}
+                    chatEndpoint={chatEndpoint}
+                    sessionName={sessionName}
+                    onSend={chat.sendMessage}
+                    onSendDirected={chat.sendDirectedMessages}
+                    onStop={chat.sendInterrupt}
+                    onClear={chat.clearMessages}
+                    onSetInternalVisibility={chat.sendSetInternalVisibility}
+                    onSetModel={chat.sendSetModel}
+                    onSetThinkingTokens={chat.sendSetThinkingTokens}
+                    onRewindFiles={chat.sendRewindFiles}
+                    onPermissionRespond={chat.respondToPermission}
+                    onFetchFiles={fetchSessionMentionFiles}
+                    onMessageCountChange={setVisibleMessageCount}
+                    renderPermissions={permissionRenderer}
                   />
-                )}
+                </>
+              ) : canReplayTranscript && transcriptQuery.isLoading ? (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  Loading saved transcript…
+                </div>
+              ) : canReplayTranscript && transcriptQuery.isError ? (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-critical">
+                  Failed to load saved transcript.
+                </div>
+              ) : canReplayTranscript && replayMessages.length > 0 ? (
                 <SessionChat
                   className="niuu:h-full"
                   showToolbar={false}
                   showInternalToggle={false}
                   internalVisibility={showInternalMessages}
-                  messages={chat.messages}
-                  streamingContent={chat.streamingContent}
-                  streamingParts={chat.streamingParts}
-                  streamingModel={chat.streamingModel}
-                  connected={chat.connected}
-                  historyLoaded={chat.historyLoaded}
-                  participants={chat.participants}
-                  meshEvents={chat.meshEvents}
-                  agentEvents={chat.agentEvents}
-                  pendingPermissions={chat.pendingPermissions}
-                  availableCommands={chat.availableCommands}
-                  capabilities={chat.capabilities}
+                  showTokenUsage={showTokenUsage}
+                  messages={replayMessages}
                   chatEndpoint={chatEndpoint}
+                  connected={false}
+                  historyLoaded={!transcriptQuery.isLoading}
+                  participants={replayParticipants}
+                  meshEvents={replayMeshEvents}
                   sessionName={sessionName}
-                  onSend={chat.sendMessage}
-                  onSendDirected={chat.sendDirectedMessages}
-                  onStop={chat.sendInterrupt}
-                  onClear={chat.clearMessages}
-                  onSetInternalVisibility={chat.sendSetInternalVisibility}
-                  onSetModel={chat.sendSetModel}
-                  onSetThinkingTokens={chat.sendSetThinkingTokens}
-                  onRewindFiles={chat.sendRewindFiles}
-                  onPermissionRespond={chat.respondToPermission}
-                  onFetchFiles={fetchSessionMentionFiles}
                   onMessageCountChange={setVisibleMessageCount}
-                  renderPermissions={permissionRenderer}
+                  onSend={() => {}}
+                  onStop={() => {}}
                 />
-              </>
-            ) : canReplayTranscript && transcriptQuery.isLoading ? (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                Loading saved transcript…
-              </div>
-            ) : canReplayTranscript && transcriptQuery.isError ? (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-critical">
-                Failed to load saved transcript.
-              </div>
-            ) : canReplayTranscript && replayMessages.length > 0 ? (
-              <SessionChat
-                className="niuu:h-full"
-                showToolbar={false}
-                showInternalToggle={false}
-                internalVisibility={showInternalMessages}
-                messages={replayMessages}
-                connected={false}
-                historyLoaded={!transcriptQuery.isLoading}
-                participants={replayParticipants}
-                meshEvents={replayMeshEvents}
-                sessionName={sessionName}
-                onMessageCountChange={setVisibleMessageCount}
-                onSend={() => {}}
-                onStop={() => {}}
+              ) : isSessionBooting(sessionStatus) ? (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  Session is starting…
+                </div>
+              ) : canReplayTranscript ? (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  No saved transcript yet.
+                </div>
+              ) : (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  Start the session to chat.
+                </div>
+              )}
+            </div>
+          )}
+
+          {resolvedActiveTab === 'terminal' && (
+            <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
+              {isReady ? (
+                <SessionTerminalLive url={terminalUrl} readOnly={readOnly} />
+              ) : isSessionBooting(sessionStatus) ? (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  Session is starting…
+                </div>
+              ) : (
+                <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
+                  Start the session to access terminal.
+                </div>
+              )}
+            </div>
+          )}
+
+          {resolvedActiveTab === 'diffs' && (
+            <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
+              <LiveDiffsTab chatEndpoint={chatEndpoint} />
+            </div>
+          )}
+
+          {resolvedActiveTab === 'files' && (
+            <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
+              <SessionFilesWorkspace sessionId={sessionId} filesystem={filesystem} />
+            </div>
+          )}
+
+          {resolvedActiveTab === 'chronicles' && (
+            <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
+              <LiveChroniclesTab
+                sessionId={sessionId}
+                sessionStatus={sessionStatus}
+                session={liveSession ?? null}
+                volundr={volundr}
               />
-            ) : isSessionBooting(sessionStatus) ? (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                Session is starting…
-              </div>
-            ) : canReplayTranscript ? (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                No saved transcript yet.
-              </div>
-            ) : (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                Start the session to chat.
-              </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
 
-        {resolvedActiveTab === 'terminal' && (
-          <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
-            {isReady ? (
-              <SessionTerminalLive url={terminalUrl} readOnly={readOnly} />
-            ) : isSessionBooting(sessionStatus) ? (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                Session is starting…
-              </div>
-            ) : (
-              <div className="niuu:flex niuu:h-full niuu:items-center niuu:justify-center niuu:text-sm niuu:text-text-muted">
-                Start the session to access terminal.
-              </div>
-            )}
-          </div>
-        )}
+          {resolvedActiveTab === 'telemetry' && (
+            <div
+              role="tabpanel"
+              className="niuu-live-telemetry-panel niuu:h-full niuu:min-h-0 niuu:overflow-auto"
+            >
+              <TelemetryTab
+                sessionId={sessionId}
+                session={liveSession ?? null}
+                runLabel={telemetryRunLabel ?? sessionName ?? 'session'}
+                volundr={volundr}
+                isRunning={isRunning}
+              />
+            </div>
+          )}
 
-        {resolvedActiveTab === 'diffs' && (
-          <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
-            <LiveDiffsTab chatEndpoint={chatEndpoint} />
-          </div>
-        )}
+          {resolvedActiveTab === 'logs' && (
+            <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
+              <LiveLogsTab sessionId={sessionId} volundr={volundr} />
+            </div>
+          )}
+        </div>
 
-        {resolvedActiveTab === 'files' && (
-          <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
-            <SessionFilesWorkspace sessionId={sessionId} filesystem={filesystem} />
-          </div>
-        )}
-
-        {resolvedActiveTab === 'chronicles' && (
-          <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
-            <LiveChroniclesTab
-              sessionId={sessionId}
-              sessionStatus={sessionStatus}
-              session={liveSession ?? null}
-              volundr={volundr}
-            />
-          </div>
-        )}
-
-        {resolvedActiveTab === 'telemetry' && (
-          <div
-            role="tabpanel"
-            className="niuu-live-telemetry-panel niuu:h-full niuu:min-h-0 niuu:overflow-auto"
-          >
-            <TelemetryTab
-              sessionId={sessionId}
-              session={liveSession ?? null}
-              runLabel={telemetryRunLabel ?? sessionName ?? 'session'}
-              volundr={volundr}
-              isRunning={isRunning}
-            />
-          </div>
-        )}
-
-        {resolvedActiveTab === 'logs' && (
-          <div role="tabpanel" className="niuu:h-full niuu:min-h-0">
-            <LiveLogsTab sessionId={sessionId} volundr={volundr} />
-          </div>
-        )}
+        <DeleteSessionDialog
+          open={deleteDialogOpen}
+          session={liveSession ?? null}
+          onClose={() => setDeleteDialogOpen(false)}
+          onConfirm={(cleanup) => void handleDeleteSession(cleanup)}
+          busy={actionBusy === 'delete'}
+        />
       </div>
-
-      <DeleteSessionDialog
-        open={deleteDialogOpen}
-        session={liveSession ?? null}
-        onClose={() => setDeleteDialogOpen(false)}
-        onConfirm={(cleanup) => void handleDeleteSession(cleanup)}
-        busy={actionBusy === 'delete'}
-      />
-    </div>
+    </SessionResources>
   );
 }

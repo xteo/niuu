@@ -4,7 +4,6 @@ Add shared discovery when one local platform is no longer the whole world.
 
 This is where Guild and Observatory become useful.
 
-![Guild instances](../images/ui-guild-instances.png)
 
 ## What changes at this step
 

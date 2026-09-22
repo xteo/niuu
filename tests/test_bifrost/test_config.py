@@ -64,7 +64,7 @@ class TestBifrostConfig:
         assert default.tier == ManagedModelTier.FRONTIER
 
     def test_fable_entry_is_fable_5_1(self):
-        # The Fable row is Claude Fable 5.1 (Damien, 2026-09-02). Fable 5 stays served by
+        # The Fable row is Claude Fable 5.1 (user, 2026-09-02). Fable 5 stays served by
         # Anthropic, so an old client sending `claude-fable-5` still works — it is just no
         # longer the catalogue's Fable entry.
         from bifrost.config import _default_models
@@ -81,7 +81,7 @@ class TestBifrostConfig:
         )
 
     def test_codex_catalog_preserves_astra_sol_and_terra(self):
-        # Astra + Sol are the only two Codex choices, Astra the default (Damien,
+        # Astra + Sol are the only two Codex choices, Astra the default (user,
         # 2026-09-05). Terra was removed with the same decision.
         from bifrost.config import _default_models
         from niuu.domain.model_catalog import ManagedModelTier
@@ -116,11 +116,18 @@ class TestBifrostConfig:
         # outright, so every Grok session died at its first prompt while this
         # test stayed green. Ids here must track the live catalogue.
         models = BifrostConfig().models
-        for model_id in ("grok-4.6", "grok-4.5"):
+        assert [m.id for m in models if m.session_definition == "skuldGrok"] == [
+            "grok-4.7",
+            "grok-4.6",
+        ]
+        for model_id in ("grok-4.7", "grok-4.6"):
             grok = next((m for m in models if m.id == model_id), None)
             assert grok is not None, f"{model_id} missing from default model catalog"
             assert grok.session_definition == "skuldGrok"
             assert grok.vendor == "xai"
+            assert grok.supports_tools and grok.supports_thinking
+            assert grok.effort_levels == ["low", "medium", "high", "xhigh"]
+            assert grok.default_effort == "xhigh"
         assert not [m for m in models if m.id == "grok-build"], (
             "grok-build is not a real model id and must not reappear in the catalogue"
         )

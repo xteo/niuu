@@ -329,7 +329,7 @@ Use:
 ```yaml
 server:
   host: 0.0.0.0
-  external_host: 100.66.123.128
+  external_host: 198.51.100.10
   port: 8080
 ```
 

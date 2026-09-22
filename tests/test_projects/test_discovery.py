@@ -173,7 +173,7 @@ async def test_api_connect_discovers_and_retries_one_registration(rig):
         slug="kit",
         name="kit",
         repo_url="https://github.com/nvidia-dev/df-project-kit",
-        workspace_path="/home/horde/projects/kit",
+        workspace_path="/home/worker/projects/kit",
     )
     service.workspace.discover.return_value = detected
     principal_for = AsyncMock(return_value=None)

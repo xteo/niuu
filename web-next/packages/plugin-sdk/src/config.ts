@@ -40,6 +40,8 @@ export const serviceConfigSchema = z
      */
     wsUrl: absoluteOrRootRelativeWsUrlSchema.optional(),
     mode: z.enum(['http', 'mock', 'ws']).default('http'),
+    /** Deadline for one Forge's session inventory; other hosts continue independently. */
+    sessionListTimeoutMs: z.number().int().positive().optional(),
   })
   .catchall(z.unknown());
 
@@ -51,7 +53,7 @@ export const authConfigSchema = z.object({
 export const niuuConfigSchema = z
   .object({
     demoMode: z.boolean().default(false),
-    theme: z.enum(['ice', 'amber', 'spring']).default('ice'),
+    theme: z.enum(['ice', 'amber', 'spring', 'xteo']).default('ice'),
     plugins: z.record(z.string(), pluginConfigSchema).default({}),
     services: z.record(z.string(), serviceConfigSchema).default({}),
     auth: authConfigSchema.optional(),

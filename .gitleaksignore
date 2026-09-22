@@ -1,0 +1,69 @@
+# Reviewed historical findings from the public-ref audit (2026-09-22).
+# These exact commit/path/line fingerprints are inert examples/test fixtures.
+# No directory, detector or future finding is globally excluded.
+# The historical APNs key was test-only; current tests generate ephemeral keys.
+
+# generic-api-key — charts/bifrost/values.yaml
+00f8c99efadd8c2e5ffad29cbe188577557bb079:charts/bifrost/values.yaml:generic-api-key:205
+# generic-api-key — charts/bifrost/values.yaml
+11d46b3305bfb82f06de63319bacce35fb67b9bf:charts/bifrost/values.yaml:generic-api-key:205
+# generic-api-key — cli/internal/forge/forge.example.yaml
+608fd982bdc23f373bbace9481e9153bce5912b9:cli/internal/forge/forge.example.yaml:generic-api-key:57
+# generic-api-key — cli/internal/forge/forge.example.yaml
+608fd982bdc23f373bbace9481e9153bce5912b9:cli/internal/forge/forge.example.yaml:generic-api-key:59
+# generic-api-key — cli/internal/forge/forge.example.yaml
+f9a74bdbacff5484fc1712b51e8e5f70e29f4441:cli/internal/forge/forge.example.yaml:generic-api-key:57
+# generic-api-key — cli/internal/forge/forge.example.yaml
+f9a74bdbacff5484fc1712b51e8e5f70e29f4441:cli/internal/forge/forge.example.yaml:generic-api-key:59
+# generic-api-key — scripts/ravn-mesh-e2e.sh
+359b97d536719f5e6f05cb331aafc2e68921b435:scripts/ravn-mesh-e2e.sh:generic-api-key:195
+# generic-api-key — scripts/ravn-mesh-e2e.sh
+7bc1726024d201d82102108567418f79a0ea0252:scripts/ravn-mesh-e2e.sh:generic-api-key:195
+# generic-api-key — tests/ravn/unit/test_hooks.py
+00f8c99efadd8c2e5ffad29cbe188577557bb079:tests/ravn/unit/test_hooks.py:generic-api-key:311
+# generic-api-key — tests/ravn/unit/test_hooks.py
+00f8c99efadd8c2e5ffad29cbe188577557bb079:tests/ravn/unit/test_hooks.py:generic-api-key:597
+# generic-api-key — tests/ravn/unit/test_hooks.py
+11d46b3305bfb82f06de63319bacce35fb67b9bf:tests/ravn/unit/test_hooks.py:generic-api-key:311
+# generic-api-key — tests/ravn/unit/test_hooks.py
+11d46b3305bfb82f06de63319bacce35fb67b9bf:tests/ravn/unit/test_hooks.py:generic-api-key:597
+# private-key — tests/test_adapters/test_push_channels.py
+1c1b2ceb9066d234aa80924e8793cc73bbb5332b:tests/test_adapters/test_push_channels.py:private-key:13
+# private-key — tests/test_adapters/test_push_channels.py
+841a1f95caa7635f48c3ef5bad37682a17f8ca56:tests/test_adapters/test_push_channels.py:private-key:14
+# private-key — tests/test_adapters/test_push_channels.py
+b372860cf686e1b3bcdabd45913980666818242b:tests/test_adapters/test_push_channels.py:private-key:14
+# generic-api-key — tests/test_bifrost/test_config.py
+00f8c99efadd8c2e5ffad29cbe188577557bb079:tests/test_bifrost/test_config.py:generic-api-key:19
+# generic-api-key — tests/test_bifrost/test_config.py
+11d46b3305bfb82f06de63319bacce35fb67b9bf:tests/test_bifrost/test_config.py:generic-api-key:19
+# generic-api-key — tests/test_integration_registry.py
+1db185e74b040d95084f3ac08a68c924eddba912:tests/test_integration_registry.py:generic-api-key:165
+# generic-api-key — tests/test_integration_registry.py
+1db185e74b040d95084f3ac08a68c924eddba912:tests/test_integration_registry.py:generic-api-key:210
+# generic-api-key — tests/test_niuu/test_keycloak_token_issuer.py
+359b97d536719f5e6f05cb331aafc2e68921b435:tests/test_niuu/test_keycloak_token_issuer.py:generic-api-key:18
+# generic-api-key — tests/test_niuu/test_keycloak_token_issuer.py
+ba8275b74ed8d2ceaf7d7f3eb5e9f357896f8926:tests/test_niuu/test_keycloak_token_issuer.py:generic-api-key:18
+# generic-api-key — tests/test_niuu/test_memory_token_issuer.py
+359b97d536719f5e6f05cb331aafc2e68921b435:tests/test_niuu/test_memory_token_issuer.py:generic-api-key:12
+# generic-api-key — tests/test_niuu/test_memory_token_issuer.py
+359b97d536719f5e6f05cb331aafc2e68921b435:tests/test_niuu/test_memory_token_issuer.py:generic-api-key:13
+# generic-api-key — tests/test_niuu/test_memory_token_issuer.py
+ba8275b74ed8d2ceaf7d7f3eb5e9f357896f8926:tests/test_niuu/test_memory_token_issuer.py:generic-api-key:12
+# generic-api-key — tests/test_niuu/test_memory_token_issuer.py
+ba8275b74ed8d2ceaf7d7f3eb5e9f357896f8926:tests/test_niuu/test_memory_token_issuer.py:generic-api-key:13
+# generic-api-key — tests/test_niuu/test_pat_revocation_middleware.py
+359b97d536719f5e6f05cb331aafc2e68921b435:tests/test_niuu/test_pat_revocation_middleware.py:generic-api-key:15
+# generic-api-key — tests/test_niuu/test_pat_revocation_middleware.py
+ba8275b74ed8d2ceaf7d7f3eb5e9f357896f8926:tests/test_niuu/test_pat_revocation_middleware.py:generic-api-key:15
+# generic-api-key — tests/test_niuu/test_rest_instances.py
+d664936066d436c858bf2222ac3e6fc232f8ff6b:tests/test_niuu/test_rest_instances.py:generic-api-key:523
+# generic-api-key — tests/test_ravn/openclaw_handshake.py
+7ca1603a7f19ae681f3d1ee3b0bcb945c8420374:tests/test_ravn/openclaw_handshake.py:generic-api-key:117
+# generic-api-key — web-next/packages/auth/src/AuthProvider.stories.tsx
+359b97d536719f5e6f05cb331aafc2e68921b435:web-next/packages/auth/src/AuthProvider.stories.tsx:generic-api-key:59
+# generic-api-key — web-next/packages/auth/src/AuthProvider.stories.tsx
+ba8275b74ed8d2ceaf7d7f3eb5e9f357896f8926:web-next/packages/auth/src/AuthProvider.stories.tsx:generic-api-key:59
+# generic-api-key — web/src/utils/bearerWebSocketFactory.test.ts
+98972e869d7345367848cd60bd39ab7d987a34fd:web/src/utils/bearerWebSocketFactory.test.ts:generic-api-key:65

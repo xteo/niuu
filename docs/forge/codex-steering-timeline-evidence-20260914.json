@@ -14,11 +14,11 @@
   "protected_processes": 6,
   "gateways": 1,
   "archived_samples": {
-    "0f84a1e0-4aad-50d3-b58a-29af015bf28e": {
+    "ed2a1948-7615-5796-bb71-685b8a9e8ce6": {
       "turns": 4,
       "sha256": "1f0133fb87c364bdcdc165c74622dc40cbb2fc337b6b2c200d5042a527c2c110"
     },
-    "20165833-46bf-48ed-bbc7-8a1de29196e8": {
+    "508cc880-5d0a-547f-9237-ea64422ccc15": {
       "turns": 2,
       "sha256": "fbdee981a196e18a35f0379c1b65fbc2968948605066abb01f6b2d8f286246f9"
     }
@@ -58,12 +58,12 @@
     "failed_plugins": []
   },
   "existing_gateway_disposition": {
-    "e93a4633-c288-519c-bb6b-7dc2274aa2e2": {
+    "3f75d77b-3d4d-59a1-bf01-2eeb71815969": {
       "pid": 3741717,
       "port": 19100,
       "health": {
         "status": "healthy",
-        "session_id": "e93a4633-c288-519c-bb6b-7dc2274aa2e2",
+        "session_id": "3f75d77b-3d4d-59a1-bf01-2eeb71815969",
         "revision": "f5d7a5e49eafd765f8daf53bdc51c95ac1949939",
         "build": "forge-codex-ready-20260913-v2",
         "source_sha256": "47dfd370523fefaabcf9189808495a942c9548d3c148203d4251ab15907c42a1",
@@ -71,7 +71,7 @@
       }
     }
   },
-  "new_owned_drop_in": "/home/xteo/.config/systemd/user/niuu-forge.service.d/zzzzzzz-steering-timeline-v3-20260914.conf",
+  "new_owned_drop_in": "/home/operator/.config/systemd/user/niuu-forge.service.d/zzzzzzz-steering-timeline-v3-20260914.conf",
   "previous_files_preserved": true,
   "session_native_processes_restarted": false,
   "new_sessions_launched": false,

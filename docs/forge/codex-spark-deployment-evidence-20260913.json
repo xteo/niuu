@@ -8,7 +8,7 @@
   },
   "runner": {
     "instance_id": "thor",
-    "session_id": "4ab99660-05e8-52c3-90d3-85d7463ce8a2"
+    "session_id": "2a5ebca8-019a-5291-869f-f3761aac7575"
   },
   "candidate": {
     "revision": "f5d7a5e49eafd765f8daf53bdc51c95ac1949939",
@@ -16,7 +16,7 @@
     "dirty": false,
     "failed_plugins": []
   },
-  "candidate_root": "/home/xteo/.local/share/niuu/releases/forge-codex-ready-20260913-v2",
+  "candidate_root": "/home/operator/.local/share/niuu/releases/forge-codex-ready-20260913-v2",
   "safe_rollback": {
     "revision": "e8c814f854beb30d00d068622d63a3c3ab244976",
     "source_sha256": "068cb62412746da3e46cedc180f48365577f723c9d9aff994341cd7d29faeae5",
@@ -52,7 +52,7 @@
     "conversation_turns": 46,
     "model_catalog_count": 19,
     "original_unit_and_config_files_equal": true,
-    "only_added_dropin": "/home/xteo/.config/systemd/user/niuu-forge.service.d/zzzzz-preservation-safe-20260913.conf",
+    "only_added_dropin": "/home/operator/.config/systemd/user/niuu-forge.service.d/zzzzz-preservation-safe-20260913.conf",
     "no_automatic_restarts": true
   },
   "thor": {
@@ -69,13 +69,13 @@
         "232702": {
           "pid": 232702,
           "start_ticks": "154717564",
-          "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+          "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
           "argv_sha256": "17ba9985f13f19ce73717948284b8c8301becf2d53dc38ea5916502532a4b835"
         },
         "232709": {
           "pid": 232709,
           "start_ticks": "154717567",
-          "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+          "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
           "argv_sha256": "086cd8e9863e68b3a13e1ffe03e2fec7941ba28874964b417bbc0524d4aa8422"
         }
       },
@@ -83,13 +83,13 @@
         "255524": {
           "pid": 255524,
           "start_ticks": "154897562",
-          "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+          "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
           "argv_sha256": "17ba9985f13f19ce73717948284b8c8301becf2d53dc38ea5916502532a4b835"
         },
         "255531": {
           "pid": 255531,
           "start_ticks": "154897565",
-          "boot_id": "4147f3c1-f01e-47c2-b9cf-39c5d6bacba4",
+          "boot_id": "03852a87-ae9f-56ba-9dba-f277a79c0202",
           "argv_sha256": "086cd8e9863e68b3a13e1ffe03e2fec7941ba28874964b417bbc0524d4aa8422"
         }
       },
@@ -128,9 +128,9 @@
     },
     "user_read_or_acceptance_claimed": false
   },
-  "maintenance_receipt": "2527aaf0-1270-4230-8877-e7e1895bd774",
+  "maintenance_receipt": "5eb24590-5192-5312-bdbe-7d3e28c3799c",
   "private_evidence_root": ".local/spark-release-20260913",
-  "spark_private_evidence_root": "/home/xteo/.local/share/niuu/spark-release-20260913-2200",
+  "spark_private_evidence_root": "/home/operator/.local/share/niuu/spark-release-20260913-2200",
   "artifacts": {
     "manifest.json": {
       "sha256": "0c4e2bc5fdd977f8d4beaf3501744fb438ccd338742a9e6c2e3479229f5828ad",

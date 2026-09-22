@@ -84,6 +84,39 @@ describe('identified text across browser live/history handoff', () => {
     expect(result.current.messages[0]?.status).toBe('done');
   });
 
+  it('attaches Claude user-envelope image results to the assistant and deduplicates native delivery', async () => {
+    const { result } = renderHook(() => useSkuldChat(url));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    complete('a', 'Inspecting the generated chart');
+    emit({
+      type: 'content_block_start',
+      turn_id: 'native-turn',
+      content_block: {
+        type: 'tool_use',
+        id: 'image-read',
+        name: 'Read',
+        input: { file_path: '/workspace/chart.png' },
+      },
+    });
+    const image = {
+      type: 'tool_result',
+      tool_use_id: 'image-read',
+      is_image: true,
+      mime_type: 'image/png',
+      img_w: 600,
+      img_h: 400,
+      truncated: true,
+    };
+    emit({ type: 'content_block_start', content_block: image });
+    emit({ type: 'result', turn_id: 'native-turn' });
+    emit({ type: 'user', turn_id: 'native-turn', message: { content: [image] } });
+    const results = result.current.messages
+      .flatMap((message) => message.parts ?? [])
+      .filter((part) => part.type === 'tool_result');
+    expect(results).toEqual([image]);
+    expect(result.current.messages.every((message) => message.role === 'assistant')).toBe(true);
+  });
+
   it('preserves a tools-first turn and an authoritative completion-only answer', async () => {
     const { result } = renderHook(() => useSkuldChat(url));
     await waitFor(() => expect(result.current.historyLoaded).toBe(true));
@@ -99,30 +132,14 @@ describe('identified text across browser live/history handoff', () => {
     expect(result.current.messages[0]?.content).toBe('Done');
   });
 
-  it('socket snapshot wins delayed REST and accepts same-item completion in place', async () => {
-    let deliver!: (value: unknown) => void;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(
-        () =>
-          new Promise((resolve) => {
-            deliver = resolve;
-          }),
-      ),
-    );
-    const { result } = renderHook(() => useSkuldChat(url));
+  it('socket-only native history seeds the stream and accepts same-item completion in place', async () => {
+    const { result } = renderHook(() => useSkuldChat(url, { historyMode: 'none' }));
     emit({
       type: 'conversation_history',
       projection_revision: 'repair-2',
       turns: [turn('canonical', 'Newer', true)],
     });
     complete('a', 'Newer complete');
-    await act(async () =>
-      deliver({
-        ok: true,
-        json: async () => ({ projection_revision: 'repair-1', turns: [turn('canonical', 'Old')] }),
-      }),
-    );
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0]?.content).toBe('Newer complete');
     expect(result.current.messages[0]?.parts).toHaveLength(1);
@@ -134,7 +151,7 @@ describe('identified text across browser live/history handoff', () => {
     );
   });
 
-  it('recovers the settled REST prefix without rolling back a newer token-only tail', async () => {
+  it('recovers the settled AND active REST prefix without rolling back a newer live tail', async () => {
     let deliver!: (value: unknown) => void;
     vi.stubGlobal(
       'fetch',
@@ -150,13 +167,22 @@ describe('identified text across browser live/history handoff', () => {
     await act(async () =>
       deliver({
         ok: true,
-        json: async () => ({ turns: [turn('old', 'History'), turn('active', 'Stale', true)] }),
+        json: async () => ({
+          turns: [
+            { ...turn('old', 'History'), parts: [] },
+            turn('active', 'Earlier commentary', true),
+          ],
+        }),
       }),
     );
     expect(result.current.messages.map((message) => message.content)).toEqual([
       'History',
-      'Live now',
+      'Earlier commentary\n\nLive now',
     ]);
+    complete('next', 'Next update');
+    expect(result.current.messages.at(-1)?.content).toBe(
+      'Earlier commentary\n\nLive now\n\nNext update',
+    );
   });
 
   it('harmless capability handshakes do not discard the initial history', async () => {
@@ -178,8 +204,75 @@ describe('identified text across browser live/history handoff', () => {
     expect(result.current.messages[0]?.content).toBe('History');
   });
 
-  it('repair revision replaces the cached prefix, then keeps a stable tool position on new tokens', async () => {
+  it('restores the earlier active turn even when the socket finishes it before REST returns', async () => {
+    let deliver!: (value: unknown) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        () =>
+          new Promise((resolve) => {
+            deliver = resolve;
+          }),
+      ),
+    );
     const { result } = renderHook(() => useSkuldChat(url));
+    complete('b', 'Final answer', 'final_answer');
+    emit({ type: 'result', turn_id: 'native-turn' });
+    await act(async () =>
+      deliver({
+        ok: true,
+        json: async () => ({ turns: [turn('active', 'Earlier commentary', true)] }),
+      }),
+    );
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0]?.content).toBe('Earlier commentary\n\nFinal answer');
+    expect(result.current.messages[0]?.status).toBe('done');
+    expect(result.current.streamingContent).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    'loads a truncated active turn inline and merges live text (arrives during read: %s)',
+    async (duringRead) => {
+      const preview = { ...turn('in-progress', 'Tail only', true), history_preview: true };
+      let deliver!: (value: Response) => void;
+      const fetcher = vi.fn(async (raw: string) => {
+        if (new URL(raw).searchParams.has('turn_id'))
+          return new Promise<Response>((resolve) => {
+            deliver = resolve;
+          });
+        return Response.json({ turns: [preview] });
+      });
+      vi.stubGlobal('fetch', fetcher);
+      const { result } = renderHook(() => useSkuldChat(url));
+      await waitFor(() => expect(deliver).toBeDefined());
+      expect(result.current.historyLoaded).toBe(false);
+      if (duringRead) complete('b', 'New live commentary');
+      await act(async () =>
+        deliver(
+          Response.json({
+            turn: turn('in-progress', 'All saved commentary', true),
+          }),
+        ),
+      );
+      await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+      if (!duringRead) complete('b', 'New live commentary');
+      expect(result.current.messages).toHaveLength(1);
+      expect(result.current.messages[0]?.content).toBe(
+        'All saved commentary\n\nNew live commentary',
+      );
+      expect(result.current.messages[0]?.historyPreview).toBeFalsy();
+      complete('c', 'Final answer', 'final_answer');
+      emit({ type: 'result', turn_id: 'native-turn' });
+      expect(result.current.messages).toHaveLength(1);
+      expect(result.current.messages[0]?.content).toBe(
+        'All saved commentary\n\nNew live commentary\n\nFinal answer',
+      );
+      expect(result.current.messages[0]?.status).toBe('done');
+    },
+  );
+
+  it('repair revision replaces the cached prefix, then keeps a stable tool position on new tokens', async () => {
+    const { result } = renderHook(() => useSkuldChat(url, { historyMode: 'none' }));
     await waitFor(() => expect(result.current.historyLoaded).toBe(true));
     emit({
       type: 'conversation_history',

@@ -10,9 +10,9 @@ undisturbed. Physics owners also explicitly depend on Forge while operating Mini
 
 ## Authority and scope
 
-Coordinator instruction `a5690ba6-80d1-47fa-8810-876a2ad2bf58` supersedes earlier
+Coordinator instruction `d24c856e-e223-55c2-bb64-4ef51e35d7f6` supersedes earlier
 maintenance assumptions that allowed a brief reconnect. Safety update
-`7064b75a-06d3-475c-ae0e-3583f1da82aa` confirms the hold and permits only a read-only
+`56352626-aea5-525f-a55f-da21b579750a` confirms the hold and permits only a read-only
 assessment/plan: no Thor/Forge/Tailscale restart, network change, source/env change,
 gateway adoption, stop/start, or resend. No shared change was performed.
 
@@ -28,7 +28,7 @@ performed. The candidate is not an installed Thor release.
 Observed at approximately **12:08–12:14 UTC, September 14**:
 
 - `volundr-forge.service` remains on API PID **61138**, source
-  `/home/thor/repos/worktrees/niuu-project-discovery`, docs `c6d80980` over
+  `/home/operator/repos/worktrees/niuu-project-discovery`, docs `c6d80980` over
   `forge-project-discovery-44f85dc3`, source SHA
   `e34593b7c6a10add6e50d62d2f9f3202a940f9d14bdf4819a26761d27610b7b0`.
 - Its process directly owns the **0.0.0.0:8080** listener. The installed wrapper
@@ -63,11 +63,11 @@ that is recovery **after interruption**, not zero interruption.
 - **38 protected process identities** were inventoried, including gateway/native
   owners, tmux and two PostgreSQL postmasters. Original identities and API identity
   remained present in the follow-up; no runtime action was taken against them.
-- New research runner **`thor:0a713405-79b2-566c-a953-802e3a080c49`** is included in
+- New research runner **`thor:2d12742e-25cf-5b50-8fec-334a9edf3715`** is included in
   the live inventory. Its creation at 12:08:02 preceded this inventory; do not reuse
   an earlier manifest omitting it or later native children.
-- Physics coordinator **`thor:2f441fee-583d-580c-b1ec-d51e2fa79655`** and native
-  owner **`thor:69c828ae-1512-5dc3-866a-8da74f956895`** explicitly report active
+- Physics coordinator **`thor:41eb07f3-de28-5847-801e-1e5ca806841b`** and native
+  owner **`thor:4fe452ae-3f5d-5937-8b56-a810ed1d5c94`** explicitly report active
   Forge-hosted Codex/tools, message/receipt APIs and SSH/mesh administration of Mini.
   Their lack of a dependency on the 9500 relay is **not Forge quiescence**.
 - PostgreSQL postmasters **4587** and **4594** are running container init processes
@@ -85,7 +85,7 @@ that is recovery **after interruption**, not zero interruption.
   do not prove every historical or in-flight byte is durable.
 
 Spark still reports clean **650088f3 / timeline-v4**. Its latest flow tester
-**`spark:2e6286cb-e25a-507d-ad4a-7725879eed9e`** is now **archived**, timestamp
+**`spark:35648f41-7b58-501e-9a5e-e925324efb96`** is now **archived**, timestamp
 **12:02:20.871167 UTC**, with seven readable replay rows. This supersedes the earlier
 running notice. This worker did not archive it and will not resume it.
 
@@ -194,5 +194,7 @@ and `hold-notification-response.json`. Public summary:
 
 OpenClaw HOLD milestone **6701** was verified. One central hourly monitor remains;
 no new timer, restart window, background test or automatic retry was created.
-Runtime sender: `thor:4ab99660-05e8-52c3-90d3-85d7463ce8a2`;
-coordinator recipient: `thor:8f20102d-6da7-58aa-98c2-e0bce2deab97`.
+Runtime sender: `thor:2a5ebca8-019a-5291-869f-f3761aac7575`;
+coordinator recipient: `thor:68095a63-8a6a-55e8-aba8-1e3566c3e346`.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

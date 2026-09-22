@@ -1,7 +1,7 @@
 # Steering chronology and duplicate-display handoff
 
 September 14, 2026. Server/runtime worker:
-`thor:4ab99660-05e8-52c3-90d3-85d7463ce8a2`.
+`thor:2a5ebca8-019a-5291-869f-f3761aac7575`.
 **Native implementation required for reliable live reconciliation; this is not an
 assignment to the chat-polish runner, a native release reservation, or device QA.**
 The coordinator should route the bounded native work to a dedicated session.
@@ -13,9 +13,9 @@ records identify the latest delivered iOS build as **2.0 (2263)**, signed source
 `f9b78bd1`; the source below was inspected at that pin, not a moving worker HEAD.
 Do not describe this as a verified installed-device version.
 
-Affected session: `spark:e93a4633-c288-519c-bb6b-7dc2274aa2e2`,
+Affected session: `spark:3f75d77b-3d4d-59a1-bf01-2eeb71815969`,
 `lexi-spark-codex-server-test`, native thread
-`01a09ed2-a7b6-7e23-9e01-94a77aff208d`. Its gateway uses the September 13
+`4a807504-5d63-59f6-bc3c-422e7d814944`. Its gateway uses the September 13
 `f5d7a5e49eafd765f8daf53bdc51c95ac1949939` candidate.
 
 Read-only conversation and 258 public log frames show:
@@ -30,7 +30,7 @@ Read-only conversation and 258 public log frames show:
 6. Further activity and final answer at approximately 07:32.
 
 Both native acknowledgements identify the **same** executing native turn
-`01a09ed2-a82e-72a2-9556-539b4179ea01`. There is no need to replace working
+`c25cbb8c-257f-5634-b338-27919569d8c7`. There is no need to replace working
 `turn/steer` with interruption or new-turn dispatch.
 
 The old canonical response instead contains **three user rows followed by one
@@ -173,3 +173,5 @@ adds real fresh-gateway evidence, precise frozen-tool/result and mutable-cache
 boundary findings, an explicit native-owner escalation, and a shared synthetic
 fixture. It also corrects the prior overly broad archive parity claim: the
 filesystem archive normalization path was omitted despite reducer/cache parity.
+
+> Public copy: deployment addresses, personal paths and session identifiers have been anonymized.

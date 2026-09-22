@@ -124,8 +124,39 @@ class InMemorySessionRepository(SessionRepository):
         return sessions
 
     async def update(self, session: Session) -> Session:
-        self._sessions[session.id] = session
-        return session
+        current = self._sessions[session.id]
+        config = dict(session.workload_config)
+        if session.coordination_revision != current.coordination_revision:
+            config.pop("project_context", None)
+        updated = session.model_copy(
+            update={
+                "coordination": current.coordination,
+                "coordination_revision": current.coordination_revision,
+                "workload_config": config,
+            }
+        )
+        self._sessions[session.id] = updated
+        return updated
+
+    async def update_coordination(self, session, coordination):
+        current = self._sessions.get(session.id)
+        if current is None or (
+            current.coordination_revision,
+            current.owner_id,
+            current.tenant_id,
+        ) != (session.coordination_revision, session.owner_id, session.tenant_id):
+            return None
+        config = dict(current.workload_config)
+        config.pop("project_context", None)
+        updated = current.model_copy(
+            update={
+                "coordination": coordination,
+                "coordination_revision": current.coordination_revision + 1,
+                "workload_config": config,
+            }
+        )
+        self._sessions[session.id] = updated
+        return updated
 
     async def list_stale_running(self, older_than):
         return [
@@ -133,6 +164,34 @@ class InMemorySessionRepository(SessionRepository):
             for s in self._sessions.values()
             if s.status == SessionStatus.RUNNING and (s.last_active or s.created_at) <= older_than
         ]
+
+    async def get_read_states(self, session_ids, user_id):
+        from volundr.domain.session_read_state import SessionReadState
+
+        markers = getattr(self, "read_markers", {})
+        return {sid: markers.get((sid, user_id), SessionReadState()) for sid in session_ids}
+
+    async def change_read_state(self, session_id, user_id, change):
+        from volundr.domain.session_read_state import SessionReadStateConflictError
+
+        current = (await self.get_read_states([session_id], user_id))[session_id]
+        if current.revision != change.expected_revision:
+            raise SessionReadStateConflictError("Read state changed")
+        if change.through_seq > current.latest_output_seq:
+            raise ValueError("Cannot mark future output read")
+        if not hasattr(self, "read_markers"):
+            self.read_markers = {}
+        updated = current.model_copy(
+            update={
+                "read_through_seq": max(current.read_through_seq, change.through_seq)
+                if change.state == "read"
+                else current.read_through_seq,
+                "manually_unread": change.state == "unread",
+                "revision": current.revision + 1,
+            }
+        )
+        self.read_markers[(session_id, user_id)] = updated
+        return updated
 
     async def delete(self, session_id: UUID) -> bool:
         if session_id in self._sessions:

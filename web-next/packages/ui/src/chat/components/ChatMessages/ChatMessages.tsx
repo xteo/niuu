@@ -1,12 +1,10 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { useCopyFeedback } from '../../hooks/useCopyFeedback';
 import {
   Hammer,
   Copy,
   Check,
   RefreshCw,
-  ThumbsUp,
-  ThumbsDown,
   ChevronRight,
   ChevronDown,
   Loader2,
@@ -20,6 +18,9 @@ import { ToolBlock, ToolGroupBlock, groupContentBlocks } from '../ToolBlock';
 import type { ChatMessage, ChatMessagePart } from '../../types';
 import type { ContentBlock as ToolContentBlock } from '../ToolBlock';
 import './ChatMessages.css';
+import { ToolImageCard } from '../ToolImages';
+import { PresentedFileCard } from '../ConversationResources';
+import { isPresentedFileTool } from '../ToolBlock/groupContentBlocks';
 
 const formatTime = (date: Date): string =>
   date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
@@ -31,13 +32,19 @@ function formatFileSize(bytes: number): string {
 }
 
 function hasToolParts(parts?: readonly ChatMessagePart[]): boolean {
-  return parts?.some((p) => p.type === 'tool_use') ?? false;
+  return (
+    parts?.some(
+      (p) => p.type === 'tool_use' || p.type === 'tool_result' || p.type === 'tool_separator',
+    ) ?? false
+  );
 }
 
 function partsToContentBlocks(parts: readonly ChatMessagePart[]): ToolContentBlock[] {
   const blocks: ToolContentBlock[] = [];
   for (const part of parts) {
-    if (part.type === 'text' && part.text != null) {
+    if (part.type === 'tool_separator') {
+      blocks.push(part);
+    } else if (part.type === 'text' && part.text != null) {
       blocks.push({
         type: 'text',
         text: part.text,
@@ -50,7 +57,7 @@ function partsToContentBlocks(parts: readonly ChatMessagePart[]): ToolContentBlo
     } else if (part.type === 'tool_use' && part.id && part.name && part.input) {
       blocks.push({ type: 'tool_use', id: part.id, name: part.name, input: part.input });
     } else if (part.type === 'tool_result' && part.tool_use_id) {
-      blocks.push({ type: 'tool_result', tool_use_id: part.tool_use_id, content: part.content });
+      blocks.push(part as ToolContentBlock);
     }
   }
   return blocks;
@@ -67,6 +74,17 @@ function extractTokens(usage: Record<string, { inputTokens?: number; outputToken
     output += entry.outputTokens ?? 0;
   }
   return { input, output };
+}
+
+/** Compact, rounded counts keep the conversation header quiet. */
+export function formatTokenCount(count: number): string {
+  if (!Number.isFinite(count) || count < 0) return '0';
+  return new Intl.NumberFormat('en-US', {
+    notation: 'compact',
+    maximumFractionDigits: 0,
+  })
+    .format(count)
+    .toLowerCase();
 }
 
 /* ── UserMessage ── */
@@ -130,6 +148,7 @@ interface AssistantMessageProps {
   onRegenerate?: (messageId: string) => void;
   onBookmark?: (messageId: string, bookmarked: boolean) => void;
   bookmarked?: boolean;
+  showTokenUsage?: boolean;
 }
 
 export function AssistantMessage({
@@ -138,9 +157,9 @@ export function AssistantMessage({
   onRegenerate,
   onBookmark,
   bookmarked = false,
+  showTokenUsage = false,
 }: AssistantMessageProps) {
   const [copied, handleCopyClick] = useCopyFeedback(message.content);
-  const [thumbState, setThumbState] = useState<'up' | 'down' | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
 
   const reasoningParts = (message.parts?.filter((p) => p.type === 'reasoning') ?? []) as Array<{
@@ -174,11 +193,11 @@ export function AssistantMessage({
               Generating...
             </span>
           )}
-          {tokens && (
+          {showTokenUsage && tokens && (
             <>
               <span className="niuu-chat-header-sep">&middot;</span>
               <span className="niuu-chat-token-info">
-                {tokens.input}&rarr;{tokens.output} tok
+                {formatTokenCount(tokens.input)} → {formatTokenCount(tokens.output)} tokens
               </span>
             </>
           )}
@@ -248,34 +267,16 @@ export function AssistantMessage({
               <RefreshCw className="niuu-chat-action-icon" />
             </button>
           )}
-          <div className="niuu-chat-action-divider" />
-          <button
-            type="button"
-            className="niuu-chat-action-btn"
-            data-active={thumbState === 'up'}
-            onClick={() => setThumbState((prev) => (prev === 'up' ? null : 'up'))}
-            title="Helpful"
-          >
-            <ThumbsUp className="niuu-chat-action-icon" />
-          </button>
-          <button
-            type="button"
-            className="niuu-chat-action-btn"
-            data-active={thumbState === 'down'}
-            onClick={() => setThumbState((prev) => (prev === 'down' ? null : 'down'))}
-            title="Not helpful"
-          >
-            <ThumbsDown className="niuu-chat-action-icon" />
-          </button>
-          <div className="niuu-chat-action-divider" />
-          <button
-            type="button"
-            className={cn('niuu-chat-action-btn', bookmarked && 'niuu-chat-action-btn--active')}
-            onClick={() => onBookmark?.(message.id, !bookmarked)}
-            title={bookmarked ? 'Remove bookmark' : 'Bookmark'}
-          >
-            <Bookmark className="niuu-chat-action-icon" />
-          </button>
+          {onBookmark && (
+            <button
+              type="button"
+              className={cn('niuu-chat-action-btn', bookmarked && 'niuu-chat-action-btn--active')}
+              onClick={() => onBookmark(message.id, !bookmarked)}
+              title={bookmarked ? 'Remove bookmark' : 'Bookmark'}
+            >
+              <Bookmark className="niuu-chat-action-icon" />
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -293,8 +294,7 @@ function AssistantContentWithTools({
   fallbackContent: string;
   isStreaming?: boolean;
 }) {
-  const blocks = partsToContentBlocks(parts);
-  const grouped = groupContentBlocks(blocks);
+  const grouped = useMemo(() => groupContentBlocks(partsToContentBlocks(parts), true), [parts]);
   // Older histories retain tool positions but only aggregate prose. Preserve that prose once;
   // its original position cannot be recovered here. Structured text parts remain authoritative.
   const hasText = grouped.some((item) => item.kind === 'text' && item.text.trim().length > 0);
@@ -305,6 +305,22 @@ function AssistantContentWithTools({
   return (
     <>
       {grouped.map((item, i) => {
+        if (item.kind === 'image')
+          return (
+            <ToolImageCard
+              key={`image:${item.image.toolUseId}:${item.image.index}`}
+              image={item.image}
+            />
+          );
+        if (item.kind === 'separator') {
+          return (
+            <hr
+              key={`separator:${item.id ?? i}`}
+              className="niuu-chat-tool-separator"
+              aria-label="Hidden tool calls"
+            />
+          );
+        }
         if (item.kind === 'text') {
           if (!item.text.trim()) return null;
           const key = item.id
@@ -320,6 +336,8 @@ function AssistantContentWithTools({
           );
         }
         if (item.kind === 'single') {
+          if (isPresentedFileTool(item.block.name))
+            return <PresentedFileCard key={`file:${item.block.id}`} block={item.block} />;
           return (
             <ToolBlock key={`tool:${item.block.id}`} block={item.block} result={item.result} />
           );
