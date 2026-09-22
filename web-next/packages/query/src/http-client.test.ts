@@ -206,7 +206,7 @@ describe('setTokenProvider / getAccessToken', () => {
     };
     vi.stubGlobal('window', {
       location: new URL(
-        'http://198.51.100.16/volundr?devUserId=guild-user-lan&devTenantId=tenant-lan&devRoles=volundr%3Adeveloper',
+        'http://192.168.0.10/volundr?devUserId=guild-user-lan&devTenantId=tenant-lan&devRoles=volundr%3Adeveloper',
       ),
       sessionStorage: fakeSessionStorage,
     });
@@ -215,7 +215,7 @@ describe('setTokenProvider / getAccessToken', () => {
 
     expect(fresh.getAuthHeaders().get('x-auth-user-id')).toBe('guild-user-lan');
     expect(fresh.withAuthQuery('/stream')).toBe(
-      'http://198.51.100.16/stream?devUserId=guild-user-lan&devTenantId=tenant-lan&devRoles=volundr%3Adeveloper',
+      'http://192.168.0.10/stream?devUserId=guild-user-lan&devTenantId=tenant-lan&devRoles=volundr%3Adeveloper',
     );
 
     vi.unstubAllGlobals();
