@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import textwrap
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +147,8 @@ def _tracker_issue_script(base_url: str, timeout: float, pat_token: str) -> str:
 
 # The `present-file` command — an ENGINE-AGNOSTIC (claude + codex) PATH shim that hands the user a
 # file in the Lexi app (in-app SendUserFile). It POSTs the resolved absolute path to the broker's
-# loopback endpoint (URL from FORGE_PRESENT_FILE_URL, injected by the transport); the broker stages
+# loopback endpoint (URL from FORGE_PRESENT_FILE_URL, exported by every transport that installs the
+# shims) with the broker's per-start secret read from FORGE_BROKER_TOKEN_FILE; the broker stages
 # + emits the card. A pure-stdlib python3 script → no curl/jq dependency, no bash-quoting fragility.
 _PRESENT_FILE_SHIM = '''#!/usr/bin/env python3
 """present-file <path> [--caption ...] [--title ...] — show a file to the user in Lexi."""
@@ -176,14 +178,23 @@ def main() -> None:
     if not url:
         print("present-file: not available in this session", file=sys.stderr)
         sys.exit(3)
+    headers = {"content-type": "application/json"}
+    token_file = os.environ.get("FORGE_BROKER_TOKEN_FILE")
+    if token_file:
+        # The broker's per-start loopback secret; read from the 0600 file, never from argv/env.
+        try:
+            with open(token_file, encoding="utf-8") as handle:
+                headers["authorization"] = "Bearer " + handle.read().strip()
+        except OSError as e:
+            print("present-file: cannot read the broker token:", e, file=sys.stderr)
+            sys.exit(3)
     payload = {"path": os.path.abspath(os.path.expanduser(path))}
     if caption:
         payload["caption"] = caption
     if title:
         payload["title"] = title
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(),
-        headers={"content-type": "application/json"}, method="POST",
+        url, data=json.dumps(payload).encode(), headers=headers, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -209,7 +220,14 @@ def ensure_codex_tool_shims(
     workspace_dir: str,
     *,
     mcp_servers: list[dict[str, Any]] | None = None,
+    session_env: Mapping[str, str] | None = None,
 ) -> tuple[Path | None, dict[str, str]]:
+    """Install the workspace PATH shims and return the env the agent process needs.
+
+    ``session_env`` (the broker's :class:`SessionTools` env: present-file URL and
+    loopback token file) is merged in, so every transport that installs the shims
+    also makes them usable.
+    """
     servers = list(mcp_servers or [])
     mount = _extract_mimir_mount(servers)
     workspace = Path(workspace_dir).expanduser().resolve()
@@ -323,4 +341,5 @@ def ensure_codex_tool_shims(
         env["RAVN_MIMIR_PATH"] = mimir_path
         if mimir_name:
             env["RAVN_MIMIR_NAME"] = mimir_name
+    env.update(session_env or {})
     return bin_dir, env

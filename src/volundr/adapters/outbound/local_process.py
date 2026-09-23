@@ -55,6 +55,8 @@ logger = logging.getLogger(__name__)
 
 # Default configuration values
 DEFAULT_WORKSPACES_DIR = "~/.niuu/workspaces"
+# Broker-owned present-file staging for local sessions, under the workspaces dir.
+LOCAL_PRESENTED_FILES_DIR = ".forge-presented"
 DEFAULT_CLAUDE_BINARY = "claude"
 # Capable hosts run many sessions comfortably (each ~0.5 GB); the practical
 # ceiling is the Claude/Codex *subscription* concurrency, not the box. Deployments
@@ -986,6 +988,14 @@ class LocalProcessPodManager(PodManager):
         env["SKULD__PORT"] = str(port)
         env.setdefault("SKULD__TRANSPORT", "sdk")
         env["SKULD__PERSISTENCE_MOUNT_PATH"] = str(self._workspaces_dir)
+        # A local session has no per-session home mount: its agent runs with this
+        # host HOME. Tell the broker so present-file accepts ~ files, and give it a
+        # per-session staging dir outside the workspace (the cluster layout
+        # {mount}/{id}/home does not exist here).
+        env["SKULD__HOME_DIR"] = env.get("HOME") or str(Path.home())
+        env["SKULD__PRESENTED_FILES_DIR"] = str(
+            self._workspaces_dir / LOCAL_PRESENTED_FILES_DIR / session_id
+        )
 
         # Volundr API URL so Skuld can post chronicles/timeline events back
         server_host = self._server_host

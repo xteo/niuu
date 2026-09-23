@@ -16,17 +16,19 @@ import json
 import os
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
+    NoDecode,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
 
 from niuu.domain.observability import ObservabilityConfig
+from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.mesh.config import MeshNatsConfig
 
 
@@ -494,6 +496,101 @@ class WorkloadIdentityConfig(BaseModel):
         return value
 
 
+class ForgeMcpConfig(BaseModel):
+    """The built-in ``forge`` MCP server Skuld injects into every MCP-capable engine.
+
+    The engine spawns ``python -m skuld.forge_mcp`` over stdio; it forwards each
+    tool call to this broker's loopback ``/api/forge-mcp/*`` routes, guarded by
+    the per-start broker secret. The broker performs the Forge calls with its
+    own credential (or ``token`` when set), so no Forge credential reaches the
+    model.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Inject the built-in forge MCP server (SKULD__FORGE_MCP__ENABLED=false: off).",
+    )
+    server_name: str = Field(
+        default="forge",
+        min_length=1,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="MCP server name; tools appear to Claude as mcp__<name>__<tool>.",
+    )
+    grants: Annotated[list[ForgeMcpGrant], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Extra tool grants: 'message' (send_message, message_status) and 'lifecycle' "
+            "(create/start/stop_session). Read tools and notify need no grant."
+        ),
+    )
+    token: str = Field(
+        default="",
+        description=(
+            "Scoped session-bound Forge token (SKULD__FORGE_MCP__TOKEN). Used only as the "
+            "bearer for MCP-proxied Forge calls; empty uses the broker's own credential."
+        ),
+    )
+    runtime_dir: str = Field(
+        default="",
+        description=(
+            "Broker-owned 0700 directory for the loopback secret and generated engine "
+            "configs. Empty uses <tempdir>/skuld-<uid>/<session id>."
+        ),
+    )
+    notify_confirm_timeout_s: float = Field(
+        default=5.0,
+        ge=0,
+        description="How long notify waits for Forge to acknowledge the log flush.",
+    )
+    forge_request_timeout_s: float = Field(
+        default=20.0, gt=0, description="Timeout for one Forge REST call made by a tool."
+    )
+    broker_request_timeout_s: float = Field(
+        default=60.0,
+        gt=0,
+        description="Timeout for one stdio-server → broker tool call.",
+    )
+    stdio_max_concurrency: int = Field(
+        default=4, ge=1, description="Tool calls the stdio server runs in parallel."
+    )
+    startup_timeout_s: float = Field(
+        default=20.0, gt=0, description="Engine-side MCP server startup timeout (Codex)."
+    )
+    tool_timeout_s: float = Field(
+        default=120.0, gt=0, description="Engine-side MCP tool call timeout (Codex)."
+    )
+    list_default_limit: int = Field(
+        default=20, ge=1, description="Items returned by list tools when none is asked."
+    )
+    list_max_limit: int = Field(default=50, ge=1, description="Upper bound for list tools.")
+    transcript_default_turns: int = Field(
+        default=10, ge=1, description="Turns session_transcript returns when none is asked."
+    )
+    transcript_max_turns: int = Field(
+        default=30, ge=1, description="Upper bound on turns session_transcript returns."
+    )
+    transcript_turn_max_chars: int = Field(
+        default=2000, ge=1, description="Characters kept per transcript turn."
+    )
+    output_max_chars: int = Field(
+        default=24000, ge=1024, description="Upper bound on one tool result's text."
+    )
+    skill_enabled: bool = Field(
+        default=True,
+        description="Materialize the forge-notify skill for engines with per-session skills.",
+    )
+
+    @field_validator("grants", mode="before")
+    @classmethod
+    def _coerce_grants(cls, value: Any) -> Any:
+        """Accept ``message,lifecycle`` or a JSON list (env forms) as well as a list."""
+        if not isinstance(value, str):
+            return value
+        if value.strip().startswith("["):
+            return json.loads(value)
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+
 class CodexAuthConfig(BaseModel):
     """Dynamic Codex authentication adapter configuration."""
 
@@ -718,6 +815,21 @@ class SkuldSettings(BaseSettings):
     service_user_id: str = Field(default="skuld-broker")
     service_tenant_id: str = Field(default="default")
     persistence_mount_path: str = Field(default="/volundr/sessions")
+    home_dir: str = Field(
+        default="",
+        description=(
+            "The session's home directory (what the agent sees as ~). Empty derives the "
+            "cluster layout {persistence_mount_path}/{session.id}/home. Local mode sets the "
+            "HOME the broker actually runs with."
+        ),
+    )
+    presented_files_dir: str = Field(
+        default="",
+        description=(
+            "Broker-owned staging directory for present-file copies (outside the "
+            "workspace, survives broker restarts). Empty uses {home}/.forge-presented."
+        ),
+    )
     archive_store: ArchiveStoreConfig = Field(default_factory=ArchiveStoreConfig)
     # OFF by default in our pipeline: the watcher tails session JSONL and POSTs
     # chronicle timeline events we don't use (and which 405 through the guild
@@ -803,6 +915,7 @@ class SkuldSettings(BaseSettings):
     )
     acp_prompt_timeout_s: float = Field(default=300.0)  # ACP/MSP (Grok Build, Muse) turn timeout
     mcp_servers: list[dict[str, Any]] = Field(default_factory=list)
+    forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     reflex: ReflexConfig = Field(default_factory=ReflexConfig)
     observability: SkuldObservabilityConfig = Field(default_factory=SkuldObservabilityConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
@@ -862,7 +975,16 @@ class SkuldSettings(BaseSettings):
     @property
     def home_path(self) -> str:
         """Resolved home directory path for the session."""
+        if self.home_dir:
+            return self.home_dir
         return f"{self.persistence_mount_path}/{self.session.id}/home"
+
+    @property
+    def presented_files_path(self) -> str:
+        """Where present-file stages its copies."""
+        if self.presented_files_dir:
+            return self.presented_files_dir
+        return f"{self.home_path}/.forge-presented"
 
     @classmethod
     def settings_customise_sources(
