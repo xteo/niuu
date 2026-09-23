@@ -172,6 +172,20 @@ def _model_supports_ultra(model: str) -> bool:
     return (model or "").strip().lower() in _ULTRA_EFFORT_MODELS
 
 
+def _mcp_tool_name(server: object, tool: object) -> str:
+    """Name a Codex MCP call ``server.tool`` (e.g. ``forge.notify``), like Claude's
+    ``mcp__server__tool``, so clients can tell which server a tool belongs to.
+
+    Tools that map onto a built-in (``read_file`` → ``Read``) keep that mapping.
+    """
+    tool_name = str(tool or "")
+    mapped = _map_codex_tool(tool_name)
+    server_name = str(server or "").strip()
+    if mapped != tool_name or not server_name:
+        return mapped
+    return f"{server_name}.{tool_name}"
+
+
 def _codex_effort_for_model(model: str) -> str:
     """Default reasoning effort to push a new Codex session to, by model.
 
@@ -1852,9 +1866,8 @@ class CodexWebSocketTransport(CLITransport):
             return
 
         if item_type == "mcpToolCall":
-            tool = item.get("tool", "")
             args = item.get("arguments", {})
-            normalized = _map_codex_tool(tool)
+            normalized = _mcp_tool_name(item.get("server", ""), item.get("tool", ""))
             await self._emit_tool_use(item_id, normalized, args if isinstance(args, dict) else {})
             return
 
