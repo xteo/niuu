@@ -171,11 +171,22 @@ def test_fleet_without_limit_uses_the_nodes_page_size():
 
 
 @respx.mock
-def test_fleet_gap_fill_is_ascending_and_reads_unseen_nodes_from_zero():
-    respx.get("http://remote/api/v1/forge/notifications").mock(side_effect=_remote_feed)
+def test_fleet_gap_fill_is_ascending_and_only_reads_named_nodes():
+    remote = respx.get("http://remote/api/v1/forge/notifications").mock(side_effect=_remote_feed)
     calls: list = []
     client = _client([LOCAL, REMOTE], embedded_forge_app=_embedded(calls))
-    page = _fleet(client, after=encode_cursor({"local": 1}), limit=5).json()
+
+    local_only = _fleet(client, after=encode_cursor({"local": 1}), limit=5).json()
+    assert [(i["instance_id"], i["seq"]) for i in local_only["items"]] == [
+        ("local", 2),
+        ("local", 3),
+    ]
+    assert not remote.called  # a node missing from the after-cursor is skipped
+    assert calls[-1]["after"] == "1" and "all_instances" not in calls[-1]
+    assert decode_cursor(local_only["next_after"]) == {"local": 3}
+    assert local_only["next_before"] is None
+
+    page = _fleet(client, after=encode_cursor({"local": 1, "remote": 0}), limit=5).json()
     assert [(i["instance_id"], i["seq"]) for i in page["items"]] == [
         ("remote", 10),
         ("local", 2),
@@ -183,9 +194,8 @@ def test_fleet_gap_fill_is_ascending_and_reads_unseen_nodes_from_zero():
         ("local", 3),
         ("remote", 12),
     ]
-    assert calls[-1]["after"] == "1" and "all_instances" not in calls[-1]
+    assert remote.calls[-1].request.url.params["after"] == "0"
     assert decode_cursor(page["next_after"]) == {"local": 3, "remote": 12}
-    assert page["next_before"] is None
     empty = _fleet(client, after=page["next_after"]).json()
     assert empty["items"] == [] and decode_cursor(empty["next_after"]) == {"local": 3, "remote": 12}
 

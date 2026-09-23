@@ -105,8 +105,8 @@ seq order.
 - **Cursors** are opaque: unpadded base64url JSON of `{instance_id: seq}`.
   - `next_before` pages older. A host that is missing from it has nothing older left, and
     a `null` position means "from that host's newest".
-  - `after` takes the same shape for gap-fill. A host that is missing from an `after`
-    cursor is read from seq 0.
+  - `after` takes the same shape for gap-fill. Only the hosts named in an `after`
+    cursor are read; send a host with seq `0` to read it from the start.
   - `next_after` is the gap-fill cursor to keep. It holds the newest seq per host.
 - **Response fields.**
   - `unread_count` is summed across hosts, and the per-host counters are under
