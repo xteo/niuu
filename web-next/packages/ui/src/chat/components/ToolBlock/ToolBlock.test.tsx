@@ -347,3 +347,34 @@ describe('hierarchical tool groups', () => {
     expect(screen.queryAllByTestId('tool-block')).toHaveLength(0);
   });
 });
+
+describe('Forge notification tool parts', () => {
+  it('keeps notification cards out of hierarchical tool groups', () => {
+    const blocks: ContentBlock[] = [
+      bashBlock,
+      { type: 'tool_use', id: 'nt_1', name: 'forge_notification', input: { title: 'Done' } },
+      { ...bashBlock, id: 'next' },
+      { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'a.ts' } },
+    ];
+    const grouped = groupContentBlocks(blocks, true);
+    expect(grouped.map((item) => item.kind)).toEqual(['single', 'single', 'group']);
+    expect(grouped[1]).toMatchObject({ block: { id: 'nt_1' } });
+  });
+
+  it('labels the Forge MCP notify call in group summaries', () => {
+    expect(getToolLabel('mcp__forge__notify')).toBe('Notify');
+    expect(getToolLabel('forge.notify')).toBe('Notify');
+  });
+
+  it('shows a notify call without a title as a bare notified line', () => {
+    render(
+      <ToolBlock
+        block={{ type: 'tool_use', id: 'n', name: 'forge.notify', input: { kind: 'info' } }}
+      />,
+    );
+    const block = screen.getByTestId('tool-block');
+    expect(block).toHaveAttribute('data-tool-kind', 'forge-notify');
+    expect(block).toHaveClass('niuu-chat-tool-block--mcp');
+    expect(block.querySelector('.niuu-chat-tool-preview')).toBeNull();
+  });
+});

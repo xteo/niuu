@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getAuthHeaders } from '@niuulabs/query';
+import { FORGE_NOTIFICATION_TOOL_NAME } from '@niuulabs/domain';
 import { extractOutcomeBlock } from '../components/OutcomeCard';
 import type {
   AgentInternalEvent,
@@ -172,6 +173,7 @@ type CliStreamEvent = {
   skills?: SlashCommandWireItem[];
   commands?: SlashCommandWireItem[];
   turns?: ConversationTurn[];
+  turn?: ConversationTurn;
   fields?: Record<string, unknown>;
 };
 
@@ -527,6 +529,34 @@ export function transformTurns(turns: ConversationTurn[]): ChatMessage[] {
       visibility: turn.visibility,
     };
   });
+}
+
+/** Broker-appended notification turns (contract §1) that must render live, not only on reload. */
+export function isNotificationTurn(turn: ConversationTurn | undefined): turn is ConversationTurn {
+  if (!turn || typeof turn.id !== 'string' || !turn.id) return false;
+  if (turn.metadata?.kind === 'notification') return true;
+  return (
+    turn.parts?.some(
+      (part) => part.type === 'tool_use' && part.name === FORGE_NOTIFICATION_TOOL_NAME,
+    ) ?? false
+  );
+}
+
+/**
+ * Place a live broker turn where the durable log will put it: the broker appends it
+ * while the provider turn is still streaming, so it precedes that (unflushed) turn.
+ */
+export function insertBrokerTurn(
+  messages: ChatMessage[],
+  message: ChatMessage,
+  streamingMessageId: string | null,
+): ChatMessage[] {
+  if (messages.some((existing) => existing.id === message.id)) return messages;
+  const streamingIndex = streamingMessageId
+    ? messages.findIndex((existing) => existing.id === streamingMessageId)
+    : -1;
+  if (streamingIndex < 0) return [...messages, message];
+  return [...messages.slice(0, streamingIndex), message, ...messages.slice(streamingIndex)];
 }
 
 export function participantsFromTurns(turns: ConversationTurn[]): Map<string, RoomParticipant> {
@@ -1876,6 +1906,16 @@ export function useSkuldChat(
             if (url) {
               setHistoryLoadedForUrl(url);
             }
+            break;
+          }
+          case 'conversation.turn': {
+            // Other broker turns keep their existing (history-refresh) behaviour.
+            if (!isNotificationTurn(event.turn)) break;
+            const [message] = transformTurns([event.turn]);
+            if (!message) break;
+            const streamingId = streamingMessageIdRef.current;
+            const live = { ...message, participant: getDefaultAssistantParticipant() };
+            setMessages((prev) => insertBrokerTurn(prev, live, streamingId));
             break;
           }
           case 'user_confirmed': {

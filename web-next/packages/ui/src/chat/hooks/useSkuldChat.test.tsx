@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   formatOutcomeContent,
   getStorageKey,
+  insertBrokerTurn,
+  isNotificationTurn,
   parseEvent,
   parseParticipantMeta,
   pushOutcomeField,
@@ -3041,5 +3043,92 @@ page_path: council/demo/opinion-b.md
 
     expect(result.current.messages).toHaveLength(1);
     expect(result.current.messages[0]?.id).toBe('done-message');
+  });
+});
+
+describe('live Forge notification turns', () => {
+  const notificationTurn = {
+    id: 'nt_abc',
+    role: 'assistant',
+    content: 'Deploy finished',
+    created_at: '2026-09-23T10:00:00Z',
+    parts: [
+      {
+        type: 'tool_use',
+        id: 'nt_abc',
+        name: 'forge_notification',
+        input: { notification_id: 'n-1', kind: 'milestone', title: 'Deploy finished' },
+      },
+    ],
+    metadata: { kind: 'notification' },
+  };
+
+  beforeEach(() => {
+    sendJson.mockReset();
+    wsHandlers = {};
+    sessionStorage.clear();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, json: async () => ({ turns: [] }) })),
+    );
+  });
+
+  it('recognises notification turns by metadata or by their card part', () => {
+    expect(isNotificationTurn(notificationTurn)).toBe(true);
+    expect(isNotificationTurn({ ...notificationTurn, metadata: {} })).toBe(true);
+    expect(isNotificationTurn({ ...notificationTurn, metadata: {}, parts: [] })).toBe(false);
+    expect(isNotificationTurn({ ...notificationTurn, id: '' })).toBe(false);
+    expect(isNotificationTurn(undefined)).toBe(false);
+  });
+
+  it('places a broker turn before the unflushed streaming turn and never duplicates it', () => {
+    const base = transformTurns([
+      { id: 'u1', role: 'user', content: 'go', created_at: '2026-09-23T09:59:00Z' },
+      { id: 'run', role: 'assistant', content: 'working', created_at: '2026-09-23T09:59:30Z' },
+    ]);
+    const [card] = transformTurns([notificationTurn]);
+    const placed = insertBrokerTurn(base, card!, 'run');
+    expect(placed.map((message) => message.id)).toEqual(['u1', 'nt_abc', 'run']);
+    expect(insertBrokerTurn(placed, card!, 'run')).toBe(placed);
+    expect(insertBrokerTurn(base, card!, null).map((message) => message.id)).toEqual([
+      'u1',
+      'run',
+      'nt_abc',
+    ]);
+    expect(insertBrokerTurn(base, card!, 'gone').at(-1)?.id).toBe('nt_abc');
+  });
+
+  it('renders a live notification turn without waiting for a history refresh', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+
+    act(() => {
+      wsHandlers.onMessage?.(JSON.stringify({ type: 'conversation.turn', turn: notificationTurn }));
+      wsHandlers.onMessage?.(JSON.stringify({ type: 'conversation.turn', turn: notificationTurn }));
+    });
+
+    expect(result.current.messages).toHaveLength(1);
+    expect(result.current.messages[0]).toMatchObject({
+      id: 'nt_abc',
+      role: 'assistant',
+      content: 'Deploy finished',
+      parts: notificationTurn.parts,
+    });
+  });
+
+  it('leaves other broker turns to the history refresh path', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'conversation.turn',
+          turn: { ...notificationTurn, id: 'file', metadata: { present_file: true }, parts: [] },
+        }),
+      );
+    });
+
+    expect(result.current.messages).toHaveLength(0);
   });
 });
