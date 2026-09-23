@@ -108,6 +108,13 @@ const volundrMocks = vi.hoisted(() => ({
   buildVolundrFileSystemHttpAdapter: vi.fn((options) => ({ kind: 'filesystem', options })),
   buildVolundrPtyWsAdapter: vi.fn(() => ({})),
   buildVolundrMetricsSseAdapter: vi.fn(() => ({})),
+  buildNotificationFeedHttpAdapter: vi.fn((client, options) => ({
+    kind: 'notifications',
+    client,
+    options,
+  })),
+  createMockNotificationFeed: vi.fn(() => ({ kind: 'mock-notifications' })),
+  forgeApiBasePath: vi.fn((basePath: string) => basePath),
 }));
 
 vi.mock('@niuulabs/query', () => ({
@@ -1558,6 +1565,31 @@ describe('buildServices', () => {
     expect((services.sessionStore as any).kind).toBe('mock-session-store');
     expect((services['volundr.clusters'] as any).kind).toBe('mock-clusters');
     expect((services.clusterAdapter as any).kind).toBe('mock-clusters');
+    expect((services['volundr.notifications'] as any).kind).toBe('mock-notifications');
+  });
+
+  it('builds the notifications feed on the Forge base, sharing the Forge fleet stream', () => {
+    const forgeAdapter = { kind: 'forge-http', subscribeForgeStream: vi.fn() };
+    // The Forge runtime adapter is built first, before the catalog adapter.
+    volundrMocks.buildVolundrHttpAdapter.mockReturnValueOnce(forgeAdapter as any);
+    const services = buildServices({
+      theme: 'ice',
+      plugins: {},
+      services: { forge: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/forge' } },
+    } as any);
+    const feed = services['volundr.notifications'] as any;
+    expect(feed.kind).toBe('notifications');
+    expect(feed.client).toEqual({ basePath: 'http://localhost:8080/api/v1/forge' });
+    expect(volundrMocks.forgeApiBasePath).toHaveBeenCalledWith(
+      'http://localhost:8080/api/v1/forge',
+    );
+    // The feed listens on the Forge adapter itself, not on a second stream.
+    expect(feed.options.stream).toBe(forgeAdapter);
+  });
+
+  it('leaves notifications unavailable without a Forge or demo mode', () => {
+    const services = buildServices({ theme: 'ice', plugins: {}, services: {} } as any);
+    expect(isUnavailableService(services['volundr.notifications'])).toBe(true);
   });
 
   it('maps lifecycle variants and subscription updates through the live session store', async () => {
