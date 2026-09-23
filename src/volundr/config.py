@@ -27,6 +27,7 @@ from pydantic_settings import (
 )
 
 from bifrost.config import BifrostConfig
+from niuu.adapters.notifications.integrations import DEFAULT_INTEGRATION_SINKS
 from niuu.config import (
     CorsConfig,
     DynamicAdapterConfig,
@@ -56,6 +57,7 @@ from volundr.domain.notifications import (
     INTEGRATION_SINK,
     MAX_SINK_NAME_CHARS,
     SINK_NAME_PATTERN,
+    NotificationRateLimit,
 )
 
 __all__ = ["GitHubInstance", "GitLabInstance"]
@@ -715,8 +717,15 @@ class NotificationReplyReadyConfig(BaseModel):
 
 
 class NotificationDispatcherConfig(BaseModel):
-    """Outbox dispatcher timing. Consumed by the notification dispatcher loop."""
+    """Outbox dispatcher: the background loop that delivers notifications to sinks."""
 
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the outbox dispatcher (needs notifications.enabled). It only sends what "
+            "an owner rule selects, so it is idle until a rule exists."
+        ),
+    )
     poll_interval_seconds: float = Field(
         default=2.0, gt=0, description="Pause between outbox polls when nothing is due."
     )
@@ -725,6 +734,17 @@ class NotificationDispatcherConfig(BaseModel):
         default=60.0,
         gt=0,
         description="How long a claim is held before another worker may re-claim it.",
+    )
+    send_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+        description=(
+            "Upper bound for one sink send. Must be shorter than lease_seconds; a send "
+            "is only started while at least this much of its lease remains."
+        ),
+    )
+    max_concurrent_sends: int = Field(
+        default=8, ge=1, description="Sends in flight at once within one poll."
     )
     max_attempts: int = Field(
         default=8, ge=1, description="Attempts before a delivery is marked dead."
@@ -735,14 +755,29 @@ class NotificationDispatcherConfig(BaseModel):
     backoff_max_seconds: float = Field(
         default=900.0, gt=0, description="Upper bound for the retry delay."
     )
+    backoff_jitter_ratio: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="Random spread applied to each retry delay (0.2 = up to ±20%).",
+    )
+    default_rate_limit: NotificationRateLimit | None = Field(
+        default_factory=lambda: NotificationRateLimit(max_count=60, window_seconds=3600),
+        description=(
+            "Rate limit for rules that set no config.rate_limit: at most max_count "
+            "deliveries per rule in any window_seconds. Null disables the default."
+        ),
+    )
     max_error_chars: int = Field(
         default=2000, ge=1, description="Longest delivery error kept on the outbox row."
     )
 
     @model_validator(mode="after")
-    def _ordered_backoff(self) -> "NotificationDispatcherConfig":
+    def _ordered_timing(self) -> "NotificationDispatcherConfig":
         if self.backoff_base_seconds > self.backoff_max_seconds:
             raise ValueError("backoff_base_seconds must not exceed backoff_max_seconds")
+        if self.send_timeout_seconds >= self.lease_seconds:
+            raise ValueError("send_timeout_seconds must be shorter than lease_seconds")
         return self
 
 
@@ -760,11 +795,14 @@ class NotificationsConfig(BaseModel):
             enabled: true
             title_chars: 120
             body_chars: 280
+          public_web_url: "https://forge.example.com"
           sinks:
             - name: ops-webhook
               label: Ops webhook
-              adapter: "niuu.adapters.notifications.webhook.WebhookNotificationAdapter"
+              adapter: "niuu.adapters.notifications.webhook.WebhookNotificationSink"
               url: "https://hooks.example.com/forge"
+              secret_kwargs_env:
+                secret: FORGE_OPS_WEBHOOK_SECRET
     """
 
     enabled: bool = Field(
@@ -779,8 +817,36 @@ class NotificationsConfig(BaseModel):
         default_factory=list,
         description=(
             "Named delivery sinks (dynamic adapters): each entry has 'name', optional "
-            "'label', 'adapter' (fully-qualified class path) and adapter kwargs."
+            "'label', 'adapter' (fully-qualified NotificationSink class path), optional "
+            "'secret_kwargs_env' (kwarg name -> env var) and adapter kwargs."
         ),
+    )
+    integration_sinks: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_INTEGRATION_SINKS),
+        description=(
+            "Integration slug -> NotificationSink class path used for rules that deliver "
+            "through an owner's messaging integration. A connection whose slug is not "
+            "listed may store a NotificationSink class path as its adapter."
+        ),
+    )
+    public_web_url: str = Field(
+        default="",
+        description=(
+            "Browser-facing Forge web origin used for deep links in delivered messages. "
+            "Empty uses the host's public origin."
+        ),
+    )
+    host_label: str = Field(
+        default="",
+        description="Label for this Forge host in delivered messages; empty uses its hostname.",
+    )
+    session_link_path: str = Field(
+        default="/volundr/session/{session_id}#notification-{notification_id}",
+        description="Deep-link path for a session notification ({session_id}, {notification_id}).",
+    )
+    feed_link_path: str = Field(
+        default="/volundr/notifications",
+        description="Deep-link path for a notification without a session.",
     )
 
     @model_validator(mode="after")
@@ -803,7 +869,27 @@ class NotificationsConfig(BaseModel):
                 raise ValueError("'integration' is reserved for messaging-integration rules")
             if name in names:
                 raise ValueError(f"Duplicate notifications sink name {name!r}")
+            secret_env = sink.get("secret_kwargs_env", {})
+            if not isinstance(secret_env, dict) or not all(
+                isinstance(key, str) and isinstance(value, str) for key, value in secret_env.items()
+            ):
+                raise ValueError(
+                    f"notifications.sinks[{name!r}].secret_kwargs_env must map kwarg names "
+                    "to environment variable names"
+                )
             names.add(name)
+        for slug, adapter in self.integration_sinks.items():
+            if not slug or "." not in adapter:
+                raise ValueError(
+                    f"notifications.integration_sinks[{slug!r}] needs a sink class path"
+                )
+        try:
+            self.session_link_path.format(session_id="s", notification_id="n")
+            self.feed_link_path.format()
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "notifications link paths may only use {session_id} and {notification_id}"
+            ) from exc
         return self
 
 
@@ -1205,6 +1291,9 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             name="Telegram",
             description="Telegram bot — notifications, session alerts, and dispatch commands",
             integration_type="messaging",
+            # Ting's per-user channel; Forge delivery picks its sink by slug
+            # (notifications.integration_sinks), whatever the stored adapter.
+            adapter="niuu.adapters.notifications.telegram.TelegramNotificationAdapter",
             icon="telegram",
             credential_schema={
                 "required": ["bot_token", "chat_id"],

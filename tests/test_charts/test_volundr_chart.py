@@ -554,6 +554,21 @@ class TestConfigMapTemplate:
         assert parsed.reply_ready.body_chars == 400
         assert parsed.sinks[0]["url"] == "https://x"
 
+        delivery = render(
+            "--set-json",
+            'notifications={"public_web_url":"https://forge.example.com",'
+            '"dispatcher":{"max_attempts":5,"default_rate_limit":null},'
+            '"integration_sinks":{"telegram":"niuu.adapters.notifications.telegram.'
+            'TelegramNotificationSink"},'
+            '"sinks":[{"name":"ops","adapter":"a.B","url":"https://x",'
+            '"secret_kwargs_env":{"secret":"FORGE_OPS_WEBHOOK_SECRET"}}]}',
+        )
+        parsed = NotificationsConfig.model_validate(delivery["notifications"])
+        assert parsed.public_web_url == "https://forge.example.com"
+        assert parsed.dispatcher.max_attempts == 5
+        assert parsed.dispatcher.default_rate_limit is None
+        assert parsed.sinks[0]["secret_kwargs_env"] == {"secret": "FORGE_OPS_WEBHOOK_SECRET"}
+
     def test_ci_values_run_resident_runtime_migrations(self):
         result = subprocess.run(
             [

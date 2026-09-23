@@ -156,6 +156,7 @@ def serve(config_path: Path):
         local_mounts={"enabled": True, "mini_mode": True},
         session_liveness={"enabled": False, "reconcile_interval_seconds": 5},
         telegram_ingress={"enabled": False},
+        notifications={"dispatcher": {"enabled": False}},
     )
     with (
         patch("volundr.main._bootstrap_startup_schema", new=AsyncMock()),

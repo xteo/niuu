@@ -164,6 +164,11 @@ from volundr.domain.services.tracker import TrackerService
 from volundr.domain.services.tracker_factory import TrackerFactory
 from volundr.domain.services.workspace import WorkspaceService
 from volundr.infrastructure.database import database_pool
+from volundr.notification_composition import (
+    NotificationDelivery,
+    create_notification_delivery,
+    create_push_channel,
+)
 
 # Interval for periodic stats and heartbeat broadcasts (seconds)
 BROADCAST_INTERVAL = 30
@@ -240,6 +245,40 @@ def _create_notification_service(
         ],
         engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
         integration_repository=integration_repository,
+    )
+
+
+def _create_notification_delivery(
+    settings: Settings,
+    pool: Any,
+    *,
+    public_origin: str,
+    integration_repository: Any,
+    credential_store: Any,
+    device_repository: Any,
+    push_channel: Any,
+    attention_push_enabled: bool,
+) -> NotificationDelivery | None:
+    """Compose the outbox dispatcher (``notifications.dispatcher.enabled``).
+
+    A configured push sink reuses the needs-input push channel when push is on,
+    and otherwise builds its own from ``push.adapter``.
+    """
+    config = settings.notifications
+    if config.enabled and config.dispatcher.enabled and push_channel is None:
+        try:
+            push_channel = create_push_channel(settings)
+        except Exception:
+            logger.exception("Push channel for notification delivery could not be built")
+    return create_notification_delivery(
+        settings,
+        pool,
+        public_origin=public_origin,
+        integration_repository=integration_repository,
+        credential_store=credential_store,
+        device_repository=device_repository,
+        push_channel=push_channel,
+        attention_push_enabled=attention_push_enabled,
     )
 
 
@@ -627,13 +666,11 @@ def create_app(
             # Fans a "session needs you" push out to the owner's devices when a
             # session enters awaiting_input.
             attention_notifier = None
+            push_channel = None
             if settings.push.enabled:
                 try:
-                    channel_cls = import_class(settings.push.adapter)
-                    channel_kwargs = resolve_secret_kwargs(
-                        settings.push.kwargs, settings.push.secret_kwargs_env
-                    )
-                    notification_channel = channel_cls(**channel_kwargs)
+                    notification_channel = create_push_channel(settings)
+                    push_channel = notification_channel
                     attention_notifier = PushAttentionNotifier(
                         device_repository,
                         notification_channel,
@@ -722,6 +759,19 @@ def create_app(
                 settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
             )
             app.state.notification_service = notification_service
+            notification_delivery = _create_notification_delivery(
+                settings,
+                pool,
+                public_origin=public_origin,
+                integration_repository=integration_repo,
+                credential_store=credential_store,
+                device_repository=device_repository,
+                push_channel=push_channel,
+                attention_push_enabled=attention_notifier is not None,
+            )
+            app.state.notification_dispatcher = (
+                notification_delivery.dispatcher if notification_delivery is not None else None
+            )
             tracker_factory = TrackerFactory(credential_store)
             credential_enrollment_service = CredentialEnrollmentService(
                 repository=PostgresCredentialEnrollmentRepository(pool),
@@ -1387,6 +1437,8 @@ def create_app(
                 if credential_enrollment_service is not None
                 else None
             )
+            if notification_delivery is not None:
+                await notification_delivery.start()
             if settings.telegram_ingress.enabled:
                 await telegram_ingress.start()
             else:
@@ -1408,6 +1460,8 @@ def create_app(
                     bifrost_catalog_task.cancel()
                     await asyncio.gather(bifrost_catalog_task, return_exceptions=True)
                 await telegram_ingress.stop()
+                if notification_delivery is not None:
+                    await notification_delivery.stop()
                 background_task.cancel()
                 try:
                     await background_task

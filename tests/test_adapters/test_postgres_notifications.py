@@ -360,6 +360,18 @@ class TestOutbox:
         repo = PostgresNotificationDeliveryRepository(pool, max_error_chars=4)
         assert await repo.list_for_notification(delivery.notification_id) == [delivery]
 
+    async def test_count_delivered_since_counts_one_rules_recent_successes(self):
+        pool, _ = _pool()
+        pool.fetchval.return_value = 3
+        repo = PostgresNotificationDeliveryRepository(pool, max_error_chars=4)
+        rule_id = uuid4()
+        assert await repo.count_delivered_since(rule_id, NOW) == 3
+        sql = pool.fetchval.await_args.args[0]
+        assert "status = 'delivered' AND delivered_at >= $2" in sql
+        assert pool.fetchval.await_args.args[1:] == (rule_id, NOW)
+        pool.fetchval.return_value = None
+        assert await repo.count_delivered_since(rule_id, NOW) == 0
+
 
 async def test_event_log_reads_exact_seqs_in_one_query():
     pool, _ = _pool()

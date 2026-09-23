@@ -69,3 +69,48 @@ def test_composition_builds_service_from_config():
         )
         is None
     )
+
+
+def test_delivery_defaults():
+    config = NotificationsConfig()
+    assert config.dispatcher.enabled is True
+    assert config.dispatcher.send_timeout_seconds < config.dispatcher.lease_seconds
+    assert config.dispatcher.default_rate_limit.max_count == 60
+    assert config.dispatcher.default_rate_limit.window_seconds == 3600
+    assert config.integration_sinks == {
+        "telegram": "niuu.adapters.notifications.telegram.TelegramNotificationSink",
+        "webhook": "niuu.adapters.notifications.webhook.WebhookNotificationSink",
+    }
+    assert config.public_web_url == ""
+    assert config.session_link_path.format(session_id="s", notification_id="n") == (
+        "/volundr/session/s#notification-n"
+    )
+    assert (
+        NotificationsConfig(dispatcher={"default_rate_limit": None}).dispatcher.default_rate_limit
+        is None
+    )
+
+
+def test_catalog_telegram_connections_get_a_channel_adapter():
+    telegram = next(d for d in Settings().integrations.definitions if d.slug == "telegram")
+    assert telegram.adapter == "niuu.adapters.notifications.telegram.TelegramNotificationAdapter"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"dispatcher": {"send_timeout_seconds": 60, "lease_seconds": 60}},
+        {"dispatcher": {"backoff_jitter_ratio": 1.5}},
+        {"dispatcher": {"max_concurrent_sends": 0}},
+        {"dispatcher": {"default_rate_limit": {"max_count": 0, "window_seconds": 60}}},
+        {"sinks": [{"name": "ops", "adapter": "a.B", "secret_kwargs_env": ["secret"]}]},
+        {"sinks": [{"name": "ops", "adapter": "a.B", "secret_kwargs_env": {"secret": 1}}]},
+        {"integration_sinks": {"telegram": "nodots"}},
+        {"integration_sinks": {"": "a.B"}},
+        {"session_link_path": "/s/{session}"},
+        {"feed_link_path": "/f/{session_id}"},
+    ],
+)
+def test_invalid_delivery_configuration_fails_loudly(values):
+    with pytest.raises(ValidationError):
+        NotificationsConfig(**values)

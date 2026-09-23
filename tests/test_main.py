@@ -14,6 +14,12 @@ from volundr.config import Settings
 from volundr.main import _bootstrap_startup_schema, _load_bifrost_catalog, create_app
 
 
+@pytest.fixture(autouse=True)
+def _no_notification_dispatcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These lifespans run on a mocked pool; the outbox loop has its own tests."""
+    monkeypatch.setenv("NOTIFICATIONS__DISPATCHER__ENABLED", "false")
+
+
 class TestCreateApp:
     """Tests for create_app factory."""
 
@@ -441,6 +447,63 @@ class TestLifespan:
 
         subscriber.start.assert_awaited_once()
         subscriber.stop.assert_awaited_once()
+
+    def test_lifespan_starts_and_stops_notification_delivery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The outbox dispatcher runs for the app's lifetime when notifications are on."""
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setenv("NOTIFICATIONS__DISPATCHER__ENABLED", "true")
+        mock_pool = AsyncMock()
+        mock_pool.get_max_size = MagicMock(return_value=10)
+        delivery = MagicMock()
+        delivery.start = AsyncMock()
+        delivery.stop = AsyncMock()
+        captured: dict[str, object] = {}
+
+        def _fake_delivery(settings, pool, **kwargs):
+            captured.update(kwargs, settings=settings, pool=pool)
+            return delivery
+
+        @asynccontextmanager
+        async def _mock_db_pool(_config):
+            yield mock_pool
+
+        with (
+            patch("volundr.main._bootstrap_startup_schema", new=AsyncMock()),
+            patch("volundr.main.database_pool", _mock_db_pool),
+            patch("volundr.main._create_notification_delivery", side_effect=_fake_delivery),
+            patch(
+                "volundr.adapters.outbound.bifrost_catalog_http.HttpBifrostCatalogAdapter.list_models",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "volundr.domain.services.tenant.TenantService.ensure_default_tenant",
+                new=AsyncMock(),
+            ),
+            patch(
+                "volundr.domain.services.session.SessionService.reconcile_provisioning_sessions",
+                new=AsyncMock(),
+            ),
+            patch(
+                "volundr.domain.services.session.SessionService.reconcile_active_sessions",
+                new=AsyncMock(),
+            ),
+        ):
+            app = create_app(public_origin="https://forge.example.com")
+            with TestClient(app) as client:
+                assert client.get("/health").status_code == 200
+                delivery.start.assert_awaited_once()
+                delivery.stop.assert_not_awaited()
+                assert app.state.notification_dispatcher is delivery.dispatcher
+
+        delivery.stop.assert_awaited_once()
+        assert captured["pool"] is mock_pool
+        assert captured["public_origin"] == "https://forge.example.com"
+        assert captured["attention_push_enabled"] is False
+        assert captured["push_channel"] is None
+        assert captured["settings"].notifications.dispatcher.enabled is True
 
 
 class TestBifrostCatalogLoading:
