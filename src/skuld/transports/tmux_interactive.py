@@ -35,9 +35,11 @@ from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.agent_usage import AgentUsageTracker
 from skuld.control_errors import ControlRecoveryError
 from skuld.delivery_errors import DeliveryNotAcceptedError
+from skuld.session_runtime import write_private_file
 from skuld.transports.claude_env import claude_spawn_env
 from skuld.transports.claude_text_order import preceding_tool_text
-from skuld.transports.mcp_config import build_claude_mcp_config
+from skuld.transports.mcp_config import build_claude_mcp_config, build_claude_mcp_payload
+from skuld.transports.session_tools import PRESENT_FILE_INSTRUCTION, SessionTools
 from skuld.transports.subprocess import _DEFAULT_PERMISSION_MODE
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
@@ -54,12 +56,9 @@ at its next supported boundary. Follow the applicable session and repository ins
 objectives, planning, delegation and progress reporting; the transport does not prescribe a \
 workflow."""
 
-_PRESENT_FILE_INSTRUCTION = """\
-FILE DELIVERY: when you produce a file the user should SEE or open (a report, image, PDF, diagram, \
-screenshot, chart, or build artifact), run `present-file <path> [--caption "…"] [--title "…"]`. It \
-surfaces the file in the user's app as a tappable card that opens in the file preview, and accepts \
-ANY path, including scratch files outside the workspace (e.g. /tmp). Use it for finished \
-deliverables the user would want to open — not for routine tool output or intermediate files."""
+# Default capability text for a transport built without broker SessionTools (harnesses).
+_PRESENT_FILE_INSTRUCTION = PRESENT_FILE_INSTRUCTION
+_HOOK_SETTINGS_FILE = "claude-hooks.settings.json"
 
 _BUILT_IN_SLASH_COMMANDS = [
     {"name": "/agents", "description": "Manage agent teams and subagents"},
@@ -212,9 +211,11 @@ class TmuxInteractiveTransport(CLITransport):
         question_result_history_limit: int = 128,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
+        session_tools: SessionTools | None = None,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
+        self._session_tools = session_tools
         self._model = model
         self._reasoning_effort = (
             validate_effort(reasoning_effort, MODEL_EFFORTS.get(model, ()))
@@ -257,7 +258,13 @@ class TmuxInteractiveTransport(CLITransport):
             Path(self.workspace_dir) / ".skuld" / "tmux-interactive" / self._session_name
         )
         self._pane_log_dir = self._runtime_dir / "panes"
-        self._hook_settings_path = self._runtime_dir / "claude-hooks.settings.json"
+        # With broker SessionTools the hook settings carry the loopback secret, so they
+        # live (0600) in the broker-owned runtime dir, never in the workspace.
+        self._hook_settings_path = (
+            session_tools.runtime_dir / _HOOK_SETTINGS_FILE
+            if session_tools is not None
+            else self._runtime_dir / _HOOK_SETTINGS_FILE
+        )
 
         self._turn_idle_timeout_s = self._float_env(
             "SKULD__TMUX_TURN_IDLE_TIMEOUT_SECONDS", turn_idle_timeout_s, 3.0
@@ -2768,19 +2775,35 @@ class TmuxInteractiveTransport(CLITransport):
         appended_system_prompt = self._composed_system_prompt()
         if appended_system_prompt:
             cmd.extend(["--append-system-prompt", appended_system_prompt])
-        if self._mcp_config:
-            cmd.extend(["--mcp-config", self._mcp_config])
+        mcp_config = self._mcp_config_argument()
+        if mcp_config:
+            cmd.extend(["--mcp-config", mcp_config])
+        for plugin_dir in self._session_tools.claude_plugin_dirs if self._session_tools else ():
+            cmd.extend(["--plugin-dir", str(plugin_dir)])
         if self._agent_teams:
             cmd.extend(["--teammate-mode", "tmux"])
         return cmd
+
+    def _mcp_config_argument(self) -> str | None:
+        """A 0600 config file path with SessionTools; inline JSON otherwise (legacy)."""
+        if self._session_tools is None:
+            return self._mcp_config
+        path = self._session_tools.write_claude_mcp_config(
+            build_claude_mcp_payload(self._raw_mcp_servers)
+        )
+        return str(path) if path else None
 
     def _composed_system_prompt(self) -> str:
         """Append capability help and session-supplied instructions, not workflow policy."""
         parts: list[str] = []
         if self._steering_instructions_enabled:
             parts.append(_STEERING_INPUT_INSTRUCTION)
-        # Always advertise the present-file capability so any Forge agent can hand the user a file.
-        parts.append(_PRESENT_FILE_INSTRUCTION)
+        # Always advertise the session capabilities (present-file, and the Forge notify MCP
+        # when the broker injected it) so any Forge agent can hand the user a file or ping them.
+        if self._session_tools is not None:
+            parts.append(self._session_tools.instructions)
+        else:
+            parts.append(_PRESENT_FILE_INSTRUCTION)
         if self._system_prompt:
             parts.append(self._system_prompt)
         return "\n\n".join(parts)
@@ -2798,17 +2821,18 @@ class TmuxInteractiveTransport(CLITransport):
         events = list(_CLAUDE_HOOK_EVENTS)
         if self._message_display_hook_enabled:
             events.extend(_OPTIONAL_HIGH_VOLUME_HOOK_EVENTS)
-        hook = {
+        hook: dict[str, Any] = {
             "type": "http",
             "url": f"http://127.0.0.1:{self._sdk_port}/api/claude/hooks",
             "timeout": 5,
         }
+        if self._session_tools is not None and self._session_tools.loopback_authorization:
+            # Claude HTTP hooks send literal headers; the broker requires its secret.
+            hook["headers"] = {"Authorization": self._session_tools.loopback_authorization}
         settings = {"hooks": {event: [{"matcher": "", "hooks": [hook]}] for event in events}}
+        content = json.dumps(settings, indent=2, sort_keys=True) + "\n"
         self._hook_settings_path.parent.mkdir(parents=True, exist_ok=True)
-        self._hook_settings_path.write_text(
-            json.dumps(settings, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_private_file(self._hook_settings_path, content)
 
     def _spawn_env(self) -> dict[str, str]:
         env = claude_spawn_env()
@@ -2818,12 +2842,9 @@ class TmuxInteractiveTransport(CLITransport):
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._raw_mcp_servers,
+            session_env=self._session_tools.env if self._session_tools else None,
         )
         env.update(shim_env)
-        # The present-file shim POSTs here (broker app == sdk_port). Set for every engine so the
-        # `present-file` command works in both claude and codex tmux sessions.
-        if self._sdk_port:
-            env["FORGE_PRESENT_FILE_URL"] = f"http://127.0.0.1:{self._sdk_port}/api/present-file"
         return env
 
     async def _emit_system_init(self) -> None:

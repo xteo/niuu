@@ -8,6 +8,7 @@ import tomllib
 import pytest
 
 from skuld.transports.mcp_config import (
+    build_acp_mcp_servers,
     build_claude_mcp_config,
     build_claude_mcp_payload,
     build_codex_mcp_overrides,
@@ -173,3 +174,37 @@ class TestDefaults:
         other = {"name": "mimir", "command": "m"}
         assert with_default_mcp_servers([custom, other], [builtin]) == [custom, other]
         assert with_default_mcp_servers([other], [builtin]) == [other, builtin]
+
+
+class TestAcp:
+    def test_stdio_and_http_shapes(self) -> None:
+        servers = build_acp_mcp_servers(
+            [STDIO, HTTP_BEARER, SSE],
+            env={"MIMIR_TOKEN": "tok"},
+            supports_http=True,
+            supports_sse=True,
+        )
+        assert servers == [
+            {
+                "name": "forge",
+                "command": "/venv/bin/python",
+                "args": ["-m", "skuld.forge_mcp", "--broker-url", "http://127.0.0.1:9"],
+                "env": [{"name": "PYTHONUNBUFFERED", "value": "1"}],
+            },
+            {
+                "type": "http",
+                "name": "mimir",
+                "url": "https://mimir.example/mcp",
+                "headers": [
+                    {"name": "X-Tenant", "value": "acme"},
+                    {"name": "Authorization", "value": "Bearer tok"},
+                ],
+            },
+            {"type": "sse", "name": "legacy", "url": "https://old.example/sse", "headers": []},
+        ]
+
+    def test_unsupported_transport_and_missing_bearer_fail_loudly(self) -> None:
+        with pytest.raises(ValueError, match="does not advertise"):
+            build_acp_mcp_servers([SSE], env={}, supports_http=True, supports_sse=False)
+        with pytest.raises(ValueError, match=r"\$MIMIR_TOKEN"):
+            build_acp_mcp_servers([HTTP_BEARER], env={}, supports_http=True, supports_sse=True)

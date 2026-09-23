@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from typing import Any
 
 # Streamable HTTP is the current MCP network transport; SSE is legacy. A URL
@@ -224,3 +225,62 @@ def build_codex_mcp_overrides(raw_servers: object) -> list[tuple[str, str]]:
 def mcp_server_names(raw_servers: object) -> list[str]:
     """Names of the servers a translator would emit (for environment reporting)."""
     return [server["name"] for server in normalize_mcp_servers(raw_servers)]
+
+
+def _name_value_pairs(values: dict[str, str]) -> list[dict[str, str]]:
+    return [{"name": key, "value": value} for key, value in values.items()]
+
+
+def build_acp_mcp_servers(
+    raw_servers: object,
+    *,
+    env: Mapping[str, str],
+    supports_http: bool,
+    supports_sse: bool,
+) -> list[dict[str, Any]]:
+    """Translate MCP servers into ACP ``session/new`` ``mcpServers`` entries.
+
+    ACP stdio servers are ``{name, command, args, env: [{name, value}]}``; HTTP/SSE
+    servers are ``{type, name, url, headers: [{name, value}]}`` and are only valid
+    when the agent advertises the matching ``mcpCapabilities``. ACP has no env-var
+    expansion, so a ``bearer_token_env_var`` is resolved from ``env`` here (the
+    value travels over the agent's stdin, never argv).
+    """
+    servers: list[dict[str, Any]] = []
+    for server in normalize_mcp_servers(raw_servers):
+        if not server.get("url"):
+            servers.append(
+                {
+                    "name": server["name"],
+                    "command": server.get("command") or "",
+                    "args": list(server.get("args") or []),
+                    "env": _name_value_pairs(dict(server.get("env") or {})),
+                }
+            )
+            continue
+        transport = url_transport(server)
+        supported = supports_http if transport == "http" else supports_sse
+        if not supported:
+            raise ValueError(
+                f"MCP server {server['name']!r} uses {transport}, which this ACP agent does "
+                "not advertise in mcpCapabilities; use a stdio server or remove it"
+            )
+        headers = dict(server.get("headers") or {})
+        bearer_env = server.get("bearer_token_env_var")
+        if bearer_env and not any(key.lower() == "authorization" for key in headers):
+            token = env.get(bearer_env, "")
+            if not token:
+                raise ValueError(
+                    f"MCP server {server['name']!r} needs ${bearer_env} "
+                    "(bearer_token_env_var), which is not set for this session"
+                )
+            headers[_AUTHORIZATION_HEADER] = f"Bearer {token}"
+        servers.append(
+            {
+                "type": transport,
+                "name": server["name"],
+                "url": server["url"],
+                "headers": _name_value_pairs(headers),
+            }
+        )
+    return servers
