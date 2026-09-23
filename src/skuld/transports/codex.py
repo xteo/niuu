@@ -19,6 +19,7 @@ from niuu.adapters.cli.runtime import (
 )
 from niuu.ports.cli import CLITransport
 from skuld.transports.mcp_config import build_codex_mcp_overrides
+from skuld.transports.session_env import session_process_env
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
@@ -128,7 +129,7 @@ class CodexSubprocessTransport(CLITransport):
         self._completed_text_items: dict[str, str] = {}
         self._text_item_indexes: dict[str, int] = {}
         self._native_thread_id: str | None = None
-        self._env = dict(os.environ)
+        self._env = session_process_env()
         _ensure_codex_home(self._env)
 
     async def start(self) -> None:

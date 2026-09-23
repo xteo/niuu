@@ -20,6 +20,8 @@ import os
 import sys
 from pathlib import Path
 
+from skuld.transports.session_env import session_process_env
+
 logger = logging.getLogger(__name__)
 
 _API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
@@ -28,10 +30,11 @@ _API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 def claude_spawn_env() -> dict[str, str]:
     """Build the child env for a Claude CLI/SDK spawn (see module docstring)."""
     mode = os.environ.get("SKULD__CLAUDE_AUTH", "subscription").strip().lower()
+    base = session_process_env()  # never hand the broker's credentials to the model
     if mode == "api_key":
-        return {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        return {k: v for k, v in base.items() if k != "CLAUDECODE"}
 
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and k not in _API_KEY_VARS}
+    env = {k: v for k, v in base.items() if k != "CLAUDECODE" and k not in _API_KEY_VARS}
     # On macOS the CLI stores its OAuth login in the Keychain, so the
     # credentials file only signals a missing login on other platforms.
     if sys.platform != "darwin" and not (Path.home() / ".claude" / ".credentials.json").exists():

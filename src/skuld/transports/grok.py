@@ -36,6 +36,7 @@ from skuld.transports import (
     _filter_event,
     _stop_process,
 )
+from skuld.transports.session_env import session_process_env
 
 logger = logging.getLogger("skuld.transport")
 
@@ -278,7 +279,7 @@ class GrokACPTransport(CLITransport):
                 cwd=self.workspace_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ},
+                env=session_process_env(),
             )
             await asyncio.wait_for(proc.communicate(), timeout=self._auth_preflight_timeout)
             logger.info("Grok auth preflight complete (rc=%s)", proc.returncode)
@@ -350,7 +351,7 @@ class GrokACPTransport(CLITransport):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ},  # inherits XAI_API_KEY / auth.json etc.
+            env=session_process_env(),  # XAI_API_KEY / auth.json, no broker creds
             limit=self._live_frame_max_bytes,
         )
         self._process = process

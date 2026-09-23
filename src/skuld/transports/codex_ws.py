@@ -48,6 +48,7 @@ from skuld.tool_images import image_payloads
 from skuld.transports.codex import _map_codex_tool, resolve_codex_cli
 from skuld.transports.mcp_config import build_codex_mcp_overrides
 from skuld.transports.owned_codex_process import OwnedCodexProcess, OwnedProcessError
+from skuld.transports.session_env import session_process_env
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
@@ -319,7 +320,7 @@ class CodexWebSocketTransport(CLITransport):
         self._mcp_servers = list(mcp_servers or [])
         self._mcp_overrides = build_codex_mcp_overrides(self._mcp_servers)
         self._resume_session_id = (resume_session_id or "").strip() or None
-        self._env = dict(os.environ)
+        self._env = session_process_env()
         self._codex_auth_provider = codex_auth_provider or HostCodexAuthProvider()
         self._process_owner = (
             OwnedCodexProcess(
