@@ -254,10 +254,10 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
       if (after) {
         state.gapCursors.push(after);
         const marks = decodeCursor(after) as Record<string, number>;
-        // Facade rules: every newer row, no truncation; a node missing from the
-        // cursor is read from seq 0.
+        // Facade rules: only the nodes the cursor names are read (seq 0 reads a
+        // node from the start), ascending, each node capped at `limit`.
         const newer = rows
-          .filter((r) => r.seq > (marks[r.instance_id] ?? 0))
+          .filter((r) => marks[r.instance_id] !== undefined && r.seq > marks[r.instance_id]!)
           .sort((a, b) => a.seq - b.seq);
         return route.fulfill({
           json: {

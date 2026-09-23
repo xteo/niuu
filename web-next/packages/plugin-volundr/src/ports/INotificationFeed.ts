@@ -27,8 +27,9 @@ export interface NotificationFeedPage {
 
 /**
  * Where gap-fill resumes: the server's opaque `next_after` when known, else
- * per-instance watermarks the client has seen (a node missing from either is
- * read from the beginning).
+ * per-instance watermarks the client has seen. The facade only reads the nodes
+ * a cursor names (seq 0 reads a node from the start), so watermarks must list
+ * every node the client knows about.
  */
 export interface NotificationGapCursor {
   cursor: string | null;
@@ -38,7 +39,7 @@ export interface NotificationGapCursor {
 export interface NotificationGapPage {
   /** Oldest first — rows committed after the cursor. */
   items: SessionNotification[];
-  /** True when the page was full and more rows may follow. */
+  /** True when a node's page was full, so more rows may follow. */
   hasMore: boolean;
   /** The cursor to resume from next time, when the server provides one. */
   nextAfter: string | null;

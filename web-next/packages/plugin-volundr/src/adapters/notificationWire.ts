@@ -303,10 +303,13 @@ export function ruleDraftToWire(draft: NotificationRuleDraft): Omit<RuleWire, 'i
   };
 }
 
+/** The facade's sink for delivering through the caller's own messaging integration. */
+export const INTEGRATION_SINK = 'integration';
+
 export function normalizeSink(wire: SinkWire): NotificationSinkOption {
   return {
     name: wire.name,
-    label: wire.label || wire.name,
+    label: wire.label || (wire.name === INTEGRATION_SINK ? 'Messaging integration' : wire.name),
     requiresIntegration: wire.requires_integration === true,
   };
 }

@@ -36,7 +36,7 @@ describe('createMockNotificationFeed', () => {
     expect(filtered.items.map((item) => item.id)).toEqual(['n-horde-4']);
   });
 
-  it('gap-fills from its own next_after or watermarks, reading missing nodes from the start', async () => {
+  it('gap-fills from its own next_after or watermarks, reading only the nodes named', async () => {
     const feed = createMockNotificationFeed();
     const page = await feed.list(ANY);
     expect(page.nextAfter).toMatch(/^mock-after:/);
@@ -46,18 +46,27 @@ describe('createMockNotificationFeed', () => {
       hasMore: false,
     });
     const fromMarks = await feed.listSince(ANY, { cursor: null, watermarks: { thor: 5 } });
-    // horde-1 is not in the watermarks, so both of its rows come back.
+    // horde-1 is not named, so it is skipped.
     expect(fromMarks.items.map((item) => `${item.instanceId}:${item.seq}`)).toEqual([
-      'horde-1:3',
-      'horde-1:4',
       'thor:6',
       'thor:7',
     ]);
-    const capped = await feed.listSince(ANY, { cursor: null, watermarks: {} }, { limit: 2 });
-    expect(capped).toMatchObject({ hasMore: true });
-    expect(capped.items).toHaveLength(2);
+    // Seq 0 reads a node from the start; each node caps its own page.
+    const capped = await feed.listSince(
+      ANY,
+      { cursor: null, watermarks: { thor: 0, 'horde-1': 0 } },
+      { limit: 2 },
+    );
+    expect(capped.hasMore).toBe(true);
+    expect(capped.items.map((item) => `${item.instanceId}:${item.seq}`)).toEqual([
+      'horde-1:3',
+      'thor:4',
+      'horde-1:4',
+      'thor:5',
+    ]);
     const rest = await feed.listSince(ANY, { cursor: capped.nextAfter, watermarks: {} });
-    expect(rest.items).toHaveLength(4);
+    expect(rest.items.map((item) => item.seq)).toEqual([6, 7]);
+    expect(rest.hasMore).toBe(false);
   });
 
   it('reports configured unreachable nodes', async () => {

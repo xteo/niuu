@@ -295,6 +295,11 @@ describe('notification wire format', () => {
       label: 'webhook',
       requiresIntegration: false,
     });
+    expect(normalizeSink({ name: 'integration', requires_integration: true })).toEqual({
+      name: 'integration',
+      label: 'Messaging integration',
+      requiresIntegration: true,
+    });
     expect(
       normalizeDelivery({
         id: 'd1',

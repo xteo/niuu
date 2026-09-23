@@ -291,18 +291,25 @@ export function createMockNotificationFeed(
     async listSince(filter, after, gapOptions) {
       const limit = gapOptions?.limit ?? NOTIFICATION_GAP_PAGE_SIZE;
       const marks = after.cursor ? decodeAfter(after.cursor) : after.watermarks;
-      // Like the facade: a node missing from the cursor is read from the start.
-      const newer = rows
-        .filter((row) => row.seq > (marks[instanceKey(row.instanceId)] ?? 0))
-        .filter((row) => matchesServerFilter(row, filter, isRead(row)))
-        .sort((a, b) => a.seq - b.seq)
-        .map(withRead);
-      const items = newer.slice(0, limit);
-      return {
-        items,
-        hasMore: newer.length > limit,
-        nextAfter: encodeAfter(maxSeqMaps(marks, seqWatermarks(items))),
-      };
+      // Like the facade: only the nodes the cursor names are read, and each
+      // node caps its own page at `limit`.
+      const perNode = new Map<string, SessionNotification[]>();
+      for (const row of rows) {
+        const key = instanceKey(row.instanceId);
+        const mark = marks[key];
+        if (mark === undefined || row.seq <= mark) continue;
+        if (!matchesServerFilter(row, filter, isRead(row))) continue;
+        perNode.set(key, [...(perNode.get(key) ?? []), row]);
+      }
+      let hasMore = false;
+      const items: SessionNotification[] = [];
+      for (const nodeRows of perNode.values()) {
+        const ascending = nodeRows.sort((a, b) => a.seq - b.seq);
+        hasMore ||= ascending.length > limit;
+        items.push(...ascending.slice(0, limit).map(withRead));
+      }
+      items.sort((a, b) => a.seq - b.seq);
+      return { items, hasMore, nextAfter: encodeAfter(maxSeqMaps(marks, seqWatermarks(items))) };
     },
 
     async listForSession(sessionId, after, sessionOptions) {
