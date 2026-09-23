@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from niuu.domain.transcript_reducer import is_read_path_excluded
 from skuld.channels import filter_internal_blocks
 from volundr.domain.models import SessionLogEntry
+from volundr.domain.notifications import NotificationStoreUnavailableError
 from volundr.domain.ports import SessionEventLogRepository
 from volundr.domain.services.session import SessionAccessDeniedError, SessionService
 from volundr.domain.session_read_state import is_final_output
@@ -220,6 +221,41 @@ async def _project_notifications(
     await notification_service.project_log_entries(session, stored)
 
 
+async def _project_notifications_isolated(
+    notification_service: NotificationService,
+    log_repository: SessionEventLogRepository,
+    session: Session,
+    entries: list[SessionLogEntry],
+    conflicts: list[int],
+) -> None:
+    """Project without ever putting the durable transcript at risk.
+
+    The frames are already stored. A store outage answers 503 so the producer
+    retries the (idempotent) batch and the projection runs again. Any other failure
+    is a defect in the notification path: it is logged loudly, and the append is
+    still acknowledged so one bad notification can never wedge a session's log.
+    """
+    try:
+        await _project_notifications(
+            notification_service, log_repository, session, entries, conflicts
+        )
+    except NotificationStoreUnavailableError as exc:
+        logger.warning(
+            "notification projection unavailable for session %s; asking producer to retry: %s",
+            session.id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Notification store unavailable; retry the batch",
+        ) from exc
+    except Exception:
+        logger.exception(
+            "notification projection failed for session %s; transcript append kept",
+            session.id,
+        )
+
+
 def create_session_log_router(
     log_repository: SessionEventLogRepository,
     session_service: SessionService | None = None,
@@ -305,7 +341,7 @@ def create_session_log_router(
         # Notifications are projected from the stored rows before the ack. An orphan
         # log (no session row) has no owner, so it has no feed to project into.
         if notification_service is not None and session is not None:
-            await _project_notifications(
+            await _project_notifications_isolated(
                 notification_service, log_repository, session, entries, conflicts
             )
         # Projection is committed atomically with the durable insert; this is only a refresh hint.

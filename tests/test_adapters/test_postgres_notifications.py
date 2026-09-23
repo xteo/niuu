@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 from niuu.domain.notifications import NotificationKind, NotificationSeverity, NotificationSource
@@ -31,6 +32,7 @@ from volundr.domain.notifications import (
     NotificationRule,
     NotificationRuleMatch,
     NotificationScope,
+    NotificationStoreUnavailableError,
 )
 
 NOW = datetime(2026, 9, 23, 10, tzinfo=UTC)
@@ -185,6 +187,27 @@ class TestProject:
         pool, _ = _pool()
         assert await PostgresNotificationRepository(pool).project([]) == []
         pool.acquire.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ConnectionRefusedError("refused"),
+            TimeoutError(),
+            asyncpg.exceptions.CannotConnectNowError("starting up"),
+            asyncpg.exceptions.TooManyConnectionsError("full"),
+        ],
+    )
+    async def test_connection_failures_become_retryable(self, error):
+        pool, conn = _pool()
+        conn.execute.side_effect = error
+        with pytest.raises(NotificationStoreUnavailableError):
+            await PostgresNotificationRepository(pool).project([_candidate("a")])
+
+    async def test_query_defects_are_not_masked_as_outages(self):
+        pool, conn = _pool()
+        conn.fetchrow.side_effect = asyncpg.exceptions.UndefinedColumnError("no column")
+        with pytest.raises(asyncpg.exceptions.UndefinedColumnError):
+            await PostgresNotificationRepository(pool).project([_candidate("a")])
 
 
 class TestFeed:

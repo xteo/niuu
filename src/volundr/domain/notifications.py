@@ -220,6 +220,14 @@ class NotificationReadStateConflictError(NotificationError):
     """Another change to the reader's watermark won; re-read before retrying."""
 
 
+class NotificationStoreUnavailableError(NotificationError):
+    """The notification store could not be reached; the caller may retry safely.
+
+    Projection is idempotent (dedupe keys), so a producer that retries after this
+    error cannot create duplicates.
+    """
+
+
 class NotificationRuleMatch(BaseModel):
     """What a rule selects. An empty list means "any"."""
 

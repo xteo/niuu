@@ -32,8 +32,19 @@ from volundr.domain.notifications import (
     NotificationRule,
     NotificationRuleMatch,
     NotificationScope,
+    NotificationStoreUnavailableError,
     ReadWatermark,
     rules_matching,
+)
+
+# Connection-level failures: the projection did not commit and a retry is safe.
+_UNAVAILABLE_ERRORS: tuple[type[BaseException], ...] = (
+    asyncpg.PostgresConnectionError,
+    asyncpg.InterfaceError,
+    asyncpg.exceptions.CannotConnectNowError,
+    asyncpg.exceptions.TooManyConnectionsError,
+    ConnectionError,
+    TimeoutError,
 )
 
 # Serializes seq allocation with commit: every projection transaction takes this
@@ -230,6 +241,12 @@ class PostgresNotificationRepository(NotificationRepository):
     async def project(self, candidates: list[NotificationCandidate]) -> list[Notification]:
         if not candidates:
             return []
+        try:
+            return await self._project(candidates)
+        except _UNAVAILABLE_ERRORS as exc:
+            raise NotificationStoreUnavailableError(str(exc) or type(exc).__name__) from exc
+
+    async def _project(self, candidates: list[NotificationCandidate]) -> list[Notification]:
         created: list[Notification] = []
         async with self._pool.acquire() as conn:
             async with conn.transaction():

@@ -91,3 +91,27 @@ async def test_second_question_while_awaiting_is_recorded(service, recorder):
     assert [call["request_id"] for call in recorder.calls] == ["q1", "q2"]
     assert recorder.calls[0]["state_since"] == recorder.calls[1]["state_since"]
     assert recorder.calls[1]["kind"] == "question" and recorder.calls[1]["prompt"] == ""
+
+
+async def test_recorder_failure_never_breaks_the_activity_report(
+    repository, pod_manager, broadcaster, caplog
+):
+    class FailingRecorder(NotificationRecorder):
+        async def record_attention(self, session, **_kwargs):
+            raise RuntimeError("store down")
+
+    service = SessionService(
+        repository=repository,
+        pod_manager=pod_manager,
+        broadcaster=broadcaster,
+        notification_recorder=FailingRecorder(),
+        provisioning_initial_delay=0,
+        provisioning_timeout=1.0,
+    )
+    session = await _session(service)
+    updated = await service.update_activity(
+        session.id, SessionActivityState.AWAITING_INPUT, {"request_id": "q1"}
+    )
+    assert updated.activity_state == SessionActivityState.AWAITING_INPUT
+    assert any(event.type.value == "session_needs_input" for event in broadcaster.events)
+    assert "recording the attention notification failed" in caplog.text

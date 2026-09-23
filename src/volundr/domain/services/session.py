@@ -554,13 +554,7 @@ class SessionService:
         # attention notification, deduplicated per request (a retried report of the
         # same pending request records nothing new).
         if is_new_attention and self._notification_recorder is not None:
-            await self._notification_recorder.record_attention(
-                updated,
-                state_since=session.activity_state_since,
-                kind=metadata.get("kind", "question"),
-                prompt=metadata.get("prompt", "") or "",
-                request_id=metadata.get("request_id", "") or "",
-            )
+            await self._record_attention_isolated(updated, session, metadata)
 
         # Fan a push out to the owner's devices off the activity hot-path (a slow
         # APNs/webhook call must not delay Skuld's activity report response).
@@ -584,6 +578,27 @@ class SessionService:
         )
         self._attention_notify_tasks.add(task)
         task.add_done_callback(self._attention_notify_tasks.discard)
+
+    async def _record_attention_isolated(
+        self, updated: Session, previous: Session, metadata: dict
+    ) -> None:
+        """Record the feed's attention notification without risking the activity report.
+
+        The activity transition, its SSE events and the push fan-out must not depend
+        on the notification store, so a failure here is logged and absorbed.
+        """
+        if self._notification_recorder is None:
+            return
+        try:
+            await self._notification_recorder.record_attention(
+                updated,
+                state_since=updated.activity_state_since or previous.activity_state_since,
+                kind=metadata.get("kind", "question"),
+                prompt=metadata.get("prompt", "") or "",
+                request_id=metadata.get("request_id", "") or "",
+            )
+        except Exception:
+            logger.exception("recording the attention notification failed for %s", updated.id)
 
     @staticmethod
     def _is_new_attention_request(
