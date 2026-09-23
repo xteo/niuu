@@ -81,12 +81,24 @@ export function prependNotifications(
   const firstPage: NotificationFeedPage = first ?? {
     items: [],
     nextBefore: null,
+    nextAfter: null,
     unreadCount: null,
+    unavailableInstances: [],
   };
   return {
     ...data,
     pages: [{ ...firstPage, items: mergeNotifications(firstPage.items, fresh) }, ...rest],
   };
+}
+
+/** Remember where the next gap-fill resumes (kept on the newest page). */
+export function withNextAfter(
+  data: FeedData | undefined,
+  cursor: string | null,
+): FeedData | undefined {
+  const first = data?.pages[0];
+  if (!data || !first || !cursor || first.nextAfter === cursor) return data;
+  return { ...data, pages: [{ ...first, nextAfter: cursor }, ...data.pages.slice(1)] };
 }
 
 function belongsToServerFilter(
@@ -153,16 +165,22 @@ async function gapFill(
   const data = queryClient.getQueryData<FeedData>(queryKey);
   // Before the first page lands, that pending read already covers the gap.
   if (!data) return;
-  // Capture watermarks now, before a read-state refetch can move the heads.
-  let after: InstanceSeqMap = maxSeqMaps(
+  // Resume from the server's opaque `next_after` when it gave one; otherwise
+  // from watermarks captured now, before a read-state refetch moves the heads.
+  let cursor: string | null = data.pages[0]?.nextAfter ?? null;
+  let watermarks: InstanceSeqMap = maxSeqMaps(
     seqWatermarks(data.pages.flatMap((page) => page.items)),
     headSeqs(queryClient.getQueryData<NotificationReadState>(notificationKeys.readState)),
   );
   for (let page = 0; page < GAP_FILL_MAX_PAGES; page++) {
-    const { items, hasMore } = await feed.listSince(filter, after);
-    queryClient.setQueryData<FeedData>(queryKey, (current) => prependNotifications(current, items));
-    if (!hasMore) return;
-    after = maxSeqMaps(after, seqWatermarks(items));
+    const gap = await feed.listSince(filter, { cursor, watermarks });
+    cursor = gap.nextAfter ?? cursor;
+    const resumeFrom = cursor;
+    queryClient.setQueryData<FeedData>(queryKey, (current) =>
+      withNextAfter(prependNotifications(current, gap.items), resumeFrom),
+    );
+    if (!gap.hasMore) return;
+    watermarks = maxSeqMaps(watermarks, seqWatermarks(gap.items));
   }
   // Too far behind to page through: reload from the newest page.
   await queryClient.resetQueries({ queryKey });
@@ -184,6 +202,8 @@ export interface UseNotificationsResult {
   isLoadingMore: boolean;
   /** Whether the live stream is currently connected. */
   live: boolean;
+  /** Nodes the newest page could not reach. */
+  unavailableInstances: string[];
 }
 
 export function useNotifications(filter: NotificationFilter): UseNotificationsResult {
@@ -242,6 +262,7 @@ export function useNotifications(filter: NotificationFilter): UseNotificationsRe
     loadMore: () => void query.fetchNextPage(),
     isLoadingMore: query.isFetchingNextPage,
     live: status === 'open',
+    unavailableInstances: query.data?.pages[0]?.unavailableInstances ?? [],
   };
 }
 

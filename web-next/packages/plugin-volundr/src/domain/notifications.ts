@@ -24,6 +24,8 @@ export interface SessionNotification {
   id: string;
   /** Owning Forge node (facade tag); `null` when talking to one Forge directly. */
   instanceId: string | null;
+  /** The node's display name, as the facade reports it. */
+  instanceName: string | null;
   seq: number;
   sessionId: string | null;
   sessionSeq: number | null;

@@ -36,12 +36,33 @@ describe('createMockNotificationFeed', () => {
     expect(filtered.items.map((item) => item.id)).toEqual(['n-horde-4']);
   });
 
-  it('gap-fills per instance, ascending, skipping instances it was not asked about', async () => {
+  it('gap-fills from its own next_after or watermarks, reading missing nodes from the start', async () => {
     const feed = createMockNotificationFeed();
-    expect((await feed.listSince(ANY, { thor: 5 })).items.map((item) => item.seq)).toEqual([6, 7]);
-    const capped = await feed.listSince(ANY, { thor: 0, 'horde-1': 0 }, { limit: 2 });
+    const page = await feed.list(ANY);
+    expect(page.nextAfter).toMatch(/^mock-after:/);
+    expect(page.unavailableInstances).toEqual([]);
+    expect(await feed.listSince(ANY, { cursor: page.nextAfter, watermarks: {} })).toMatchObject({
+      items: [],
+      hasMore: false,
+    });
+    const fromMarks = await feed.listSince(ANY, { cursor: null, watermarks: { thor: 5 } });
+    // horde-1 is not in the watermarks, so both of its rows come back.
+    expect(fromMarks.items.map((item) => `${item.instanceId}:${item.seq}`)).toEqual([
+      'horde-1:3',
+      'horde-1:4',
+      'thor:6',
+      'thor:7',
+    ]);
+    const capped = await feed.listSince(ANY, { cursor: null, watermarks: {} }, { limit: 2 });
     expect(capped).toMatchObject({ hasMore: true });
     expect(capped.items).toHaveLength(2);
+    const rest = await feed.listSince(ANY, { cursor: capped.nextAfter, watermarks: {} });
+    expect(rest.items).toHaveLength(4);
+  });
+
+  it('reports configured unreachable nodes', async () => {
+    const feed = createMockNotificationFeed({ unavailableInstances: ['horde-2'] });
+    expect((await feed.list(ANY)).unavailableInstances).toEqual(['horde-2']);
   });
 
   it('reads one session ascending', async () => {
