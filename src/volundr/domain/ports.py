@@ -614,7 +614,20 @@ class NotificationChannel(ABC):
     @abstractmethod
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
         """Deliver a push. ``devices`` is the owner's registered devices (may be
-        empty for relay channels that resolve recipients themselves)."""
+        empty for relay channels that resolve recipients themselves).
+
+        Best-effort: failures are logged, never raised."""
+
+    async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
+        """Deliver a push and report failures (the notification outbox path).
+
+        Raises ``niuu.ports.notifications.NotificationDeliveryError`` when nothing
+        was delivered; returns a short, secret-free description of what was.
+        Channels that cannot tell success from failure keep this default, which
+        falls back to the best-effort ``send``.
+        """
+        await self.send(message, devices)
+        return f"handed to {type(self).__name__}"
 
 
 class AttentionNotifier(ABC):

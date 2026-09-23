@@ -7,6 +7,12 @@ Selected via the dynamic-adapter config (``push.adapter`` + ``kwargs``):
   owns device fan-out). HTTP/1.1, no extra dependencies.
 - ``ApnsNotificationChannel`` — direct Apple Push, token-based (JWT) auth.
   Requires an HTTP/2 client (``h2`` installed); inject one for tests.
+
+Each channel has two entry points. ``send`` is the best-effort path the
+needs-input attention push uses: it logs failures and never raises.
+``deliver`` is the strict path the notification outbox uses (through
+``PushNotificationSink``): it raises ``NotificationDeliveryError`` when nothing
+was delivered, so the outbox can retry or give up honestly.
 """
 
 from __future__ import annotations
@@ -15,9 +21,17 @@ import hashlib
 import hmac
 import logging
 import time
+from typing import Any
 
 import httpx
 
+from niuu.adapters.notifications.delivery_http import (
+    is_retryable_status,
+    redact_url,
+    status_failure,
+    transport_failure,
+)
+from niuu.ports.notifications import NotificationDeliveryError
 from volundr.domain.models import DevicePlatform, DeviceToken, PushMessage
 from volundr.domain.ports import NotificationChannel
 
@@ -67,8 +81,20 @@ class WebhookNotificationChannel(NotificationChannel):
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
         if not self._url:
             return
-        payload = {
-            "type": "session.needs_input",
+        try:
+            await self.deliver(message, devices)
+        except Exception as exc:
+            logger.warning(
+                "Push webhook delivery failed for owner %s: %s",
+                message.owner_id,
+                exc if isinstance(exc, NotificationDeliveryError) else type(exc).__name__,
+            )
+
+    async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
+        if not self._url:
+            raise NotificationDeliveryError("Push relay has no url configured", retryable=False)
+        payload: dict[str, Any] = {
+            "type": message.event_type,
             "owner_id": message.owner_id,
             "session_id": message.session_id,
             "kind": message.kind,
@@ -78,22 +104,24 @@ class WebhookNotificationChannel(NotificationChannel):
             "request_id": message.request_id,
             "device_tokens": [{"platform": d.platform.value, "token": d.token} for d in devices],
         }
+        if message.notification_id:
+            payload["notification_id"] = message.notification_id
+        if message.url:
+            payload["url"] = message.url
         headers = {"content-type": "application/json"}
         if self._secret:
             body = httpx.Request("POST", self._url, json=payload).content
             signature = hmac.new(self._secret.encode(), body, hashlib.sha256).hexdigest()
             headers["X-Niuu-Signature"] = f"sha256={signature}"
+        target = f"push relay {redact_url(self._url)}"
+        client = await self._get_client()
         try:
-            client = await self._get_client()
             resp = await client.post(self._url, json=payload, headers=headers)
-            if resp.status_code >= 400:
-                logger.warning(
-                    "Push webhook returned %d for owner %s", resp.status_code, message.owner_id
-                )
-        except Exception:
-            logger.warning(
-                "Push webhook delivery failed for owner %s", message.owner_id, exc_info=True
-            )
+        except httpx.HTTPError as exc:
+            raise transport_failure(exc, target) from None
+        if resp.status_code >= httpx.codes.BAD_REQUEST:
+            raise status_failure(target, resp)
+        return f"{target} accepted HTTP {resp.status_code}"
 
 
 class ApnsNotificationChannel(NotificationChannel):
@@ -153,19 +181,28 @@ class ApnsNotificationChannel(NotificationChannel):
         return self._client
 
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
+        if not any(d.platform is DevicePlatform.IOS for d in devices):
+            return
+        try:
+            await self.deliver(message, devices)
+        except NotificationDeliveryError as exc:
+            logger.warning("APNs push failed for owner %s: %s", message.owner_id, exc)
+
+    async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
         ios_devices = [d for d in devices if d.platform is DevicePlatform.IOS]
         if not ios_devices:
-            return
+            raise NotificationDeliveryError(
+                "The owner has no registered iOS devices", retryable=False
+            )
         try:
             auth = self._auth_token()
             client = await self._get_client()
-        except Exception:
-            logger.warning(
-                "APNs auth/client setup failed for owner %s", message.owner_id, exc_info=True
-            )
-            return
+        except Exception as exc:
+            raise NotificationDeliveryError(
+                f"APNs auth/client setup failed: {type(exc).__name__}", retryable=False
+            ) from None
 
-        payload = {
+        payload: dict[str, Any] = {
             "aps": {
                 "alert": {"title": message.title, "body": message.body},
                 "sound": "default",
@@ -175,24 +212,61 @@ class ApnsNotificationChannel(NotificationChannel):
             "kind": message.kind,
             "request_id": message.request_id,
         }
+        if message.notification_id:
+            payload["notification_id"] = message.notification_id
+        if message.url:
+            payload["url"] = message.url
+        accepted = 0
+        failures: list[NotificationDeliveryError] = []
         for device in ios_devices:
-            topic = device.app_bundle_id or self._bundle_id
-            try:
-                resp = await client.post(
-                    f"{self._host}/3/device/{device.token}",
-                    json=payload,
-                    headers={
-                        "authorization": f"bearer {auth}",
-                        "apns-topic": topic,
-                        "apns-push-type": "alert",
-                        "apns-priority": "10",
-                    },
-                )
-                if resp.status_code >= 400:
-                    logger.warning(
-                        "APNs rejected push (status=%d) for owner %s",
-                        resp.status_code,
-                        message.owner_id,
-                    )
-            except Exception:
-                logger.warning("APNs delivery failed for owner %s", message.owner_id, exc_info=True)
+            error = await self._post(client, auth, device, payload, message.owner_id)
+            if error is None:
+                accepted += 1
+                continue
+            failures.append(error)
+        if accepted:
+            return f"APNs accepted {accepted} of {len(ios_devices)} devices"
+        raise NotificationDeliveryError(
+            f"APNs delivered to none of {len(ios_devices)} devices: {failures[0]}",
+            retryable=any(failure.retryable for failure in failures),
+            retry_after=max(
+                (f.retry_after for f in failures if f.retry_after is not None), default=None
+            ),
+        )
+
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        auth: str,
+        device: DeviceToken,
+        payload: dict[str, Any],
+        owner_id: str,
+    ) -> NotificationDeliveryError | None:
+        topic = device.app_bundle_id or self._bundle_id
+        try:
+            resp = await client.post(
+                f"{self._host}/3/device/{device.token}",
+                json=payload,
+                headers={
+                    "authorization": f"bearer {auth}",
+                    "apns-topic": topic,
+                    "apns-push-type": "alert",
+                    "apns-priority": "10",
+                },
+            )
+        except Exception as exc:
+            # One device's failure must not stop delivery to the others.
+            logger.warning("APNs delivery failed for owner %s: %s", owner_id, type(exc).__name__)
+            return NotificationDeliveryError(
+                f"{type(exc).__name__} while contacting APNs", retryable=True
+            )
+        if resp.status_code >= httpx.codes.BAD_REQUEST:
+            logger.warning(
+                "APNs rejected push (status=%d) for owner %s", resp.status_code, owner_id
+            )
+            return NotificationDeliveryError(
+                f"APNs returned HTTP {resp.status_code}",
+                retryable=is_retryable_status(resp.status_code),
+                status_code=resp.status_code,
+            )
+        return None
