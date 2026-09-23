@@ -20,6 +20,7 @@ from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.slash_commands import build_slash_command_catalog, compose_slash_command_text
 from skuld.transports.claude_env import claude_spawn_env
 from skuld.transports.mcp_config import build_claude_mcp_config
+from skuld.transports.session_tools import SessionTools, claude_cli_args
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
@@ -59,9 +60,11 @@ class SubprocessTransport(CLITransport):
         system_prompt: str = "",
         initial_prompt: str = "",
         mcp_servers: list[dict] | None = None,
+        session_tools: SessionTools | None = None,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
+        self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
         self._agent_teams = agent_teams
@@ -156,10 +159,15 @@ class SubprocessTransport(CLITransport):
             cmd.extend(["--permission-mode", _DEFAULT_PERMISSION_MODE])
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
-        elif self._system_prompt:
-            cmd.extend(["--append-system-prompt", self._system_prompt])
-        if self._mcp_config:
-            cmd.extend(["--mcp-config", self._mcp_config])
+        cmd.extend(
+            claude_cli_args(
+                self._session_tools,
+                mcp_servers=self._raw_mcp_servers,
+                legacy_mcp_config=self._mcp_config,
+                system_prompt=self._system_prompt,
+                include_system_prompt=not self._session_id,
+            )
+        )
 
         logger.info("Running Claude CLI (session=%s)", self._session_id)
         logger.debug("Claude CLI command: %s", " ".join(cmd))
@@ -170,6 +178,7 @@ class SubprocessTransport(CLITransport):
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._raw_mcp_servers,
+            session_env=self._session_tools.env if self._session_tools else None,
         )
         if shim_env:
             env.update(shim_env)

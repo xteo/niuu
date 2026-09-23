@@ -45,7 +45,9 @@ class TransportLifecycleMixin:
             "initial_prompt": (
                 "" if self._has_workflow_trigger() else self._settings.session.initial_prompt
             ),
-            "mcp_servers": self._settings.mcp_servers,
+            # Configured servers plus the built-in forge MCP (merged by name).
+            "mcp_servers": self._effective_mcp_servers(),
+            "session_tools": self._session_tools(),
             "resume_session_id": self._settings.session.resume_session_id,
             "ask_user_question_enabled": self._settings.ask_user_question_enabled,
             "acp_prompt_timeout_s": self._settings.acp_prompt_timeout_s,
@@ -376,6 +378,9 @@ class TransportLifecycleMixin:
         # Stop transport
         if self._transport:
             await self._transport.stop()
+
+        # The loopback secret dies with this broker start.
+        self._revoke_session_runtime()
 
         await self._finish_trace_span(
             self._trace_session_span_id,

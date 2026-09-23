@@ -35,6 +35,7 @@ import subprocess
 from contextlib import suppress
 
 from niuu.ports.cli import CLITransport, TransportCapabilities
+from skuld.transports.session_env import session_process_env
 
 logger = logging.getLogger("skuld.transport")
 
@@ -140,7 +141,7 @@ class RemoteControlTransport(CLITransport):
         # API-key auth vars so RC uses the host's OAuth credentials (~/.claude).
         env = {
             k: v
-            for k, v in os.environ.items()
+            for k, v in session_process_env().items()
             if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
         }
         self._process = await asyncio.create_subprocess_exec(

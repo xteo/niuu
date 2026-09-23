@@ -40,7 +40,8 @@ from niuu.adapters.cli.runtime import filter_cli_event as _filter_event
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.slash_commands import build_slash_command_catalog, compose_slash_command_text
 from skuld.transports.claude_env import claude_spawn_env
-from skuld.transports.mcp_config import build_sdk_mcp_servers
+from skuld.transports.mcp_config import build_claude_mcp_payload, build_sdk_mcp_servers
+from skuld.transports.session_tools import SessionTools, compose_prompt
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
@@ -294,9 +295,11 @@ class SDKTransport(CLITransport):
         turn_timeout_s: float = _DEFAULT_TURN_TIMEOUT_S,
         resume_session_id: str | None = None,
         ask_user_question_enabled: bool = False,
+        session_tools: SessionTools | None = None,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
+        self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
         self._agent_teams = agent_teams
@@ -652,22 +655,34 @@ class SDKTransport(CLITransport):
             await client.interrupt()
             return
 
+    def _sdk_mcp_servers_option(self) -> dict[str, Any] | str:
+        """A 0600 ``--mcp-config`` file path with SessionTools; the SDK dict otherwise."""
+        if self._session_tools is None:
+            return self._mcp_servers
+        path = self._session_tools.write_claude_mcp_config(
+            build_claude_mcp_payload(self._raw_mcp_servers)
+        )
+        return str(path) if path else {}
+
     async def _connect_client(self) -> None:
         env = claude_spawn_env()  # subscription auth by default (SKULD__CLAUDE_AUTH)
         if self._agent_teams:
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        tools = self._session_tools
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._raw_mcp_servers,
+            session_env=tools.env if tools else None,
         )
         if shim_env:
             env.update(shim_env)
 
+        system_prompt = compose_prompt(tools.instructions if tools else "", self._system_prompt)
         option_kwargs = {
             "model": self._model or None,
-            "system_prompt": self._system_prompt or None,
+            "system_prompt": system_prompt or None,
             "cwd": self.workspace_dir,
-            "mcp_servers": self._mcp_servers,
+            "mcp_servers": self._sdk_mcp_servers_option(),
             "include_partial_messages": True,
             "thinking": {"type": "adaptive", "display": "summarized"},
             # Push new sessions to the highest sensible reasoning effort by model
@@ -678,6 +693,10 @@ class SDKTransport(CLITransport):
             "continue_conversation": False,
             "env": env,
         }
+        if tools and tools.claude_plugin_dirs:
+            option_kwargs["plugins"] = [
+                {"type": "local", "path": str(path)} for path in tools.claude_plugin_dirs
+            ]
         if self._ask_user_question_enabled:
             # Route tool permissions through our handler so AskUserQuestion can
             # be answered by a human (blocks until a client responds); all other

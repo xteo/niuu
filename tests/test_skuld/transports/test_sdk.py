@@ -214,7 +214,10 @@ async def test_start_injects_tracker_shim_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("skuld.transports.sdk.ClaudeSDKClient", factory)
     monkeypatch.setattr(
         "skuld.transports.sdk.ensure_codex_tool_shims",
-        lambda workspace_dir, mcp_servers=None: (tmp_path / ".skuld-tools" / "bin", shim_env),
+        lambda workspace_dir, mcp_servers=None, session_env=None: (
+            tmp_path / ".skuld-tools" / "bin",
+            shim_env,
+        ),
     )
 
     transport = SDKTransport(workspace_dir=str(tmp_path))

@@ -1,0 +1,392 @@
+"""Forge MCP toolbox: tool list, grants, validation, bounds and Forge error mapping."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+import pytest
+
+from niuu.domain.notifications import NotificationDraft
+from niuu.forge_mcp import (
+    TOOL_NAMES,
+    ForgeApiError,
+    ForgeClient,
+    ForgeMcpGrant,
+    ForgeMcpHost,
+    ForgeMcpLimits,
+    ForgeMcpToolbox,
+    ToolResult,
+    UnknownToolError,
+)
+
+SELF = str(uuid.uuid4())
+PEER = str(uuid.uuid4())
+LIMITS = ForgeMcpLimits(
+    list_default_limit=2,
+    list_max_limit=3,
+    transcript_default_turns=2,
+    transcript_max_turns=4,
+    transcript_turn_max_chars=10,
+    output_max_chars=4000,
+)
+
+
+def _session(session_id: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "id": session_id,
+        "instance_id": "node-a",
+        "name": "peer",
+        "status": "running",
+        "model": "claude-opus-5",
+        "chat_endpoint": "wss://secret-endpoint?access_token=leak",
+        "source": {"type": "git", "repo": "github.com/acme/app", "branch": "main"},
+        "coordination": {"project_id": "proj-1", "role": "builder"},
+        **extra,
+    }
+
+
+class FakeClient(ForgeClient):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.fail: ForgeApiError | None = None
+
+    def _record(self, name: str, payload: Any) -> None:
+        self.calls.append((name, payload))
+        if self.fail is not None:
+            raise self.fail
+
+    async def list_notifications(self, params):
+        self._record("list_notifications", params)
+        items = [
+            {"id": f"n{i}", "seq": i, "kind": "milestone", "title": f"t{i}", "body": "x" * 50}
+            for i in range(5)
+        ]
+        return {"items": items, "next_before": 1, "head_seq": 9, "unread_count": 4}
+
+    async def list_sessions(self, params):
+        self._record("list_sessions", params)
+        return [_session(str(uuid.uuid4())) for _ in range(5)]
+
+    async def get_session(self, session_id, *, instance_id):
+        self._record("get_session", (session_id, instance_id))
+        return _session(session_id)
+
+    async def get_conversation(self, session_id, *, turns, instance_id):
+        self._record("get_conversation", (session_id, turns, instance_id))
+        rows = [
+            {
+                "id": f"t{i}",
+                "role": "assistant",
+                "content": "a long answer " * 5,
+                "parts": [{"type": "tool_use", "name": "Bash"}],
+            }
+            for i in range(6)
+        ]
+        rows.append({"id": "in-progress", "role": "assistant", "in_progress": True})
+        return {"turns": rows, "total_turns": 40}
+
+    async def send_message(self, session_id, *, content, request_id, instance_id):
+        self._record("send_message", (session_id, content, request_id, instance_id))
+        return {"status": "delivered", "delivery": "delivered", "request_id": request_id}
+
+    async def get_message_delivery(self, session_id, *, request_id, instance_id):
+        self._record("get_message_delivery", (session_id, request_id, instance_id))
+        return {"status": "delivered"}
+
+    async def create_session(self, body):
+        self._record("create_session", body)
+        return _session(str(uuid.uuid4()), status="starting")
+
+    async def start_session(self, session_id, *, instance_id):
+        self._record("start_session", (session_id, instance_id))
+        return _session(session_id, status="starting")
+
+    async def stop_session(self, session_id, *, instance_id):
+        self._record("stop_session", (session_id, instance_id))
+        return _session(session_id, status="stopped")
+
+
+class FakeHost(ForgeMcpHost):
+    def __init__(self) -> None:
+        self.drafts: list[NotificationDraft] = []
+
+    @property
+    def session_id(self) -> str | None:
+        return SELF
+
+    async def environment(self) -> dict[str, Any]:
+        return {"session": {"id": SELF}}
+
+    async def notify(self, draft: NotificationDraft) -> dict[str, Any]:
+        self.drafts.append(draft)
+        return {"notification_id": "nid", "turn_id": "nt_x", "session_seq": 7, "state": "pending"}
+
+
+def _toolbox(*grants: ForgeMcpGrant) -> tuple[ForgeMcpToolbox, FakeClient, FakeHost]:
+    client, host = FakeClient(), FakeHost()
+    return ForgeMcpToolbox(client=client, host=host, grants=grants, limits=LIMITS), client, host
+
+
+class TestToolList:
+    def test_every_tool_is_listed_with_a_schema(self) -> None:
+        toolbox, _, _ = _toolbox()
+        tools = toolbox.list_tools()
+        assert [tool["name"] for tool in tools] == list(TOOL_NAMES)
+        assert set(TOOL_NAMES) == {
+            "environment",
+            "notify",
+            "list_notifications",
+            "list_sessions",
+            "get_session",
+            "session_transcript",
+            "send_message",
+            "message_status",
+            "create_session",
+            "start_session",
+            "stop_session",
+        }
+        for tool in tools:
+            assert tool["inputSchema"]["type"] == "object"
+            assert tool["inputSchema"]["additionalProperties"] is False
+
+    def test_granted_tools_say_so_and_notify_teaches_when(self) -> None:
+        toolbox, _, _ = _toolbox()
+        tools = {tool["name"]: tool for tool in toolbox.list_tools()}
+        assert "'message' grant" in tools["send_message"]["description"]
+        assert "'lifecycle' grant" in tools["stop_session"]["description"]
+        notify = tools["notify"]["description"]
+        assert "reply ready" in notify and "progress" in notify
+        kinds = tools["notify"]["inputSchema"]["properties"]["kind"]["enum"]
+        assert "reply_ready" not in kinds and "milestone" in kinds
+
+    def test_schema_properties_match_argument_models(self) -> None:
+        from niuu.forge_mcp.tools import TOOL_SPECS
+
+        for spec in TOOL_SPECS:
+            fields = set(spec.args_model.model_fields)
+            assert set(spec.input_schema["properties"]) == fields, spec.name
+
+
+class TestOwnSession:
+    async def test_environment_adds_grants_and_available_tools(self) -> None:
+        toolbox, _, _ = _toolbox(ForgeMcpGrant.MESSAGE)
+        result = await toolbox.call("environment", {})
+        assert not result.is_error
+        assert result.structured["grants"] == ["message"]
+        assert "send_message" in result.structured["tools"]
+        assert "stop_session" not in result.structured["tools"]
+
+    async def test_notify_passes_a_validated_draft(self) -> None:
+        toolbox, _, host = _toolbox()
+        result = await toolbox.call(
+            "notify",
+            {
+                "kind": "milestone",
+                "severity": "success",
+                "title": "  PR   opened ",
+                "links": [{"label": "PR", "url": "https://git/pr/1", "kind": "pr"}],
+            },
+        )
+        assert not result.is_error
+        assert result.structured["state"] == "pending"
+        assert host.drafts[0].title == "PR opened"
+        assert host.drafts[0].links[0].kind.value == "pr"
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            ({"kind": "reply_ready", "title": "done"}, "reply_ready is automatic"),
+            ({"kind": "milestone", "title": "   "}, "title"),
+            ({"kind": "milestone"}, "title"),
+            ({"kind": "milestone", "title": "x", "extra": 1}, "extra"),
+            ({"kind": "milestone", "title": "x" * 201}, "title"),
+        ],
+    )
+    async def test_notify_rejects_bad_drafts(self, arguments, message) -> None:
+        toolbox, _, host = _toolbox()
+        result = await toolbox.call("notify", arguments)
+        assert result.is_error
+        assert message in result.text
+        assert host.drafts == []
+
+
+class TestReads:
+    async def test_list_notifications_encodes_filters_and_bounds(self) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call(
+            "list_notifications",
+            {
+                "limit": 99,
+                "kinds": ["milestone", "attention"],
+                "sources": ["agent"],
+                "min_severity": "warning",
+                "unread": True,
+                "before": 5,
+                "after": 1,
+                "session_id": PEER,
+                "project_id": "p",
+            },
+        )
+        params = client.calls[0][1]
+        assert params == {
+            "limit": "3",
+            "before": "5",
+            "after": "1",
+            "kind": "milestone,attention",
+            "min_severity": "warning",
+            "source": "agent",
+            "session_id": PEER,
+            "project_id": "p",
+            "unread": "true",
+        }
+        items = result.structured["items"]
+        assert len(items) == 3
+        assert items[0]["body"].endswith("…") and len(items[0]["body"]) == 10
+        assert result.structured["unread_count"] == 4
+
+    async def test_list_sessions_summarizes_and_drops_endpoints(self) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call("list_sessions", {"status": "running"})
+        assert client.calls[0][1] == {"scope": "guild", "status": "running"}
+        assert result.structured["total"] == 5 and result.structured["returned"] == 2
+        session = result.structured["sessions"][0]
+        assert session["instance_id"] == "node-a"
+        assert session["project_id"] == "proj-1"
+        assert "chat_endpoint" not in session
+        assert "access_token" not in json.dumps(result.structured)
+
+    async def test_get_session_validates_the_id(self) -> None:
+        toolbox, client, _ = _toolbox()
+        bad = await toolbox.call("get_session", {"session_id": "../../admin"})
+        assert bad.is_error and "session UUID" in bad.text
+        ok = await toolbox.call("get_session", {"session_id": PEER, "instance_id": "node-b"})
+        assert ok.structured["session"]["id"] == PEER
+        assert client.calls == [("get_session", (PEER, "node-b"))]
+
+    async def test_transcript_tail_is_bounded(self) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call("session_transcript", {"session_id": PEER, "turns": 50})
+        assert client.calls[0][1] == (PEER, 4, None)
+        turns = result.structured["turns"]
+        assert len(turns) == 3  # the in-progress sentinel is dropped from the 4-turn tail
+        assert all(len(turn["content"]) <= 10 for turn in turns)
+        assert turns[0]["tools"] == ["Bash"]
+
+
+class TestGrants:
+    @pytest.mark.parametrize(
+        ("tool", "arguments", "grant"),
+        [
+            ("send_message", {"session_id": PEER, "content": "hi"}, "message"),
+            ("message_status", {"session_id": PEER, "request_id": "r1"}, "message"),
+            ("create_session", {"name": "x"}, "lifecycle"),
+            ("start_session", {"session_id": PEER}, "lifecycle"),
+            ("stop_session", {"session_id": PEER}, "lifecycle"),
+        ],
+    )
+    async def test_missing_grant_is_an_explained_error(self, tool, arguments, grant) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call(tool, arguments)
+        assert result.is_error
+        assert f"'{grant}' grant" in result.text and "forge_mcp.grants" in result.text
+        assert client.calls == []
+
+    async def test_send_message_generates_a_stable_request_id(self) -> None:
+        toolbox, client, _ = _toolbox(ForgeMcpGrant.MESSAGE)
+        result = await toolbox.call("send_message", {"session_id": PEER, "content": "rebase"})
+        request_id = result.structured["request_id"]
+        assert request_id.startswith("fmcp-")
+        assert client.calls[0][1] == (PEER, "rebase", request_id, None)
+        again = await toolbox.call(
+            "send_message", {"session_id": PEER, "content": "rebase", "request_id": request_id}
+        )
+        assert again.structured["request_id"] == request_id
+
+    async def test_send_message_and_stop_refuse_the_own_session(self) -> None:
+        toolbox, client, _ = _toolbox(ForgeMcpGrant.MESSAGE, ForgeMcpGrant.LIFECYCLE)
+        for tool, arguments in (
+            ("send_message", {"session_id": SELF, "content": "x"}),
+            ("stop_session", {"session_id": SELF}),
+        ):
+            result = await toolbox.call(tool, arguments)
+            assert result.is_error and "own session" in result.text
+        assert client.calls == []
+
+    async def test_message_status(self) -> None:
+        toolbox, client, _ = _toolbox("message")
+        result = await toolbox.call("message_status", {"session_id": PEER, "request_id": "r-1"})
+        assert result.structured["delivery"] == {"status": "delivered"}
+        assert client.calls[0] == ("get_message_delivery", (PEER, "r-1", None))
+
+    async def test_lifecycle_tools(self) -> None:
+        toolbox, client, _ = _toolbox(ForgeMcpGrant.LIFECYCLE)
+        created = await toolbox.call(
+            "create_session",
+            {"name": "helper", "repo": "github.com/acme/app", "branch": "fix", "model": "m"},
+        )
+        assert created.structured["session"]["status"] == "starting"
+        assert client.calls[0][1] == {
+            "name": "helper",
+            "model": "m",
+            "source": {"type": "git", "repo": "github.com/acme/app", "branch": "fix"},
+        }
+        local = await toolbox.call("create_session", {"name": "l", "local_path": "/srv/app"})
+        assert not local.is_error
+        assert client.calls[-1][1]["source"] == {"type": "local_mount", "local_path": "/srv/app"}
+        both = await toolbox.call("create_session", {"name": "b", "repo": "r", "local_path": "/x"})
+        assert both.is_error
+        relative = await toolbox.call("create_session", {"name": "b", "local_path": "x"})
+        assert relative.is_error and "absolute" in relative.text
+        started = await toolbox.call("start_session", {"session_id": PEER})
+        stopped = await toolbox.call("stop_session", {"session_id": PEER})
+        assert started.structured["session"]["status"] == "starting"
+        assert stopped.structured["session"]["status"] == "stopped"
+
+
+class TestErrors:
+    async def test_unknown_tool_is_a_protocol_error(self) -> None:
+        toolbox, _, _ = _toolbox()
+        with pytest.raises(UnknownToolError):
+            await toolbox.call("delete_session", {})
+
+    @pytest.mark.parametrize(
+        ("error", "text"),
+        [
+            (ForgeApiError("connect refused"), "Forge is unreachable"),
+            (ForgeApiError("not yours", status=403), "Forge answered 403: not yours"),
+        ],
+    )
+    async def test_forge_errors_become_tool_errors(self, error, text) -> None:
+        toolbox, client, _ = _toolbox()
+        client.fail = error
+        result = await toolbox.call("list_sessions", {})
+        assert result.is_error and text in result.text
+
+    async def test_invalid_arguments(self) -> None:
+        toolbox, _, _ = _toolbox()
+        result = await toolbox.call("list_sessions", {"scope": "everywhere"})
+        assert result.is_error and "scope" in result.text
+        result = await toolbox.call("list_sessions", None)
+        assert not result.is_error
+
+
+class TestResultEncoding:
+    def test_to_mcp(self) -> None:
+        ok = ToolResult.of({"a": 1}, max_chars=100).to_mcp()
+        assert ok["isError"] is False and ok["structuredContent"] == {"a": 1}
+        assert json.loads(ok["content"][0]["text"]) == {"a": 1}
+        err = ToolResult.error("nope").to_mcp()
+        assert err == {"content": [{"type": "text", "text": "nope"}], "isError": True}
+
+    def test_text_is_bounded(self) -> None:
+        result = ToolResult.of({"blob": "x" * 500}, max_chars=100)
+        assert len(result.text) < 200 and "truncated" in result.text
+        assert result.structured == {"blob": "x" * 500}
+
+    def test_limits_clamp(self) -> None:
+        assert LIMITS.clamp_list(None) == 2
+        assert LIMITS.clamp_list(0) == 1
+        assert LIMITS.clamp_turns(None) == 2
+        assert LIMITS.clamp_turns(9) == 4

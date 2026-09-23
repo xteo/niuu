@@ -34,7 +34,6 @@ state. Revisit when upstream adds protocol-level cancel/resume.
 import asyncio
 import json
 import logging
-import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -49,6 +48,7 @@ from niuu.adapters.cli.runtime import (
     stop_subprocess as _stop_process,
 )
 from niuu.ports.cli import CLITransport, TransportCapabilities
+from skuld.transports.session_env import session_process_env
 
 logger = logging.getLogger("skuld.transport")
 
@@ -196,7 +196,7 @@ class DshJsonRpcTransport(CLITransport):
         session_root = workspace / ".dsh-sessions"
         session_root.mkdir(parents=True, exist_ok=True)
 
-        env = dict(os.environ)
+        env = session_process_env()
         env["DSH_CORDIS_CONFIG"] = cordis_config
         env["DSH_CWD"] = str(workspace)
         env["DSH_SESSION_ROOT"] = str(session_root)

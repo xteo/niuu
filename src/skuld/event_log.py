@@ -327,7 +327,7 @@ class EventLogMixin:
                 return inner
         return None
 
-    def _enqueue_event_log(self, data: dict, *, ts: datetime | None = None) -> None:
+    def _enqueue_event_log(self, data: dict, *, ts: datetime | None = None) -> dict | None:
         """Buffer a raw CLI frame for durable persistence. Never raises.
 
         Runs for every frame regardless of attached channels — this is what
@@ -335,9 +335,12 @@ class EventLogMixin:
 
         ``ts`` lets the CLI-event handler share one observation instant with
         live transcript reduction. Other callers retain the prior behavior.
+
+        Returns the buffered entry (``None`` when the durable log is off) so a
+        caller can watch it with :meth:`_watch_event_log_entry`.
         """
         if not self._settings.event_log_enabled or not self.volundr_api_url:
-            return
+            return None
         self._event_log_seq += 1
         observed_at = (ts or datetime.now(UTC)).isoformat()
         caps = getattr(self._transport, "capabilities", None)
@@ -365,8 +368,9 @@ class EventLogMixin:
         # and is logged loudly so the loss is visible.
         overflow = len(self._event_log_buffer) - self._settings.event_log_max_buffer
         if overflow <= 0:
-            return
+            return entry
         dropped = self._event_log_buffer[:overflow]
+        self._settle_event_log_receipts(dropped, stored=False)
         # True hole size: a prior overflow's sentinel may itself be among the frames
         # dropped this round. Counting it as a single frame would UNDER-report under
         # sustained overflow (the hole it stood for vanishes). Fold its accumulated
@@ -410,6 +414,55 @@ class EventLogMixin:
                 "ts": datetime.now(UTC).isoformat(),
             },
         )
+        return entry
+
+    # -- flush receipts: let a caller learn whether ONE entry reached Forge.
+
+    def _watch_event_log_entry(self, entry: dict) -> asyncio.Future[bool]:
+        """Future resolving True once Forge stores ``entry``, False if it is dropped.
+
+        Must be called in the same synchronous step as the enqueue that produced
+        ``entry`` (no await in between), so the entry cannot have been flushed yet.
+        """
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        if not any(buffered is entry for buffered in self._event_log_buffer):
+            future.set_result(False)  # already dropped by an overflow in the same step
+            return future
+        self._event_log_receipts[id(entry)] = (entry, future)
+        return future
+
+    def _settle_event_log_receipts(
+        self, entries: list[dict], *, stored: bool, conflicts: frozenset[int] = frozenset()
+    ) -> None:
+        if not self._event_log_receipts:
+            return
+        for entry in entries:
+            receipt = self._event_log_receipts.pop(id(entry), None)
+            if receipt is None:
+                continue
+            future = receipt[1]
+            if not future.done():
+                future.set_result(stored and entry["seq"] not in conflicts)
+
+    @staticmethod
+    def _append_conflicts(response: httpx.Response) -> frozenset[int]:
+        """Seqs Forge reported as conflicting (stored frame differs from ours)."""
+        try:
+            body = response.json()
+        except ValueError:
+            return frozenset()
+        if not isinstance(body, dict) or not isinstance(body.get("conflicts"), list):
+            return frozenset()
+        return frozenset(seq for seq in body["conflicts"] if isinstance(seq, int))
+
+    async def _await_event_log_receipt(
+        self, future: asyncio.Future[bool], timeout_s: float
+    ) -> bool | None:
+        """True stored, False lost, None still pending after ``timeout_s``."""
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
+        except TimeoutError:
+            return None
 
     async def _emit_broker_frame(self, frame: dict) -> None:
         """Single choke point for BROKER-ORIGINATED frames (FR-1 / INV-1).
@@ -576,6 +629,10 @@ class EventLogMixin:
             # Its prefix may now contain NEW frames, so deleting len(batch) loses
             # unsent output. Acknowledge the sent prefix by seq, trimming any gap
             # created in flight so it cannot collide with a now-persisted row.
+            if self._event_log_receipts:
+                self._settle_event_log_receipts(
+                    batch, stored=True, conflicts=self._append_conflicts(response)
+                )
             acknowledged = max(
                 entry["payload"]["last_seq"] if entry["kind"] == "log_gap" else entry["seq"]
                 for entry in batch

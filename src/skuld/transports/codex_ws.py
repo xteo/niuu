@@ -48,6 +48,8 @@ from skuld.tool_images import image_payloads
 from skuld.transports.codex import _map_codex_tool, resolve_codex_cli
 from skuld.transports.mcp_config import build_codex_mcp_overrides
 from skuld.transports.owned_codex_process import OwnedCodexProcess, OwnedProcessError
+from skuld.transports.session_env import session_process_env
+from skuld.transports.session_tools import SessionTools
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
@@ -285,10 +287,12 @@ class CodexWebSocketTransport(CLITransport):
         max_ws_message_bytes: int | None = None,
         codex_auth_provider: CodexAuthProviderPort | None = None,
         session_id: str = "",
+        session_tools: SessionTools | None = None,
         **_kwargs: object,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
+        self._session_tools = session_tools
         self._model = model
         # Default reasoning effort by model when none is specified — GPT-6 Astra
         # and GPT-5.6 Sol launch at the `ultra` tier, every other Codex model at
@@ -319,7 +323,7 @@ class CodexWebSocketTransport(CLITransport):
         self._mcp_servers = list(mcp_servers or [])
         self._mcp_overrides = build_codex_mcp_overrides(self._mcp_servers)
         self._resume_session_id = (resume_session_id or "").strip() or None
-        self._env = dict(os.environ)
+        self._env = session_process_env()
         self._codex_auth_provider = codex_auth_provider or HostCodexAuthProvider()
         self._process_owner = (
             OwnedCodexProcess(
@@ -536,6 +540,7 @@ class CodexWebSocketTransport(CLITransport):
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._mcp_servers,
+            session_env=self._session_tools.env if self._session_tools else None,
         )
         if shim_env:
             self._env.update(shim_env)
@@ -655,6 +660,7 @@ class CodexWebSocketTransport(CLITransport):
 
         await self._send_notification("initialized")
         await self._authenticate_codex()
+        await self._register_session_skills()
 
         if self._resume_session_id:
             # Imported/external session — reattach to the existing thread
@@ -705,6 +711,11 @@ class CodexWebSocketTransport(CLITransport):
                 # Skuld provides a single system_prompt that combines both,
                 # so we set it as baseInstructions (persistent identity).
                 thread_params["baseInstructions"] = self._system_prompt
+            if self._session_tools is not None and self._session_tools.instructions:
+                # Session capabilities (present-file, Forge notify) are ADDITIVE:
+                # baseInstructions replaces Codex's built-in model prompt, so
+                # capability text rides as developer instructions instead.
+                thread_params["developerInstructions"] = self._session_tools.instructions
 
             result = await self._send_rpc("thread/start", thread_params)
             self._thread_id = self._thread_response_id(result)
@@ -732,6 +743,14 @@ class CodexWebSocketTransport(CLITransport):
         if expected is not None and thread_id != expected:
             raise RuntimeError("Codex resumed a different conversation than requested")
         return thread_id
+
+    async def _register_session_skills(self) -> None:
+        """Expose the broker's per-session skill roots (never ~/.codex) to this app-server."""
+        roots = self._session_tools.codex_skill_roots if self._session_tools else ()
+        if not roots:
+            return
+        await self._send_rpc("skills/extraRoots/set", {"extraRoots": [str(root) for root in roots]})
+        logger.info("Codex session skill roots registered: %s", [str(root) for root in roots])
 
     async def _authenticate_codex(self) -> None:
         """Select host-managed or externally managed auth through the configured port."""
