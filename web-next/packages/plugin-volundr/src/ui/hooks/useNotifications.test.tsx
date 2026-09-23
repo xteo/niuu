@@ -7,6 +7,7 @@ import {
   DEFAULT_NOTIFICATION_FILTER,
   NotificationReadStateConflictError,
   emptyRuleDraft,
+  serverFilterOf,
   type NotificationFilter,
   type SessionNotification,
 } from '../../domain/notifications';
@@ -30,6 +31,7 @@ import {
   useNotificationSinks,
   useSaveNotificationRule,
   useUnreadNotificationCount,
+  withNextAfter,
 } from './useNotifications';
 
 let seq = 0;
@@ -156,7 +158,11 @@ describe('useNotifications', () => {
     act(() => feed.setStatus('open'));
 
     await waitFor(() => expect(result.current.notifications[0]?.id).toBe(missed.id));
-    expect(listSince).toHaveBeenLastCalledWith(expect.anything(), { thor: missed.seq - 1 });
+    // It resumes from the server's opaque next_after, with watermarks as the fallback.
+    expect(listSince).toHaveBeenLastCalledWith(expect.anything(), {
+      cursor: expect.stringMatching(/^mock-after:/),
+      watermarks: { thor: missed.seq - 1 },
+    });
     expect(result.current.live).toBe(true);
     // The read state is re-read after a reconnect, so the badge catches up too.
     await waitFor(() => expect(result.current.unreadCount).toBe(3));
@@ -164,7 +170,7 @@ describe('useNotifications', () => {
 
   it('reloads from the top when a gap is larger than it will page through', async () => {
     const base = createMockNotificationFeed({ seed: seeded(1) });
-    const listSince = vi.fn(async () => ({ items: [row()], hasMore: true }));
+    const listSince = vi.fn(async () => ({ items: [row()], hasMore: true, nextAfter: null }));
     const feed = { ...base, listSince };
     const list = vi.spyOn(feed, 'list');
     const { wrapper } = setup(feed);
@@ -185,6 +191,55 @@ describe('useNotifications', () => {
     expect((result.current.error as Error).message).toBe('Forge down');
     act(() => result.current.refetch());
     await waitFor(() => expect(failing.list).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe('gap-fill cursors', () => {
+  it('passes the latest next_after back and keeps it when a gap page has none', async () => {
+    const base = createMockNotificationFeed({ seed: seeded(1) });
+    const first = row();
+    const calls: unknown[] = [];
+    const feed: INotificationFeed = {
+      ...base,
+      list: async (filter, cursor) => ({ ...(await base.list(filter, cursor)), nextAfter: 'A1' }),
+      listSince: async (_filter, after) => {
+        calls.push(after);
+        return calls.length === 1
+          ? { items: [first], hasMore: false, nextAfter: 'A2' }
+          : { items: [], hasMore: false, nextAfter: null };
+      },
+    };
+    const { wrapper, client } = setup(feed);
+    const { result } = renderHook(() => useNotifications(ALL), { wrapper });
+    await waitFor(() => expect(result.current.notifications).toHaveLength(1));
+    act(() => base.setStatus('open'));
+    await waitFor(() => expect(result.current.notifications[0]?.id).toBe(first.id));
+    act(() => base.setStatus('open'));
+    await waitFor(() => expect(calls).toHaveLength(2));
+    expect(calls.map((after) => (after as { cursor: string | null }).cursor)).toEqual(['A1', 'A2']);
+    const cached = client.getQueryData<{ pages: Array<{ nextAfter: string | null }> }>(
+      notificationKeys.feed(serverFilterOf(ALL)),
+    );
+    expect(cached?.pages[0]?.nextAfter).toBe('A2');
+  });
+
+  it('keeps an unchanged cursor and an unloaded cache as they are', () => {
+    expect(withNextAfter(undefined, 'A')).toBeUndefined();
+    const data = {
+      pages: [
+        {
+          items: [],
+          nextBefore: null,
+          nextAfter: 'A',
+          unreadCount: null,
+          unavailableInstances: [],
+        },
+      ],
+      pageParams: [null],
+    };
+    expect(withNextAfter(data, 'A')).toBe(data);
+    expect(withNextAfter(data, null)).toBe(data);
+    expect(withNextAfter(data, 'B')?.pages[0]?.nextAfter).toBe('B');
   });
 });
 

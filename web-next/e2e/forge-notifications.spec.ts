@@ -53,6 +53,23 @@ function decodeCursor(cursor: string): unknown {
   return JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
 }
 
+function encodeCursor(marks: Record<string, number>): string {
+  return Buffer.from(JSON.stringify(marks), 'utf8').toString('base64url');
+}
+
+const HOST_NAMES: Record<string, string> = { thor: 'Thor', 'horde-1': 'Horde 1' };
+
+/** What the Guild facade adds to every fanned-out row. */
+function tagged(r: Row) {
+  return { ...r, instance_name: HOST_NAMES[r.instance_id], instance_slug: r.instance_id };
+}
+
+function maxSeqs(rows: Row[], base: Record<string, number> = {}): Record<string, number> {
+  const marks = { ...base };
+  for (const r of rows) marks[r.instance_id] = Math.max(marks[r.instance_id] ?? 0, r.seq);
+  return marks;
+}
+
 interface FixtureOptions {
   /** Hold the first page until released. */
   holdList?: boolean;
@@ -186,6 +203,14 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
             enabled: true,
             baseUrl: origin,
           },
+          {
+            id: 'horde-2',
+            slug: 'horde-2',
+            name: 'Horde 2',
+            kind: 'volundr',
+            enabled: true,
+            baseUrl: origin,
+          },
         ],
       });
     if (path === `${FORGE}/sessions/stream`) {
@@ -229,18 +254,41 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
       if (after) {
         state.gapCursors.push(after);
         const marks = decodeCursor(after) as Record<string, number>;
+        // Facade rules: only the nodes the cursor names are read (seq 0 reads a
+        // node from the start), ascending, each node capped at `limit`.
         const newer = rows
           .filter((r) => marks[r.instance_id] !== undefined && r.seq > marks[r.instance_id]!)
           .sort((a, b) => a.seq - b.seq);
-        return route.fulfill({ json: { items: newer, next_before: null } });
+        return route.fulfill({
+          json: {
+            items: newer.map(tagged),
+            next_before: null,
+            next_after: encodeCursor(maxSeqs(newer, marks)),
+          },
+        });
       }
       state.listCalls += 1;
       if (options.holdList) await listGate;
       if (state.failList)
         return route.fulfill({ status: 500, json: { detail: 'notification store unavailable' } });
       const items = [...rows].sort((a, b) => b.created_at.localeCompare(a.created_at));
+      const summary = unread();
       return route.fulfill({
-        json: { items, next_before: null, unread_count: unread().unread_count },
+        headers: {
+          'X-Forge-Unavailable-Instances': 'horde-2',
+          // The fake API is cross-origin here; a same-origin Guild needs no CORS.
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Expose-Headers': 'X-Forge-Unavailable-Instances',
+        },
+        json: {
+          items: items.map(tagged),
+          next_before: null,
+          next_after: encodeCursor(maxSeqs(rows)),
+          head_seq: null,
+          read_through_seq: null,
+          unread_count: summary.unread_count,
+          instances: summary.instances,
+        },
       });
     }
     return route.fulfill({ json: path.endsWith('/stats') ? {} : [] });
@@ -276,6 +324,11 @@ test('notifications feed: live rows, reconnect gap-fill, filters, delivery and m
   await expect(feedRows(page).first()).toContainText('forge-api needs your input');
   await expect(page.getByTestId('tab-count-notifications')).toHaveText('3');
   await expect(page.getByTestId('notifications-unread')).toHaveText('3 unread');
+  // The fan-out could not reach one host; the page says so quietly.
+  await expect(page.getByTestId('notifications-unavailable')).toContainText(
+    'Some hosts are unavailable (Horde 2)',
+  );
+  await expect(feedRows(page).nth(1)).toContainText('Horde 1');
 
   // A live session_notification lands on top and counts as unread.
   await expect.poll(fake.waitingStreams).toBeGreaterThan(0);

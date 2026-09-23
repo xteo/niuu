@@ -70,7 +70,16 @@ describe('NotificationsPage', () => {
     expect(within(first).getByText('forge-api needs your input')).toBeInTheDocument();
     expect(within(first).getByText('forge-api')).toBeInTheDocument();
     // Several hosts: rows name theirs.
-    expect(within(rows()[1]!).getByText('horde-1')).toBeInTheDocument();
+    expect(within(rows()[1]!).getByText('Horde 1')).toBeInTheDocument();
+    expect(screen.queryByTestId('notifications-unavailable')).toBeNull();
+  });
+
+  it('notes hosts the fan-out could not reach', async () => {
+    renderPage(createMockNotificationFeed({ unavailableInstances: ['horde-1', 'horde-9'] }));
+    await loaded();
+    expect(screen.getByTestId('notifications-unavailable')).toHaveTextContent(
+      'Some hosts are unavailable (Horde 1, horde-9)',
+    );
   });
 
   it('shows an empty state when nothing has been reported', async () => {

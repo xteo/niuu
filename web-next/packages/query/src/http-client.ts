@@ -21,9 +21,16 @@ export class ApiClientError extends Error {
   }
 }
 
+export interface ApiResponse<T> {
+  data: T;
+  headers: Headers;
+}
+
 export interface ApiClient {
   basePath?: string;
   get<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<T>;
+  /** GET that also exposes response headers (e.g. partial-availability hints). */
+  getWithHeaders?<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<ApiResponse<T>>;
   post<T>(endpoint: string, body?: unknown): Promise<T>;
   put<T>(endpoint: string, body: unknown): Promise<T>;
   patch<T>(endpoint: string, body: unknown): Promise<T>;
@@ -220,6 +227,13 @@ export function getWebSocketAuth(url: string): { url: string; protocols?: string
  */
 export function createApiClient(basePath: string): ApiClient {
   async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    return (await requestWithResponse<T>(endpoint, options)).data;
+  }
+
+  async function requestWithResponse<T>(
+    endpoint: string,
+    options: RequestInit = {},
+  ): Promise<ApiResponse<T>> {
     const url = `${basePath}${endpoint}`;
 
     const headers = getAuthHeaders({
@@ -231,7 +245,7 @@ export function createApiClient(basePath: string): ApiClient {
     const response = await fetch(url, config);
 
     if (response.status === 204) {
-      return undefined as T;
+      return { data: undefined as T, headers: response.headers };
     }
 
     const data = await response.json();
@@ -245,13 +259,19 @@ export function createApiClient(basePath: string): ApiClient {
       );
     }
 
-    return data as T;
+    return { data: data as T, headers: response.headers };
   }
 
   return {
     basePath,
     get<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<T> {
       return request<T>(endpoint, { ...options, method: 'GET' });
+    },
+    getWithHeaders<T>(
+      endpoint: string,
+      options?: { signal?: AbortSignal },
+    ): Promise<ApiResponse<T>> {
+      return requestWithResponse<T>(endpoint, { ...options, method: 'GET' });
     },
     post<T>(endpoint: string, body?: unknown): Promise<T> {
       if (body instanceof FormData) {

@@ -14,15 +14,35 @@ export interface NotificationFeedPage {
   items: SessionNotification[];
   /** Opaque cursor for the next (older) page; `null` at the end of the feed. */
   nextBefore: string | null;
+  /**
+   * Opaque "seen through" cursor (max seq per node) to pass back as `after`
+   * when gap-filling; `null` when the server does not provide one.
+   */
+  nextAfter: string | null;
   /** Unread count reported with the page, when the server includes it. */
   unreadCount: number | null;
+  /** Nodes the fan-out could not reach for this page. */
+  unavailableInstances: string[];
+}
+
+/**
+ * Where gap-fill resumes: the server's opaque `next_after` when known, else
+ * per-instance watermarks the client has seen. The facade only reads the nodes
+ * a cursor names (seq 0 reads a node from the start), so watermarks must list
+ * every node the client knows about.
+ */
+export interface NotificationGapCursor {
+  cursor: string | null;
+  watermarks: InstanceSeqMap;
 }
 
 export interface NotificationGapPage {
-  /** Oldest first — rows committed after the given watermarks. */
+  /** Oldest first — rows committed after the cursor. */
   items: SessionNotification[];
-  /** True when the page was full and more rows may follow. */
+  /** True when a node's page was full, so more rows may follow. */
   hasMore: boolean;
+  /** The cursor to resume from next time, when the server provides one. */
+  nextAfter: string | null;
 }
 
 export type NotificationStreamStatus = 'open' | 'error';
@@ -51,10 +71,10 @@ export interface INotificationFeed {
     filter: NotificationServerFilter,
     cursor?: { before?: string | null; limit?: number },
   ): Promise<NotificationFeedPage>;
-  /** Gap-fill: rows after per-instance watermarks, ascending. */
+  /** Gap-fill: rows after a cursor, ascending. */
   listSince(
     filter: NotificationServerFilter,
-    after: InstanceSeqMap,
+    after: NotificationGapCursor,
     options?: { limit?: number },
   ): Promise<NotificationGapPage>;
   /** One session's notifications after a seq, ascending. */

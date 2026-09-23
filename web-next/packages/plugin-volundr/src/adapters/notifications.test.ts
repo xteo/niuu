@@ -47,6 +47,8 @@ const wireRow: NotificationWire = {
   created_at: '2026-09-23T10:00:00Z',
   read: true,
   instance_id: 'thor',
+  instance_name: 'Thor',
+  instance_slug: 'thor',
 };
 
 function decodeCursor(cursor: string): unknown {
@@ -80,6 +82,7 @@ describe('notification wire format', () => {
     expect(normalizeNotification(wireRow)).toEqual({
       id: 'n-1',
       instanceId: 'thor',
+      instanceName: 'Thor',
       seq: 12,
       sessionId: 'sess-1',
       sessionSeq: 34,
@@ -292,6 +295,11 @@ describe('notification wire format', () => {
       label: 'webhook',
       requiresIntegration: false,
     });
+    expect(normalizeSink({ name: 'integration', requires_integration: true })).toEqual({
+      name: 'integration',
+      label: 'Messaging integration',
+      requiresIntegration: true,
+    });
     expect(
       normalizeDelivery({
         id: 'd1',
@@ -325,42 +333,92 @@ describe('notification wire format', () => {
 describe('buildNotificationFeedHttpAdapter', () => {
   it('lists a page from the facade', async () => {
     const { client, calls } = fakeClient({
-      'GET /notifications?': { items: [wireRow], next_before: 'NEXT', unread_count: 4 },
+      'GET /notifications?': {
+        items: [wireRow],
+        next_before: 'NEXT',
+        next_after: 'AFTER',
+        head_seq: null,
+        read_through_seq: null,
+        unread_count: 4,
+        instances: { thor: { head_seq: 12, read_through_seq: 3, unread_count: 4 } },
+      },
     });
     const page = await buildNotificationFeedHttpAdapter(client).list(ANY, { before: 'PREV' });
     expect(calls[0]!.path).toBe('/notifications?all_instances=true&limit=50&before=PREV');
-    expect(page).toMatchObject({ nextBefore: 'NEXT', unreadCount: 4 });
-    expect(page.items[0]!.instanceId).toBe('thor');
+    expect(page).toMatchObject({
+      nextBefore: 'NEXT',
+      nextAfter: 'AFTER',
+      unreadCount: 4,
+      unavailableInstances: [],
+    });
+    expect(page.items[0]).toMatchObject({ instanceId: 'thor', instanceName: 'Thor' });
 
     const { client: plain } = fakeClient({ 'GET /notifications?': { items: [], next_before: 7 } });
     expect(await buildNotificationFeedHttpAdapter(plain).list(ANY)).toEqual({
       items: [],
       nextBefore: '7',
+      nextAfter: null,
       unreadCount: null,
+      unavailableInstances: [],
     });
     const { client: bare } = fakeClient({ 'GET /notifications?': {} });
-    expect(await buildNotificationFeedHttpAdapter(bare).list(ANY, { limit: 5 })).toEqual({
-      items: [],
-      nextBefore: null,
-      unreadCount: null,
-    });
+    expect((await buildNotificationFeedHttpAdapter(bare).list(ANY, { limit: 5 })).items).toEqual(
+      [],
+    );
   });
 
-  it('gap-fills after per-instance watermarks and reports full pages', async () => {
-    const { client, calls } = fakeClient({ 'GET /notifications?': { items: [wireRow] } });
+  it('reports nodes the fan-out could not reach from the response header', async () => {
+    const { client } = fakeClient();
+    const getWithHeaders = vi.fn(async () => ({
+      data: { items: [{ ...wireRow, instance_name: null }], next_before: null },
+      headers: new Headers({ 'X-Forge-Unavailable-Instances': 'horde-1, horde-2,' }),
+    }));
+    const page = await buildNotificationFeedHttpAdapter({ ...client, getWithHeaders }).list(ANY);
+    expect(getWithHeaders).toHaveBeenCalledWith('/notifications?all_instances=true&limit=50');
+    expect(page.unavailableInstances).toEqual(['horde-1', 'horde-2']);
+    // The slug stands in when the facade has no display name.
+    expect(page.items[0]!.instanceName).toBe('thor');
+    getWithHeaders.mockResolvedValueOnce({ data: { items: [] } as never, headers: new Headers() });
+    expect(
+      (await buildNotificationFeedHttpAdapter({ ...client, getWithHeaders }).list(ANY))
+        .unavailableInstances,
+    ).toEqual([]);
+  });
+
+  it('gap-fills from the server cursor, or else from per-instance watermarks', async () => {
+    const { client, calls } = fakeClient({
+      'GET /notifications?': { items: [wireRow], next_after: 'NEXT-AFTER' },
+    });
     const adapter = buildNotificationFeedHttpAdapter(client);
-    const gap = await adapter.listSince(ANY, { thor: 11 }, { limit: 1 });
-    const url = new URL(calls[0]!.path, 'http://x');
+    const fromCursor = await adapter.listSince(ANY, { cursor: 'SERVER', watermarks: { thor: 1 } });
+    expect(new URL(calls[0]!.path, 'http://x').searchParams.get('after')).toBe('SERVER');
+    expect(fromCursor).toEqual({
+      items: [normalizeNotification(wireRow)],
+      hasMore: false,
+      nextAfter: 'NEXT-AFTER',
+    });
+    const gap = await adapter.listSince(
+      ANY,
+      { cursor: null, watermarks: { thor: 11 } },
+      { limit: 1 },
+    );
+    const url = new URL(calls[1]!.path, 'http://x');
     expect(decodeCursor(url.searchParams.get('after')!)).toEqual({ thor: 11 });
     expect(url.searchParams.get('limit')).toBe('1');
-    expect(gap).toEqual({ items: [normalizeNotification(wireRow)], hasMore: true });
-    expect(await adapter.listSince(ANY, {})).toEqual({ items: [], hasMore: false });
-    expect(calls).toHaveLength(1);
-    const { client: empty } = fakeClient({ 'GET /notifications?': {} });
-    expect(await buildNotificationFeedHttpAdapter(empty).listSince(ANY, { thor: 1 })).toEqual({
+    expect(gap.hasMore).toBe(true);
+    expect(await adapter.listSince(ANY, { cursor: null, watermarks: {} })).toEqual({
       items: [],
       hasMore: false,
+      nextAfter: null,
     });
+    expect(calls).toHaveLength(2);
+    const { client: empty } = fakeClient({ 'GET /notifications?': {} });
+    expect(
+      await buildNotificationFeedHttpAdapter(empty).listSince(ANY, {
+        cursor: null,
+        watermarks: { thor: 1 },
+      }),
+    ).toEqual({ items: [], hasMore: false, nextAfter: null });
   });
 
   it('reads one session ascending on its owning instance', async () => {

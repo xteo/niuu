@@ -36,6 +36,8 @@ export const READ_STATE_PATH = '/notifications/read-state';
 export const RULES_PATH = '/notifications/rules';
 export const SINKS_PATH = '/notifications/sinks';
 export const ALL_INSTANCES = 'all_instances=true';
+/** Comma-separated ids of nodes the facade fan-out could not reach (contract §6). */
+export const UNAVAILABLE_INSTANCES_HEADER = 'X-Forge-Unavailable-Instances';
 /** SSE event name on `/sessions/stream` (contract §5). */
 export const SESSION_NOTIFICATION_EVENT = 'session_notification';
 
@@ -87,14 +89,22 @@ export interface NotificationWire {
   correlation_id?: string | null;
   created_at: string;
   read?: boolean;
+  /** Added by the Guild facade. */
   instance_id?: string | null;
+  instance_name?: string | null;
+  instance_slug?: string | null;
 }
 
 export interface NotificationPageWire {
   items: NotificationWire[];
   /** Opaque at the facade (base64url); a plain seq on a single Forge. */
   next_before?: string | number | null;
+  /** Opaque at the facade: the max seq per node, to pass back as `after`. */
+  next_after?: string | number | null;
+  /** Summed across nodes at the facade. */
   unread_count?: number | null;
+  /** Per node at the facade; `head_seq`/`read_through_seq` are then null at the top. */
+  instances?: Record<string, InstanceReadStateWire>;
 }
 
 export interface InstanceReadStateWire {
@@ -177,6 +187,7 @@ export function normalizeNotification(wire: NotificationWire): SessionNotificati
   return {
     id: String(wire.id),
     instanceId: text(wire.instance_id),
+    instanceName: text(wire.instance_name) ?? text(wire.instance_slug),
     seq: Number(wire.seq) || 0,
     sessionId: text(wire.session_id),
     sessionSeq: typeof wire.session_seq === 'number' ? wire.session_seq : null,
@@ -292,10 +303,13 @@ export function ruleDraftToWire(draft: NotificationRuleDraft): Omit<RuleWire, 'i
   };
 }
 
+/** The facade's sink for delivering through the caller's own messaging integration. */
+export const INTEGRATION_SINK = 'integration';
+
 export function normalizeSink(wire: SinkWire): NotificationSinkOption {
   return {
     name: wire.name,
-    label: wire.label || wire.name,
+    label: wire.label || (wire.name === INTEGRATION_SINK ? 'Messaging integration' : wire.name),
     requiresIntegration: wire.requires_integration === true,
   };
 }
@@ -362,9 +376,17 @@ export function feedQuery(
   return `${NOTIFICATIONS_PATH}?${params.toString()}`;
 }
 
-export function nextBeforeCursor(value: NotificationPageWire['next_before']): string | null {
+/** Normalize an opaque (or single-Forge numeric) page cursor. */
+export function pageCursor(value: string | number | null | undefined): string | null {
   if (value === null || value === undefined || value === '') return null;
   return String(value);
+}
+
+export function unavailableInstances(header: string | null | undefined): string[] {
+  return (header ?? '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
 }
 
 /**

@@ -8,7 +8,10 @@ import {
   NotificationReadStateConflictError,
   compareNewestFirst,
   instanceKey,
+  maxSeqMaps,
+  seqWatermarks,
   type InstanceReadState,
+  type InstanceSeqMap,
   type NotificationDelivery,
   type NotificationReadState,
   type NotificationRule,
@@ -39,6 +42,21 @@ export interface MockNotificationFeedOptions {
   deliveries?: Record<string, NotificationDelivery[]>;
   /** Watermarks already read, per instance. */
   readThrough?: Record<string, number>;
+  /** Nodes to report as unreachable on every page. */
+  unavailableInstances?: string[];
+}
+
+const CURSOR_PREFIX = 'mock-after:';
+
+/** The mock's opaque `next_after`; like the facade's, it is only passed back. */
+function encodeAfter(marks: InstanceSeqMap): string {
+  return CURSOR_PREFIX + JSON.stringify(marks);
+}
+
+function decodeAfter(cursor: string): InstanceSeqMap {
+  return cursor.startsWith(CURSOR_PREFIX)
+    ? (JSON.parse(cursor.slice(CURSOR_PREFIX.length)) as InstanceSeqMap)
+    : {};
 }
 
 const BASE_TIME = Date.parse('2026-09-23T09:00:00Z');
@@ -52,6 +70,7 @@ function seedNotification(
 ): SessionNotification {
   return {
     instanceId: 'thor',
+    instanceName: 'Thor',
     sessionId: 'sess-forge-api',
     sessionSeq: overrides.seq * 10,
     sessionName: 'forge-api',
@@ -87,6 +106,7 @@ export const MOCK_NOTIFICATIONS: SessionNotification[] = [
     id: 'n-horde-4',
     seq: 4,
     instanceId: 'horde-1',
+    instanceName: 'Horde 1',
     sessionId: 'sess-bench',
     sessionName: 'gpu-bench',
     projectId: 'proj-bench',
@@ -129,6 +149,7 @@ export const MOCK_NOTIFICATIONS: SessionNotification[] = [
     id: 'n-horde-3',
     seq: 3,
     instanceId: 'horde-1',
+    instanceName: 'Horde 1',
     sessionId: 'sess-bench',
     sessionName: 'gpu-bench',
     projectId: 'proj-bench',
@@ -261,21 +282,34 @@ export function createMockNotificationFeed(
       return {
         items,
         nextBefore: end < matching.length ? String(end) : null,
+        nextAfter: encodeAfter(seqWatermarks(rows)),
         unreadCount: readState().unreadCount,
+        unavailableInstances: [...(options.unavailableInstances ?? [])],
       };
     },
 
     async listSince(filter, after, gapOptions) {
       const limit = gapOptions?.limit ?? NOTIFICATION_GAP_PAGE_SIZE;
-      const newer = rows
-        .filter((row) => {
-          const mark = after[instanceKey(row.instanceId)];
-          return mark !== undefined && row.seq > mark;
-        })
-        .filter((row) => matchesServerFilter(row, filter, isRead(row)))
-        .sort((a, b) => a.seq - b.seq)
-        .map(withRead);
-      return { items: newer.slice(0, limit), hasMore: newer.length > limit };
+      const marks = after.cursor ? decodeAfter(after.cursor) : after.watermarks;
+      // Like the facade: only the nodes the cursor names are read, and each
+      // node caps its own page at `limit`.
+      const perNode = new Map<string, SessionNotification[]>();
+      for (const row of rows) {
+        const key = instanceKey(row.instanceId);
+        const mark = marks[key];
+        if (mark === undefined || row.seq <= mark) continue;
+        if (!matchesServerFilter(row, filter, isRead(row))) continue;
+        perNode.set(key, [...(perNode.get(key) ?? []), row]);
+      }
+      let hasMore = false;
+      const items: SessionNotification[] = [];
+      for (const nodeRows of perNode.values()) {
+        const ascending = nodeRows.sort((a, b) => a.seq - b.seq);
+        hasMore ||= ascending.length > limit;
+        items.push(...ascending.slice(0, limit).map(withRead));
+      }
+      items.sort((a, b) => a.seq - b.seq);
+      return { items, hasMore, nextAfter: encodeAfter(maxSeqMaps(marks, seqWatermarks(items))) };
     },
 
     async listForSession(sessionId, after, sessionOptions) {

@@ -13,11 +13,12 @@ import {
   RULES_PATH,
   SESSION_NOTIFICATION_EVENT,
   SINKS_PATH,
+  UNAVAILABLE_INSTANCES_HEADER,
   afterCursor,
   deliveriesPath,
   feedQuery,
   isNotificationWire,
-  nextBeforeCursor,
+  pageCursor,
   normalizeDelivery,
   normalizeNotification,
   normalizeReadState,
@@ -27,6 +28,7 @@ import {
   ruleDraftToWire,
   rulePath,
   sessionNotificationsPath,
+  unavailableInstances,
   withInstance,
   type DeliveryWire,
   type NotificationPageWire,
@@ -43,6 +45,11 @@ export const NOTIFICATION_GAP_PAGE_SIZE = 200;
 
 export interface NotificationHttpClient {
   get<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<T>;
+  /** When available, the feed reads the facade's partial-availability header. */
+  getWithHeaders?<T>(
+    endpoint: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<{ data: T; headers: Headers }>;
   post<T>(endpoint: string, body?: unknown): Promise<T>;
   put<T>(endpoint: string, body: unknown): Promise<T>;
   delete<T>(endpoint: string, body?: unknown): Promise<T>;
@@ -63,9 +70,19 @@ export function buildNotificationFeedHttpAdapter(
   client: NotificationHttpClient,
   options: NotificationFeedHttpOptions = {},
 ): INotificationFeed {
+  async function readPage(endpoint: string) {
+    if (!client.getWithHeaders)
+      return { page: await client.get<NotificationPageWire>(endpoint), unavailable: [] };
+    const { data, headers } = await client.getWithHeaders<NotificationPageWire>(endpoint);
+    return {
+      page: data,
+      unavailable: unavailableInstances(headers?.get(UNAVAILABLE_INSTANCES_HEADER)),
+    };
+  }
+
   return {
     async list(filter, cursor) {
-      const page = await client.get<NotificationPageWire>(
+      const { page, unavailable } = await readPage(
         feedQuery(filter, {
           before: cursor?.before ?? null,
           limit: cursor?.limit ?? NOTIFICATION_PAGE_SIZE,
@@ -73,20 +90,22 @@ export function buildNotificationFeedHttpAdapter(
       );
       return {
         items: (page.items ?? []).map(normalizeNotification),
-        nextBefore: nextBeforeCursor(page.next_before),
+        nextBefore: pageCursor(page.next_before),
+        nextAfter: pageCursor(page.next_after),
         unreadCount: typeof page.unread_count === 'number' ? page.unread_count : null,
+        unavailableInstances: unavailable,
       };
     },
 
     async listSince(filter, after, gapOptions) {
-      const cursor = afterCursor(after);
-      if (!cursor) return { items: [], hasMore: false };
+      const cursor = after.cursor ?? afterCursor(after.watermarks);
+      if (!cursor) return { items: [], hasMore: false, nextAfter: null };
       const limit = gapOptions?.limit ?? NOTIFICATION_GAP_PAGE_SIZE;
       const page = await client.get<NotificationPageWire>(
         feedQuery(filter, { after: cursor, limit }),
       );
       const items = (page.items ?? []).map(normalizeNotification);
-      return { items, hasMore: items.length >= limit };
+      return { items, hasMore: items.length >= limit, nextAfter: pageCursor(page.next_after) };
     },
 
     async listForSession(sessionId, after, sessionOptions) {

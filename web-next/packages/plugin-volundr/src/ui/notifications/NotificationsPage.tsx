@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { BellOff } from 'lucide-react';
@@ -13,7 +13,6 @@ import {
 } from '@niuulabs/ui';
 import {
   DEFAULT_NOTIFICATION_FILTER,
-  instanceKey,
   isFilterActive,
   isNotificationRead,
   notificationKey,
@@ -84,6 +83,21 @@ export function NotificationsPage() {
     return names;
   }, [targets.data]);
 
+  // Names the facade reported on rows, for hosts the registry does not list.
+  const reportedNames = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const notification of feed.loaded)
+      if (notification.instanceId && notification.instanceName)
+        names.set(notification.instanceId, notification.instanceName);
+    return names;
+  }, [feed.loaded]);
+
+  const hostLabel = useCallback(
+    (id: string, reported?: string | null) =>
+      hostNames.get(id) ?? reported ?? reportedNames.get(id) ?? id,
+    [hostNames, reportedNames],
+  );
+
   const hosts = useMemo(
     () =>
       distinct([
@@ -95,10 +109,10 @@ export function NotificationsPage() {
           .filter((notification) => notification.instanceId)
           .map((notification) => ({
             id: notification.instanceId!,
-            label: hostNames.get(notification.instanceId!) ?? notification.instanceId!,
+            label: hostLabel(notification.instanceId!, notification.instanceName),
           })),
       ]),
-    [targets.data, feed.loaded, hostNames],
+    [targets.data, feed.loaded, hostLabel],
   );
 
   const projectOptions = useMemo(() => {
@@ -223,7 +237,7 @@ export function NotificationsPage() {
               read={isNotificationRead(notification, feed.readState)}
               hostLabel={
                 multiHost && notification.instanceId
-                  ? (hostNames.get(instanceKey(notification.instanceId)) ?? notification.instanceId)
+                  ? hostLabel(notification.instanceId, notification.instanceName)
                   : null
               }
               sinkLabels={sinkLabels}
@@ -291,6 +305,17 @@ export function NotificationsPage() {
         projects={projectOptions}
         sessions={sessionOptions}
       />
+      {feed.unavailableInstances.length > 0 && (
+        <p
+          role="status"
+          data-testid="notifications-unavailable"
+          className="niuu:m-0 niuu:text-xs niuu:text-text-muted"
+        >
+          Some hosts are unavailable (
+          {feed.unavailableInstances.map((id) => hostLabel(id)).join(', ')}) — their notifications
+          may be missing.
+        </p>
+      )}
       {markRead.isError && (
         <p role="alert" className="niuu:m-0 niuu:text-sm niuu:text-critical">
           Could not mark notifications read: {errorMessage(markRead.error)}
