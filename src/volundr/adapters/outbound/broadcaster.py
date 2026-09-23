@@ -35,6 +35,9 @@ def _build_realtime_sleipnir_map() -> dict[str, str]:
         # (active/idle/tool_executing) is deliberately NOT forwarded — it is
         # high-frequency SSE-only state and would flood the bus.
         EventType.SESSION_NEEDS_INPUT.value: registry.VOLUNDR_SESSION_NEEDS_INPUT,
+        # New notifications are mirrored like needs_input so Ravn/Ting can react;
+        # the payload keeps owner_id so consumers can honour its owner scope.
+        EventType.SESSION_NOTIFICATION.value: registry.VOLUNDR_SESSION_NOTIFICATION,
         EventType.STATS_UPDATED.value: registry.VOLUNDR_STATS_UPDATED,
         EventType.CHRONICLE_CREATED.value: registry.VOLUNDR_CHRONICLE_CREATED,
         EventType.CHRONICLE_UPDATED.value: registry.VOLUNDR_CHRONICLE_UPDATED,
@@ -151,8 +154,17 @@ class InMemoryEventBroadcaster(EventBroadcaster):
         try:
             from datetime import UTC  # noqa: PLC0415
 
+            from sleipnir.domain.catalog import volundr_session_notification  # noqa: PLC0415
             from sleipnir.domain.events import SleipnirEvent  # noqa: PLC0415
 
+            if event.type is EventType.SESSION_NOTIFICATION:
+                # Typed payload, and urgency that follows the notification severity.
+                await self._sleipnir_publisher.publish(
+                    volundr_session_notification(
+                        notification=event.data, source=self._sleipnir_source
+                    )
+                )
+                return
             sleipnir_event = SleipnirEvent(
                 event_type=sleipnir_type,
                 source=self._sleipnir_source,

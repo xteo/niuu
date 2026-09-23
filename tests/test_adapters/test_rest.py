@@ -1678,6 +1678,16 @@ class TestFeatureFlags:
         assert "local_mounts_allowed_prefixes" in data
         assert isinstance(data["local_mounts_allowed_prefixes"], list)
 
+    def test_feature_flags_report_notifications_only_when_served(self, client: TestClient):
+        """The flag follows whether the notification feed is composed on this host."""
+        data = client.get("/api/v1/forge/feature-flags").json()
+        assert data["notifications_enabled"] is False
+        assert data["capabilities"]["notifications"] is False
+        client.app.state.notification_service = object()
+        data = client.get("/api/v1/forge/feature-flags").json()
+        assert data["notifications_enabled"] is True
+        assert data["capabilities"]["notifications"] is True
+
 
 class TestStatsResponse:
     """Tests for StatsResponse model."""

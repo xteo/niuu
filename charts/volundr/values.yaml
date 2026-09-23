@@ -406,6 +406,19 @@ sleipnir:
   kwargs: {}
   secretKwargs: []
 
+# Forge session notifications: the feed, automatic reply_ready notifications and
+# external delivery sinks. Rendered verbatim as config.yaml's `notifications:` section
+# (snake_case keys; see NotificationsConfig). Empty keeps the defaults: feed on,
+# reply_ready on, no external sinks. Example:
+#   notifications:
+#     reply_ready: {body_chars: 400}
+#     sinks:
+#       - name: ops-webhook
+#         label: Ops webhook
+#         adapter: niuu.adapters.notifications.webhook.WebhookNotificationAdapter
+#         url: https://hooks.example.com/forge
+notifications: {}
+
 # Chronicle configuration
 chronicle:
   # -- Auto-create chronicle when a session stops

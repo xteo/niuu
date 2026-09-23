@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
+from niuu.domain.notifications import notification_visible_to
 from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, require_scope
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
@@ -55,12 +56,14 @@ from volundr.domain.models import (
     CleanupTarget,
     DevicePlatform,
     DeviceToken,
+    EventType,
     ExternalSessionRecord,
     GitProviderType,
     GitSource,
     LocalMountSource,
     ModelProvider,
     Principal,
+    RealtimeEvent,
     Session,
     SessionActivityState,
     SessionSource,
@@ -1625,12 +1628,18 @@ def create_router(
         """
         settings = request.app.state.settings
         admin = request.app.state.admin_settings
+        # True exactly when the notification feed routes are served on this host.
+        notifications = getattr(request.app.state, "notification_service", None) is not None
         return {
             "local_mounts_enabled": settings.local_mounts.enabled,
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
             "mini_mode": settings.local_mounts.mini_mode,
             "local_mounts_allowed_prefixes": settings.local_mounts.allowed_prefixes,
-            "capabilities": {"local_session_scope": True},
+            "capabilities": {
+                "local_session_scope": True,
+                "notifications": notifications,
+            },
+            "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
             "project_assignment_enabled": project_service is not None,
             "project_contract_version": 1 if project_service is not None else 0,
@@ -1739,6 +1748,7 @@ def create_router(
         - session_deleted: When a session is deleted
         - stats_updated: Periodic stats updates (every 30s)
         - heartbeat: Keep-alive signal (every 30s)
+        - session_notification: A new notification (sent only to its owner or an admin)
 
         Events are formatted as SSE:
         ```
@@ -1756,6 +1766,24 @@ def create_router(
 
         client_host = request.client.host if request.client else "unknown"
         logger.info("SSE stream: client connected from %s", client_host)
+        # Notifications are owner-scoped: only the owner (or an admin of its tenant)
+        # receives one. With no identity adapter at all (bare dev app) nothing is
+        # scoped; with one, an unidentified client gets no notification events.
+        open_stream = getattr(request.app.state, "identity", None) is None
+        viewer = None if open_stream else await _optional_principal(request)
+
+        def _visible(event: RealtimeEvent) -> bool:
+            if event.type is not EventType.SESSION_NOTIFICATION or open_stream:
+                return True
+            if viewer is None:
+                return False
+            return notification_visible_to(
+                user_id=viewer.user_id,
+                roles=viewer.roles,
+                tenant_id=viewer.tenant_id,
+                owner_id=event.data.get("owner_id"),
+                notification_tenant_id=event.data.get("tenant_id"),
+            )
 
         async def event_generator():
             event_count = 0
@@ -1769,6 +1797,8 @@ def create_router(
                             event_count,
                         )
                         break
+                    if not _visible(event):
+                        continue
 
                     # Format as SSE
                     event_data = json.dumps(event.data)

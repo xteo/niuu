@@ -65,6 +65,10 @@ data:
       {{- else }}
       secret_kwargs_env: {}
       {{- end }}
+    {{- with .Values.notifications }}
+
+    notifications: {{ toJson . }}
+    {{- end }}
 
     pod_manager:
       adapter: {{ .Values.podManager.adapter | quote }}

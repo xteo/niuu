@@ -23,9 +23,12 @@ gate; only the ``payload`` is filtered (and a frame whose payload is wholly inte
 is dropped entirely, exactly as on the streaming paths).
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, status
@@ -37,6 +40,10 @@ from volundr.domain.models import SessionLogEntry
 from volundr.domain.ports import SessionEventLogRepository
 from volundr.domain.services.session import SessionAccessDeniedError, SessionService
 from volundr.domain.session_read_state import is_final_output
+
+if TYPE_CHECKING:
+    from volundr.domain.models import Session
+    from volundr.domain.services.notifications import NotificationService
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +181,7 @@ class SessionLogEntryResponse(BaseModel):
     ts: str
 
     @classmethod
-    def from_entry(cls, entry: SessionLogEntry) -> "SessionLogEntryResponse":
+    def from_entry(cls, entry: SessionLogEntry) -> SessionLogEntryResponse:
         return cls(
             session_id=entry.session_id,
             seq=entry.seq,
@@ -186,30 +193,62 @@ class SessionLogEntryResponse(BaseModel):
         )
 
 
+async def _project_notifications(
+    notification_service: NotificationService,
+    log_repository: SessionEventLogRepository,
+    session: Session,
+    entries: list[SessionLogEntry],
+    conflicts: list[int],
+) -> None:
+    """Project the batch's notification turns and final replies (contract §3).
+
+    Runs after the idempotent insert and conflict detection, before the append is
+    acknowledged, so a producer retry re-runs it without creating duplicates. It
+    reads back the STORED rows: a conflicted seq (a distinct payload re-using a
+    stored seq) is excluded, so a colliding frame can never project its payload.
+    The submitted payloads only pick which seqs are worth reading back.
+    """
+    excluded = set(conflicts)
+    seqs = [
+        entry.seq
+        for entry in entries
+        if entry.seq not in excluded and notification_service.is_projectable(entry.payload)
+    ]
+    if not seqs:
+        return
+    stored = await log_repository.read_seqs(session.id, seqs)
+    await notification_service.project_log_entries(session, stored)
+
+
 def create_session_log_router(
     log_repository: SessionEventLogRepository,
     session_service: SessionService | None = None,
     *,
     prefix: str = "/api/v1/forge",
     default_show_internal: bool = DEFAULT_SHOW_INTERNAL,
+    notification_service: NotificationService | None = None,
 ) -> APIRouter:
     """Create the FastAPI router for the durable session event log.
 
     ``default_show_internal`` is the unified read-path visibility default (SRD
     FR-7 / INV-10); the composition root threads ``ReplayConfig`` so cold-read,
     replay, and live all share ONE configured default.
+
+    With a ``notification_service`` (and a ``session_service`` to resolve the
+    session's owner), each append also projects notification turns and final
+    replies into the notification feed before it is acknowledged.
     """
     router = APIRouter(prefix=prefix)
 
-    async def _check_access(request: Request, session_id: UUID, action: str) -> None:
+    async def _check_access(request: Request, session_id: UUID, action: str) -> Session | None:
         if session_service is None:
-            return
+            return None
         from volundr.adapters.inbound.auth import extract_principal
 
         principal = await extract_principal(request)
         session = await session_service.get_session(session_id)
         if session is None:
-            return
+            return None
         try:
             await session_service._check_access(session, principal, action)
         except SessionAccessDeniedError:
@@ -217,6 +256,7 @@ def create_session_log_router(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Not authorized to access the event log for session {session_id}",
             )
+        return session
 
     @router.post(
         "/sessions/{session_id}/log",
@@ -230,7 +270,7 @@ def create_session_log_router(
         session_id: UUID = Path(description="Session UUID to append frames for"),
     ) -> LogAppendResponse:
         """Append full-fidelity frames to the session's durable log (idempotent)."""
-        await _check_access(request, session_id, "emit_event")
+        session = await _check_access(request, session_id, "emit_event")
         now = datetime.now(UTC)
         entries = [
             SessionLogEntry(
@@ -261,6 +301,12 @@ def create_session_log_router(
             )
             await _append_conflict_sentinel(
                 log_repository, session_id=session_id, conflicting_seqs=conflicts, ts=now
+            )
+        # Notifications are projected from the stored rows before the ack. An orphan
+        # log (no session row) has no owner, so it has no feed to project into.
+        if notification_service is not None and session is not None:
+            await _project_notifications(
+                notification_service, log_repository, session, entries, conflicts
             )
         # Projection is committed atomically with the durable insert; this is only a refresh hint.
         if session_service is not None and any(

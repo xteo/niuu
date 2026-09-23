@@ -53,6 +53,7 @@ from volundr.domain.session_read_state import SessionReadState, SessionReadState
 
 if TYPE_CHECKING:
     from volundr.adapters.outbound.git_registry import GitProviderRegistry
+    from volundr.domain.notification_ports import NotificationRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ class SessionService:
         runtime_backend: str = "kubernetes",
         public_origin: str = "http://localhost:8080",
         span_repository: SessionSpanRepository | None = None,
+        notification_recorder: NotificationRecorder | None = None,
     ):
         self._repository = repository
         self._pod_manager = pod_manager
@@ -147,6 +149,7 @@ class SessionService:
         self._communication_route_repository = communication_route_repository
         self._session_communication_port = session_communication_port
         self._span_repository = span_repository
+        self._notification_recorder = notification_recorder
         self._runtime_backend = runtime_backend
         normalized_public_origin = public_origin.rstrip("/")
         if normalized_public_origin.startswith("https://"):
@@ -546,6 +549,18 @@ class SessionService:
                         timestamp=updated.updated_at,
                     )
                 )
+
+        # The same "needs the user" transition lands in the notification feed as an
+        # attention notification, deduplicated per request (a retried report of the
+        # same pending request records nothing new).
+        if is_new_attention and self._notification_recorder is not None:
+            await self._notification_recorder.record_attention(
+                updated,
+                state_since=session.activity_state_since,
+                kind=metadata.get("kind", "question"),
+                prompt=metadata.get("prompt", "") or "",
+                request_id=metadata.get("request_id", "") or "",
+            )
 
         # Fan a push out to the owner's devices off the activity hot-path (a slow
         # APNs/webhook call must not delay Skuld's activity report response).

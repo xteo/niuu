@@ -996,6 +996,20 @@ class SessionEventLogRepository(ABC):
     async def latest_seq(self, session_id: UUID) -> int:
         """Return the highest seq stored for a session, or 0 if none."""
 
+    async def read_seqs(self, session_id: UUID, seqs: list[int]) -> list[SessionLogEntry]:
+        """Return the STORED rows for exactly these seqs, ordered by seq.
+
+        Seqs with no stored row are omitted. This concrete default is built on
+        :meth:`read_after` (one bounded range read) so in-memory fakes inherit it;
+        SQL adapters override it with a single ``seq = ANY(...)`` lookup.
+        """
+        wanted = set(seqs)
+        if not wanted:
+            return []
+        low = min(wanted) - 1
+        rows = await self.read_after(session_id, after_seq=low, limit=max(wanted) - low)
+        return [row for row in rows if row.seq in wanted]
+
     async def import_history(
         self, session_id: UUID, source_id: str, entries: list[SessionLogEntry]
     ) -> int:
