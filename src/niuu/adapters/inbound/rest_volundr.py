@@ -29,11 +29,25 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp
 
 from niuu.adapters.inbound.auth import extract_principal
+from niuu.adapters.inbound.forge_notification_feed import (
+    CursorError,
+    InstancePage,
+    decode_cursor,
+    encode_cursor,
+    merge_after,
+    merge_newest,
+)
 from niuu.adapters.inbound.forge_session_stream import merge_events, remote_events
 from niuu.adapters.inbound.remote_urls import build_remote_url
 from niuu.adapters.inbound.ws_forge_replay import forward_replay
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
+from niuu.domain.notifications import notification_visible_to
 from niuu.domain.services.instances import InstanceService
+
+UNAVAILABLE_INSTANCES_HEADER = "X-Forge-Unavailable-Instances"
+NOTIFICATION_EVENT = "session_notification"
+# Gateway-only selectors: never forwarded to a Forge node, whose ids differ.
+_FLEET_SELECTORS = frozenset({"instance_id", "all_instances", "scope"})
 
 
 class SessionProjectAssignment(BaseModel):
@@ -234,6 +248,101 @@ def _ensure_history_success(response: httpx.Response) -> None:
         headers = {"Retry-After": "1"} if detail["code"] == "history_busy" else None
         raise HTTPException(response.status_code, detail, headers=headers)
     _ensure_remote_success(response)
+
+
+def _event_visible(name: str, data: Any, principal: Principal) -> bool:
+    """Owner-scope ``session_notification`` events; every other event passes."""
+    if name != NOTIFICATION_EVENT:
+        return True
+    if not isinstance(data, dict):
+        return False
+    return notification_visible_to(
+        user_id=principal.user_id,
+        roles=principal.roles,
+        tenant_id=principal.tenant_id,
+        owner_id=data.get("owner_id"),
+        notification_tenant_id=data.get("tenant_id"),
+    )
+
+
+def _fleet_request(request: Request) -> bool:
+    params = request.query_params
+    return (
+        params.get("all_instances") == "true"
+        and not params.get("instance_id")
+        and params.get("scope", "guild") != "local"
+    )
+
+
+def _forward_params(request: Request, *, drop: frozenset[str]) -> list[tuple[str, str]]:
+    return [(key, value) for key, value in request.query_params.multi_items() if key not in drop]
+
+
+def _remote_json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Forge returned invalid JSON") from exc
+
+
+def _tag_items(payload: Any, instance: RegisteredInstance) -> Any:
+    if not isinstance(payload, list):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unexpected Forge notification response")
+    return [_with_instance(item, instance, rebase_chat_endpoint=False) for item in payload]
+
+
+def _instance_page(response: httpx.Response, instance: RegisteredInstance) -> InstancePage | None:
+    """Parse one node's feed page, or ``None`` when it is malformed."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        return None
+    counters = [payload.get(key) for key in ("head_seq", "read_through_seq", "unread_count")]
+    next_before = payload.get("next_before")
+    if any(type(value) is not int for value in counters):
+        return None
+    if next_before is not None and type(next_before) is not int:
+        return None
+    return InstancePage(
+        items=[
+            _with_instance(item, instance, rebase_chat_endpoint=False)
+            for item in payload["items"]
+            if isinstance(item, dict) and type(item.get("seq")) is int
+        ],
+        next_before=next_before,
+        head_seq=counters[0],
+        read_through_seq=counters[1],
+        unread_count=counters[2],
+    )
+
+
+def _optional_limit(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "limit must be an integer"
+        ) from exc
+    if value < 1:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "limit must be at least 1")
+    return value
+
+
+def _is_client_error(response: httpx.Response) -> bool:
+    """A request error every node would repeat (bad filter or body), not an outage."""
+    return response.status_code in {
+        status.HTTP_400_BAD_REQUEST,
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+    }
+
+
+def _set_unavailable(response: Response, unavailable: set[str]) -> None:
+    if unavailable:
+        response.headers[UNAVAILABLE_INSTANCES_HEADER] = ",".join(sorted(unavailable))
 
 
 def _uses_embedded_transport(instance: RegisteredInstance) -> bool:
@@ -1118,10 +1227,16 @@ def create_volundr_router(
                 if broadcaster is None:
                     raise RuntimeError("Session event stream unavailable")
                 async for event in broadcaster.subscribe():
+                    if not _event_visible(event.type.value, event.data, principal):
+                        continue
                     yield event.type.value, _with_instance(event.data, instance)
             else:
                 url = build_remote_url(instance.base_url, "/api/v1/forge", "/sessions/stream")
                 async for name, payload in remote_events(url, headers):
+                    # The node filters too; re-check so an older node cannot leak
+                    # another owner's notification through the fleet stream.
+                    if not _event_visible(name, payload, principal):
+                        continue
                     yield name, _with_instance(payload, instance)
 
         return StreamingResponse(
@@ -1425,8 +1540,390 @@ def create_volundr_router(
             "message_delivery": True,
             "native_history_import": True,
             "local_session_scope": True,
+            "notifications": True,
         }
         return flags
+
+    # -- Notifications (contract §6) -------------------------------------------
+
+    async def _notification_target(request: Request, principal: Principal) -> RegisteredInstance:
+        """The selected instance, or the default (local) one."""
+        if _local_session_scope(request):
+            return await _local_session_instance(service, principal, request)
+        return await _resolve_target_instance(
+            service, principal, request.query_params.get("instance_id")
+        )
+
+    async def _fan_out(
+        instances: list[RegisteredInstance],
+        request: Request,
+        *,
+        method: str,
+        path: str,
+        params_for: Any,
+        json_for: Any = None,
+    ) -> tuple[dict[str, httpx.Response], set[str]]:
+        async def call(instance: RegisteredInstance) -> httpx.Response:
+            return await _request_remote(
+                instance,
+                request,
+                method=method,
+                path=path,
+                params=params_for(instance),
+                json_body=json_for(instance) if json_for else None,
+                embedded_app=embedded_forge_app,
+            )
+
+        results = await asyncio.gather(*(call(i) for i in instances), return_exceptions=True)
+        responses: dict[str, httpx.Response] = {}
+        unavailable: set[str] = set()
+        for instance, result in zip(instances, results, strict=True):
+            if isinstance(result, Exception):
+                unavailable.add(instance.id)
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            responses[instance.id] = result
+        return responses, unavailable
+
+    async def _proxy_to(
+        instance: RegisteredInstance,
+        request: Request,
+        *,
+        method: str,
+        path: str,
+        body: Any = None,
+    ) -> httpx.Response:
+        response = await _request_remote(
+            instance,
+            request,
+            method=method,
+            path=path,
+            params=_forward_params(request, drop=_FLEET_SELECTORS),
+            json_body=body,
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        return response
+
+    @router.get("/notifications")
+    async def list_notifications(
+        request: Request,
+        response: Response,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """One node's feed, or with ``all_instances=true`` every visible node's feed
+        merged newest first with opaque per-node cursors."""
+        if not _fleet_request(request):
+            instance = await _notification_target(request, principal)
+            remote = await _proxy_to(instance, request, method="GET", path="/notifications")
+            payload = _remote_json(remote)
+            if not isinstance(payload, dict):
+                raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unexpected Forge feed response")
+            payload["items"] = _tag_items(payload.get("items"), instance)
+            payload["instance_id"] = instance.id
+            return payload
+
+        query = request.query_params
+        try:
+            before = decode_cursor(query["before"]) if "before" in query else None
+            after = decode_cursor(query["after"]) if "after" in query else None
+        except CursorError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        if before is not None and after is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "Use either before or after, not both"
+            )
+        limit = _optional_limit(query.get("limit"))
+        visible = await _visible_instances(service, principal)
+        # A node missing from a before-cursor has no older rows left; a node missing
+        # from an after-cursor has not been seen yet, so it is read from the start.
+        instances = [i for i in visible if i.id in before] if before is not None else visible
+        base = _forward_params(request, drop=_FLEET_SELECTORS | {"before", "after"})
+
+        def params_for(instance: RegisteredInstance) -> list[tuple[str, str]]:
+            if before is not None and before.get(instance.id) is not None:
+                return [*base, ("before", str(before[instance.id]))]
+            if after is not None:
+                return [*base, ("after", str(after.get(instance.id) or 0))]
+            return base
+
+        responses, unavailable = await _fan_out(
+            instances, request, method="GET", path="/notifications", params_for=params_for
+        )
+        pages: dict[str, InstancePage] = {}
+        for instance in instances:
+            result = responses.get(instance.id)
+            if result is None:
+                continue
+            if _is_client_error(result):
+                _ensure_remote_success(result)
+            page = _instance_page(result, instance) if result.status_code < 400 else None
+            if page is None:
+                unavailable.add(instance.id)
+                continue
+            pages[instance.id] = page
+        if instances and not pages:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "No Forge instance answered the notification feed"
+            )
+        _set_unavailable(response, unavailable)
+        merged = (
+            merge_after(pages, previous=after, unavailable=unavailable)
+            if after is not None
+            else merge_newest(pages, previous=before or {}, unavailable=unavailable, limit=limit)
+        )
+        return {
+            "items": merged.items,
+            "next_before": encode_cursor(merged.next_before) if merged.next_before else None,
+            "next_after": encode_cursor(merged.next_after),
+            # Seqs are per node: the fleet-wide values live under ``instances``.
+            "head_seq": None,
+            "read_through_seq": None,
+            "unread_count": sum(page.unread_count for page in pages.values()),
+            "instances": merged.summaries,
+        }
+
+    @router.get("/notifications/read-state")
+    async def get_notification_read_state(
+        request: Request,
+        response: Response,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        if not _fleet_request(request):
+            instance = await _notification_target(request, principal)
+            remote = await _proxy_to(
+                instance, request, method="GET", path="/notifications/read-state"
+            )
+            payload = _remote_json(remote)
+            return {**payload, "instance_id": instance.id} if isinstance(payload, dict) else {}
+        instances = await _visible_instances(service, principal)
+        base = _forward_params(request, drop=_FLEET_SELECTORS)
+        responses, unavailable = await _fan_out(
+            instances,
+            request,
+            method="GET",
+            path="/notifications/read-state",
+            params_for=lambda _instance: base,
+        )
+        states: dict[str, Any] = {}
+        for instance_id, result in responses.items():
+            payload = _remote_json(result) if result.status_code < 400 else None
+            if not isinstance(payload, dict) or type(payload.get("unread_count")) is not int:
+                unavailable.add(instance_id)
+                continue
+            states[instance_id] = payload
+        if instances and not states:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "No Forge instance answered")
+        _set_unavailable(response, unavailable)
+        return {
+            "unread_count": sum(state["unread_count"] for state in states.values()),
+            "instances": states,
+        }
+
+    @router.put("/notifications/read-state")
+    async def put_notification_read_state(
+        request: Request,
+        response: Response,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Advance one node's watermark, or several with ``{"instances": {id: {...}}}``."""
+        targets = body.get("instances")
+        if targets is None:
+            instance = await _notification_target(request, principal)
+            remote = await _proxy_to(
+                instance, request, method="PUT", path="/notifications/read-state", body=body
+            )
+            payload = _remote_json(remote)
+            return {**payload, "instance_id": instance.id} if isinstance(payload, dict) else {}
+        if not isinstance(targets, dict) or not targets:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "instances must map instance ids to {read_through_seq, expected_revision}",
+            )
+        instances = [
+            await _resolve_target_instance(service, principal, instance_id)
+            for instance_id in targets
+        ]
+        base = _forward_params(request, drop=_FLEET_SELECTORS)
+        responses, unavailable = await _fan_out(
+            instances,
+            request,
+            method="PUT",
+            path="/notifications/read-state",
+            params_for=lambda _instance: base,
+            json_for=lambda instance: targets[instance.id],
+        )
+        states: dict[str, Any] = {}
+        conflicts: list[str] = []
+        for instance in instances:
+            result = responses.get(instance.id)
+            if result is None:
+                continue
+            if result.status_code == status.HTTP_409_CONFLICT:
+                conflicts.append(instance.id)
+                continue
+            if status.HTTP_400_BAD_REQUEST <= result.status_code < 500:
+                _ensure_remote_success(result)
+            payload = _remote_json(result) if result.status_code < 400 else None
+            if not isinstance(payload, dict):
+                unavailable.add(instance.id)
+                continue
+            states[instance.id] = payload
+        _set_unavailable(response, unavailable)
+        if conflicts:
+            headers = (
+                {UNAVAILABLE_INSTANCES_HEADER: ",".join(sorted(unavailable))}
+                if unavailable
+                else None
+            )
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "Notification read state changed; refresh before changing it",
+                    "conflicts": sorted(conflicts),
+                    "instances": states,
+                },
+                headers=headers,
+            )
+        if not states:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "No Forge instance answered")
+        return {
+            "unread_count": sum(
+                state["unread_count"]
+                for state in states.values()
+                if type(state.get("unread_count")) is int
+            ),
+            "instances": states,
+        }
+
+    async def _proxy_rule_request(
+        request: Request, principal: Principal, *, method: str, path: str, body: Any = None
+    ) -> Response:
+        instance = await _notification_target(request, principal)
+        remote = await _proxy_to(instance, request, method=method, path=path, body=body)
+        if remote.status_code == status.HTTP_204_NO_CONTENT or not remote.content:
+            return Response(status_code=remote.status_code)
+        payload = _remote_json(remote)
+        if isinstance(payload, list):
+            payload = _tag_items(payload, instance)
+        elif isinstance(payload, dict):
+            payload = _with_instance(payload, instance, rebase_chat_endpoint=False)
+        return JSONResponse(payload, status_code=remote.status_code)
+
+    @router.get("/notifications/rules")
+    async def list_notification_rules(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> Response:
+        return await _proxy_rule_request(
+            request, principal, method="GET", path="/notifications/rules"
+        )
+
+    @router.post("/notifications/rules", status_code=status.HTTP_201_CREATED)
+    async def create_notification_rule(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        return await _proxy_rule_request(
+            request, principal, method="POST", path="/notifications/rules", body=body
+        )
+
+    @router.put("/notifications/rules/{rule_id}")
+    async def update_notification_rule(
+        request: Request,
+        rule_id: str = Path(description="Rule id"),
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        return await _proxy_rule_request(
+            request,
+            principal,
+            method="PUT",
+            path=f"/notifications/rules/{quote(rule_id, safe='')}",
+            body=body,
+        )
+
+    @router.delete("/notifications/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_notification_rule(
+        request: Request,
+        rule_id: str = Path(description="Rule id"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        return await _proxy_rule_request(
+            request,
+            principal,
+            method="DELETE",
+            path=f"/notifications/rules/{quote(rule_id, safe='')}",
+        )
+
+    @router.get("/notifications/sinks")
+    async def list_notification_sinks(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> Response:
+        return await _proxy_rule_request(
+            request, principal, method="GET", path="/notifications/sinks"
+        )
+
+    @router.get("/notifications/{notification_id}/deliveries")
+    async def list_notification_deliveries(
+        request: Request,
+        notification_id: str = Path(description="Notification id"),
+        principal: Principal = Depends(extract_principal),
+    ) -> list[dict[str, Any]]:
+        """Delivery rows from the node that holds the notification."""
+        selected = request.query_params.get("instance_id")
+        instances = (
+            [await _resolve_target_instance(service, principal, selected)]
+            if selected
+            else await _visible_instances(service, principal)
+        )
+        path = f"/notifications/{quote(notification_id, safe='')}/deliveries"
+        for instance in instances:
+            remote = await _request_remote(
+                instance, request, method="GET", path=path, embedded_app=embedded_forge_app
+            )
+            if remote.status_code in {status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND}:
+                continue
+            _ensure_remote_success(remote)
+            return _tag_items(_remote_json(remote), instance)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Notification not found: {notification_id}")
+
+    @router.get("/sessions/{session_id}/notifications")
+    async def list_session_notifications(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> list[dict[str, Any]]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        remote = await _proxy_to(
+            instance, request, method="GET", path=f"/sessions/{session_id}/notifications"
+        )
+        return _tag_items(_remote_json(remote), instance)
+
+    @router.post("/sessions/{session_id}/notifications", status_code=status.HTTP_201_CREATED)
+    async def submit_session_notification(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Direct submit on the owning node; 201 when new, 200 when deduplicated."""
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        remote = await _proxy_to(
+            instance,
+            request,
+            method="POST",
+            path=f"/sessions/{session_id}/notifications",
+            body=body,
+        )
+        payload = _with_instance(_remote_json(remote), instance, rebase_chat_endpoint=False)
+        return JSONResponse(payload, status_code=remote.status_code)
 
     @router.get("/external-sessions")
     async def list_external_sessions(

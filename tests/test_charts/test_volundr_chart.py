@@ -525,6 +525,35 @@ class TestConfigMapTemplate:
 
         assert config["resident_runtimes"]["profiles"] == []
 
+    def test_notifications_section_renders_into_config(self):
+        from volundr.config import NotificationsConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "notifications" not in render()
+        sinks = '[{"name":"ops","adapter":"a.B","url":"https://x"}]'
+        config = render(
+            "--set-json",
+            f'notifications={{"reply_ready":{{"body_chars":400}},"sinks":{sinks}}}',
+        )
+        parsed = NotificationsConfig.model_validate(config["notifications"])
+        assert parsed.reply_ready.body_chars == 400
+        assert parsed.sinks[0]["url"] == "https://x"
+
     def test_ci_values_run_resident_runtime_migrations(self):
         result = subprocess.run(
             [

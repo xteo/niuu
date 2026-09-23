@@ -139,6 +139,8 @@ class EventType(StrEnum):
     SESSION_READ_STATE = "session_read_state"
     SESSION_ACTIVITY = "session_activity"
     SESSION_NEEDS_INPUT = "session_needs_input"
+    # A new Forge notification (owner-scoped: only its owner or an admin receives it).
+    SESSION_NOTIFICATION = "session_notification"
 
 
 class CommunicationPlatform(StrEnum):

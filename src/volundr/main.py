@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 from uuid import UUID
 
 from fastapi import FastAPI, Request
@@ -53,6 +54,7 @@ from volundr.adapters.inbound.rest_git import create_git_router
 from volundr.adapters.inbound.rest_integrations import create_canonical_integrations_router
 from volundr.adapters.inbound.rest_issues import create_canonical_issues_router
 from volundr.adapters.inbound.rest_message_delivery import create_message_delivery_router
+from volundr.adapters.inbound.rest_notifications import create_notifications_router
 from volundr.adapters.inbound.rest_oauth import create_canonical_oauth_router
 from volundr.adapters.inbound.rest_openshell_credentials import (
     create_openshell_credentials_router,
@@ -91,6 +93,11 @@ from volundr.adapters.outbound.postgres_device_tokens import PostgresDeviceToken
 from volundr.adapters.outbound.postgres_integrations import PostgresIntegrationRepository
 from volundr.adapters.outbound.postgres_launch_specs import PostgresLaunchSpecRepository
 from volundr.adapters.outbound.postgres_mappings import PostgresMappingRepository
+from volundr.adapters.outbound.postgres_notifications import (
+    PostgresNotificationDeliveryRepository,
+    PostgresNotificationRepository,
+    PostgresNotificationRuleRepository,
+)
 from volundr.adapters.outbound.postgres_prompts import PostgresPromptRepository
 from volundr.adapters.outbound.postgres_resident_runtimes import (
     PostgresResidentRuntimeRepository,
@@ -124,6 +131,7 @@ from volundr.composition_builders import (  # noqa: F401
 )
 from volundr.config import Settings
 from volundr.domain.models import SessionStatus
+from volundr.domain.notifications import NotificationSinkInfo
 from volundr.domain.ports import OpenShellCredentialGrantPort
 from volundr.domain.services import (
     ChronicleService,
@@ -146,6 +154,7 @@ from volundr.domain.services.credential_enrollment import (
 )
 from volundr.domain.services.event_ingestion import EventIngestionService
 from volundr.domain.services.mount_strategies import SecretMountStrategyRegistry
+from volundr.domain.services.notifications import NotificationService, engine_resolver_for
 from volundr.domain.services.resident_runtime import (
     ResidentRuntimeNotFoundError,
     ResidentRuntimeService,
@@ -193,6 +202,45 @@ async def _refresh_bifrost_catalog(
     while True:
         await _load_bifrost_catalog(pricing_provider, bifrost_catalog)
         await asyncio.sleep(interval_seconds)
+
+
+def _create_notification_service(
+    settings: Settings,
+    pool: Any,
+    *,
+    broadcaster: InMemoryEventBroadcaster,
+    integration_repository: PostgresIntegrationRepository,
+) -> NotificationService | None:
+    """Compose the notification feed, rules and outbox (``notifications.enabled``)."""
+    config = settings.notifications
+    if not config.enabled:
+        logger.info("Forge notifications disabled (notifications.enabled=false)")
+        return None
+    cli_types = {
+        name: (definition.defaults.get("broker") or {}).get("cliType")
+        for name, definition in settings.session_definitions.items()
+    }
+    return NotificationService(
+        PostgresNotificationRepository(pool),
+        PostgresNotificationRuleRepository(pool),
+        PostgresNotificationDeliveryRepository(
+            pool, max_error_chars=config.dispatcher.max_error_chars
+        ),
+        broadcaster=broadcaster,
+        reply_ready_enabled=config.reply_ready.enabled,
+        reply_title_chars=config.reply_ready.title_chars,
+        reply_body_chars=config.reply_ready.body_chars,
+        sinks=[
+            NotificationSinkInfo(
+                name=sink["name"],
+                label=str(sink.get("label") or sink["name"]),
+                requires_integration=False,
+            )
+            for sink in config.sinks
+        ],
+        engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
+        integration_repository=integration_repository,
+    )
 
 
 async def _bootstrap_startup_schema(settings: Settings) -> None:
@@ -670,6 +718,10 @@ def create_app(
             integration_registry = IntegrationRegistry(integration_definitions)
             integration_repo = PostgresIntegrationRepository(pool)
             mapping_repository = PostgresMappingRepository(pool)
+            notification_service = _create_notification_service(
+                settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
+            )
+            app.state.notification_service = notification_service
             tracker_factory = TrackerFactory(credential_store)
             credential_enrollment_service = CredentialEnrollmentService(
                 repository=PostgresCredentialEnrollmentRepository(pool),
@@ -743,6 +795,7 @@ def create_app(
                 attention_notifier=attention_notifier,
                 runtime_backend=_runtime_backend(settings, pod_manager),
                 span_repository=span_repository,
+                notification_recorder=notification_service,
             )
             # Local-process brokers notify the session service when they exit so
             # the DB row is reconciled promptly (pod-status authoritative) rather
@@ -1205,8 +1258,19 @@ def create_app(
                 session_service=session_service,
                 prefix="/api/v1/forge",
                 default_show_internal=settings.replay.default_show_internal,
+                notification_service=notification_service,
             )
             app.include_router(session_log_router)
+            if notification_service is not None:
+                app.include_router(
+                    create_notifications_router(
+                        notification_service,
+                        session_service,
+                        prefix="/api/v1/forge",
+                        default_page_size=settings.notifications.default_page_size,
+                        max_page_size=settings.notifications.max_page_size,
+                    )
+                )
             app.include_router(
                 create_message_delivery_router(PostgresMessageDelivery(pool), session_service)
             )

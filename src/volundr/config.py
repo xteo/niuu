@@ -14,6 +14,7 @@ All configuration MUST flow through the Settings class.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from niuu.config_models import (
     WorkloadIdentityConfig,
     default_session_definitions,
 )
+from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
 from ravn.config import PersonaSourceConfig
 from volundr.domain.models import (
     IntegrationType,
@@ -49,6 +51,11 @@ from volundr.domain.models import (
     ResidentCapability,
     ResidentEngine,
     SecretType,
+)
+from volundr.domain.notifications import (
+    INTEGRATION_SINK,
+    MAX_SINK_NAME_CHARS,
+    SINK_NAME_PATTERN,
 )
 
 __all__ = ["GitHubInstance", "GitLabInstance"]
@@ -684,6 +691,120 @@ class PushNotificationConfig(BaseModel):
         le=1.0,
         description="Drop pushes below this urgency.",
     )
+
+
+class NotificationReplyReadyConfig(BaseModel):
+    """The automatic ``reply_ready`` notification raised for each final reply."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Record a reply_ready notification for every final assistant reply.",
+    )
+    title_chars: int = Field(
+        default=120,
+        ge=1,
+        le=MAX_TITLE_CHARS,
+        description="Title length (the reply's first line) before it is truncated.",
+    )
+    body_chars: int = Field(
+        default=280,
+        ge=0,
+        le=MAX_BODY_CHARS,
+        description="Length of the reply excerpt kept as the notification body.",
+    )
+
+
+class NotificationDispatcherConfig(BaseModel):
+    """Outbox dispatcher timing. Consumed by the notification dispatcher loop."""
+
+    poll_interval_seconds: float = Field(
+        default=2.0, gt=0, description="Pause between outbox polls when nothing is due."
+    )
+    batch_size: int = Field(default=50, ge=1, description="Deliveries claimed per poll.")
+    lease_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="How long a claim is held before another worker may re-claim it.",
+    )
+    max_attempts: int = Field(
+        default=8, ge=1, description="Attempts before a delivery is marked dead."
+    )
+    backoff_base_seconds: float = Field(
+        default=5.0, gt=0, description="First retry delay; doubles on each attempt."
+    )
+    backoff_max_seconds: float = Field(
+        default=900.0, gt=0, description="Upper bound for the retry delay."
+    )
+    max_error_chars: int = Field(
+        default=2000, ge=1, description="Longest delivery error kept on the outbox row."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_backoff(self) -> "NotificationDispatcherConfig":
+        if self.backoff_base_seconds > self.backoff_max_seconds:
+            raise ValueError("backoff_base_seconds must not exceed backoff_max_seconds")
+        return self
+
+
+class NotificationsConfig(BaseModel):
+    """Forge session notifications: the feed, the projection and external delivery.
+
+    Nothing is delivered externally by default: a sink must be configured here (or
+    an owner's messaging integration used) and an owner rule must select it.
+
+    Example YAML::
+
+        notifications:
+          enabled: true
+          reply_ready:
+            enabled: true
+            title_chars: 120
+            body_chars: 280
+          sinks:
+            - name: ops-webhook
+              label: Ops webhook
+              adapter: "niuu.adapters.notifications.webhook.WebhookNotificationAdapter"
+              url: "https://hooks.example.com/forge"
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Project notifications and serve the notification API.",
+    )
+    reply_ready: NotificationReplyReadyConfig = Field(default_factory=NotificationReplyReadyConfig)
+    default_page_size: int = Field(default=50, ge=1, description="Feed page size default.")
+    max_page_size: int = Field(default=200, ge=1, description="Largest feed page allowed.")
+    dispatcher: NotificationDispatcherConfig = Field(default_factory=NotificationDispatcherConfig)
+    sinks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Named delivery sinks (dynamic adapters): each entry has 'name', optional "
+            "'label', 'adapter' (fully-qualified class path) and adapter kwargs."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _valid(self) -> "NotificationsConfig":
+        if self.default_page_size > self.max_page_size:
+            raise ValueError("notifications.default_page_size must not exceed max_page_size")
+        names: set[str] = set()
+        for sink in self.sinks:
+            name, adapter = sink.get("name"), sink.get("adapter")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Every notifications.sinks entry needs a non-empty 'name'")
+            if not isinstance(adapter, str) or "." not in adapter:
+                raise ValueError(f"notifications.sinks[{name!r}] needs an 'adapter' class path")
+            if len(name) > MAX_SINK_NAME_CHARS or not re.fullmatch(SINK_NAME_PATTERN, name):
+                raise ValueError(
+                    f"notifications sink name {name!r} must match {SINK_NAME_PATTERN} "
+                    f"(at most {MAX_SINK_NAME_CHARS} characters)"
+                )
+            if name == INTEGRATION_SINK.name:
+                raise ValueError("'integration' is reserved for messaging-integration rules")
+            if name in names:
+                raise ValueError(f"Duplicate notifications sink name {name!r}")
+            names.add(name)
+        return self
 
 
 class IdentityConfig(BaseModel):
@@ -1727,6 +1848,7 @@ class Settings(BaseSettings):
     replay: ReplayConfig = Field(default_factory=ReplayConfig)
     sleipnir: SleipnirConfig = Field(default_factory=SleipnirConfig)
     push: PushNotificationConfig = Field(default_factory=PushNotificationConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)
     credential_store: CredentialStoreConfig = Field(default_factory=CredentialStoreConfig)
