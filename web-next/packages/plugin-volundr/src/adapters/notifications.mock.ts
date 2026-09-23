@@ -285,6 +285,7 @@ export function createMockNotificationFeed(
         nextAfter: encodeAfter(seqWatermarks(rows)),
         unreadCount: readState().unreadCount,
         unavailableInstances: [...(options.unavailableInstances ?? [])],
+        instanceHeads: seqWatermarks(rows),
       };
     },
 

@@ -23,6 +23,11 @@ export interface NotificationFeedPage {
   unreadCount: number | null;
   /** Nodes the fan-out could not reach for this page. */
   unavailableInstances: string[];
+  /**
+   * Head seq of every node this page covered (the facade's `instances`),
+   * including nodes with no rows; `null` when the server does not report it.
+   */
+  instanceHeads: InstanceSeqMap | null;
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   afterCursor,
   encodeInstanceCursor,
   feedQuery,
+  instanceHeads,
   normalizeDelivery,
   normalizeNotification,
   normalizeReadState,
@@ -289,6 +290,15 @@ describe('notification wire format', () => {
     expect(ruleDraftToWire({ ...rule, quietHours: null }).quiet_hours).toBeNull();
   });
 
+  it('reads every covered node from the per-node summary, including empty ones', () => {
+    expect(instanceHeads(undefined)).toBeNull();
+    expect(instanceHeads({ thor: { head_seq: 9 }, empty: {}, odd: null as never })).toEqual({
+      thor: 9,
+      empty: 0,
+      odd: 0,
+    });
+  });
+
   it('normalizes sinks and deliveries', () => {
     expect(normalizeSink({ name: 'webhook' })).toEqual({
       name: 'webhook',
@@ -350,6 +360,7 @@ describe('buildNotificationFeedHttpAdapter', () => {
       nextAfter: 'AFTER',
       unreadCount: 4,
       unavailableInstances: [],
+      instanceHeads: { thor: 12 },
     });
     expect(page.items[0]).toMatchObject({ instanceId: 'thor', instanceName: 'Thor' });
 
@@ -360,6 +371,7 @@ describe('buildNotificationFeedHttpAdapter', () => {
       nextAfter: null,
       unreadCount: null,
       unavailableInstances: [],
+      instanceHeads: null,
     });
     const { client: bare } = fakeClient({ 'GET /notifications?': {} });
     expect((await buildNotificationFeedHttpAdapter(bare).list(ANY, { limit: 5 })).items).toEqual(
