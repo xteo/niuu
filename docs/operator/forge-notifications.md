@@ -151,31 +151,178 @@ A rule selects notifications from its owner and names a sink:
 - In `match`, an empty list means "any".
 - `sink` must be one of the configured `notifications.sinks` names. The exception is a
   rule that sets `integration_connection_id`: that must be one of the caller's enabled
-  messaging integrations, and its credentials and adapter are used.
+  messaging integrations, and its credentials and adapter are used. Such rules use the
+  sink name `integration`.
 - `quiet_hours` is a daily window in an IANA timezone. A window whose start is after its
   end spans midnight.
 - `config.rate_limit` caps the deliveries per rule within a window.
 
 When a notification is recorded, every matching enabled rule gets a `pending` row in
-`forge_notification_deliveries`. The dispatcher claims due rows with
-`FOR UPDATE SKIP LOCKED` and a lease, then settles each one as `delivered`, `failed`
-(retried with exponential backoff), `dead` (after `max_attempts`), or `suppressed` (held
-back by quiet hours or the rate limit). The row is kept for audit either way.
+`forge_notification_deliveries`, in the same transaction. Nothing is delivered externally
+unless a sink is configured and a rule selects it.
 
-- Quiet hours and rate limits are evaluated when a row is claimed, not when it is
-  scheduled.
-- Every settle is fenced by `(delivery id, attempts)`, so a worker whose lease expired
-  cannot overwrite a newer claim.
+### How the dispatcher settles a delivery
 
-Nothing is delivered externally unless a sink is configured and a rule selects it.
+The outbox dispatcher is a background loop in every Forge host
+(`notifications.dispatcher.enabled`, on by default; it is idle until a rule exists). Each
+poll it claims up to `batch_size` due rows with `FOR UPDATE SKIP LOCKED` and a lease of
+`lease_seconds`, then settles each one:
 
-Two pieces come from the delivery workstream (contract §7):
+| Outcome | Status | When |
+|---|---|---|
+| Sent | `delivered` | The sink accepted it. `delivered_at` is set. |
+| Held back | `suppressed` | The rule was disabled after scheduling, quiet hours applied, the rate limit was reached, or the sink declined it (see push below). `last_error` holds the reason. |
+| Transient failure | `failed` | A 408/425/429/5xx response, a network error, a timeout, or a sink that is not configured on this host. Retried at `next_attempt_at`. |
+| Permanent failure | `dead` | Any other 4xx, a missing or disabled integration, a missing credential, or `max_attempts` reached. Never retried. |
 
-- the dispatcher loop that claims and settles outbox rows;
-- the sink adapters under `niuu.adapters.notifications`.
+- **Order of checks, at claim time:** the attempt count, the rule's `enabled` flag, quiet
+  hours, the rate limit, sink resolution, then the send. A suppressed row is kept for
+  audit and never retried.
+- **Quiet hours** are evaluated in the rule's timezone. Notifications at or above
+  `allow_min_severity` (default `critical`) are still delivered.
+- **Rate limit.** `config.rate_limit` = `{max_count, window_seconds}` counts the rule's
+  `delivered` rows in the trailing window. Rules without one use
+  `notifications.dispatcher.default_rate_limit` (60 per hour; `null` turns the default
+  off). Messages over the limit are `suppressed`, not delayed. Several dispatchers
+  counting at once can overshoot by at most one poll's worth of sends.
+- **Backoff.** Retry *n* waits `backoff_base_seconds × 2^(n-1)`, capped at
+  `backoff_max_seconds`, spread by ±`backoff_jitter_ratio`. A provider's `Retry-After`
+  (Telegram's `retry_after`) is honoured when it asks for longer.
+- **Leases and crashes.** A send runs for at most `send_timeout_seconds`, and only starts
+  while at least that much of its lease remains, so a slow batch never overlaps a
+  re-claim. If a host dies mid-send, the row stays `claimed` until its lease expires, and
+  then any dispatcher re-claims it. Every settle is fenced by `(delivery id, attempts)`,
+  so a worker whose lease expired cannot overwrite a newer claim.
+- **At-least-once.** A send that timed out, or a crash between a send and its settle, is
+  sent again. Webhook receivers should de-duplicate on `X-Niuu-Delivery`.
+- **Shutdown.** Stopping Forge stops polling and gives in-flight sends
+  `send_timeout_seconds` to finish. Anything left is re-claimed after its lease.
 
-Until they are deployed, matching rules leave their rows `pending`, and the dispatcher
-picks those rows up when it starts.
+Any number of Forge hosts can share one database. Each row is sent by exactly one of
+them.
+
+## Delivery setup
+
+### Telegram, through the owner's integration
+
+Telegram needs no Forge config. Each user connects their own bot:
+
+1. Create a bot with @BotFather and note its token. Add the bot to the chat, group or
+   channel that should receive messages, and find the chat id (for example, send a
+   message and read `getUpdates`).
+2. In the web app, open **Settings → Integrations**, add **Telegram**, and enter the bot
+   token and chat id. This stores the credential in the credential store and creates a
+   `messaging` integration connection owned by the user. `message_thread_id` in the
+   connection config posts to a forum topic.
+3. In **Notifications → Rules**, create a rule whose sink is **Messaging integration**
+   and pick the Telegram connection (`sink: "integration"`,
+   `integration_connection_id: <connection id>`).
+
+The dispatcher resolves the connection at send time. It checks that the connection
+still exists, belongs to the rule's owner, is enabled and is a messaging integration,
+loads its credential, and builds the sink named for the connection's slug in
+`notifications.integration_sinks` (Telegram maps to
+`niuu.adapters.notifications.telegram.TelegramNotificationSink`). The same connection keeps
+working for Ting's run notifications. Connections created before this release, whose
+stored adapter is empty or the old `ting.adapters.telegram_notification…` path, resolve
+the same way.
+
+Messages use Telegram HTML: a severity emoji and bold title, an italic context line
+(severity, kind, session, host), the body, the notification's links, and **Open session
+in Forge**. All text is escaped. Bodies are shortened to fit Telegram's 4096-character
+limit. Telegram 429 and 5xx responses are retried (honouring `retry_after`). Other
+errors, such as a wrong token (401), a bot removed from the chat (403) or an unknown chat
+(400), make the delivery `dead` with Telegram's description.
+
+### Webhook sink (operator-configured)
+
+```yaml
+notifications:
+  sinks:
+    - name: ops-webhook
+      label: Ops webhook
+      adapter: niuu.adapters.notifications.webhook.WebhookNotificationSink
+      url: https://hooks.example.com/forge
+      timeout: 10                          # seconds, optional
+      headers: {X-Team: platform}          # optional extra headers
+      secret_kwargs_env:
+        secret: FORGE_OPS_WEBHOOK_SECRET   # env var holding the HMAC secret
+```
+
+Each delivery is a `POST` with `Content-Type: application/json`:
+
+```json
+{"type": "forge.notification", "version": 1, "delivery_id": "…", "attempt": 1,
+ "notification": {"id": "…", "kind": "decision", "severity": "warning", "source": "agent",
+   "title": "…", "body": "…", "owner_id": "…", "session_id": "…", "session_name": "…",
+   "host": "…", "project_id": null, "url": "https://forge…/volundr/session/…",
+   "links": [{"label": "PR", "url": "…", "kind": "pr"}], "engine": "claude",
+   "model": "…", "correlation_id": null, "created_at": "ISO-8601"}}
+```
+
+Headers: `X-Niuu-Event: forge.notification`, `X-Niuu-Delivery: <delivery_id>` (stable
+across retries) and, when a secret is set, `X-Niuu-Signature: sha256=<hex>`: the
+HMAC-SHA256 of the exact request body. Verify it before trusting the payload. Any 2xx
+is success. Redirects are not followed and count as permanent failures.
+
+Users can also connect a webhook as a messaging integration (slug `webhook`, config
+`url`, credential `secret`) and target it with an integration rule.
+
+### Push (opt-in)
+
+```yaml
+notifications:
+  sinks:
+    - name: push
+      label: Forge app push
+      adapter: volundr.adapters.outbound.push_notification_sink.PushNotificationSink
+      max_body_chars: 280                  # optional
+```
+
+The push sink delivers through the channel configured under `push:` (APNs, the webhook
+relay, or the logging default) to the devices the owner registered. It uses that
+channel even when `push.enabled` is false, so you can offer push rules without the
+automatic needs-input push.
+
+The existing needs-input push (`PushAttentionNotifier`, `push.enabled`) is unchanged. It
+still pushes every "session needs you" moment as it happens. To avoid a second push for
+the same moment, the push sink **suppresses** `attention` notifications raised by Forge
+itself (`source: system`) while `push.enabled` is on. Agent-raised `attention`
+notifications and every other kind are pushed. A rule that targets the push sink is the
+only way other notifications reach a phone.
+
+APNs results: delivered if at least one device accepted. It is retryable when every
+device failed transiently (429/5xx, network). It is `dead` when the owner has no iOS
+devices or APNs rejected them all.
+
+### Deep links
+
+Messages link back to `notifications.public_web_url`, or else the host's public origin,
+with `session_link_path` (default
+`/volundr/session/{session_id}#notification-{notification_id}`, which opens the session
+at the notification's card) or `feed_link_path` for sessionless notifications. Set
+`public_web_url` whenever Forge is reached through a proxy or a public hostname. Relative
+notification links (`/volundr/…`) are made absolute against the same base.
+
+## Troubleshooting
+
+Check a notification's delivery rows with `GET /api/v1/forge/notifications/{id}/deliveries`.
+`status`, `attempts`, `next_attempt_at` and `last_error` explain every outcome. The
+dispatcher logs each delivery, retry, suppression and dead row under
+`volundr.domain.services.notification_dispatcher`. Logs and `last_error` never contain
+bot tokens, webhook paths or secrets.
+
+| Symptom | Likely cause |
+|---|---|
+| Rows stay `pending` | The dispatcher is off (`notifications.dispatcher.enabled`), or no Forge host with access to this database is running. |
+| `suppressed`: "Quiet hours …" | Expected inside the rule's window. Raise the notification's severity, or change `allow_min_severity`. |
+| `suppressed`: "Rate limit …" | The rule reached `config.rate_limit`, or the default of 60/hour. Raise it on the rule. |
+| `failed`: "Sink 'x' is not configured on this host" | The rule names a sink missing from `notifications.sinks`, or it failed to build. Check the startup log for "Notification sink … could not be built" and restart once it is fixed. |
+| `dead`: "Integration connection … is disabled / was not found" | The user disabled or deleted the integration. Re-enable it, or point the rule at another connection. |
+| `dead`: "Credential '…' … was not found" | The integration's credential was deleted. Re-enter it in Settings → Integrations. |
+| `dead`: "Telegram Bot API returned HTTP 401/403/400" | Wrong bot token, bot not in the chat, or wrong chat id. |
+| `dead`: "Gave up after N attempts" | The sink kept failing for about `max_attempts` backoffs. Fix the receiver; new notifications deliver normally. |
+| Telegram rules are not offered in the UI | `GET /notifications/sinks` lists `integration` only for users with an enabled messaging integration. |
 
 ## Configuration
 
@@ -188,25 +335,47 @@ notifications:
     body_chars: 280          # <= 4000 (protocol limit)
   default_page_size: 50
   max_page_size: 200
-  dispatcher:                # used by the outbox dispatcher
+  public_web_url: ""         # deep-link origin; empty = the host's public origin
+  host_label: ""             # host name shown in messages; empty = the URL's hostname
+  session_link_path: /volundr/session/{session_id}#notification-{notification_id}
+  feed_link_path: /volundr/notifications
+  dispatcher:
+    enabled: true            # run the outbox dispatcher on this host
     poll_interval_seconds: 2.0
     batch_size: 50
     lease_seconds: 60
+    send_timeout_seconds: 20 # must be shorter than lease_seconds
+    max_concurrent_sends: 8
     max_attempts: 8
     backoff_base_seconds: 5
     backoff_max_seconds: 900
+    backoff_jitter_ratio: 0.2
+    default_rate_limit: {max_count: 60, window_seconds: 3600}   # null = none
     max_error_chars: 2000
+  integration_sinks:         # integration slug -> NotificationSink class
+    telegram: niuu.adapters.notifications.telegram.TelegramNotificationSink
+    webhook: niuu.adapters.notifications.webhook.WebhookNotificationSink
   sinks:                     # dynamic adapters: name, label, adapter, then kwargs
     - name: ops-webhook
       label: Ops webhook
-      adapter: niuu.adapters.notifications.webhook.WebhookNotificationAdapter
+      adapter: niuu.adapters.notifications.webhook.WebhookNotificationSink
       url: https://hooks.example.com/forge
+      secret_kwargs_env: {secret: FORGE_OPS_WEBHOOK_SECRET}
 ```
 
 Sink names use lowercase letters, digits, `.`, `_` and `-`. `integration` is reserved.
-In Helm, set `notifications:` in `values.yaml`. It is rendered verbatim into the Volundr
-config. `GET /api/v1/forge/feature-flags` reports `notifications_enabled` and
-`capabilities.notifications`.
+Every key of a sink entry except `label`, `adapter` and `secret_kwargs_env` is passed to
+the adapter. `secret_kwargs_env` maps a kwarg to the environment variable that holds its
+value. A sink that cannot be built is logged at startup and skipped. In Helm, set
+`notifications:` in `values.yaml` (it is rendered verbatim into the Volundr config) and
+mount sink secrets with `extraEnv`. `GET /api/v1/forge/feature-flags` reports
+`notifications_enabled` and `capabilities.notifications`.
+
+The shared sink port is `niuu.ports.notifications.NotificationSink`. A custom sink
+implements `name` and `async send(OutboundNotification) -> DeliveryResult`, and raises
+`NotificationDeliveryError(retryable=…)` on failure. It can then be named in
+`notifications.sinks`, or stored as the adapter of a messaging integration whose slug is
+not in `integration_sinks`.
 
 ## Storage
 
@@ -219,9 +388,13 @@ Migration `000069_forge_notifications` creates four tables:
 - `forge_notification_deliveries`, which cascades from both its notification and its
   rule, and is indexed on `(status, next_attempt_at)`.
 
-The migration ships in `migrations/`, in the Helm migrations configmap, and in the CLI
-bundle (`src/cli/migrations/volundr/`). Mini mode applies it at startup.
+Migration `000070_forge_notification_delivery_rate_index` adds a partial index on
+`(rule_id, delivered_at) WHERE status = 'delivered'` for the per-rule rate limit.
 
-To check it against a disposable PostgreSQL database, run:
-`FORGE_HISTORY_TEST_DATABASE_URL=postgresql://… pytest -m integration tests/test_adapters/test_notifications_postgres_integration.py`.
-The `database` lane of `scripts/verify_forge.py` includes it.
+Both migrations ship in `migrations/`, in the Helm migrations configmap, and in the CLI
+bundle (`src/cli/migrations/volundr/`). Mini mode applies them at startup.
+
+To check them, and the dispatcher against a local webhook receiver, on a disposable
+PostgreSQL database, run:
+`FORGE_HISTORY_TEST_DATABASE_URL=postgresql://… pytest -m integration tests/test_adapters/test_notifications_postgres_integration.py tests/test_adapters/test_notification_dispatcher_postgres_integration.py`.
+The `database` lane of `scripts/verify_forge.py` includes both.
