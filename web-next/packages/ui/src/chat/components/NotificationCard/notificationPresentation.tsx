@@ -43,8 +43,11 @@ export const NOTIFICATION_SEVERITY_LABELS: Record<ForgeNotificationSeverity, str
 export interface NotificationTone {
   /** Foreground accent for the icon and kind label. */
   text: string;
-  /** Left accent border for cards and rows. */
-  accent: string;
+  /**
+   * Background for a severity accent bar. A separate element, not a border
+   * colour, so a host's own border utilities can never override it.
+   */
+  bar: string;
   /** Soft background for chips. */
   soft: string;
 }
@@ -52,22 +55,22 @@ export interface NotificationTone {
 const TONES: Record<ForgeNotificationSeverity, NotificationTone> = {
   info: {
     text: 'niuu:text-brand',
-    accent: 'niuu:border-l-brand',
+    bar: 'niuu:bg-brand',
     soft: 'niuu:bg-brand/15 niuu:text-brand',
   },
   success: {
     text: 'niuu:text-state-ok',
-    accent: 'niuu:border-l-state-ok',
+    bar: 'niuu:bg-state-ok',
     soft: 'niuu:bg-state-ok-bg niuu:text-state-ok',
   },
   warning: {
     text: 'niuu:text-state-warn',
-    accent: 'niuu:border-l-state-warn',
+    bar: 'niuu:bg-state-warn',
     soft: 'niuu:bg-state-warn-bg niuu:text-state-warn',
   },
   critical: {
     text: 'niuu:text-critical',
-    accent: 'niuu:border-l-critical',
+    bar: 'niuu:bg-critical',
     soft: 'niuu:bg-critical-bg niuu:text-critical',
   },
 };

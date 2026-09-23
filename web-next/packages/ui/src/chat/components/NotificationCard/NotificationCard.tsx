@@ -97,15 +97,19 @@ export function NotificationCard({ notification, className }: NotificationCardPr
       data-targeted={targeted || undefined}
       aria-label={`${NOTIFICATION_KIND_LABELS[kind]}: ${title}`}
       className={cn(
-        'niuu:my-3 niuu:flex niuu:items-start niuu:gap-3 niuu:rounded-lg niuu:border niuu:border-l-4 niuu:border-solid niuu:border-border-subtle niuu:bg-bg-secondary niuu:p-3',
-        tone.accent,
+        'niuu:my-3 niuu:flex niuu:items-stretch niuu:gap-3 niuu:overflow-hidden niuu:rounded-lg niuu:border niuu:border-solid niuu:border-border-subtle niuu:bg-bg-secondary niuu:py-3 niuu:pr-3',
         targeted && 'niuu:ring-2 niuu:ring-brand',
         className,
       )}
     >
+      <span
+        aria-hidden="true"
+        data-testid="notification-accent"
+        className={cn('niuu:-my-3 niuu:w-1 niuu:shrink-0', tone.bar)}
+      />
       <NotificationKindIcon
         kind={kind}
-        className={cn('niuu:mt-0.5 niuu:h-4 niuu:w-4', tone.text)}
+        className={cn('niuu:mt-0.5 niuu:h-4 niuu:w-4 niuu:shrink-0', tone.text)}
       />
       <div className="niuu:flex niuu:min-w-0 niuu:flex-1 niuu:flex-col niuu:gap-1">
         <div className="niuu:flex niuu:flex-wrap niuu:items-center niuu:gap-2 niuu:text-xs">

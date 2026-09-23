@@ -41,7 +41,7 @@ describe('NotificationCard', () => {
     expect(card).toHaveAttribute('data-severity', 'success');
     expect(card).toHaveAttribute('id', 'notification-n-1');
     expect(card).toHaveAccessibleName('Milestone: Migration applied');
-    expect(card.className).toContain('niuu:border-l-state-ok');
+    expect(within(card).getByTestId('notification-accent').className).toContain('niuu:bg-state-ok');
     expect(within(card).getByText('Milestone')).toBeInTheDocument();
     expect(within(card).getByText('Success')).toBeInTheDocument();
     expect(within(card).getByText('Migration applied')).toBeInTheDocument();
@@ -133,7 +133,7 @@ describe('NotificationCard', () => {
 describe('notification presentation', () => {
   it('maps every severity to a token tone and falls back to info', () => {
     expect(notificationTone('critical').text).toBe('niuu:text-critical');
-    expect(notificationTone('warning').accent).toBe('niuu:border-l-state-warn');
+    expect(notificationTone('warning').bar).toBe('niuu:bg-state-warn');
     expect(notificationTone('info').soft).toContain('niuu:text-brand');
     expect(notificationTone('unknown' as never)).toEqual(notificationTone('info'));
   });
