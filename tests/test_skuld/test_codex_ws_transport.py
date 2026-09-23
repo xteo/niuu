@@ -1206,6 +1206,29 @@ class TestItemLifecycle:
         assert assistant_events[0]["message"]["content"][0]["name"] == "Read"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("server", "tool", "name"),
+        [("forge", "notify", "forge.notify"), ("", "notify", "notify")],
+    )
+    async def test_mcp_tool_call_is_qualified_by_server(self, tmp_path, server, tool, name):
+        t = _make_transport(tmp_path)
+        emit = _collect_emits(t)
+
+        await t._handle_item_started(
+            {
+                "type": "mcpToolCall",
+                "id": "mcp-2",
+                "server": server,
+                "tool": tool,
+                "arguments": {"kind": "milestone", "title": "t"},
+            }
+        )
+
+        block = _events_of_type(emit, "assistant")[0]["message"]["content"][0]
+        assert block["name"] == name
+        assert block["input"] == {"kind": "milestone", "title": "t"}
+
+    @pytest.mark.asyncio
     async def test_web_search_started(self, tmp_path):
         t = _make_transport(tmp_path)
         emit = _collect_emits(t)
