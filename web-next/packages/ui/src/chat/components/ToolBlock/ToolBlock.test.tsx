@@ -361,6 +361,13 @@ describe('Forge notification tool parts', () => {
     expect(grouped[1]).toMatchObject({ block: { id: 'nt_1' } });
   });
 
+  it('labels Codex server.tool MCP calls like Claude mcp__ calls', () => {
+    expect(getToolLabel('mimir.mimir_search')).toBe('mimir:mimir_search');
+    expect(getToolCategory('mimir.mimir_search')).toBe('mcp');
+    expect(getToolLabel('report.v2.final')).toBe('report.v2.final');
+    expect(getToolCategory('file.name with space')).toBe('default');
+  });
+
   it('labels the Forge MCP notify call in group summaries', () => {
     expect(getToolLabel('mcp__forge__notify')).toBe('Notify');
     expect(getToolLabel('forge.notify')).toBe('Notify');
