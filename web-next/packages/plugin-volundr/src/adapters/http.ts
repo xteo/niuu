@@ -17,6 +17,7 @@ import type {
   VolundrConversationHistory,
 } from '../ports/IVolundrService';
 import type { IFileSystemPort, FileTreeNode } from '../ports/IFileSystemPort';
+import type { ForgeEventStreamSource, ForgeStreamListener } from '../ports/IForgeEventStream';
 import type {
   VolundrSession,
   VolundrStats,
@@ -84,6 +85,9 @@ const LIVE_POLL_MS = 2_000;
 interface VolundrHttpAdapterOptions {
   niuuBasePath?: string | null;
 }
+
+/** The Forge service plus its shared fleet stream, for features that need raw events. */
+export type VolundrHttpAdapter = IVolundrService & ForgeEventStreamSource;
 
 interface FileEntryPayload {
   name: string;
@@ -177,6 +181,12 @@ type SessionPayload = {
   instance_id?: string | null;
   instanceName?: string | null;
   instance_name?: string | null;
+  read_state?: {
+    is_unread?: boolean;
+    latest_output_seq?: number;
+    read_through_seq?: number;
+    revision?: number;
+  } | null;
 };
 
 type ExternalSessionPayload = {
@@ -572,6 +582,16 @@ function normalizeSession(session: SessionPayload): VolundrSession {
     tenantId: session.tenantId ?? session.tenant_id ?? undefined,
     instanceId: session.instanceId ?? session.instance_id ?? undefined,
     instanceName: session.instanceName ?? session.instance_name ?? undefined,
+    ...(session.read_state
+      ? {
+          readState: {
+            isUnread: session.read_state.is_unread === true,
+            latestOutputSeq: session.read_state.latest_output_seq ?? 0,
+            readThroughSeq: session.read_state.read_through_seq ?? 0,
+            revision: session.read_state.revision ?? 0,
+          },
+        }
+      : {}),
   };
 }
 
@@ -653,6 +673,11 @@ function deriveCanonicalForgeBasePath(basePath?: string): string | null {
   if (normalized.endsWith('/api/v1')) return `${normalized}/forge`;
   const sharedBasePath = deriveSharedApiBasePath(normalized);
   return sharedBasePath ? `${sharedBasePath}/forge` : null;
+}
+
+/** The `{forge}` base the Forge adapter talks to for a configured service base. */
+export function forgeApiBasePath(basePath: string): string {
+  return deriveCanonicalForgeBasePath(basePath) ?? basePath;
 }
 
 function deriveCanonicalVolundrBasePath(basePath?: string): string | null {
@@ -1250,7 +1275,7 @@ export function buildVolundrHttpAdapter(
   client: HttpClient,
   openStream: EventStreamOpener = openEventStream,
   options: VolundrHttpAdapterOptions = {},
-): IVolundrService {
+): VolundrHttpAdapter {
   const forgeClient = (() => {
     const forgeBasePath = deriveCanonicalForgeBasePath(client.basePath);
     return forgeBasePath && forgeBasePath !== client.basePath
@@ -1287,6 +1312,9 @@ export function buildVolundrHttpAdapter(
   const chronicleCache = new Map<string, SessionChronicle>();
   let statsCache: VolundrStats | null = null;
   let streamHandle: EventStreamHandle | null = null;
+  const streamListeners = new Set<ForgeStreamListener>();
+  let streamStatus: 'open' | 'error' | null = null;
+  const readStateRefreshes = new Set<string>();
   let sessionsHydration: Promise<void> | null = null;
   let statsHydration: Promise<void> | null = null;
   const chronicleHydration = new Map<string, Promise<void>>();
@@ -1485,14 +1513,50 @@ export function buildVolundrHttpAdapter(
     registry.delete(sessionId);
   }
 
+  function publishStreamStatus(status: 'open' | 'error'): void {
+    streamStatus = status;
+    for (const listener of Array.from(streamListeners)) listener.onStatus?.(status);
+  }
+
+  function publishStreamEvent(type: string, data: unknown): void {
+    for (const listener of Array.from(streamListeners)) {
+      try {
+        listener.onEvent({ type, data });
+      } catch {
+        // One feature's listener must never break the shared fleet stream.
+      }
+    }
+  }
+
+  /** The read-state hint carries no state; re-read the authorized session projection. */
+  function refreshReadState(sessionId: string): void {
+    if (!sessionCache.has(sessionId) || readStateRefreshes.has(sessionId)) return;
+    readStateRefreshes.add(sessionId);
+    void loadSession(sessionId)
+      .catch(() => undefined)
+      .finally(() => {
+        readStateRefreshes.delete(sessionId);
+      });
+  }
+
   function ensureStream(): void {
     if (streamHandle || !forgeClient.basePath) return;
     streamHandle = openStream(`${forgeClient.basePath}/sessions/stream?all_instances=true`, {
       onMessage: () => {},
+      onOpen: () => publishStreamStatus('open'),
+      onError: () => publishStreamStatus('error'),
       onEvent: ({ event, data }) => {
         try {
           const payload = JSON.parse(data) as SessionPayload | StatsPayload | { id?: string };
           const eventType = event ?? inferEventType(payload);
+          if (eventType) publishStreamEvent(eventType, payload);
+          // Notifications are owned by the notifications feed's listener.
+          if (eventType === 'session_notification') return;
+          if (eventType === 'session_read_state') {
+            const sessionId = (payload as { session_id?: unknown }).session_id;
+            if (typeof sessionId === 'string') refreshReadState(sessionId);
+            return;
+          }
           if (eventType === 'session_created' || eventType === 'session_updated') {
             const session = keepNewerActivity(normalizeSession(payload as SessionPayload));
             sessionCache.set(session.id, session);
@@ -1577,9 +1641,16 @@ export function buildVolundrHttpAdapter(
     const hasChronicleSubscribers = Array.from(chronicleSubscribers.values()).some(
       (subscribers) => subscribers.size > 0,
     );
-    if (sessionSubscribers.size > 0 || statsSubscribers.size > 0 || hasChronicleSubscribers) return;
+    if (
+      sessionSubscribers.size > 0 ||
+      statsSubscribers.size > 0 ||
+      streamListeners.size > 0 ||
+      hasChronicleSubscribers
+    )
+      return;
     streamHandle?.close();
     streamHandle = null;
+    streamStatus = null;
   }
 
   function hydrateSessions(): void {
@@ -1694,6 +1765,15 @@ export function buildVolundrHttpAdapter(
       }
       return () => {
         sessionSubscribers.delete(callback);
+        maybeCloseStream();
+      };
+    },
+    subscribeForgeStream: (listener) => {
+      streamListeners.add(listener);
+      ensureStream();
+      if (streamStatus) listener.onStatus?.(streamStatus);
+      return () => {
+        streamListeners.delete(listener);
         maybeCloseStream();
       };
     },

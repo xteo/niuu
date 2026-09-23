@@ -6,6 +6,8 @@ import { SessionsPage } from './ui/SessionsPage';
 import { VolundrSessionRoute, VolundrArchivedRoute } from './ui/routes';
 import { LaunchCatalogPage } from './ui/LaunchCatalogPage';
 import { HistoryPage } from './ui/HistoryPage';
+import { NotificationsPage } from './ui/notifications/NotificationsPage';
+import { useUnreadNotificationCount } from './ui/hooks/useNotifications';
 
 export const volundrPlugin = definePlugin({
   id: 'volundr',
@@ -16,6 +18,12 @@ export const volundrPlugin = definePlugin({
     { id: 'forge', label: 'Forge', path: '/volundr/forge' },
     { id: 'sessions', label: 'Sessions', path: '/volundr/sessions' },
     { id: 'catalog', label: 'Catalog', path: '/volundr/catalog' },
+    {
+      id: 'notifications',
+      label: 'Notifications',
+      path: '/volundr/notifications',
+      useCount: useUnreadNotificationCount,
+    },
   ],
   routes: (rootRoute) => [
     createRoute({
@@ -91,6 +99,11 @@ export const volundrPlugin = definePlugin({
       path: '/volundr/history',
       component: HistoryPage,
     }),
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: '/volundr/notifications',
+      component: NotificationsPage,
+    }),
   ],
 });
 
@@ -101,8 +114,19 @@ export { createMockSessionStore } from './adapters/mock';
 export { createMockPtyStream } from './adapters/mock';
 export { createMockMetricsStream } from './adapters/mock';
 export { createMockFileSystemPort } from './adapters/mock';
-export { buildVolundrHttpAdapter, buildVolundrFileSystemHttpAdapter } from './adapters/http';
+export {
+  buildVolundrHttpAdapter,
+  buildVolundrFileSystemHttpAdapter,
+  forgeApiBasePath,
+} from './adapters/http';
 export { buildVolundrPtyWsAdapter, buildVolundrMetricsSseAdapter } from './adapters/streams';
+export { buildNotificationFeedHttpAdapter } from './adapters/notifications';
+export {
+  createMockNotificationFeed,
+  type MockNotificationFeed,
+  type MockNotificationFeedOptions,
+} from './adapters/notifications.mock';
+export type { VolundrHttpAdapter } from './adapters/http';
 
 // Port types
 export type { IVolundrService } from './ports/IVolundrService';
@@ -111,6 +135,18 @@ export type { ISessionStore, SessionFilters } from './ports/ISessionStore';
 export type { IPtyStream } from './ports/IPtyStream';
 export type { IMetricsStream, MetricPoint } from './ports/IMetricsStream';
 export type { IFileSystemPort, FileTreeNode } from './ports/IFileSystemPort';
+export type {
+  INotificationFeed,
+  NotificationFeedPage,
+  NotificationFeedSubscriber,
+  NotificationGapPage,
+  NotificationStreamStatus,
+} from './ports/INotificationFeed';
+export type {
+  ForgeEventStreamSource,
+  ForgeStreamEvent,
+  ForgeStreamListener,
+} from './ports/IForgeEventStream';
 
 // UI components
 export { Terminal } from './ui/Terminal/Terminal';
@@ -128,6 +164,13 @@ export {
   type LiveSessionTab,
 } from './ui/LiveSessionDetailPage';
 export { SessionsPage } from './ui/SessionsPage';
+export { NotificationsPage } from './ui/notifications/NotificationsPage';
+export {
+  NOTIFICATIONS_SERVICE,
+  useNotifications,
+  useNotificationReadState,
+  useUnreadNotificationCount,
+} from './ui/hooks/useNotifications';
 export { ForgePage } from './ui/ForgePage';
 export { StructuredLogViewer } from './ui/components/StructuredLogViewer';
 export { useSkuldChat } from './ui/hooks/useSkuldChat';
@@ -149,6 +192,17 @@ export { appendExecEntry, updateExecEntry } from './domain/exec';
 export type { PodSpec, Mount, MountSource, ResourceSpec, MountKind } from './domain/pod';
 export type { Cluster, ClusterNode, ClusterCapacity, NodeStatus } from './domain/cluster';
 export type { Quota, QuotaLimit, QuotaScope } from './domain/quota';
+export type {
+  SessionNotification,
+  NotificationFilter,
+  NotificationReadState,
+  NotificationRule,
+  NotificationRuleDraft,
+  NotificationSinkOption,
+  NotificationDelivery,
+  NotificationDeliveryStatus,
+} from './domain/notifications';
+export { NotificationReadStateConflictError } from './domain/notifications';
 
 // Model types (lifted from web/)
 export type {

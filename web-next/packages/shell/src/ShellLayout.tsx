@@ -1,7 +1,7 @@
 import { createElement, useCallback, useEffect, useMemo, type ReactNode } from 'react';
 import clsx from 'clsx';
 import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
-import { type PluginCtx, type PluginDescriptor } from '@niuulabs/plugin-sdk';
+import { type PluginCtx, type PluginDescriptor, type PluginTab } from '@niuulabs/plugin-sdk';
 import {
   LiveBadge,
   Kbd,
@@ -36,6 +36,25 @@ export function PluginSlot({
   ctx: PluginCtx;
 }) {
   return render ? createElement(render, ctx) : null;
+}
+
+function TabCountBadge({ tabId, count }: { tabId: string; count: number | null | undefined }) {
+  if (count == null || count <= 0) return null;
+  return (
+    <span className="niuu-shell__tab-count" data-testid={`tab-count-${tabId}`}>
+      {count}
+    </span>
+  );
+}
+
+function LiveTabCount({
+  tabId,
+  useCount,
+}: {
+  tabId: string;
+  useCount: NonNullable<PluginTab['useCount']>;
+}) {
+  return <TabCountBadge tabId={tabId} count={useCount()} />;
 }
 
 function RailTooltipContent({ title, subtitle }: { title: string; subtitle?: string }) {
@@ -192,10 +211,14 @@ export function ShellLayout() {
                   >
                     {t.rune && <span className="niuu-shell__tab-rune">{t.rune}</span>}
                     <span className="niuu-shell__tab-label">{t.label}</span>
-                    {t.count != null && t.count > 0 && (
-                      <span className="niuu-shell__tab-count" data-testid={`tab-count-${t.id}`}>
-                        {t.count}
-                      </span>
+                    {t.useCount ? (
+                      <LiveTabCount
+                        key={`${active.id}:${t.id}`}
+                        tabId={t.id}
+                        useCount={t.useCount}
+                      />
+                    ) : (
+                      <TabCountBadge tabId={t.id} count={t.count} />
                     )}
                   </button>
                 );

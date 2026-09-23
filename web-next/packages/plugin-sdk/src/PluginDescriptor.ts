@@ -17,6 +17,13 @@ export interface PluginTab {
   path?: string;
   /** Optional count badge rendered next to the tab label. */
   count?: number;
+  /**
+   * Optional live count badge. A React hook the shell calls inside its own badge
+   * component, so it may read services or queries; it is only mounted while the
+   * plugin's tabs are visible. Takes precedence over `count`. Return `null` or
+   * `undefined` (or 0) to hide the badge.
+   */
+  useCount?: () => number | null | undefined;
 }
 
 export interface PluginDescriptor {

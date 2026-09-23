@@ -1,3 +1,5 @@
+import { isForgeNotifyCall } from '@niuulabs/domain';
+
 export type ToolCategory =
   'terminal' | 'file' | 'search' | 'web' | 'agent' | 'task' | 'mcp' | 'default';
 
@@ -33,6 +35,7 @@ const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
 
 export function getToolLabel(toolName: string): string {
   if (TOOL_LABEL_MAP[toolName]) return TOOL_LABEL_MAP[toolName];
+  if (isForgeNotifyCall(toolName)) return 'Notify';
   // MCP tools use __ separator → display as namespace:tool
   if (toolName.includes('__')) return toolName.replace('__', ':');
   return toolName;
