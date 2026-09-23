@@ -1845,6 +1845,26 @@ async def test_workspace_trust_menu_is_not_a_prompt_and_cannot_receive_chat(tmp_
     await transport.stop()
 
 
+@pytest.mark.parametrize(
+    ("screen", "ready"),
+    [
+        # Claude Code 2.1.281, fresh workspace: placeholder in the empty composer and
+        # no "? for shortcuts" footer.
+        (
+            '❯ Try "edit <filepath> to..."\n'
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            True,
+        ),
+        ("❯ \n  ⏵⏵ bypass permissions on", True),
+        ("❯ fix the flaky test\n", False),  # typed input is not an empty composer
+        ('❯ 1. Try "again"\n  2. Cancel', False),  # a menu row, not the composer
+    ],
+)
+def test_repl_readiness_recognises_the_empty_composer(tmp_path, screen, ready):
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    assert transport._repl_looks_ready(screen) is ready
+
+
 @pytest.mark.asyncio
 async def test_seed_prompt_and_command_discovery_reject_workspace_trust_menu(tmp_path):
     transport = FakeTmuxInteractiveTransport(str(tmp_path))

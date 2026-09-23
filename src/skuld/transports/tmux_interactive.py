@@ -147,6 +147,10 @@ _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
 _WORKSPACE_TRUST_ROW_RE = re.compile(
     r"^\s*([❯>])?\s*(?:[1-9][.)]\s+)?(No, exit|Yes, I trust this folder)\s*$"
 )
+# An EMPTY composer that shows Claude Code's placeholder suggestion, e.g.
+# '❯ Try "edit <filepath> to..."' (2.1.281 renders it in fresh workspaces instead
+# of the older "? for shortcuts" footer). Menu rows never look like this.
+_PLACEHOLDER_PROMPT_ROW_RE = re.compile(r'^\s*❯\s+Try "[^"\n]*"\s*$')
 
 
 @dataclass
@@ -515,7 +519,10 @@ class TmuxInteractiveTransport(CLITransport):
             marker and marker != "❯" and marker in text for marker in self._repl_ready_markers
         ) or (
             "❯" in self._repl_ready_markers
-            and any(self._is_empty_prompt_row(row) for row in text.splitlines())
+            and any(
+                self._is_empty_prompt_row(row) or _PLACEHOLDER_PROMPT_ROW_RE.match(row)
+                for row in text.splitlines()
+            )
         )
 
     @staticmethod
