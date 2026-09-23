@@ -4,7 +4,8 @@ Each Forge node orders its own feed by a node-local ``seq``. A fleet-wide page
 merges the per-node pages newest first by ``(created_at, instance_id, seq)`` and
 carries one position per node in an opaque cursor: base64url JSON
 ``{instance_id: seq}``. A ``null`` position means "from that node's newest"; a node
-absent from a ``before`` cursor has no older notifications left.
+absent from a ``before`` cursor has no older notifications left, and a node absent
+from an ``after`` cursor is not gap-filled (send it with seq 0 to read from the start).
 """
 
 from __future__ import annotations

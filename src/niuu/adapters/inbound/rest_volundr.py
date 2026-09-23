@@ -1636,9 +1636,11 @@ def create_volundr_router(
             )
         limit = _optional_limit(query.get("limit"))
         visible = await _visible_instances(service, principal)
-        # A node missing from a before-cursor has no older rows left; a node missing
-        # from an after-cursor has not been seen yet, so it is read from the start.
-        instances = [i for i in visible if i.id in before] if before is not None else visible
+        # A cursor names the nodes it continues: a node missing from a before-cursor
+        # has no older rows left, and one missing from an after-cursor is not being
+        # gap-filled (a client that wants a node from the start sends it with seq 0).
+        cursor = before if before is not None else after
+        instances = [i for i in visible if i.id in cursor] if cursor is not None else visible
         base = _forward_params(request, drop=_FLEET_SELECTORS | {"before", "after"})
 
         def params_for(instance: RegisteredInstance) -> list[tuple[str, str]]:
