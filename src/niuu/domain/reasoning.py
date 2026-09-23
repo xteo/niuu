@@ -12,6 +12,7 @@ MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
 MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
     "claude-fable-5-1": CLAUDE_EFFORTS,
     "claude-fable-5": CLAUDE_EFFORTS,
+    "claude-opus-5-5": CLAUDE_EFFORTS,
     "claude-opus-5": CLAUDE_EFFORTS,
     "claude-opus-4-8": CLAUDE_EFFORTS,
     "claude-sonnet-5": CLAUDE_EFFORTS,
