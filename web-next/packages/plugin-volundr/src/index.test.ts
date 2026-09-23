@@ -1,6 +1,7 @@
 import { createRootRoute } from '@tanstack/react-router';
 import { describe, expect, it } from 'vitest';
 import { volundrPlugin } from './index';
+import { useUnreadNotificationCount } from './ui/hooks/useNotifications';
 
 describe('volundrPlugin', () => {
   it('keeps Forge at the beginning of the tab list while sessions use their dedicated route', () => {
@@ -8,6 +9,12 @@ describe('volundrPlugin', () => {
       { id: 'forge', label: 'Forge', path: '/volundr/forge' },
       { id: 'sessions', label: 'Sessions', path: '/volundr/sessions' },
       { id: 'catalog', label: 'Catalog', path: '/volundr/catalog' },
+      {
+        id: 'notifications',
+        label: 'Notifications',
+        path: '/volundr/notifications',
+        useCount: useUnreadNotificationCount,
+      },
     ]);
   });
 
@@ -21,6 +28,7 @@ describe('volundrPlugin', () => {
     expect(paths).toContain('/volundr/sessions');
     expect(paths).toContain('/volundr/sessions/$sessionId');
     expect(paths).toContain('/volundr/catalog');
+    expect(paths).toContain('/volundr/notifications');
     expect(paths).not.toContain('/volundr/templates');
     expect(paths).toContain('/volundr/credentials');
     expect(paths).toContain('/volundr/clusters');
