@@ -281,8 +281,16 @@ class CorsConfig(BaseSettings):
         default_factory=lambda: ["*"],
         validation_alias=AliasChoices("allow_headers", "CORS_ALLOW_HEADERS"),
     )
+    # Response headers a cross-origin page may read. The Forge fleet endpoints report
+    # hosts that did not answer in this header, and the web surfaces it.
+    expose_headers: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["X-Forge-Unavailable-Instances"],
+        validation_alias=AliasChoices("expose_headers", "CORS_EXPOSE_HEADERS"),
+    )
 
-    @field_validator("allowed_origins", "allow_methods", "allow_headers", mode="before")
+    @field_validator(
+        "allowed_origins", "allow_methods", "allow_headers", "expose_headers", mode="before"
+    )
     @classmethod
     def _normalize_list(cls, value: object) -> object:
         if value is None:

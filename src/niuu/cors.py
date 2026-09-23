@@ -19,4 +19,5 @@ def apply_cors_middleware(app: FastAPI, cors: CorsConfig) -> None:
         allow_credentials=cors.allow_credentials,
         allow_methods=cors.allow_methods,
         allow_headers=cors.allow_headers,
+        expose_headers=cors.expose_headers,
     )
