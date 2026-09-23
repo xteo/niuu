@@ -19,6 +19,7 @@ import {
 import {
   GAP_FILL_MAX_PAGES,
   NOTIFICATIONS_SERVICE,
+  needsFirstPageReload,
   notificationKeys,
   prependNotifications,
   readEverythingThrough,
@@ -240,6 +241,89 @@ describe('gap-fill cursors', () => {
     expect(withNextAfter(data, 'A')).toBe(data);
     expect(withNextAfter(data, null)).toBe(data);
     expect(withNextAfter(data, 'B')?.pages[0]?.nextAfter).toBe('B');
+  });
+});
+
+describe('reconnects that must refetch the newest page', () => {
+  it('refetches instead of gap-filling when the first load missed a host', async () => {
+    const feed = createMockNotificationFeed({
+      seed: seeded(1),
+      unavailableInstances: ['horde-2'],
+    });
+    const listSince = vi.spyOn(feed, 'listSince');
+    const list = vi.spyOn(feed, 'list');
+    const { wrapper } = setup(feed);
+    const { result } = renderHook(() => useNotifications(ALL), { wrapper });
+    await waitFor(() => expect(result.current.unavailableInstances).toEqual(['horde-2']));
+    const before = list.mock.calls.length;
+    act(() => feed.setStatus('open'));
+    await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(before));
+    expect(listSince).not.toHaveBeenCalled();
+  });
+
+  it('refetches when a live row comes from a host the first page did not cover', async () => {
+    const feed = createMockNotificationFeed({ seed: seeded(1) });
+    const listSince = vi.spyOn(feed, 'listSince');
+    const list = vi.spyOn(feed, 'list');
+    const { wrapper } = setup(feed);
+    const { result } = renderHook(() => useNotifications(ALL), { wrapper });
+    await waitFor(() => expect(result.current.notifications).toHaveLength(1));
+    act(() => feed.emit(row({ instanceId: 'horde-new' })));
+    await waitFor(() => expect(result.current.notifications).toHaveLength(2));
+    const before = list.mock.calls.length;
+    act(() => feed.setStatus('open'));
+    await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(before));
+    expect(listSince).not.toHaveBeenCalled();
+  });
+
+  it('decides from the first page what it covered', () => {
+    const page = {
+      items: [],
+      nextBefore: null,
+      nextAfter: null,
+      unreadCount: null,
+      unavailableInstances: [],
+      instanceHeads: { thor: 3, empty: 0 },
+    };
+    const thorRow = row({ instanceId: 'thor' });
+    expect(needsFirstPageReload(undefined, [], undefined)).toBe(false);
+    expect(needsFirstPageReload(page, [thorRow], undefined)).toBe(false);
+    expect(
+      needsFirstPageReload({ ...page, instanceHeads: null }, [row({ instanceId: 'x' })], undefined),
+    ).toBe(false);
+    expect(
+      needsFirstPageReload(page, [thorRow], {
+        unreadCount: 0,
+        instances: {
+          late: { readThroughSeq: 0, revision: 0, unreadCount: 0, headSeq: 2 },
+        },
+      }),
+    ).toBe(true);
+    expect(needsFirstPageReload({ ...page, unavailableInstances: ['x'] }, [], undefined)).toBe(
+      true,
+    );
+  });
+
+  it('names every covered node in the fallback cursor, including empty ones', async () => {
+    const base = createMockNotificationFeed({ seed: seeded(1) });
+    const listSince = vi.spyOn(base, 'listSince');
+    const feed: INotificationFeed = {
+      ...base,
+      list: async (filter, cursor) => ({
+        ...(await base.list(filter, cursor)),
+        nextAfter: null,
+        instanceHeads: { thor: 0, quiet: 0 },
+      }),
+    };
+    const { wrapper } = setup(feed);
+    const { result } = renderHook(() => useNotifications(ALL), { wrapper });
+    await waitFor(() => expect(result.current.notifications).toHaveLength(1));
+    act(() => base.setStatus('open'));
+    await waitFor(() => expect(listSince).toHaveBeenCalled());
+    expect(listSince.mock.calls[0]![1]).toEqual({
+      cursor: null,
+      watermarks: { thor: result.current.loaded[0]!.seq, quiet: 0 },
+    });
   });
 });
 

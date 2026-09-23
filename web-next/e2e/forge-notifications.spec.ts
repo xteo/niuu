@@ -57,7 +57,11 @@ function encodeCursor(marks: Record<string, number>): string {
   return Buffer.from(JSON.stringify(marks), 'utf8').toString('base64url');
 }
 
-const HOST_NAMES: Record<string, string> = { thor: 'Thor', 'horde-1': 'Horde 1' };
+const HOST_NAMES: Record<string, string> = {
+  thor: 'Thor',
+  'horde-1': 'Horde 1',
+  'horde-2': 'Horde 2',
+};
 
 /** What the Guild facade adds to every fanned-out row. */
 function tagged(r: Row) {
@@ -73,6 +77,8 @@ function maxSeqs(rows: Row[], base: Record<string, number> = {}): Record<string,
 interface FixtureOptions {
   /** Hold the first page until released. */
   holdList?: boolean;
+  /** Add a third host, horde-2, with one notification. */
+  hordeTwo?: boolean;
 }
 
 async function fixture(page: Page, options: FixtureOptions = {}) {
@@ -117,14 +123,37 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
       15,
     ),
   ];
-  const readState = {
+  const readState: Record<
+    string,
+    { read_through_seq: number; revision: number; head_seq: number }
+  > = {
     thor: { read_through_seq: 5, revision: 1, head_seq: 7 },
     'horde-1': { read_through_seq: 0, revision: 0, head_seq: 4 },
   };
+  if (options.hordeTwo) {
+    readState['horde-2'] = { read_through_seq: 0, revision: 0, head_seq: 2 };
+    rows.push(
+      row(
+        {
+          id: 'n-night',
+          seq: 2,
+          instance_id: 'horde-2',
+          session_id: 'sess-night',
+          session_name: 'nightly',
+          kind: 'milestone',
+          severity: 'success',
+          title: 'Night build finished',
+        },
+        30,
+      ),
+    );
+  }
   const state = {
     listCalls: 0,
     /** While true, the feed answers 500 (the app retries once on its own). */
     failList: false,
+    /** Hosts the fan-out cannot reach right now. */
+    unavailable: [] as string[],
     gapCursors: [] as string[],
     readStatePuts: [] as unknown[],
   };
@@ -144,9 +173,13 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
   );
   const gap = row({ id: 'n-gap', seq: 9, kind: 'decision', title: 'Chose the facade cursor' }, 0);
 
+  const reachable = (id: string) => !state.unavailable.includes(id);
+  const visibleRows = () => rows.filter((r) => reachable(r.instance_id));
+
   function unread() {
+    const nodes = Object.entries(readState).filter(([id]) => reachable(id));
     const counts = Object.fromEntries(
-      Object.entries(readState).map(([id, s]) => [
+      nodes.map(([id, s]) => [
         id,
         rows.filter((r) => r.instance_id === id && r.seq > s.read_through_seq).length,
       ]),
@@ -154,7 +187,7 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
     return {
       unread_count: Object.values(counts).reduce((a, b) => a + b, 0),
       instances: Object.fromEntries(
-        Object.entries(readState).map(([id, s]) => [
+        nodes.map(([id, s]) => [
           id,
           {
             ...s,
@@ -256,7 +289,7 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
         const marks = decodeCursor(after) as Record<string, number>;
         // Facade rules: only the nodes the cursor names are read (seq 0 reads a
         // node from the start), ascending, each node capped at `limit`.
-        const newer = rows
+        const newer = visibleRows()
           .filter((r) => marks[r.instance_id] !== undefined && r.seq > marks[r.instance_id]!)
           .sort((a, b) => a.seq - b.seq);
         return route.fulfill({
@@ -271,11 +304,17 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
       if (options.holdList) await listGate;
       if (state.failList)
         return route.fulfill({ status: 500, json: { detail: 'notification store unavailable' } });
-      const items = [...rows].sort((a, b) => b.created_at.localeCompare(a.created_at));
+      const items = visibleRows().sort((a, b) => b.created_at.localeCompare(a.created_at));
       const summary = unread();
+      // next_after names every node that answered, at its head — even empty ones.
+      const heads = Object.fromEntries(
+        Object.entries(summary.instances).map(([id, s]) => [id, s.head_seq]),
+      );
       return route.fulfill({
         headers: {
-          'X-Forge-Unavailable-Instances': 'horde-2',
+          ...(state.unavailable.length > 0
+            ? { 'X-Forge-Unavailable-Instances': state.unavailable.join(',') }
+            : {}),
           // The fake API is cross-origin here; a same-origin Guild needs no CORS.
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Expose-Headers': 'X-Forge-Unavailable-Instances',
@@ -283,7 +322,7 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
         json: {
           items: items.map(tagged),
           next_before: null,
-          next_after: encodeCursor(maxSeqs(rows)),
+          next_after: encodeCursor(heads),
           head_seq: null,
           read_through_seq: null,
           unread_count: summary.unread_count,
@@ -301,6 +340,10 @@ async function fixture(page: Page, options: FixtureOptions = {}) {
     sendLive() {
       rows.push(live);
       pushStream(`event: session_notification\ndata: ${JSON.stringify(live)}\n\n`);
+    },
+    /** Accept the open fleet-stream connection(s) without sending an event. */
+    acceptStream() {
+      pushStream(': connected\n\n');
     },
     /** Commit a row nobody hears about, then accept the reconnect. */
     reconnectAfterGap() {
@@ -324,11 +367,8 @@ test('notifications feed: live rows, reconnect gap-fill, filters, delivery and m
   await expect(feedRows(page).first()).toContainText('forge-api needs your input');
   await expect(page.getByTestId('tab-count-notifications')).toHaveText('3');
   await expect(page.getByTestId('notifications-unread')).toHaveText('3 unread');
-  // The fan-out could not reach one host; the page says so quietly.
-  await expect(page.getByTestId('notifications-unavailable')).toContainText(
-    'Some hosts are unavailable (Horde 2)',
-  );
   await expect(feedRows(page).nth(1)).toContainText('Horde 1');
+  await expect(page.getByTestId('notifications-unavailable')).toHaveCount(0);
 
   // A live session_notification lands on top and counts as unread.
   await expect.poll(fake.waitingStreams).toBeGreaterThan(0);
@@ -384,6 +424,32 @@ test('notifications feed: live rows, reconnect gap-fill, filters, delivery and m
     .getByRole('button', { name: /Benchmark run crashed — open gpu-bench/ })
     .click();
   await expect(page).toHaveURL(/\/volundr\/session\/sess-bench#notification-n-crash$/);
+});
+
+test('a host the first load missed is picked up by refetching, not by gap-fill', async ({
+  page,
+}) => {
+  const fake = await fixture(page, { hordeTwo: true });
+  fake.state.unavailable = ['horde-2'];
+  await page.goto('/volundr/notifications');
+  await expect(feedRows(page)).toHaveCount(3);
+  await expect(page.getByTestId('notifications-unavailable')).toContainText(
+    'Some hosts are unavailable (Horde 2)',
+  );
+  await expect(page.getByTestId('notifications-unread')).toHaveText('3 unread');
+
+  // horde-2 is back when the fleet stream (re)connects. The facade skips nodes
+  // an `after` cursor does not name, so the web refetches the newest page.
+  fake.state.unavailable = [];
+  const listsBefore = fake.state.listCalls;
+  await expect.poll(fake.waitingStreams).toBeGreaterThan(0);
+  fake.acceptStream();
+  await expect(feedRows(page)).toHaveCount(4);
+  await expect(feedRows(page).filter({ hasText: 'Night build finished' })).toContainText('Horde 2');
+  await expect(page.getByTestId('notifications-unavailable')).toHaveCount(0);
+  await expect(page.getByTestId('notifications-unread')).toHaveText('4 unread');
+  expect(fake.state.listCalls).toBeGreaterThan(listsBefore);
+  expect(fake.state.gapCursors).toEqual([]);
 });
 
 test('notifications feed shows a loading state before the first page', async ({ page }) => {

@@ -17,6 +17,7 @@ import {
   afterCursor,
   deliveriesPath,
   feedQuery,
+  instanceHeads,
   isNotificationWire,
   pageCursor,
   normalizeDelivery,
@@ -70,6 +71,8 @@ export function buildNotificationFeedHttpAdapter(
   client: NotificationHttpClient,
   options: NotificationFeedHttpOptions = {},
 ): INotificationFeed {
+  // The unavailable-nodes header is readable same-origin (the Guild host); a
+  // cross-origin facade must list it in Access-Control-Expose-Headers.
   async function readPage(endpoint: string) {
     if (!client.getWithHeaders)
       return { page: await client.get<NotificationPageWire>(endpoint), unavailable: [] };
@@ -94,6 +97,7 @@ export function buildNotificationFeedHttpAdapter(
         nextAfter: pageCursor(page.next_after),
         unreadCount: typeof page.unread_count === 'number' ? page.unread_count : null,
         unavailableInstances: unavailable,
+        instanceHeads: instanceHeads(page.instances),
       };
     },
 

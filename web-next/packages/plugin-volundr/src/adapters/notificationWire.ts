@@ -36,7 +36,12 @@ export const READ_STATE_PATH = '/notifications/read-state';
 export const RULES_PATH = '/notifications/rules';
 export const SINKS_PATH = '/notifications/sinks';
 export const ALL_INSTANCES = 'all_instances=true';
-/** Comma-separated ids of nodes the facade fan-out could not reach (contract §6). */
+/**
+ * Comma-separated ids of nodes the facade fan-out could not reach (contract §6).
+ * Browsers only expose it to the page same-origin — the supported setup, with
+ * the web served by the Guild host. A cross-origin deployment needs the facade
+ * to send `Access-Control-Expose-Headers: X-Forge-Unavailable-Instances`.
+ */
 export const UNAVAILABLE_INSTANCES_HEADER = 'X-Forge-Unavailable-Instances';
 /** SSE event name on `/sessions/stream` (contract §5). */
 export const SESSION_NOTIFICATION_EVENT = 'session_notification';
@@ -380,6 +385,14 @@ export function feedQuery(
 export function pageCursor(value: string | number | null | undefined): string | null {
   if (value === null || value === undefined || value === '') return null;
   return String(value);
+}
+
+/** Head seq per node from the facade's per-node `instances` summary. */
+export function instanceHeads(instances: NotificationPageWire['instances']): InstanceSeqMap | null {
+  if (!instances || typeof instances !== 'object') return null;
+  const heads: InstanceSeqMap = {};
+  for (const [id, state] of Object.entries(instances)) heads[id] = Number(state?.head_seq) || 0;
+  return heads;
 }
 
 export function unavailableInstances(header: string | null | undefined): string[] {

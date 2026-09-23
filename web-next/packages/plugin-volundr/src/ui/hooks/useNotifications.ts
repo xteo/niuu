@@ -15,6 +15,7 @@ import {
   advancingReadThrough,
   countLiveNotification,
   headSeqs,
+  instanceKey,
   matchesNotificationFilter,
   maxSeqMaps,
   mergeNotifications,
@@ -84,6 +85,7 @@ export function prependNotifications(
     nextAfter: null,
     unreadCount: null,
     unavailableInstances: [],
+    instanceHeads: null,
   };
   return {
     ...data,
@@ -156,6 +158,28 @@ export function useUnreadNotificationCount(): number | undefined {
 
 // ── The feed ────────────────────────────────────────────────────────────────
 
+/**
+ * Whether a reconnect must refetch the newest page instead of gap-filling.
+ * The facade only reads the nodes an `after` cursor names, so a node the first
+ * page did not cover — unreachable then, or visible only since — would be
+ * skipped; refetching picks up its backlog within the normal page limit.
+ */
+export function needsFirstPageReload(
+  first: NotificationFeedPage | undefined,
+  loaded: readonly SessionNotification[],
+  readState: NotificationReadState | undefined,
+): boolean {
+  if (!first) return false;
+  if (first.unavailableInstances.length > 0) return true;
+  if (!first.instanceHeads) return false;
+  const covered = new Set(Object.keys(first.instanceHeads));
+  const known = [
+    ...loaded.map((notification) => instanceKey(notification.instanceId)),
+    ...Object.keys(readState?.instances ?? {}),
+  ];
+  return known.some((id) => !covered.has(id));
+}
+
 async function gapFill(
   feed: INotificationFeed,
   queryClient: QueryClient,
@@ -165,12 +189,25 @@ async function gapFill(
   const data = queryClient.getQueryData<FeedData>(queryKey);
   // Before the first page lands, that pending read already covers the gap.
   if (!data) return;
-  // Resume from the server's opaque `next_after` when it gave one; otherwise
-  // from watermarks captured now, before a read-state refetch moves the heads.
-  let cursor: string | null = data.pages[0]?.nextAfter ?? null;
+  const first = data.pages[0];
+  const loaded = data.pages.flatMap((page) => page.items);
+  // Capture state now, before a read-state refetch moves the heads.
+  const readState = queryClient.getQueryData<NotificationReadState>(notificationKeys.readState);
+  if (needsFirstPageReload(first, loaded, readState)) {
+    // The read state most likely misses the same nodes.
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey }),
+      queryClient.invalidateQueries({ queryKey: notificationKeys.readState }),
+    ]);
+    return;
+  }
+  // Resume from the server's opaque `next_after` when it gave one. Otherwise
+  // name every known node explicitly: the facade skips nodes a cursor omits.
+  let cursor: string | null = first?.nextAfter ?? null;
   let watermarks: InstanceSeqMap = maxSeqMaps(
-    seqWatermarks(data.pages.flatMap((page) => page.items)),
-    headSeqs(queryClient.getQueryData<NotificationReadState>(notificationKeys.readState)),
+    first?.instanceHeads ?? {},
+    seqWatermarks(loaded),
+    headSeqs(readState),
   );
   for (let page = 0; page < GAP_FILL_MAX_PAGES; page++) {
     const gap = await feed.listSince(filter, { cursor, watermarks });
@@ -182,8 +219,8 @@ async function gapFill(
     if (!gap.hasMore) return;
     watermarks = maxSeqMaps(watermarks, seqWatermarks(gap.items));
   }
-  // Too far behind to page through: reload from the newest page.
-  await queryClient.resetQueries({ queryKey });
+  // Too far behind to page through: refetch from the newest page instead.
+  await queryClient.invalidateQueries({ queryKey });
 }
 
 export interface UseNotificationsResult {
