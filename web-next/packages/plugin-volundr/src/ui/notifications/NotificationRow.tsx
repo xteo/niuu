@@ -154,134 +154,138 @@ export function NotificationRow({
       data-unread={!read || undefined}
       data-kind={notification.kind}
       data-severity={notification.severity}
-      className={cn(
-        'niuu:rounded-md niuu:border niuu:border-l-4 niuu:border-solid niuu:border-border-subtle niuu:bg-bg-secondary',
-        tone.accent,
-      )}
+      className="niuu:flex niuu:overflow-hidden niuu:rounded-md niuu:border niuu:border-solid niuu:border-border-subtle niuu:bg-bg-secondary"
     >
-      <div className="niuu:flex niuu:items-start niuu:gap-3 niuu:p-3">
-        <span className="niuu:mt-1.5 niuu:flex niuu:h-2 niuu:w-2 niuu:shrink-0">
-          {!read && (
-            <span
-              className="niuu:h-2 niuu:w-2 niuu:rounded-full niuu:bg-brand"
-              data-testid="notification-unread-dot"
-              title="Unread"
-            />
-          )}
-        </span>
-        <NotificationKindIcon
-          kind={notification.kind}
-          className={cn('niuu:mt-0.5 niuu:h-4 niuu:w-4 niuu:shrink-0', tone.text)}
-        />
-        <div className="niuu:flex niuu:min-w-0 niuu:flex-1 niuu:flex-col niuu:gap-1">
-          <button
-            type="button"
-            data-notification-open
-            className={cn(
-              'niuu:m-0 niuu:cursor-pointer niuu:border-0 niuu:bg-transparent niuu:p-0 niuu:text-left niuu:text-sm niuu:text-text-primary niuu:hover:underline',
-              read ? 'niuu:font-normal' : 'niuu:font-semibold',
+      <span
+        aria-hidden="true"
+        data-testid="notification-accent"
+        className={cn('niuu:w-1 niuu:shrink-0', tone.bar)}
+      />
+      <div className="niuu:flex niuu:min-w-0 niuu:flex-1 niuu:flex-col">
+        <div className="niuu:flex niuu:items-start niuu:gap-3 niuu:p-3">
+          <span className="niuu:mt-1.5 niuu:flex niuu:h-2 niuu:w-2 niuu:shrink-0">
+            {!read && (
+              <span
+                className="niuu:h-2 niuu:w-2 niuu:rounded-full niuu:bg-brand"
+                data-testid="notification-unread-dot"
+                title="Unread"
+              />
             )}
-            onClick={() => (canOpen ? onOpen(notification) : setExpanded((open) => !open))}
-            aria-label={`${read ? '' : 'Unread. '}${NOTIFICATION_KIND_LABELS[notification.kind]}: ${notification.title}${canOpen ? ` — open ${notification.sessionName ?? 'session'}` : ''}`}
-          >
-            {notification.title}
-          </button>
-          {!expanded && excerpt && (
-            <p className="niuu:m-0 niuu:line-clamp-2 niuu:text-sm niuu:text-text-secondary">
-              {excerpt}
-            </p>
-          )}
-          <div className="niuu:flex niuu:flex-wrap niuu:items-center niuu:gap-2 niuu:text-xs niuu:text-text-muted">
-            <span className={tone.text}>{NOTIFICATION_KIND_LABELS[notification.kind]}</span>
-            {notification.severity !== 'info' && (
-              <span>{NOTIFICATION_SEVERITY_LABELS[notification.severity]}</span>
-            )}
-            <span>{SOURCE_LABELS[notification.source]}</span>
-            {notification.sessionName && (
-              <span className="niuu:font-mono niuu:text-text-secondary">
-                {notification.sessionName}
-              </span>
-            )}
-            {hostLabel && <Chip tone="muted">{hostLabel}</Chip>}
-            {notification.engine && <CliBadge cli={notification.engine} compact />}
-            {notification.model && <ModelChip model={notification.model} />}
-            <time
-              dateTime={notification.createdAt}
-              title={new Date(notification.createdAt).toLocaleString()}
+          </span>
+          <NotificationKindIcon
+            kind={notification.kind}
+            className={cn('niuu:mt-0.5 niuu:h-4 niuu:w-4 niuu:shrink-0', tone.text)}
+          />
+          <div className="niuu:flex niuu:min-w-0 niuu:flex-1 niuu:flex-col niuu:gap-1">
+            <button
+              type="button"
+              data-notification-open
+              className={cn(
+                'niuu:m-0 niuu:cursor-pointer niuu:border-0 niuu:bg-transparent niuu:p-0 niuu:text-left niuu:text-sm niuu:text-text-primary niuu:hover:underline',
+                read ? 'niuu:font-normal' : 'niuu:font-semibold',
+              )}
+              onClick={() => (canOpen ? onOpen(notification) : setExpanded((open) => !open))}
+              aria-label={`${read ? '' : 'Unread. '}${NOTIFICATION_KIND_LABELS[notification.kind]}: ${notification.title}${canOpen ? ` — open ${notification.sessionName ?? 'session'}` : ''}`}
             >
-              {relTime(notification.createdAt)}
-            </time>
+              {notification.title}
+            </button>
+            {!expanded && excerpt && (
+              <p className="niuu:m-0 niuu:line-clamp-2 niuu:text-sm niuu:text-text-secondary">
+                {excerpt}
+              </p>
+            )}
+            <div className="niuu:flex niuu:flex-wrap niuu:items-center niuu:gap-2 niuu:text-xs niuu:text-text-muted">
+              <span className={tone.text}>{NOTIFICATION_KIND_LABELS[notification.kind]}</span>
+              {notification.severity !== 'info' && (
+                <span>{NOTIFICATION_SEVERITY_LABELS[notification.severity]}</span>
+              )}
+              <span>{SOURCE_LABELS[notification.source]}</span>
+              {notification.sessionName && (
+                <span className="niuu:font-mono niuu:text-text-secondary">
+                  {notification.sessionName}
+                </span>
+              )}
+              {hostLabel && <Chip tone="muted">{hostLabel}</Chip>}
+              {notification.engine && <CliBadge cli={notification.engine} compact />}
+              {notification.model && <ModelChip model={notification.model} />}
+              <time
+                dateTime={notification.createdAt}
+                title={new Date(notification.createdAt).toLocaleString()}
+              >
+                {relTime(notification.createdAt)}
+              </time>
+            </div>
           </div>
-        </div>
-        <div className="niuu:flex niuu:shrink-0 niuu:items-center niuu:gap-1">
-          {!read && (
+          <div className="niuu:flex niuu:shrink-0 niuu:items-center niuu:gap-1">
+            {!read && (
+              <button
+                type="button"
+                className={ACTION_CLASS}
+                disabled={markingRead}
+                onClick={() => onMarkReadThrough(notification)}
+                title="Mark this and everything older as read"
+              >
+                Read through here
+              </button>
+            )}
             <button
               type="button"
               className={ACTION_CLASS}
-              disabled={markingRead}
-              onClick={() => onMarkReadThrough(notification)}
-              title="Mark this and everything older as read"
+              aria-expanded={expanded}
+              aria-controls={detailsId}
+              aria-label={expanded ? 'Hide details' : 'Show details'}
+              onClick={() => setExpanded((open) => !open)}
             >
-              Read through here
+              {expanded ? (
+                <ChevronDown className="niuu:h-3 niuu:w-3" aria-hidden="true" />
+              ) : (
+                <ChevronRight className="niuu:h-3 niuu:w-3" aria-hidden="true" />
+              )}
             </button>
-          )}
-          <button
-            type="button"
-            className={ACTION_CLASS}
-            aria-expanded={expanded}
-            aria-controls={detailsId}
-            aria-label={expanded ? 'Hide details' : 'Show details'}
-            onClick={() => setExpanded((open) => !open)}
+          </div>
+        </div>
+        {expanded && (
+          <div
+            id={detailsId}
+            className="niuu:flex niuu:flex-col niuu:gap-3 niuu:border-0 niuu:border-t niuu:border-solid niuu:border-border-subtle niuu:px-3 niuu:py-3 niuu:pl-12"
           >
-            {expanded ? (
-              <ChevronDown className="niuu:h-3 niuu:w-3" aria-hidden="true" />
+            {notification.body ? (
+              <div className="niuu:text-sm niuu:text-text-secondary">
+                <MarkdownContent content={notification.body} />
+              </div>
             ) : (
-              <ChevronRight className="niuu:h-3 niuu:w-3" aria-hidden="true" />
+              <p className="niuu:m-0 niuu:text-sm niuu:text-text-muted">No details.</p>
             )}
-          </button>
-        </div>
+            {notification.links.length > 0 && (
+              <ul
+                aria-label="Links"
+                className="niuu:m-0 niuu:flex niuu:list-none niuu:flex-wrap niuu:gap-2 niuu:p-0 niuu:text-xs"
+              >
+                {notification.links.map((link, index) => {
+                  const href = safeLinkHref(link.url);
+                  return (
+                    <li key={`${link.label}:${index}`}>
+                      {href ? (
+                        <a
+                          href={href}
+                          target={href.startsWith('/') ? undefined : '_blank'}
+                          rel="noopener noreferrer"
+                          className="niuu:text-brand"
+                        >
+                          {link.label}
+                        </a>
+                      ) : (
+                        <span title="Open it from the session">{link.label}</span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <DeliveryStatus notification={notification} sinkLabels={sinkLabels} />
+          </div>
+        )}
       </div>
-      {expanded && (
-        <div
-          id={detailsId}
-          className="niuu:flex niuu:flex-col niuu:gap-3 niuu:border-0 niuu:border-t niuu:border-solid niuu:border-border-subtle niuu:px-3 niuu:py-3 niuu:pl-12"
-        >
-          {notification.body ? (
-            <div className="niuu:text-sm niuu:text-text-secondary">
-              <MarkdownContent content={notification.body} />
-            </div>
-          ) : (
-            <p className="niuu:m-0 niuu:text-sm niuu:text-text-muted">No details.</p>
-          )}
-          {notification.links.length > 0 && (
-            <ul
-              aria-label="Links"
-              className="niuu:m-0 niuu:flex niuu:list-none niuu:flex-wrap niuu:gap-2 niuu:p-0 niuu:text-xs"
-            >
-              {notification.links.map((link, index) => {
-                const href = safeLinkHref(link.url);
-                return (
-                  <li key={`${link.label}:${index}`}>
-                    {href ? (
-                      <a
-                        href={href}
-                        target={href.startsWith('/') ? undefined : '_blank'}
-                        rel="noopener noreferrer"
-                        className="niuu:text-brand"
-                      >
-                        {link.label}
-                      </a>
-                    ) : (
-                      <span title="Open it from the session">{link.label}</span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          <DeliveryStatus notification={notification} sinkLabels={sinkLabels} />
-        </div>
-      )}
     </li>
   );
 }

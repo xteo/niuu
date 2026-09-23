@@ -31,10 +31,11 @@ import { NotificationFilters, type FilterOption } from './NotificationFilters';
 import { NotificationRow } from './NotificationRow';
 import { DeliveryRulesPanel } from './DeliveryRulesPanel';
 import { useNotificationFilter } from './useNotificationFilter';
+import { describeError } from './errors';
 import { PRIMARY_BUTTON, SECONDARY_BUTTON } from './RuleEditor';
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : 'The Forge did not answer.';
+  return describeError(error, 'The Forge did not answer.');
 }
 
 function distinct(options: FilterOption[]): FilterOption[] {

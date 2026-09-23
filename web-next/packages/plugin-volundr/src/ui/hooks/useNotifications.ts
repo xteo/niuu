@@ -114,7 +114,9 @@ export function useNotificationReadState() {
 
   useEffect(() => {
     if (!feed) return;
-    let dropped = false;
+    // The first `open` is the connection this subscriber joined; every later one
+    // is a reconnect (clean or after an error) that may have missed rows.
+    let opened = false;
     return safeSubscribe(feed, {
       onNotification: (notification) => {
         queryClient.setQueryData<NotificationReadState>(notificationKeys.readState, (state) =>
@@ -122,12 +124,11 @@ export function useNotificationReadState() {
         );
       },
       onStatus: (status) => {
-        if (status === 'error') {
-          dropped = true;
+        if (status !== 'open') return;
+        if (!opened) {
+          opened = true;
           return;
         }
-        if (!dropped) return;
-        dropped = false;
         void queryClient.invalidateQueries({ queryKey: notificationKeys.readState });
       },
     });

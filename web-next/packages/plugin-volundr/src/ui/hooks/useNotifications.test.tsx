@@ -199,6 +199,19 @@ describe('prependNotifications', () => {
 });
 
 describe('unread count and mark read', () => {
+  it('re-reads the count after a clean reconnect, not on the first open', async () => {
+    const feed = createMockNotificationFeed({ seed: seeded(1) });
+    const getReadState = vi.spyOn(feed, 'getReadState');
+    const { wrapper } = setup(feed);
+    const { result } = renderHook(() => useUnreadNotificationCount(), { wrapper });
+    await waitFor(() => expect(result.current).toBe(1));
+    expect(getReadState).toHaveBeenCalledTimes(1);
+    feed.commit(row());
+    act(() => feed.setStatus('open'));
+    await waitFor(() => expect(result.current).toBe(2));
+    expect(getReadState).toHaveBeenCalledTimes(2);
+  });
+
   it('reads the unread count and follows live rows', async () => {
     const feed = createMockNotificationFeed({ seed: seeded(3) });
     const { wrapper } = setup(feed);

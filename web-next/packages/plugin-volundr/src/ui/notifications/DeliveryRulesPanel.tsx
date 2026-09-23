@@ -16,12 +16,13 @@ import {
   useSaveNotificationRule,
 } from '../hooks/useNotifications';
 import { SOURCE_LABELS, type FilterOption } from './NotificationFilters';
+import { describeError } from './errors';
 import { PRIMARY_BUTTON, RuleEditor, SECONDARY_BUTTON, type ConnectionOption } from './RuleEditor';
 
 const MESSAGING = 'messaging';
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : 'Something went wrong.';
+  return describeError(error, 'Something went wrong.');
 }
 
 /** Messaging integration connections a sink such as Telegram can deliver through. */
