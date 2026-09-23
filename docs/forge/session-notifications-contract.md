@@ -153,8 +153,10 @@ An empty list in `match` means "any".
 ## 6. Guild facade on niuu, in `rest_volundr.py` (core)
 
 - Proxy every route in §4.
-- `GET /notifications` fans out to the visible instances and merges newest first
-  by `(created_at, instance_id, seq)`.
+- `GET /notifications?all_instances=true` fans out to the visible instances and
+  merges newest first by `(created_at, instance_id, seq)`. The web always sends
+  `all_instances=true`, as it does for `/sessions/stream`. Without it, the request
+  goes to the local instance, or to the one named by `instance_id`.
   - The cursor is opaque: base64url JSON `{instance_id: seq}` for `before`, and
     the same for `after`.
   - It reports `X-Forge-Unavailable-Instances`.
