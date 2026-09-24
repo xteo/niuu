@@ -134,13 +134,23 @@ def test_draft_from_log_payload_ignores_non_notifications(payload):
     assert draft_from_log_payload(payload) is None
 
 
-def test_summarize_reply_uses_first_line_and_bounds_body():
+def test_summarize_reply_uses_first_line_and_continues_after_it():
     title, body = summarize_reply(
-        "\n\n## Done: shipped\nmore detail", title_chars=50, body_chars=12
+        "\n\n## Done: shipped\nmore detail here", title_chars=50, body_chars=12
     )
     assert title == "Done: shipped"
-    assert body == "## Done: sh…"
+    assert body == "more detail…"
     assert len(body) == 12
+
+
+def test_summarize_reply_one_line_reply_has_no_repeated_body():
+    assert summarize_reply("done", title_chars=50, body_chars=100) == ("done", "")
+
+
+def test_summarize_reply_keeps_full_text_when_title_is_shortened():
+    title, body = summarize_reply("a" * 30 + "\nnext", title_chars=10, body_chars=100)
+    assert title == "a" * 9 + "…"
+    assert body == "a" * 30 + "\nnext"
 
 
 def test_summarize_reply_handles_empty_and_zero_limits():

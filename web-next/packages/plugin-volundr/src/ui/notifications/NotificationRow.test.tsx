@@ -131,6 +131,14 @@ describe('NotificationRow', () => {
     expect(deliveries[1]!.querySelector('time')).toBeNull();
   });
 
+  it('never repeats a title that an older reply summary copied into its body', async () => {
+    const user = userEvent.setup();
+    renderRow({ notification: { ...base, kind: 'reply_ready', title: 'done', body: ' done ' } });
+    expect(screen.getAllByText('done')).toHaveLength(1);
+    await user.click(screen.getByRole('button', { name: 'Show details' }));
+    expect(screen.getByText('No details.')).toBeInTheDocument();
+  });
+
   it('expands instead of navigating when there is no session', async () => {
     const user = userEvent.setup();
     const props = renderRow({ notification: { ...base, sessionId: null } });

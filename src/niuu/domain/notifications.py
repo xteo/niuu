@@ -225,11 +225,23 @@ def draft_from_log_payload(payload: dict) -> tuple[str, NotificationDraft] | Non
 
 
 def summarize_reply(content: str, *, title_chars: int, body_chars: int) -> tuple[str, str]:
-    """Title (first non-empty line) and body (bounded excerpt) for a reply_ready event."""
+    """Title (first non-empty line) and body (bounded excerpt) for a reply_ready event.
+
+    When the title carries the whole first line, the body continues after it so the
+    two never repeat each other; a one-line reply therefore has an empty body. When
+    the first line had to be shortened, the body keeps the full text.
+    """
     text = content.strip()
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    title = _truncate(" ".join(first_line.lstrip("#>*- ").split()), title_chars) or "Reply ready"
-    return title, _truncate(text, body_chars)
+    lines = text.splitlines()
+    first_index = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first_index is None:
+        return "Reply ready", ""
+    headline = " ".join(lines[first_index].strip().lstrip("#>*- ").split())
+    title = _truncate(headline, title_chars) or "Reply ready"
+    if title != headline:
+        return title, _truncate(text, body_chars)
+    rest = "\n".join(lines[first_index + 1 :]).strip()
+    return title, _truncate(rest, body_chars)
 
 
 def _truncate(text: str, limit: int) -> str:

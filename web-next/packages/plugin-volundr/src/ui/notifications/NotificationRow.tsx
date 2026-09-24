@@ -145,7 +145,9 @@ export function NotificationRow({
   const [expanded, setExpanded] = useState(false);
   const tone = notificationTone(notification.severity);
   const detailsId = `notification-details-${notification.instanceId ?? 'local'}-${notification.id}`;
-  const excerpt = notificationExcerpt(notification.body, NOTIFICATION_EXCERPT_CHARS);
+  // Older reply summaries repeat the title as their body; never show the same text twice.
+  const body = notification.body.trim() === notification.title.trim() ? '' : notification.body;
+  const excerpt = notificationExcerpt(body, NOTIFICATION_EXCERPT_CHARS);
   const canOpen = Boolean(notification.sessionId);
 
   return (
@@ -249,9 +251,9 @@ export function NotificationRow({
             id={detailsId}
             className="niuu:flex niuu:flex-col niuu:gap-3 niuu:border-0 niuu:border-t niuu:border-solid niuu:border-border-subtle niuu:px-3 niuu:py-3 niuu:pl-12"
           >
-            {notification.body ? (
+            {body ? (
               <div className="niuu:text-sm niuu:text-text-secondary">
-                <MarkdownContent content={notification.body} />
+                <MarkdownContent content={body} />
               </div>
             ) : (
               <p className="niuu:m-0 niuu:text-sm niuu:text-text-muted">No details.</p>
