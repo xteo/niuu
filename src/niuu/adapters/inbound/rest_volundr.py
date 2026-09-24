@@ -22,13 +22,15 @@ from fastapi import (
     Request,
     Response,
     WebSocket,
+    WebSocketException,
     status,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp
 
-from niuu.adapters.inbound.auth import extract_principal
+from niuu.adapters.inbound.auth import extract_principal, presented_session_claims
 from niuu.adapters.inbound.forge_notification_feed import (
     CursorError,
     InstancePage,
@@ -42,9 +44,14 @@ from niuu.adapters.inbound.remote_urls import build_remote_url
 from niuu.adapters.inbound.ws_forge_replay import forward_replay
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.notifications import notification_visible_to
+from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
+from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
+from niuu.forge_mcp.credentials import token_scopes
 
 UNAVAILABLE_INSTANCES_HEADER = "X-Forge-Unavailable-Instances"
+#: The Forge-hosted MCP endpoint, under the Forge API prefix on every node.
+MCP_PATH = "/mcp"
 NOTIFICATION_EVENT = "session_notification"
 # Gateway-only selectors: never forwarded to a Forge node, whose ids differ.
 _FLEET_SELECTORS = frozenset({"instance_id", "all_instances", "scope"})
@@ -55,6 +62,24 @@ class SessionProjectAssignment(BaseModel):
     project_id: UUID
     project_instance_id: str | None = Field(default=None, min_length=1, max_length=100)
     expected_revision: int = Field(ge=0)
+
+
+LOCAL_NODE_ONLY_DETAIL = (
+    "Forge session tokens are local credentials: peer supervision is limited to the "
+    "session's own Forge node, so this request cannot go to instance {instance_id}. "
+    "Use a PAT or your own identity to act on other nodes."
+)
+#: WebSocket close code mirroring HTTP 403, and the close-frame reason bound.
+_WS_FORBIDDEN = 4403
+_WS_REASON_CHARS = 120
+
+
+def _is_session_principal(principal: Principal) -> bool:
+    return principal.token_use == FORGE_SESSION_TOKEN_USE
+
+
+def _local_only(instances: list[RegisteredInstance]) -> list[RegisteredInstance]:
+    return [instance for instance in instances if _uses_embedded_transport(instance)]
 
 
 def _forward_headers(request: Request) -> dict[str, str]:
@@ -76,11 +101,13 @@ async def _visible_instances(
     service: InstanceService,
     principal: Principal,
 ) -> list[RegisteredInstance]:
-    return await service.list_visible(
+    instances = await service.list_visible(
         principal,
         kind=InstanceKind.VOLUNDR,
         enabled_only=True,
     )
+    # A session credential is only valid on its own (the local) node.
+    return _local_only(instances) if _is_session_principal(principal) else instances
 
 
 def _strip_instance_hints(payload: Any) -> Any:
@@ -364,6 +391,13 @@ async def _request_remote(
     embedded_app: ASGIApp | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
+    if not _uses_embedded_transport(instance) and presented_session_claims(request) is not None:
+        # Never forward a session credential to another node: it is local, and the
+        # remote node could not (and must not) honour it.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=LOCAL_NODE_ONLY_DETAIL.format(instance_id=instance.id),
+        )
     headers = _forward_headers(request)
     if extra_headers:
         headers.update(extra_headers)
@@ -628,6 +662,8 @@ async def _resolve_target_instance(
         tags=tags,
         match=match,
     )
+    if _is_session_principal(principal):
+        instances = _local_only(instances)
     if not instances:
         # Fail loud: never silently fall back to an untagged backend when a tag
         # selector was requested.
@@ -644,13 +680,32 @@ async def _resolve_target_instance(
     return default_instance or instances[0]
 
 
+async def _session_route_guard(connection: HTTPConnection) -> None:
+    """Apply the session-credential allow-list at the edge (Forge enforces it too)."""
+    claims = presented_session_claims(connection)
+    if claims is None:
+        return
+    websocket = connection.scope["type"] == "websocket"
+    method = "GET" if websocket else str(connection.scope.get("method", ""))
+    refusal = policy_refusal(method, connection.url.path, token_scopes(claims))
+    if refusal is None:
+        return
+    if websocket:
+        raise WebSocketException(code=_WS_FORBIDDEN, reason=refusal[:_WS_REASON_CHARS])
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
+
+
 def create_volundr_router(
     service: InstanceService,
     *,
     embedded_forge_app: ASGIApp | None = None,
 ) -> APIRouter:
     """Create a registry-aware Forge runtime router."""
-    router = APIRouter(prefix="/api/v1/forge", tags=["Forge"])
+    router = APIRouter(
+        prefix="/api/v1/forge",
+        tags=["Forge"],
+        dependencies=[Depends(_session_route_guard)],
+    )
 
     @router.get("/resident-profiles")
     async def list_resident_profiles(
@@ -1137,6 +1192,9 @@ def create_volundr_router(
             if selected
             else await _visible_instances(service, principal)
         )
+        # A session credential only reads its own node, so that node's refusal (a
+        # revoked token, a missing scope) is the answer, not a skipped host.
+        strict = bool(selected) or _is_session_principal(principal)
         params = _query_params(request)
         results = await asyncio.gather(
             *[
@@ -1156,7 +1214,7 @@ def create_volundr_router(
         merged: dict[str, dict[str, Any]] = {}
         for instance, result in zip(instances, results, strict=False):
             if isinstance(result, Exception):
-                if selected:
+                if strict:
                     if isinstance(result, HTTPException):
                         raise result
                     raise HTTPException(
@@ -1164,7 +1222,7 @@ def create_volundr_router(
                     ) from result
                 continue
             if result.status_code >= 400:
-                if selected:
+                if strict:
                     _ensure_remote_success(result)
                 continue
             try:
@@ -1203,6 +1261,7 @@ def create_volundr_router(
 
         Remote reads deliberately omit all_instances so facade-to-facade
         connections never recursively fan out to each other's registries.
+        Session credentials never get here: the stream is not on their allow-list.
         """
         selected = request.query_params.get("instance_id")
         fleet = (
@@ -1506,6 +1565,54 @@ def create_volundr_router(
             if isinstance(payload, list):
                 archived.extend(str(item) for item in payload)
         return archived
+
+    async def _mcp_target(request: Request, principal: Principal) -> RegisteredInstance:
+        """The node whose MCP endpoint serves this request: named, else the local one."""
+        selected = request.query_params.get("instance_id")
+        if selected:
+            return await _resolve_target_instance(service, principal, selected)
+        local = _local_only(await _visible_instances(service, principal))
+        if len(local) == 1:
+            return local[0]
+        return await _resolve_target_instance(service, principal, None)
+
+    @router.post("/mcp")
+    async def forge_mcp(
+        request: Request,
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The Forge-hosted MCP (Streamable HTTP) of the local node, or ``?instance_id=``.
+
+        The body and the MCP transport headers pass through unchanged; the node
+        validates Origin, negotiates the protocol and authorizes every tool call.
+        A Forge session token only reaches its own (local) node.
+        """
+        instance = await _mcp_target(request, principal)
+        passthrough = {
+            name: value
+            for name in ("content-type", "accept", "origin", "mcp-protocol-version")
+            if (value := request.headers.get(name)) is not None
+        }
+        upstream = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=MCP_PATH,
+            content_body=await request.body(),
+            params=_forward_params(request, drop=_FLEET_SELECTORS),
+            extra_headers=passthrough,
+            embedded_app=embedded_forge_app,
+        )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    @router.api_route("/mcp", methods=["GET", "DELETE"], include_in_schema=False)
+    async def forge_mcp_not_offered() -> Response:
+        """The endpoint is stateless and offers no server stream (MCP JSON mode)."""
+        return Response(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, headers={"Allow": "POST"})
 
     @router.get("/feature-flags")
     async def get_feature_flags(
