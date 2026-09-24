@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
+import jwt
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, Request
 
@@ -24,6 +25,27 @@ PEER_ID = str(uuid.uuid4())
 FORGE = "http://forge.test"
 SERVICE_TOKEN = "svc-broker-credential"
 LOG_PATH = f"/api/v1/forge/sessions/{SESSION_ID}/log"
+#: Skuld only reads a session token's claims (Forge verifies it), so any key will do.
+_TEST_SIGNING_KEY = "test-only-signing-key-that-is-32-bytes"
+
+
+def _session_token(*grant_scopes: str) -> str:
+    """A forge_session-shaped token with the default scopes plus ``grant_scopes``."""
+    return jwt.encode(
+        {
+            "sub": "owner-1",
+            "token_use": "forge_session",
+            "scopes": ["forge:notify", "forge:session:read", *grant_scopes],
+            "workload_session_id": SESSION_ID,
+            "exp": 4_102_444_800,
+        },
+        _TEST_SIGNING_KEY,
+        algorithm="HS256",
+    )
+
+
+MESSAGE_TOKEN = _session_token("forge:session:message")
+FULL_TOKEN = _session_token("forge:session:message", "forge:session:lifecycle")
 
 
 class FakeForge:
@@ -269,7 +291,7 @@ class TestEnvironment:
                 "coordination": {"project_id": "proj-42"},
             },
         )
-        broker = _broker(tmp_path, forge, token="scoped-mcp-token", grants=["message"])
+        broker = _broker(tmp_path, forge, token=FULL_TOKEN, grants=["message"])
         broker._session_tools()  # materialize the skill like a started broker
 
         result = await _call(broker, "environment", {})
@@ -282,13 +304,39 @@ class TestEnvironment:
         assert env["forge_reachable"] is True
         assert "forge" in env["mcp_servers"]
         assert env["skills"] == ["forge-notify"]
-        assert env["grants"] == ["message"]
+        assert env["grants"] == ["message"]  # explicit grants narrowed the token's
         assert "send_message" in env["tools"] and "create_session" not in env["tools"]
         assert {"revision", "build"} <= set(env["runtime"])
+        assert env["forge_credential"]["kind"] == "forge_session"
+        assert env["forge_credential"]["session_id"] == SESSION_ID
+        assert "forge:session:lifecycle" in env["forge_credential"]["scopes"]
         text = json.dumps(result)
         secret = broker._session_runtime.authorization.removeprefix("Bearer ")
-        for leaked in (SERVICE_TOKEN, "scoped-mcp-token", secret):
+        for leaked in (SERVICE_TOKEN, FULL_TOKEN, secret):
             assert leaked not in text
+
+    async def test_grants_come_from_the_token(self, tmp_path, forge) -> None:
+        broker = _broker(tmp_path, forge, token=FULL_TOKEN)
+        env = (await _call(broker, "environment", {}))["structuredContent"]
+        assert env["grants"] == ["lifecycle", "message"]
+
+    async def test_explicit_grants_never_widen(self, tmp_path, forge) -> None:
+        broker = _broker(tmp_path, forge, token=MESSAGE_TOKEN, grants=["message", "lifecycle"])
+        env = (await _call(broker, "environment", {}))["structuredContent"]
+        assert env["grants"] == ["message"]
+        result = await _call(broker, "start_session", {"session_id": PEER_ID})
+        assert result["isError"] is True and "'lifecycle' grant" in result["content"][0]["text"]
+
+    async def test_no_token_means_no_grants(self, tmp_path, forge) -> None:
+        broker = _broker(tmp_path, forge, grants=["message", "lifecycle"])
+        env = (await _call(broker, "environment", {}))["structuredContent"]
+        assert env["grants"] == []
+        assert env["forge_credential"]["kind"] == "broker"
+
+    async def test_an_explicitly_empty_env_value_narrows_to_nothing(self, tmp_path, forge) -> None:
+        broker = _broker(tmp_path, forge, token=FULL_TOKEN, grants="")
+        env = (await _call(broker, "environment", {}))["structuredContent"]
+        assert env["grants"] == []
 
     async def test_reports_an_unreachable_forge(self, tmp_path, forge) -> None:
         def down(request: httpx.Request) -> httpx.Response:
@@ -319,7 +367,7 @@ class TestEnvironment:
 
 class TestForgeProxy:
     async def test_scoped_token_is_used_for_mcp_calls_only(self, flushing, forge) -> None:
-        flushing._settings.forge_mcp.token = "scoped-mcp-token"
+        flushing._settings.forge_mcp.token = MESSAGE_TOKEN
         flushing._forge_mcp_toolbox_cache = None
         forge.routes[("GET", "/api/v1/forge/sessions")] = lambda _r: httpx.Response(200, json=[])
 
@@ -327,7 +375,7 @@ class TestForgeProxy:
         await _call(flushing, "notify", NOTIFY)
 
         listed = next(r for r in forge.requests if r.url.path == "/api/v1/forge/sessions")
-        assert listed.headers["authorization"] == "Bearer scoped-mcp-token"
+        assert listed.headers["authorization"] == f"Bearer {MESSAGE_TOKEN}"
         assert listed.url.params["scope"] == "local"
         log_post = next(r for r in forge.requests if r.url.path == LOG_PATH)
         assert log_post.headers["authorization"] == f"Bearer {SERVICE_TOKEN}"
@@ -363,7 +411,7 @@ class TestForgeProxy:
                 ("POST", f"{base}/stop"): record("stop", {"id": PEER_ID}),
             }
         )
-        broker = _broker(tmp_path, forge, grants=["message", "lifecycle"])
+        broker = _broker(tmp_path, forge, token=FULL_TOKEN)
         calls = [
             ("list_notifications", {"kinds": ["attention"]}),
             ("session_transcript", {"session_id": PEER_ID, "instance_id": "node-b"}),

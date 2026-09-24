@@ -25,6 +25,7 @@ from identity.models import (  # noqa: F401
     UserStatus,
 )
 from niuu.domain import models as shared_models
+from niuu.domain.services.forge_session_token import IssuedForgeSessionToken
 from tracker.models import ProjectMapping, TrackerConnectionStatus, TrackerIssue  # noqa: F401
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.session_read_state import SessionReadState
@@ -1608,10 +1609,16 @@ class TranslatedResources:
 
 @dataclass
 class SessionSpec:
-    """Merged result from all contributors."""
+    """Merged result from all contributors.
+
+    ``forge_session`` is the scoped credential minted for this launch. It is a
+    secret: pod managers deliver it to the broker only when they declare
+    ``delivers_forge_session_token`` and never put it in values or manifests.
+    """
 
     values: dict[str, Any]
     pod_spec: PodSpecAdditions
+    forge_session: IssuedForgeSessionToken | None = None
 
     @staticmethod
     def merge(contributions: list) -> SessionSpec:

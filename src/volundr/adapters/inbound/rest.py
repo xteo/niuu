@@ -16,14 +16,21 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
 from niuu.domain.notifications import notification_visible_to
-from niuu.domain.services.token_scope import OPENSHELL_SESSION_TOKEN_USE, require_scope
+from niuu.domain.services.token_scope import (
+    FORGE_NOTIFY_SCOPE,
+    FORGE_SESSION_LIFECYCLE_SCOPE,
+    FORGE_SESSION_MESSAGE_SCOPE,
+    FORGE_SESSION_READ_SCOPE,
+    require_scope,
+)
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
+from niuu.forge_mcp.models import ForgeMcpGrant
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
 from skuld.conversation_snapshot import (
     ConversationSnapshotTooLargeError,
@@ -38,6 +45,7 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
+from volundr.adapters.inbound.forge_session_auth import require_bound_session, session_token_in
 from volundr.adapters.inbound.rest_projects import (
     create_projects_router,
     create_session_projects_router,
@@ -101,6 +109,10 @@ from volundr.domain.services import (
     SessionStateError,
     StatsService,
     TokenService,
+)
+from volundr.domain.services.forge_session_launch import (
+    FORGE_MCP_KEY,
+    ForgeMcpGrantEscalationError,
 )
 from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
@@ -426,6 +438,21 @@ def _fallback_workspace_transcript(session: Session) -> dict | None:
 _RFC1123_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+class ForgeMcpSessionOptions(BaseModel):
+    """Forge MCP options for a new session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    grants: list[ForgeMcpGrant] = Field(
+        default_factory=list,
+        description=(
+            "Operator grants for the session's Forge MCP: 'message' (steer other "
+            "sessions) and 'lifecycle' (create/start/stop sessions). Reading sessions "
+            "and notifying need no grant. They persist across restarts."
+        ),
+    )
+
+
 class SessionCreate(BaseModel):
     """Request model for creating a session."""
 
@@ -543,6 +570,19 @@ class SessionCreate(BaseModel):
         default_factory=dict,
         description="Workload-specific configuration (e.g. personas, mesh, mimir settings)",
     )
+    forge_mcp: ForgeMcpSessionOptions | None = Field(
+        default=None,
+        description="Forge MCP grants for the session (see ForgeMcpSessionOptions).",
+    )
+
+    @field_validator("workload_config")
+    @classmethod
+    def _no_forge_mcp_in_workload_config(cls, value: dict) -> dict:
+        if FORGE_MCP_KEY in value:
+            raise ValueError(
+                "set Forge MCP grants with the top-level forge_mcp field, not workload_config"
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -1565,14 +1605,7 @@ def create_router(
     )
 
     def _require_bound_workload_session(request: Request, session_id: UUID) -> None:
-        if request.headers.get("x-auth-token-use") != OPENSHELL_SESSION_TOKEN_USE:
-            return
-        if request.headers.get("x-auth-workload-session-id") == str(session_id):
-            return
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="OpenShell workload token is not bound to this session",
-        )
+        require_bound_session(request, session_id)
 
     async def _optional_principal(request: Request, *, strict: bool = False) -> Principal | None:
         """Extract principal if identity is configured, else return None.
@@ -1592,7 +1625,8 @@ def create_router(
         try:
             principal = await extract_principal(request)
         except HTTPException:
-            if strict:
+            # A presented session credential is never downgraded to anonymous.
+            if strict or session_token_in(request.scope):
                 raise
             return None
 
@@ -1630,6 +1664,7 @@ def create_router(
         admin = request.app.state.admin_settings
         # True exactly when the notification feed routes are served on this host.
         notifications = getattr(request.app.state, "notification_service", None) is not None
+        session_tokens = getattr(request.app.state, "forge_session_tokens", None)
         return {
             "local_mounts_enabled": settings.local_mounts.enabled,
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
@@ -1638,6 +1673,9 @@ def create_router(
             "capabilities": {
                 "local_session_scope": True,
                 "notifications": notifications,
+                "forge_session_tokens": session_tokens is not None,
+                "forge_session_token_key": session_tokens.key_source if session_tokens else None,
+                "forge_mcp_http": getattr(request.app.state, "forge_mcp_http", False),
             },
             "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
@@ -1679,7 +1717,12 @@ def create_router(
         """Bind the shared Forge facade to the request-scoped workspace service."""
         return forge.with_workspace_service(request.app.state.workspace_service)
 
-    @router.get("/sessions", response_model=list[SessionResponse], tags=["Sessions"])
+    @router.get(
+        "/sessions",
+        response_model=list[SessionResponse],
+        tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def list_sessions(
         request: Request,
         response: Response,
@@ -1973,7 +2016,9 @@ def create_router(
     async def create_session(
         request: Request,
         data: SessionCreate,
-        _build_scope: None = Depends(require_scope("forge:session:create")),
+        _build_scope: None = Depends(
+            require_scope("forge:session:create", FORGE_SESSION_LIFECYCLE_SCOPE)
+        ),
     ) -> SessionResponse:
         """Create and start a new session.
 
@@ -1992,6 +2037,8 @@ def create_router(
             started = await project_result(
                 forge.create_and_start_session(data, principal=principal)
             )
+        except ForgeMcpGrantEscalationError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except RepoValidationError as e:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -2006,6 +2053,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         response_model=SessionResponse,
         responses={404: {"model": ErrorResponse}},
         tags=["Sessions"],
@@ -2224,6 +2272,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/start",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2233,6 +2282,7 @@ def create_router(
     )
     @router.post(
         "/sessions/{session_id}/resume",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2261,6 +2311,8 @@ def create_router(
                 principal=principal,
             )
             return _session_response(session)
+        except ForgeMcpGrantEscalationError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2279,6 +2331,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/stop",
+        dependencies=[Depends(require_scope(FORGE_SESSION_LIFECYCLE_SCOPE))],
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
@@ -2312,6 +2365,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/activity",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
         status_code=status.HTTP_204_NO_CONTENT,
         responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
         tags=["Sessions"],
@@ -2570,6 +2624,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/usage",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
         response_model=TokenUsageResponse,
         status_code=status.HTTP_201_CREATED,
         responses={
@@ -2956,6 +3011,7 @@ def create_router(
 
     @router.post(
         "/sessions/{session_id}/messages",
+        dependencies=[Depends(require_scope(FORGE_SESSION_MESSAGE_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -3185,6 +3241,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/conversation",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -3599,7 +3656,11 @@ def create_router(
                 detail=str(e),
             )
 
-    @router.get("/sessions/{session_id}/conversation/turns/{turn_id}", tags=["Sessions"])
+    @router.get(
+        "/sessions/{session_id}/conversation/turns/{turn_id}",
+        tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def get_conversation_item(request: Request, session_id: UUID, turn_id: str) -> dict:
         """Explicit full-item expansion, never used for automatic history recovery."""
         return await get_conversation(
@@ -4172,6 +4233,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/transcript",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             404: {"model": ErrorResponse},
@@ -4202,6 +4264,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}/transcript/download",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
         tags=["Sessions"],
         responses={
             400: {"model": ErrorResponse},

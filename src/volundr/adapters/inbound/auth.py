@@ -80,6 +80,25 @@ async def extract_principal(request: Request) -> Principal:
     - Envoy header mode: reads trusted headers injected by the Envoy sidecar
     - Token mode (allow-all / dev): validates the Authorization header
     """
+    from volundr.adapters.inbound.forge_session_auth import (
+        forge_session_claims,
+        presents_unverified_session_token,
+    )
+
+    # A Forge session token is verified by ForgeSessionAuthMiddleware in every
+    # identity mode and wins over headers and the anonymous dev principal. One
+    # that reached here unverified (no middleware on this app) is refused rather
+    # than silently treated as anonymous.
+    claims = forge_session_claims(request)
+    if claims is not None:
+        return claims.principal()
+    if presents_unverified_session_token(request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Forge session token was not verified by this service",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     identity: IdentityPort = request.app.state.identity
     from volundr.adapters.outbound.identity import (
         AllowAllIdentityAdapter,

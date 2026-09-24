@@ -433,6 +433,18 @@ sleipnir:
 #       valueFrom: {secretKeyRef: {name: forge-notification-sinks, key: ops-webhook-secret}}
 notifications: {}
 
+# Forge MCP session credentials and the Forge-hosted MCP endpoint. Rendered verbatim
+# as config.yaml's `forge_mcp:` section (snake_case keys; see ForgeMcpConfig). Empty
+# keeps the defaults: session credentials on (signed by workload identity when it has
+# a configured key, else a key file), no default grants, HTTP endpoint on with no
+# browser origins. Session credentials are delivered only by the local process pod
+# manager today. See docs/operator/forge-mcp.md. Example:
+#   forgeMcp:
+#     default_grants: []
+#     session_tokens: {ttl_seconds: 604800}
+#     http: {allowed_origins: ["https://forge.example.com"]}
+forgeMcp: {}
+
 # Chronicle configuration
 chronicle:
   # -- Auto-create chronicle when a session stops

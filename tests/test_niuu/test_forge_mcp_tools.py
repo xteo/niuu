@@ -16,6 +16,7 @@ from niuu.forge_mcp import (
     ForgeMcpGrant,
     ForgeMcpHost,
     ForgeMcpLimits,
+    ForgeMcpNotifyMode,
     ForgeMcpToolbox,
     ToolResult,
     UnknownToolError,
@@ -106,6 +107,10 @@ class FakeClient(ForgeClient):
     async def stop_session(self, session_id, *, instance_id):
         self._record("stop_session", (session_id, instance_id))
         return _session(session_id, status="stopped")
+
+    async def submit_notification(self, session_id, draft, *, idempotency_key, instance_id):
+        self._record("submit_notification", (session_id, draft, idempotency_key, instance_id))
+        return {"id": "nid-feed", "seq": 12, "session_id": session_id, "source": "agent"}
 
 
 class FakeHost(ForgeMcpHost):
@@ -390,3 +395,98 @@ class TestResultEncoding:
         assert LIMITS.clamp_list(0) == 1
         assert LIMITS.clamp_turns(None) == 2
         assert LIMITS.clamp_turns(9) == 4
+
+
+class _SessionlessHost(FakeHost):
+    @property
+    def session_id(self) -> str | None:
+        return None
+
+
+def _feed_toolbox(host: ForgeMcpHost | None = None) -> tuple[ForgeMcpToolbox, FakeClient]:
+    client = FakeClient()
+    toolbox = ForgeMcpToolbox(
+        client=client,
+        host=host or FakeHost(),
+        grants=(),
+        limits=LIMITS,
+        notify_mode=ForgeMcpNotifyMode.FEED,
+    )
+    return toolbox, client
+
+
+class TestFeedNotify:
+    def test_feed_notify_schema_requires_an_idempotency_key(self) -> None:
+        toolbox, _ = _feed_toolbox()
+        notify = next(tool for tool in toolbox.list_tools() if tool["name"] == "notify")
+        schema = notify["inputSchema"]
+        assert schema["required"] == ["kind", "title", "idempotency_key"]
+        assert {"session_id", "instance_id", "idempotency_key"} <= set(schema["properties"])
+        assert "feed-only" in notify["description"]
+        assert [tool["name"] for tool in toolbox.list_tools()] == list(TOOL_NAMES)
+
+    def test_transcript_mode_keeps_the_session_schema(self) -> None:
+        toolbox, _, _ = _toolbox()
+        notify = next(tool for tool in toolbox.list_tools() if tool["name"] == "notify")
+        assert "idempotency_key" not in notify["inputSchema"]["properties"]
+
+    async def test_defaults_to_the_callers_session(self) -> None:
+        toolbox, client = _feed_toolbox()
+        result = await toolbox.call(
+            "notify", {"kind": "milestone", "title": "Done", "idempotency_key": "k-1"}
+        )
+        assert not result.is_error
+        name, (session_id, draft, key, instance_id) = client.calls[-1]
+        assert name == "submit_notification"
+        assert (session_id, key, instance_id) == (SELF, "k-1", None)
+        assert draft.title == "Done" and draft.kind.value == "milestone"
+        assert result.structured == {
+            "notification_id": "nid-feed",
+            "seq": 12,
+            "session_id": SELF,
+            "source": "agent",
+            "state": "committed",
+        }
+
+    async def test_explicit_session_and_instance(self) -> None:
+        toolbox, client = _feed_toolbox(_SessionlessHost())
+        result = await toolbox.call(
+            "notify",
+            {
+                "kind": "attention",
+                "title": "Look",
+                "idempotency_key": "k-2",
+                "session_id": PEER,
+                "instance_id": "node-b",
+            },
+        )
+        assert not result.is_error
+        assert client.calls[-1][1][0] == PEER and client.calls[-1][1][3] == "node-b"
+
+    async def test_without_a_session_the_call_explains(self) -> None:
+        toolbox, client = _feed_toolbox(_SessionlessHost())
+        result = await toolbox.call(
+            "notify", {"kind": "info", "title": "x", "idempotency_key": "k-3"}
+        )
+        assert result.is_error and "needs session_id" in result.text
+        assert client.calls == []
+
+    async def test_missing_idempotency_key_is_invalid(self) -> None:
+        toolbox, client = _feed_toolbox()
+        result = await toolbox.call("notify", {"kind": "info", "title": "x"})
+        assert result.is_error and "idempotency_key" in result.text
+        assert client.calls == []
+
+    async def test_reply_ready_cannot_be_raised(self) -> None:
+        toolbox, _ = _feed_toolbox()
+        result = await toolbox.call(
+            "notify", {"kind": "reply_ready", "title": "x", "idempotency_key": "k"}
+        )
+        assert result.is_error and "reply_ready is automatic" in result.text
+
+    async def test_environment_lists_the_granted_tools(self) -> None:
+        toolbox, _ = _feed_toolbox()
+        result = await toolbox.call("environment", {})
+        assert result.structured["grants"] == []
+        assert "send_message" not in result.structured["tools"]
+        assert "notify" in result.structured["tools"]

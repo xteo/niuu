@@ -69,6 +69,10 @@ data:
 
     notifications: {{ toJson . }}
     {{- end }}
+    {{- with .Values.forgeMcp }}
+
+    forge_mcp: {{ toJson . }}
+    {{- end }}
 
     pod_manager:
       adapter: {{ .Values.podManager.adapter | quote }}

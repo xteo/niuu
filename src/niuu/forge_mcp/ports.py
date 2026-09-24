@@ -59,6 +59,17 @@ class ForgeClient(ABC):
     async def stop_session(self, session_id: str, *, instance_id: str | None) -> dict[str, Any]:
         """``POST /sessions/{id}/stop``."""
 
+    @abstractmethod
+    async def submit_notification(
+        self,
+        session_id: str,
+        draft: NotificationDraft,
+        *,
+        idempotency_key: str,
+        instance_id: str | None,
+    ) -> dict[str, Any]:
+        """``POST /sessions/{id}/notifications``: a feed-only direct submit."""
+
 
 class ForgeMcpHost(ABC):
     """The caller's own context: who is asking, and how its notifications are recorded."""

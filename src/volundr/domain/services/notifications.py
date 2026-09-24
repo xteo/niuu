@@ -240,18 +240,28 @@ class NotificationService(NotificationRecorder):
         draft: NotificationDraft,
         *,
         idempotency_key: str,
+        source: NotificationSource = NotificationSource.OPERATOR,
     ) -> tuple[Notification, bool]:
-        """Direct submit; returns ``(notification, created)`` (False when deduped)."""
+        """Direct submit; returns ``(notification, created)`` (False when deduped).
+
+        ``source`` is ``agent`` when the session itself submits (with its own session
+        credential); its idempotency keys then live apart from its owner's.
+        """
         if draft.kind not in AGENT_KINDS:
             raise NotificationValidationError(
                 f"Kind {draft.kind.value!r} is derived by Forge and cannot be submitted"
             )
+        submitter = (
+            principal.user_id
+            if source is NotificationSource.OPERATOR
+            else f"{source.value}:{principal.user_id}"
+        )
         context = self._context(session)
         candidate = self._candidate(
             context,
-            dedupe_key=submit_dedupe_key(session.id, principal.user_id, idempotency_key),
+            dedupe_key=submit_dedupe_key(session.id, submitter, idempotency_key),
             draft=draft,
-            source=NotificationSource.OPERATOR,
+            source=source,
             session_seq=None,
             metadata={"submitted_by": principal.user_id},
         )

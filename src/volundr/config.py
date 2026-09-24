@@ -45,6 +45,7 @@ from niuu.config_models import (
     default_session_definitions,
 )
 from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
+from niuu.forge_mcp.models import ForgeMcpGrant
 from ravn.config import PersonaSourceConfig
 from volundr.domain.models import (
     IntegrationType,
@@ -891,6 +892,112 @@ class NotificationsConfig(BaseModel):
                 "notifications link paths may only use {session_id} and {notification_id}"
             ) from exc
         return self
+
+
+class ForgeMcpSessionTokenConfig(BaseModel):
+    """The scoped ``forge_session`` credential Forge mints for each session launch.
+
+    The token is signed by the workload-identity issuer when that is enabled with a
+    configured key (``workload_identity.signing_key_pem`` / ``signing_key_env``).
+    Otherwise, as in local mini mode, Forge keeps its own RSA key in
+    ``signing_key_file``, generated once with mode 0600 and never overwritten.
+
+    Its lifetime is tied to the session launch: every start mints a new token and
+    revokes the previous one, and Forge checks each presented token against the live
+    session row, so ``ttl_seconds`` is only a backstop.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Mint a scoped session credential at launch (false: brokers keep "
+        "their own credential and the Forge MCP offers no grants).",
+    )
+    ttl_seconds: int = Field(
+        default=30 * 24 * 3600,
+        ge=300,
+        description="Backstop lifetime of a session credential; a restart re-mints it.",
+    )
+    signing_key_file: str = Field(
+        default="~/.niuu/forge-session-signing-key.pem",
+        description="Private RSA key used when workload identity has no configured key.",
+    )
+    signing_key_bits: int = Field(
+        default=2048, ge=2048, description="Size of a generated signing key."
+    )
+    issuer: str = Field(
+        default="niuu-forge-session",
+        min_length=1,
+        description="Issuer of tokens signed with signing_key_file.",
+    )
+    key_id: str = Field(
+        default="niuu-forge-session", min_length=1, description="kid of signing_key_file."
+    )
+    audiences: list[str] = Field(
+        default_factory=lambda: ["volundr-api"],
+        min_length=1,
+        description="Audiences of tokens signed with signing_key_file.",
+    )
+
+
+class ForgeMcpHttpConfig(BaseModel):
+    """The Forge-hosted MCP endpoint (``POST /api/v1/forge/mcp``) for external agents."""
+
+    enabled: bool = Field(default=True, description="Serve the HTTP MCP endpoint.")
+    allowed_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Browser origins allowed to call the endpoint (exact scheme://host[:port]). "
+            "Requests without an Origin header (agents, CLIs) are always allowed; any "
+            "other Origin is refused with 403 to stop DNS-rebinding and CSRF."
+        ),
+    )
+    list_default_limit: int = Field(default=20, ge=1, description="Default list size.")
+    list_max_limit: int = Field(default=50, ge=1, description="Upper bound for list tools.")
+    transcript_default_turns: int = Field(default=10, ge=1, description="Default turns.")
+    transcript_max_turns: int = Field(default=30, ge=1, description="Upper bound on turns.")
+    transcript_turn_max_chars: int = Field(default=2000, ge=1, description="Chars per turn.")
+    output_max_chars: int = Field(default=24000, ge=1024, description="Tool result bound.")
+    request_timeout_seconds: float = Field(
+        default=20.0, gt=0, description="Timeout for one Forge REST call made by a tool."
+    )
+    max_body_bytes: int = Field(
+        default=1024 * 1024, ge=1024, description="Largest JSON-RPC request accepted."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_limits(self) -> "ForgeMcpHttpConfig":
+        if self.list_default_limit > self.list_max_limit:
+            raise ValueError("forge_mcp.http.list_default_limit must not exceed list_max_limit")
+        if self.transcript_default_turns > self.transcript_max_turns:
+            raise ValueError(
+                "forge_mcp.http.transcript_default_turns must not exceed transcript_max_turns"
+            )
+        return self
+
+
+class ForgeMcpConfig(BaseModel):
+    """Forge MCP credentials and grants.
+
+    Example YAML::
+
+        forge_mcp:
+          default_grants: []          # message, lifecycle: added to every session
+          session_tokens:
+            enabled: true
+            ttl_seconds: 2592000
+            signing_key_file: ~/.niuu/forge-session-signing-key.pem
+          http:
+            enabled: true
+            allowed_origins: []
+    """
+
+    default_grants: list[ForgeMcpGrant] = Field(
+        default_factory=list,
+        description="Grants every session's credential carries (on top of the launch "
+        "spec's and the session-create request's).",
+    )
+    session_tokens: ForgeMcpSessionTokenConfig = Field(default_factory=ForgeMcpSessionTokenConfig)
+    http: ForgeMcpHttpConfig = Field(default_factory=ForgeMcpHttpConfig)
 
 
 class IdentityConfig(BaseModel):
@@ -1938,6 +2045,7 @@ class Settings(BaseSettings):
     sleipnir: SleipnirConfig = Field(default_factory=SleipnirConfig)
     push: PushNotificationConfig = Field(default_factory=PushNotificationConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)
     credential_store: CredentialStoreConfig = Field(default_factory=CredentialStoreConfig)

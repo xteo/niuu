@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -15,6 +16,14 @@ except ImportError:
     _catalog_started = None  # type: ignore[assignment]
     _catalog_failed = None  # type: ignore[assignment]
 
+from niuu.domain.services.forge_session_token import (
+    ForgeSessionTokenService,
+    IssuedForgeSessionToken,
+    new_launch_id,
+)
+from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
+from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
+from niuu.forge_mcp.models import ForgeMcpGrant
 from volundr.domain.models import (
     CleanupTarget,
     CommunicationRoute,
@@ -49,6 +58,14 @@ from volundr.domain.ports import (
     StoragePort,
 )
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.services.forge_session_launch import (
+    ForgeMcpGrantEscalationError,
+    grants_in,
+    launch_id_of,
+    launch_spec_grants,
+    with_forge_mcp,
+    without_forge_mcp,
+)
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 if TYPE_CHECKING:
@@ -127,6 +144,8 @@ class SessionService:
         public_origin: str = "http://localhost:8080",
         span_repository: SessionSpanRepository | None = None,
         notification_recorder: NotificationRecorder | None = None,
+        forge_session_tokens: ForgeSessionTokenService | None = None,
+        forge_mcp_default_grants: Iterable[ForgeMcpGrant | str] = (),
     ):
         self._repository = repository
         self._pod_manager = pod_manager
@@ -150,6 +169,8 @@ class SessionService:
         self._session_communication_port = session_communication_port
         self._span_repository = span_repository
         self._notification_recorder = notification_recorder
+        self._forge_session_tokens = forge_session_tokens
+        self._forge_mcp_default_grants = frozenset(normalize_grants(forge_mcp_default_grants))
         self._runtime_backend = runtime_backend
         normalized_public_origin = public_origin.rstrip("/")
         if normalized_public_origin.startswith("https://"):
@@ -967,6 +988,12 @@ class SessionService:
         if project_context:
             workload_config = {**(workload_config or {}), "project_context": project_context}
 
+        # Forge MCP grants persist across restarts and every start is a new launch,
+        # which revokes the previous launch's session credential.
+        workload_config = self._with_forge_mcp_launch(
+            session, principal, workload_config, launch_spec
+        )
+
         # Set chat_endpoint eagerly — Flux/Gateway sessions know their public
         # route before the pod is ready; local mode falls back to the root proxy.
         chat_endpoint = self._pod_manager.initial_chat_endpoint(session)
@@ -1010,7 +1037,9 @@ class SessionService:
                 system_prompt=system_prompt,
                 initial_prompt=initial_prompt,
                 workload_type=workload_type,
-                workload_config=workload_config,
+                # Contributors never see the credential bookkeeping: an otherwise
+                # empty workload config must still read as empty to them.
+                workload_config=without_forge_mcp(workload_config),
             ),
             name=f"provision-{session_id}",
         )
@@ -1131,6 +1160,7 @@ class SessionService:
             contributions.append(contribution)
 
         spec = SessionSpec.merge(contributions)
+        spec.forge_session = self._mint_forge_session(session)
         if session.coordination and (
             project_context := session.workload_config.get("project_context")
         ):
@@ -1143,6 +1173,92 @@ class SessionService:
             )
         self._overlay_resume_session(session, spec)
         return await self._pod_manager.start(session, spec=spec)
+
+    def check_forge_mcp_grants(
+        self,
+        principal: Principal | None,
+        requested: Iterable[ForgeMcpGrant | str],
+        *,
+        launch_spec: str | None,
+    ) -> None:
+        """Refuse a new session whose grants exceed a session-credential caller's own.
+
+        Raises :class:`ForgeMcpGrantEscalationError`. Callers that are not session
+        credentials (humans, PATs) may grant anything.
+        """
+        if principal is None or principal.token_use != FORGE_SESSION_TOKEN_USE:
+            return
+        wanted = frozenset(normalize_grants(requested)) | launch_spec_grants(
+            self._launch_spec_for(launch_spec)
+        )
+        beyond = wanted - grants_from_scopes(principal.scopes)
+        if beyond:
+            raise ForgeMcpGrantEscalationError(None, beyond)
+
+    def _with_forge_mcp_launch(
+        self,
+        session: Session,
+        principal: Principal | None,
+        workload_config: dict | None,
+        launch_spec: str | None,
+    ) -> dict:
+        """Merge this start's grants into the stored ones and open a new launch.
+
+        Grants come from the stored session row, the caller (the session-create
+        request) and the launch spec this start applies. A caller holding a session
+        credential may not add grants it does not hold itself.
+        """
+        stored = grants_in(session.workload_config, source=f"session {session.id}")
+        requested = grants_in(workload_config, source="session request")
+        from_spec = launch_spec_grants(self._launch_spec_for(launch_spec))
+        added = (requested | from_spec) - stored
+        if principal is not None and principal.token_use == FORGE_SESSION_TOKEN_USE:
+            beyond = added - grants_from_scopes(principal.scopes)
+            if beyond:
+                raise ForgeMcpGrantEscalationError(session.id, beyond)
+        return with_forge_mcp(
+            workload_config,
+            grants=stored | requested | from_spec,
+            launch_id=new_launch_id(),
+        )
+
+    def _launch_spec_for(self, name: str | None):
+        """The launch spec a start applies (as the launch-spec contributor resolves it)."""
+        if self._launch_spec_provider is None:
+            return None
+        if name:
+            spec = self._launch_spec_provider.get(name)
+            if spec is not None:
+                return spec
+        return self._launch_spec_provider.get_default("session")
+
+    def _mint_forge_session(self, session: Session) -> IssuedForgeSessionToken | None:
+        """Mint this launch's scoped credential, when a broker can receive one."""
+        if self._forge_session_tokens is None:
+            return None
+        if not getattr(self._pod_manager, "delivers_forge_session_token", False):
+            return None
+        launch_id = launch_id_of(session.workload_config)
+        if launch_id is None:
+            raise RuntimeError(f"Session {session.id} started without a Forge MCP launch id")
+        if not session.owner_id:
+            logger.info(
+                "Session %s has no owner; its broker keeps its own Forge credential",
+                session.id,
+            )
+            return None
+        grants = (
+            grants_in(session.workload_config, source=f"session {session.id}")
+            | self._forge_mcp_default_grants
+        )
+        return self._forge_session_tokens.mint(
+            session_id=session.id,
+            session_name=session.name,
+            owner_id=session.owner_id,
+            tenant_id=session.tenant_id,
+            grants=grants,
+            launch_id=launch_id,
+        )
 
     @staticmethod
     def _overlay_resume_session(session: Session, spec: SessionSpec) -> None:

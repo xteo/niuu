@@ -18,6 +18,7 @@ This page covers how to operate the feature.
 | `system` | reply_ready | Every final assistant reply (the same rule that drives the session inbox). The title is the reply's first line and the body is a bounded excerpt. | `turn:{session}:{final_turn_id}:reply_ready` |
 | `system` | attention | A session starts waiting for its owner (a question, confirmation or permission request). | `attention:{session}:{state_since}[:{request_id}]` |
 | `operator` | any except reply_ready | `POST /api/v1/forge/sessions/{id}/notifications` | `submit:{session}:{principal}:{idempotency_key}` |
+| `agent` (direct) | milestone, decision, attention, error, info | The same direct submit made by the session itself with its own session credential, for example through the Forge-hosted MCP endpoint | `submit:{session}:agent:{owner}:{idempotency_key}` |
 
 The notification id is a uuid5 of the dedupe key, so every retry maps to the same
 notification. A retried log append, activity report or submit never creates a second
@@ -47,7 +48,7 @@ All routes are under `/api/v1/forge`. The Guild facade serves the same paths.
 | `GET /notifications/read-state` | `{read_through_seq, revision, unread_count, head_seq}` |
 | `PUT /notifications/read-state` | `{read_through_seq, expected_revision}`. The watermark only moves forward. A stale `expected_revision` returns `409`. A `read_through_seq` beyond the newest notification you can see returns `422`. |
 | `GET /sessions/{id}/notifications?after=&limit=` | One session's notifications as a JSON list, ascending. Requires read access to the session. |
-| `POST /sessions/{id}/notifications` | Direct submit: a `NotificationDraft` plus `idempotency_key`. Returns `201` for a new notification, `200` for a deduplicated one. `session_seq` is always null. Requires the session's `emit_event` permission, the same as appending to its log. |
+| `POST /sessions/{id}/notifications` | Direct submit: a `NotificationDraft` plus `idempotency_key`. Returns `201` for a new notification, `200` for a deduplicated one. `session_seq` is always null. Requires the session's `emit_event` permission, the same as appending to its log. The source is `agent` when the session submits for itself with its session credential, and `operator` otherwise. |
 | `GET/POST /notifications/rules`, `PUT/DELETE /notifications/rules/{id}` | Your own delivery rules. |
 | `GET /notifications/sinks` | Sinks a rule may name: `[{name, label, requires_integration}]` |
 | `GET /notifications/{id}/deliveries` | Outbox rows for a notification you can see. |
@@ -323,6 +324,15 @@ bot tokens, webhook paths or secrets.
 | `dead`: "Telegram Bot API returned HTTP 401/403/400" | Wrong bot token, bot not in the chat, or wrong chat id. |
 | `dead`: "Gave up after N attempts" | The sink kept failing for about `max_attempts` backoffs. Fix the receiver; new notifications deliver normally. |
 | Telegram rules are not offered in the UI | `GET /notifications/sinks` lists `integration` only for users with an enabled messaging integration. |
+
+## Session credentials
+
+A session's own Forge MCP calls carry a scoped, session-bound credential. With it a
+session may read the feed and its owner's sessions (`forge:session:read`) and notify
+as itself (`forge:notify`), but it cannot touch delivery rules, sinks or delivery rows.
+Session credentials are local to their node. The operator guide covers the scopes,
+the grants, the token lifecycle and the Forge-hosted MCP endpoint
+(`POST /api/v1/forge/mcp`): [forge-mcp.md](forge-mcp.md).
 
 ## Configuration
 
