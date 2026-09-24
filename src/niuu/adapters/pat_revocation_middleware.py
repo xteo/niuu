@@ -30,11 +30,13 @@ class PATRevocationMiddleware(BaseHTTPMiddleware):
         _mw_logger = logging.getLogger("niuu.middleware.pat")
 
         if "activity" in request.url.path:
+            # Only the scheme: a bearer prefix is still part of a credential.
+            scheme = request.headers.get("authorization", "none").split(" ", 1)[0]
             _mw_logger.info(
                 "PAT middleware: %s %s auth=%s",
                 request.method,
                 request.url.path,
-                request.headers.get("authorization", "none")[:30],
+                scheme,
             )
 
         validator = getattr(request.app.state, "pat_validator", None)
