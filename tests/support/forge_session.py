@@ -1,7 +1,7 @@
 """Test support for Forge session credentials: a real Forge app slice, in memory.
 
 The app has the production middleware, auth dependency and routers (sessions,
-notifications, session log, message delivery) over in-memory
+notifications, session log, message delivery, HTTP MCP) over in-memory
 repositories, a real ``ForgeSessionTokenService`` and an allow-all identity, so
 tests exercise session-token verification and enforcement end to end without a
 database.
@@ -26,10 +26,12 @@ from tests.conftest import InMemorySessionRepository, MockPodManager
 from tests.support.notifications import InMemoryNotificationStore
 from volundr.adapters.inbound.forge_session_auth import ForgeSessionAuthMiddleware
 from volundr.adapters.inbound.rest import create_router
+from volundr.adapters.inbound.rest_forge_mcp import create_forge_mcp_router
 from volundr.adapters.inbound.rest_message_delivery import create_message_delivery_router
 from volundr.adapters.inbound.rest_notifications import create_notifications_router
 from volundr.adapters.inbound.rest_session_log import create_session_log_router
 from volundr.adapters.outbound.identity import AllowAllIdentityAdapter
+from volundr.config import ForgeMcpHttpConfig
 from volundr.domain.models import Session, SessionLogEntry, SessionStatus, User
 from volundr.domain.notifications import NotificationSinkInfo
 from volundr.domain.ports import SessionEventLogRepository
@@ -145,6 +147,7 @@ class ForgeApp:
 def build_forge_app(
     *,
     tokens: ForgeSessionTokenService | None = None,
+    mcp_config: ForgeMcpHttpConfig | None = None,
     **service_kwargs: Any,
 ):
     """The Forge app slice. ``tokens=None`` builds one; pass ``False`` for none."""
@@ -187,6 +190,7 @@ def build_forge_app(
         )
     )
     app.include_router(create_message_delivery_router(InMemoryDeliveries(), session_service))
+    app.include_router(create_forge_mcp_router(mcp_config or ForgeMcpHttpConfig(), prefix=PREFIX))
     return ForgeApp(
         app=app,
         client=TestClient(app),

@@ -30,7 +30,13 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
 )
-from niuu.forge_mcp.models import ForgeApiError, ForgeMcpGrant, ForgeMcpLimits, ToolResult
+from niuu.forge_mcp.models import (
+    ForgeApiError,
+    ForgeMcpGrant,
+    ForgeMcpLimits,
+    ForgeMcpNotifyMode,
+    ToolResult,
+)
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
 
 # Wire-format patterns Forge itself enforces (request ids) or that keep ids from
@@ -83,6 +89,17 @@ class _NotifyArgs(NotificationDraft):
             allowed = ", ".join(sorted(kind.value for kind in AGENT_KINDS))
             raise ValueError(f"agents may raise only: {allowed} (reply_ready is automatic)")
         return value
+
+
+class _FeedNotifyArgs(_NotifyArgs):
+    idempotency_key: str = Field(pattern=_REQUEST_ID_PATTERN)
+    session_id: str | None = None
+    instance_id: str | None = Field(default=None, pattern=_INSTANCE_ID_PATTERN)
+
+    @field_validator("session_id")
+    @classmethod
+    def _session_uuid(cls, value: str | None) -> str | None:
+        return None if value is None else _uuid_text(value)
 
 
 class _ListNotificationsArgs(_Args):
@@ -257,6 +274,45 @@ with present-file via kind=file and file_id, other sessions) in `links`.
 Returns {notification_id, turn_id, session_seq, state}. state=committed means \
 Forge recorded it; state=pending means it is saved in this session's durable log \
 and will reach Forge automatically when Forge is reachable — do not resend it."""
+
+
+_FEED_NOTIFY_SCHEMA = {
+    **_NOTIFY_SCHEMA,
+    "properties": {
+        **_NOTIFY_SCHEMA["properties"],
+        "idempotency_key": {
+            "type": "string",
+            "pattern": _REQUEST_ID_PATTERN,
+            "description": (
+                "Your own id for this notification. Retrying with the same key returns "
+                "the notification already recorded instead of a second one."
+            ),
+        },
+        "session_id": {
+            **_SESSION_ID_SCHEMA,
+            "description": (
+                "The session the notification is about. Defaults to your own session "
+                "when you are a Forge session; required otherwise."
+            ),
+        },
+        "instance_id": _INSTANCE_ID_SCHEMA,
+    },
+    "required": [*_NOTIFY_SCHEMA["required"], "idempotency_key"],
+}
+
+_FEED_NOTIFY_DESCRIPTION = """\
+Record a notification in the Forge Notifications feed for a session you own \
+(your own session by default when you are a Forge session). It is feed-only: it \
+is not added to the session's transcript. It appears in the feed across every \
+host and may reach the owner's phone or chat through their delivery rules.
+
+kind: milestone (meaningful work finished), decision (a significant choice was \
+made), attention (someone must act or answer), error (a failure that matters) or \
+info (a brief FYI). Keep the title to one short line and the body to a few \
+sentences of markdown; link artifacts in `links`. Do not send progress chatter.
+
+idempotency_key is required: retrying with the same key returns the notification \
+already recorded. Returns {notification_id, seq, session_id, state}."""
 
 
 @dataclass(frozen=True)
@@ -469,6 +525,20 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
 
 TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in TOOL_SPECS)
 
+#: ``notify`` as the Forge-hosted HTTP endpoint serves it (direct feed submit).
+FEED_NOTIFY_SPEC = ToolSpec(
+    name="notify",
+    description=_FEED_NOTIFY_DESCRIPTION,
+    input_schema=_FEED_NOTIFY_SCHEMA,
+    args_model=_FeedNotifyArgs,
+)
+
+
+def _specs_for(mode: ForgeMcpNotifyMode) -> tuple[ToolSpec, ...]:
+    if mode is ForgeMcpNotifyMode.TRANSCRIPT:
+        return TOOL_SPECS
+    return tuple(FEED_NOTIFY_SPEC if spec.name == "notify" else spec for spec in TOOL_SPECS)
+
 
 # --------------------------------------------------------------------------- projections
 
@@ -575,15 +645,18 @@ class ForgeMcpToolbox:
         host: ForgeMcpHost,
         grants: Iterable[ForgeMcpGrant | str],
         limits: ForgeMcpLimits,
+        notify_mode: ForgeMcpNotifyMode = ForgeMcpNotifyMode.TRANSCRIPT,
     ) -> None:
         self._client = client
         self._host = host
         self._grants = frozenset(ForgeMcpGrant(grant) for grant in grants)
         self._limits = limits
-        self._specs = {spec.name: spec for spec in TOOL_SPECS}
+        self._tool_specs = _specs_for(notify_mode)
+        self._specs = {spec.name: spec for spec in self._tool_specs}
+        notify = self._notify if notify_mode is ForgeMcpNotifyMode.TRANSCRIPT else self._feed_notify
         self._handlers: dict[str, Callable[[Any], Awaitable[ToolResult]]] = {
             "environment": self._environment,
-            "notify": self._notify,
+            "notify": notify,
             "list_notifications": self._list_notifications,
             "list_sessions": self._list_sessions,
             "get_session": self._get_session,
@@ -601,7 +674,7 @@ class ForgeMcpToolbox:
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Every tool, granted or not, so the model learns why a denied one fails."""
-        return [spec.to_mcp() for spec in TOOL_SPECS]
+        return [spec.to_mcp() for spec in self._tool_specs]
 
     async def call(self, name: str, arguments: dict[str, Any] | None) -> ToolResult:
         spec = self._specs.get(name)
@@ -637,13 +710,41 @@ class ForgeMcpToolbox:
         environment = await self._host.environment()
         environment["grants"] = sorted(grant.value for grant in self._grants)
         environment["tools"] = [
-            spec.name for spec in TOOL_SPECS if spec.grant is None or spec.grant in self._grants
+            spec.name
+            for spec in self._tool_specs
+            if spec.grant is None or spec.grant in self._grants
         ]
         return self._ok(environment)
 
     async def _notify(self, args: _NotifyArgs) -> ToolResult:
         draft = NotificationDraft.model_validate(args.model_dump())
         return self._ok(await self._host.notify(draft))
+
+    async def _feed_notify(self, args: _FeedNotifyArgs) -> ToolResult:
+        session_id = args.session_id or self._host.session_id
+        if not session_id:
+            return ToolResult.error(
+                "notify needs session_id: name the session the notification is about "
+                "(its id from list_sessions)."
+            )
+        draft = NotificationDraft.model_validate(
+            args.model_dump(exclude={"idempotency_key", "session_id", "instance_id"})
+        )
+        recorded = await self._client.submit_notification(
+            session_id,
+            draft,
+            idempotency_key=args.idempotency_key,
+            instance_id=args.instance_id,
+        )
+        return self._ok(
+            {
+                "notification_id": recorded.get("id"),
+                "seq": recorded.get("seq"),
+                "session_id": recorded.get("session_id"),
+                "source": recorded.get("source"),
+                "state": "committed",
+            }
+        )
 
     # -- reads
 

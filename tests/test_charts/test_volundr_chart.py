@@ -576,11 +576,13 @@ class TestConfigMapTemplate:
         assert "forge_mcp" not in render()
         config = render(
             "--set-json",
-            'forgeMcp={"default_grants":["message"],"session_tokens":{"ttl_seconds":604800}}',
+            'forgeMcp={"default_grants":["message"],"session_tokens":{"ttl_seconds":604800},'
+            '"http":{"allowed_origins":["https://forge.example.com"]}}',
         )
         parsed = ForgeMcpConfig.model_validate(config["forge_mcp"])
         assert [grant.value for grant in parsed.default_grants] == ["message"]
         assert parsed.session_tokens.ttl_seconds == 604800
+        assert parsed.http.allowed_origins == ["https://forge.example.com"]
 
     def test_ci_values_run_resident_runtime_migrations(self):
         result = subprocess.run(

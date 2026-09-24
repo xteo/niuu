@@ -51,6 +51,7 @@ from volundr.adapters.inbound.rest_audit import (
 from volundr.adapters.inbound.rest_codex_credentials import create_codex_credentials_router
 from volundr.adapters.inbound.rest_credentials import create_canonical_credentials_router
 from volundr.adapters.inbound.rest_events import create_events_router
+from volundr.adapters.inbound.rest_forge_mcp import create_forge_mcp_router
 from volundr.adapters.inbound.rest_git import create_git_router
 from volundr.adapters.inbound.rest_integrations import create_canonical_integrations_router
 from volundr.adapters.inbound.rest_issues import create_canonical_issues_router
@@ -1280,6 +1281,9 @@ def create_app(
             app.include_router(
                 create_message_delivery_router(PostgresMessageDelivery(pool), session_service)
             )
+            if settings.forge_mcp.http.enabled:
+                app.include_router(create_forge_mcp_router(settings.forge_mcp.http))
+            app.state.forge_mcp_http = settings.forge_mcp.http.enabled
 
             # Replay-as-live: paced re-emit of recorded frames over a WebSocket,
             # speaking the live-session frame protocol so existing clients

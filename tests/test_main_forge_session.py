@@ -15,7 +15,7 @@ from volundr.composition_builders import (
     KEY_SOURCE_WORKLOAD_IDENTITY,
     _create_forge_session_tokens,
 )
-from volundr.config import ForgeMcpConfig, Settings
+from volundr.config import ForgeMcpConfig, ForgeMcpHttpConfig, Settings
 
 
 def _settings(tmp_path, **forge_mcp) -> Settings:
@@ -102,11 +102,23 @@ class TestConfig:
         assert config.session_tokens.enabled is True
         assert config.session_tokens.ttl_seconds == 30 * 24 * 3600
         assert config.session_tokens.signing_key_file.endswith("forge-session-signing-key.pem")
+        assert config.http.enabled is True and config.http.allowed_origins == []
 
     def test_grants_are_validated(self) -> None:
         assert ForgeMcpConfig(default_grants=["message"]).default_grants[0].value == "message"
         with pytest.raises(ValidationError):
             ForgeMcpConfig(default_grants=["root"])
+
+    @pytest.mark.parametrize(
+        "limits",
+        [
+            {"list_default_limit": 60, "list_max_limit": 50},
+            {"transcript_default_turns": 40, "transcript_max_turns": 30},
+        ],
+    )
+    def test_http_limits_are_ordered(self, limits) -> None:
+        with pytest.raises(ValidationError):
+            ForgeMcpHttpConfig(**limits)
 
     def test_key_size_floor(self) -> None:
         with pytest.raises(ValidationError):

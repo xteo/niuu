@@ -20,6 +20,19 @@ class ForgeMcpGrant(StrEnum):
     LIFECYCLE = "lifecycle"
 
 
+class ForgeMcpNotifyMode(StrEnum):
+    """How ``notify`` records a notification.
+
+    ``transcript``: the broker appends a notification turn to its own session's
+    durable log (inline in the conversation, then projected into the feed).
+    ``feed``: a direct submit to Forge's feed (``POST /sessions/{id}/notifications``),
+    used by the Forge-hosted HTTP endpoint, which has no session log to append to.
+    """
+
+    TRANSCRIPT = "transcript"
+    FEED = "feed"
+
+
 @dataclass(frozen=True)
 class ForgeMcpLimits:
     """Output bounds. They come from configuration so a deployment can tune them."""

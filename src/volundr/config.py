@@ -853,6 +853,42 @@ class ForgeMcpSessionTokenConfig(BaseModel):
     )
 
 
+class ForgeMcpHttpConfig(BaseModel):
+    """The Forge-hosted MCP endpoint (``POST /api/v1/forge/mcp``) for external agents."""
+
+    enabled: bool = Field(default=True, description="Serve the HTTP MCP endpoint.")
+    allowed_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Browser origins allowed to call the endpoint (exact scheme://host[:port]). "
+            "Requests without an Origin header (agents, CLIs) are always allowed; any "
+            "other Origin is refused with 403 to stop DNS-rebinding and CSRF."
+        ),
+    )
+    list_default_limit: int = Field(default=20, ge=1, description="Default list size.")
+    list_max_limit: int = Field(default=50, ge=1, description="Upper bound for list tools.")
+    transcript_default_turns: int = Field(default=10, ge=1, description="Default turns.")
+    transcript_max_turns: int = Field(default=30, ge=1, description="Upper bound on turns.")
+    transcript_turn_max_chars: int = Field(default=2000, ge=1, description="Chars per turn.")
+    output_max_chars: int = Field(default=24000, ge=1024, description="Tool result bound.")
+    request_timeout_seconds: float = Field(
+        default=20.0, gt=0, description="Timeout for one Forge REST call made by a tool."
+    )
+    max_body_bytes: int = Field(
+        default=1024 * 1024, ge=1024, description="Largest JSON-RPC request accepted."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_limits(self) -> "ForgeMcpHttpConfig":
+        if self.list_default_limit > self.list_max_limit:
+            raise ValueError("forge_mcp.http.list_default_limit must not exceed list_max_limit")
+        if self.transcript_default_turns > self.transcript_max_turns:
+            raise ValueError(
+                "forge_mcp.http.transcript_default_turns must not exceed transcript_max_turns"
+            )
+        return self
+
+
 class ForgeMcpConfig(BaseModel):
     """Forge MCP credentials and grants.
 
@@ -864,6 +900,9 @@ class ForgeMcpConfig(BaseModel):
             enabled: true
             ttl_seconds: 2592000
             signing_key_file: ~/.niuu/forge-session-signing-key.pem
+          http:
+            enabled: true
+            allowed_origins: []
     """
 
     default_grants: list[ForgeMcpGrant] = Field(
@@ -872,6 +911,7 @@ class ForgeMcpConfig(BaseModel):
         "spec's and the session-create request's).",
     )
     session_tokens: ForgeMcpSessionTokenConfig = Field(default_factory=ForgeMcpSessionTokenConfig)
+    http: ForgeMcpHttpConfig = Field(default_factory=ForgeMcpHttpConfig)
 
 
 class IdentityConfig(BaseModel):

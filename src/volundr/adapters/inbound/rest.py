@@ -1675,6 +1675,7 @@ def create_router(
                 "notifications": notifications,
                 "forge_session_tokens": session_tokens is not None,
                 "forge_session_token_key": session_tokens.key_source if session_tokens else None,
+                "forge_mcp_http": getattr(request.app.state, "forge_mcp_http", False),
             },
             "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
