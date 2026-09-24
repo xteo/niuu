@@ -891,6 +891,27 @@ class SkuldSettings(BaseSettings):
         ge=1,
         description="Maximum retained native question receipt identities for deduplication.",
     )
+    tmux_workspace_trust_stable_s: float = Field(
+        default=0.5,
+        ge=0,
+        description=(
+            "How long Claude's workspace-trust menu must render unchanged before a key is "
+            "sent (early keys are dropped while the CLI negotiates the terminal)."
+        ),
+    )
+    tmux_workspace_trust_settle_s: float = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "Minimum time after a workspace-trust key before the next one; a menu still "
+            "shown after it means the key was not consumed and is retried."
+        ),
+    )
+    tmux_workspace_trust_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum navigation keys and, separately, confirmations for workspace trust.",
+    )
     codex_receive_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     # Unified internal-visibility default for a freshly-connected live channel
     # (SRD FR-7 / INV-10). The read paths thread the SAME configured default

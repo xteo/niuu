@@ -212,6 +212,9 @@ class TmuxInteractiveTransport(CLITransport):
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
         session_tools: SessionTools | None = None,
+        workspace_trust_stable_s: float = 0.5,
+        workspace_trust_settle_s: float = 1.0,
+        workspace_trust_max_attempts: int = 3,
     ) -> None:
         super().__init__()
         self.workspace_dir = workspace_dir
@@ -293,6 +296,16 @@ class TmuxInteractiveTransport(CLITransport):
         )
         if question_transcript_max_bytes < 1 or question_result_history_limit < 1:
             raise ValueError("Native question transcript and receipt bounds must be positive")
+        if workspace_trust_stable_s < 0 or workspace_trust_settle_s < 0:
+            raise ValueError("Workspace trust stability and settle intervals must be >= 0")
+        if workspace_trust_max_attempts < 1:
+            raise ValueError("Workspace trust needs at least one attempt per key")
+        # Claude redraws the trust menu while it negotiates the terminal, so a key can be
+        # swallowed by a transient render. Act only on a menu that has been stable, let
+        # each key settle, and retry (bounded) when the menu is still there afterwards.
+        self._workspace_trust_stable_s = workspace_trust_stable_s
+        self._workspace_trust_settle_s = workspace_trust_settle_s
+        self._workspace_trust_max_attempts = workspace_trust_max_attempts
         self._question_transcript_max_bytes = question_transcript_max_bytes
         # Initial-prompt fix: the REPL isn't ready to accept input the instant the
         # CLI is spawned — pasting the seed prompt into a still-booting Claude makes
@@ -369,8 +382,7 @@ class TmuxInteractiveTransport(CLITransport):
 
         self._alive = False
         self._startup_ready = False
-        self._workspace_trust_navigation_sent = False
-        self._workspace_trust_submitted = False
+        self._reset_workspace_trust_state()
         self._initial_prompt_sent = False
         self._lifecycle_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
@@ -536,11 +548,47 @@ class TmuxInteractiveTransport(CLITransport):
     def _workspace_trust_pending(text: str) -> bool:
         return "Yes, I trust this folder" in text and "Accessing workspace:" in text
 
+    def _reset_workspace_trust_state(self) -> None:
+        """Per tmux process: key budgets, last key time and the menu stability window."""
+        self._workspace_trust_navigations = 0
+        self._workspace_trust_submissions = 0
+        self._workspace_trust_last_key_at: float | None = None
+        self._workspace_trust_screen: str | None = None
+        self._workspace_trust_screen_since = 0.0
+
+    def _workspace_trust_menu_settled(self, text: str) -> bool:
+        """True once this exact menu frame has held for the stability window and the
+        previous trust key (if any) has had its settle interval.
+
+        Two identical consecutive captures are always required, so a transient frame —
+        e.g. a highlight Claude is about to reset while it negotiates the terminal —
+        never triggers a key.
+        """
+        now = time.monotonic()
+        if text != self._workspace_trust_screen:
+            self._workspace_trust_screen = text
+            self._workspace_trust_screen_since = now
+            return False
+        if now - self._workspace_trust_screen_since < self._workspace_trust_stable_s:
+            return False
+        last_key = self._workspace_trust_last_key_at
+        return last_key is None or now - last_key >= self._workspace_trust_settle_s
+
+    async def _send_workspace_trust_key(self, key: str, *, pane_id: str) -> None:
+        # Record before sending: an uncertain tmux failure counts against the budget and
+        # the settle interval, so a replay only follows a fresh, stable observation.
+        self._workspace_trust_last_key_at = time.monotonic()
+        self._workspace_trust_screen = None
+        await self._send_key(key, pane_id=pane_id)
+
     async def _confirm_workspace_trust(self, text: str, *, pane_id: str) -> None:
         """Answer only the launch workspace's trust menu, one observed step at a time.
 
-        Callers hold the input lock. Wait for the highlight to move to Yes before
-        pressing Enter; never replay either key if tmux captures the old frame.
+        Callers hold the input lock. Enter is pressed ONLY while the highlight is
+        observed on "Yes, I trust this folder" for the configured workspace. Every key
+        waits for a stable menu and for the previous key to settle; a menu still shown
+        after that means the key was dropped (Claude redrew the dialog), so navigation
+        and confirmation are retried, each up to ``workspace_trust_max_attempts``.
         """
         rows = self._normalize_terminal_rows(text)
         workspace = re.search(r"(?m)^\s*Accessing workspace:\s*\n\s*(/[^\n]+)", text)
@@ -560,18 +608,40 @@ class TmuxInteractiveTransport(CLITransport):
         ):
             return
         selected = [index for index, choice in enumerate(choices) if choice[1]]
-        if len(selected) != 1 or self._workspace_trust_submitted:
+        if len(selected) != 1 or not self._workspace_trust_menu_settled(text):
             return
         yes_index = next(i for i, choice in enumerate(choices) if choice[2].startswith("Yes,"))
+        limit = self._workspace_trust_max_attempts
         if selected[0] == yes_index:
-            # Mark before sending: an uncertain tmux failure must not replay Enter.
-            self._workspace_trust_submitted = True
-            await self._send_key("Enter", pane_id=pane_id)
-            logger.info("Submitted Claude workspace trust confirmation for %s", displayed_path)
+            if self._workspace_trust_submissions >= limit:
+                raise DeliveryNotAcceptedError(
+                    f"Workspace trust was not accepted after {limit} confirmations; "
+                    "confirm it in the terminal"
+                )
+            self._workspace_trust_submissions += 1
+            await self._send_workspace_trust_key("Enter", pane_id=pane_id)
+            log = logger.info if self._workspace_trust_submissions == 1 else logger.warning
+            log(
+                "Submitted Claude workspace trust confirmation %d/%d for %s",
+                self._workspace_trust_submissions,
+                limit,
+                displayed_path,
+            )
             return
-        if not self._workspace_trust_navigation_sent:
-            self._workspace_trust_navigation_sent = True
-            await self._send_key("Down" if yes_index > selected[0] else "Up", pane_id=pane_id)
+        if self._workspace_trust_navigations >= limit:
+            raise DeliveryNotAcceptedError(
+                f"Workspace trust selection did not move to Yes after {limit} attempts; "
+                "confirm it in the terminal"
+            )
+        self._workspace_trust_navigations += 1
+        key = "Down" if yes_index > selected[0] else "Up"
+        await self._send_workspace_trust_key(key, pane_id=pane_id)
+        if self._workspace_trust_navigations > 1 or self._workspace_trust_submissions:
+            logger.warning(
+                "Claude workspace trust menu was redrawn on No; re-selecting Yes (%d/%d)",
+                self._workspace_trust_navigations,
+                limit,
+            )
 
     async def _wait_for_repl_ready(self, *, allow_pending_question: bool = False) -> bool:
         """Monitor startup, confirm workspace trust, then wait for the input prompt.
@@ -613,8 +683,7 @@ class TmuxInteractiveTransport(CLITransport):
             if not await self._has_session():
                 await self._create_session()
                 self._startup_ready = False
-                self._workspace_trust_navigation_sent = False
-                self._workspace_trust_submitted = False
+                self._reset_workspace_trust_state()
                 await self._apply_tmux_options()
             self._alive = True
             await self._refresh_panes(emit_events=True)
