@@ -356,6 +356,7 @@ async def test_resident_installs_learning_and_exposes_it_as_a_signal_hint(tmp_pa
     assert (
         "YOLO override installed after non-blocking Odin findings" in peer.decisions()[0].rationale
     )
+    await bus.flush()  # deliver published events before inspecting them
     odin = next(event for event in events if event.event_type == registry.ODIN_COURT_DECIDED)
     assert odin.payload["decision"] == "learning_adoption_allowed"
     assert odin.payload["install_authorization"] == "yolo_override"
@@ -486,6 +487,7 @@ async def test_guarded_peer_holds_for_operator_when_odin_needs_approval(tmp_path
     assert (
         await guarded_skills.get_runnable_skill("valkyrie-inspect-kubernetes-pod-oomkilled") is None
     )
+    await bus.flush()  # deliver published events before inspecting them
     odin = next(event for event in events if event.event_type == registry.ODIN_COURT_DECIDED)
     assert odin.payload["decision"] == "learning_adoption_blocked"
     assert odin.payload["authority_boundary"] == "human_review_required"
@@ -546,6 +548,7 @@ async def test_yolo_peer_rejects_unusable_kubectl_only_learning(tmp_path) -> Non
     assert decision.action == "rejected"
     assert "Odin review blocked" in decision.rationale
     assert await peer_skills.get_runnable_skill("valkyrie-kubectl-only") is None
+    await bus.flush()  # deliver published events before inspecting them
     odin = next(event for event in events if event.event_type == registry.ODIN_COURT_DECIDED)
     assert odin.payload["decision"] == "learning_adoption_blocked"
     assert any(
@@ -624,6 +627,7 @@ async def test_operator_adoption_command_installs_and_acknowledges_skill(tmp_pat
         and event.payload.get("resident_valkyrie_id") == "valkyrie:k8s-command"
         for event in events
     )
+    await bus.flush()  # deliver published events before inspecting them
     activated = next(
         event for event in events if event.event_type == "valkyrie.evolution.activated"
     )
@@ -773,6 +777,7 @@ async def test_start_publishes_inventory_snapshot_and_stop_cancels_heartbeat(tmp
     await bus.flush()
 
     inventory = [e for e in events if e.event_type == EVOLUTION_SKILL_INVENTORY_EVENT]
+    await bus.flush()  # deliver published events before inspecting them
     skill_event = next(
         e for e in inventory if e.payload["skill_name"] == "valkyrie-preexisting-skill"
     )
