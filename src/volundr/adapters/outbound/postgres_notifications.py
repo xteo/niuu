@@ -549,3 +549,12 @@ class PostgresNotificationDeliveryRepository(NotificationDeliveryRepository):
             notification_id,
         )
         return [row_to_delivery(row) for row in rows]
+
+    async def count_delivered_since(self, rule_id: UUID, since: datetime) -> int:
+        count = await self._pool.fetchval(
+            """SELECT COUNT(*) FROM forge_notification_deliveries
+               WHERE rule_id = $1 AND status = 'delivered' AND delivered_at >= $2""",
+            rule_id,
+            since,
+        )
+        return int(count or 0)

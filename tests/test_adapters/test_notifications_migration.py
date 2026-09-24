@@ -1,4 +1,4 @@
-"""Migration 000069 ships identically in all three places and is idempotent SQL."""
+"""Notification migrations ship identically in all three places and are idempotent SQL."""
 
 from __future__ import annotations
 
@@ -46,3 +46,22 @@ def test_up_migration_only_uses_idempotent_ddl():
     assert down.count("DROP TABLE IF EXISTS") == 4
     # Children first, so the down migration never trips a foreign key.
     assert down.index("forge_notification_deliveries") < down.index("forge_notifications;")
+
+
+RATE_INDEX = "000070_forge_notification_delivery_rate_index"
+
+
+@pytest.mark.parametrize("direction", ["up", "down"])
+def test_rate_index_migration_is_identical_in_all_three_locations(direction):
+    name = f"{RATE_INDEX}.{direction}.sql"
+    source = (ROOT / "migrations" / name).read_bytes()
+    assert (ROOT / "src/cli/migrations/volundr" / name).read_bytes() == source
+    assert _chart_block(name) == source.decode().strip()
+
+
+def test_rate_index_is_partial_and_idempotent():
+    up = (ROOT / "migrations" / f"{RATE_INDEX}.up.sql").read_text()
+    assert "CREATE INDEX IF NOT EXISTS idx_forge_notification_deliveries_rule_delivered" in up
+    assert "(rule_id, delivered_at)" in up and "WHERE status = 'delivered'" in up
+    down = (ROOT / "migrations" / f"{RATE_INDEX}.down.sql").read_text()
+    assert "DROP INDEX IF EXISTS idx_forge_notification_deliveries_rule_delivered" in down

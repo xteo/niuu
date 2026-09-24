@@ -7,7 +7,8 @@ tests can exercise the domain without a database.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from volundr.domain.notification_ports import (
@@ -31,10 +32,18 @@ from volundr.domain.notifications import (
 )
 
 
-class InMemoryNotificationStore:
-    """Shared state; ``feed``, ``rule_repo`` and ``outbox`` are the three ports."""
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
-    def __init__(self) -> None:
+
+class InMemoryNotificationStore:
+    """Shared state; ``feed``, ``rule_repo`` and ``outbox`` are the three ports.
+
+    ``clock`` stands in for the database's ``now()`` so tests can move time.
+    """
+
+    def __init__(self, clock: Callable[[], datetime] = _utc_now) -> None:
+        self.clock = clock
         self.notifications: dict[str, Notification] = {}
         self.rules: dict[UUID, NotificationRule] = {}
         self.deliveries: dict[UUID, NotificationDelivery] = {}
@@ -62,12 +71,12 @@ class InMemoryNotificationRepository(NotificationRepository):
                 **candidate.model_dump(),
                 id=candidate.id,
                 seq=store.seq,
-                created_at=datetime.now(UTC),
+                created_at=store.clock(),
             )
             store.notifications[candidate.dedupe_key] = notification
             created.append(notification)
         enabled = [rule for rule in store.rules.values() if rule.enabled]
-        now = datetime.now(UTC)
+        now = store.clock()
         for notification in created:
             for rule in rules_matching(notification, enabled):
                 delivery = NotificationDelivery(
@@ -184,23 +193,95 @@ class InMemoryNotificationRuleRepository(NotificationRuleRepository):
         return True
 
 
+_CLAIMABLE = (DeliveryStatus.PENDING, DeliveryStatus.FAILED, DeliveryStatus.CLAIMED)
+
+
 class InMemoryNotificationDeliveryRepository(NotificationDeliveryRepository):
-    """Only the read side; claims and settles are exercised against PostgreSQL."""
+    """The outbox with the Postgres claim semantics: due rows, leases, fenced settles.
+
+    Claims are atomic (no awaits inside), which is what ``FOR UPDATE SKIP LOCKED``
+    gives concurrent workers against the real table.
+    """
 
     def __init__(self, store: InMemoryNotificationStore) -> None:
+        self.store = store
         self.deliveries = store.deliveries
+        self.claim_calls = 0
 
     async def claim_due(self, *, limit: int, lease_seconds: float) -> list[ClaimedDelivery]:
-        raise NotImplementedError("claims are exercised against PostgreSQL")
+        self.claim_calls += 1
+        now = self.store.clock()
+        due = sorted(
+            (
+                d
+                for d in self.deliveries.values()
+                if d.status in _CLAIMABLE and d.next_attempt_at <= now
+            ),
+            key=lambda d: (d.next_attempt_at, d.created_at),
+        )[:limit]
+        by_id = {n.id: n for n in self.store.notifications.values()}
+        lease = now + timedelta(seconds=lease_seconds)
+        claimed: list[ClaimedDelivery] = []
+        for delivery in due:
+            updated = delivery.model_copy(
+                update={
+                    "status": DeliveryStatus.CLAIMED,
+                    "attempts": delivery.attempts + 1,
+                    "lease_until": lease,
+                    "next_attempt_at": lease,
+                    "updated_at": now,
+                }
+            )
+            self.deliveries[delivery.id] = updated
+            claimed.append(
+                ClaimedDelivery(
+                    delivery=updated,
+                    notification=by_id[delivery.notification_id],
+                    rule=self.store.rules[delivery.rule_id],
+                )
+            )
+        return claimed
+
+    def _settle(self, delivery: NotificationDelivery, **changes: object) -> bool:
+        current = self.deliveries.get(delivery.id)
+        if (
+            current is None
+            or current.attempts != delivery.attempts
+            or current.status is not DeliveryStatus.CLAIMED
+        ):
+            return False
+        self.deliveries[delivery.id] = current.model_copy(
+            update={**changes, "lease_until": None, "updated_at": self.store.clock()}
+        )
+        return True
 
     async def mark_delivered(self, delivery: NotificationDelivery) -> bool:
-        raise NotImplementedError("settles are exercised against PostgreSQL")
+        return self._settle(
+            delivery,
+            status=DeliveryStatus.DELIVERED,
+            delivered_at=self.store.clock(),
+            last_error=None,
+        )
 
     async def mark_failed(self, delivery, *, error, retry_at) -> bool:  # type: ignore[override]
-        raise NotImplementedError("settles are exercised against PostgreSQL")
+        if retry_at is None:
+            return self._settle(delivery, status=DeliveryStatus.DEAD, last_error=error)
+        return self._settle(
+            delivery, status=DeliveryStatus.FAILED, next_attempt_at=retry_at, last_error=error
+        )
 
     async def mark_suppressed(self, delivery, *, reason) -> bool:  # type: ignore[override]
-        raise NotImplementedError("settles are exercised against PostgreSQL")
+        return self._settle(delivery, status=DeliveryStatus.SUPPRESSED, last_error=reason)
 
     async def list_for_notification(self, notification_id: UUID) -> list[NotificationDelivery]:
         return [d for d in self.deliveries.values() if d.notification_id == notification_id]
+
+    async def count_delivered_since(self, rule_id: UUID, since: datetime) -> int:
+        return sum(
+            1
+            for d in self.deliveries.values()
+            if d.rule_id == rule_id
+            and d.status is DeliveryStatus.DELIVERED
+            and d.delivered_at is not None
+            and d.delivered_at >= since
+        )

@@ -12,12 +12,12 @@ import logging
 from contextlib import suppress
 from typing import Any
 
-from ting.ports.channel_resolver import ChannelResolverPort
-from ting.ports.event_bus import EventBusPort, TingEvent
-from ting.ports.notification_channel import (
+from niuu.ports.channel_resolver import ChannelResolverPort
+from niuu.ports.notification_channel import (
     Notification,
     NotificationUrgency,
 )
+from ting.ports.event_bus import EventBusPort, TingEvent
 
 logger = logging.getLogger(__name__)
 

@@ -267,10 +267,16 @@ class PushMessage:
     title: str
     body: str
     session_id: str
-    #: question | confirmation | permission
+    #: question | confirmation | permission (needs input), or a notification kind
     kind: str
     urgency: float
     request_id: str = ""
+    #: What the push announces; relays route on it.
+    event_type: str = "session.needs_input"
+    #: Set for pushes delivered from the Forge notification outbox.
+    notification_id: str = ""
+    #: Deep link back to Forge, when known.
+    url: str = ""
 
 
 class GitSource(BaseModel):

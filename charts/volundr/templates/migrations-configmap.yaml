@@ -1896,4 +1896,14 @@ data:
     DROP TABLE IF EXISTS forge_notification_rules;
     DROP TABLE IF EXISTS forge_notification_read_states;
     DROP TABLE IF EXISTS forge_notifications;
+
+  000070_forge_notification_delivery_rate_index.up.sql: |
+    -- Per-rule rate limiting counts a rule's recent successful deliveries. A partial
+    -- index keeps that count proportional to the window, not the rule's history.
+    CREATE INDEX IF NOT EXISTS idx_forge_notification_deliveries_rule_delivered
+        ON forge_notification_deliveries (rule_id, delivered_at)
+        WHERE status = 'delivered';
+
+  000070_forge_notification_delivery_rate_index.down.sql: |
+    DROP INDEX IF EXISTS idx_forge_notification_deliveries_rule_delivered;
 {{- end }}

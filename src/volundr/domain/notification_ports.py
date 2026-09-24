@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from uuid import UUID
 
+from niuu.ports.notifications import NotificationSink
 from volundr.domain.models import Session
 from volundr.domain.notifications import (
     ClaimedDelivery,
@@ -145,6 +146,36 @@ class NotificationDeliveryRepository(ABC):
     @abstractmethod
     async def list_for_notification(self, notification_id: UUID) -> list[NotificationDelivery]:
         """Return a notification's delivery rows, oldest first."""
+
+    @abstractmethod
+    async def count_delivered_since(self, rule_id: UUID, since: datetime) -> int:
+        """How many of a rule's deliveries were ``delivered`` at or after ``since``.
+
+        The dispatcher's per-rule rate limit reads it at claim time.
+        """
+
+
+class NotificationSinkProvider(ABC):
+    """Finds the sink that delivers a rule's notifications.
+
+    A rule with an ``integration_connection_id`` delivers through that owner's
+    messaging integration; any other rule names a configured sink. Raises
+    ``niuu.ports.notifications.NotificationSinkUnavailableError`` when neither
+    resolves. Every sink returned by :meth:`open` goes back through
+    :meth:`release`, which closes per-use sinks and keeps shared ones.
+    """
+
+    @abstractmethod
+    async def open(self, rule: NotificationRule) -> NotificationSink:
+        """Return the sink for ``rule``."""
+
+    @abstractmethod
+    async def release(self, sink: NotificationSink) -> None:
+        """Give back a sink obtained from :meth:`open`."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close every shared sink (on shutdown)."""
 
 
 class NotificationRecorder(ABC):

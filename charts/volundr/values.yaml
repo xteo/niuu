@@ -406,17 +406,31 @@ sleipnir:
   kwargs: {}
   secretKwargs: []
 
-# Forge session notifications: the feed, automatic reply_ready notifications and
-# external delivery sinks. Rendered verbatim as config.yaml's `notifications:` section
-# (snake_case keys; see NotificationsConfig). Empty keeps the defaults: feed on,
-# reply_ready on, no external sinks. Example:
+# Forge session notifications: the feed, automatic reply_ready notifications, the
+# delivery outbox dispatcher and external sinks. Rendered verbatim as config.yaml's
+# `notifications:` section (snake_case keys; see NotificationsConfig). Empty keeps the
+# defaults: feed on, reply_ready on, dispatcher on (idle until an owner rule selects a
+# sink), no configured sinks. Telegram rules deliver through the owner's Telegram
+# integration and need no entry here. Sink secrets come from env vars named in
+# `secret_kwargs_env`; mount them with `extraEnv` (secretKeyRef). Example:
 #   notifications:
+#     public_web_url: https://forge.example.com     # deep links in messages
 #     reply_ready: {body_chars: 400}
+#     dispatcher:
+#       max_attempts: 8
+#       default_rate_limit: {max_count: 60, window_seconds: 3600}
 #     sinks:
 #       - name: ops-webhook
 #         label: Ops webhook
-#         adapter: niuu.adapters.notifications.webhook.WebhookNotificationAdapter
+#         adapter: niuu.adapters.notifications.webhook.WebhookNotificationSink
 #         url: https://hooks.example.com/forge
+#         secret_kwargs_env: {secret: FORGE_OPS_WEBHOOK_SECRET}
+#       - name: push
+#         label: Forge app push
+#         adapter: volundr.adapters.outbound.push_notification_sink.PushNotificationSink
+#   extraEnv:
+#     - name: FORGE_OPS_WEBHOOK_SECRET
+#       valueFrom: {secretKeyRef: {name: forge-notification-sinks, key: ops-webhook-secret}}
 notifications: {}
 
 # Chronicle configuration

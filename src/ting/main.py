@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request, Response
 
 from niuu.adapters.http_integrations import HTTPIntegrationRepository
+from niuu.adapters.notifications.integrations import NotificationChannelFactory
 from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
 from niuu.adapters.postgres_integrations import PostgresIntegrationRepository
 from niuu.cors import apply_cors_middleware
@@ -27,7 +28,6 @@ from ting.adapters.guild_instances import GuildInstanceRegistryClient
 from ting.adapters.inbound.rest_integrations import create_telegram_setup_router
 from ting.adapters.inbound.rest_pats import create_pats_router
 from ting.adapters.inbound.rest_telegram_webhook import create_telegram_webhook_router
-from ting.adapters.notification_channel_factory import NotificationChannelFactory
 from ting.adapters.postgres_a2a_push import PostgresA2APushConfigRepository
 from ting.adapters.postgres_dispatcher import PostgresDispatcherRepository
 from ting.adapters.postgres_notification_subscriptions import (
@@ -279,7 +279,7 @@ async def _seed_webhook_integration(
         id="0e1b3a82-7c4f-5d62-9e8b-1e4cf5ab21d3",
         owner_id=owner_id,
         integration_type=IntegrationType.MESSAGING,
-        adapter="ting.adapters.webhook_notification.WebhookNotificationAdapter",
+        adapter="niuu.adapters.notifications.webhook.WebhookNotificationAdapter",
         credential_name=cred_name,
         config={"url": url, "min_urgency": min_urgency},
         enabled=True,
