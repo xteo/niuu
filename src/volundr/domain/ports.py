@@ -440,6 +440,16 @@ class PodManager(ABC):
         """
         return None
 
+    @property
+    def delivers_forge_session_token(self) -> bool:
+        """Whether ``start`` hands ``spec.forge_session`` to the broker privately.
+
+        Forge mints a session credential only for a pod manager that can deliver it
+        without exposing it (process env, never argv, logs or the model's env). A
+        manager that cannot keeps the broker on its own credential.
+        """
+        return False
+
     def initial_chat_endpoint(self, session: Session) -> str | None:
         """Return the deterministic chat endpoint before pods are ready, if known."""
         return None

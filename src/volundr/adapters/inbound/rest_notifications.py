@@ -27,6 +27,12 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
 )
+from niuu.domain.services.token_scope import (
+    FORGE_NOTIFY_SCOPE,
+    FORGE_SESSION_READ_SCOPE,
+    FORGE_SESSION_TOKEN_USE,
+    require_scope,
+)
 from volundr.adapters.inbound.auth import extract_principal
 from volundr.domain.models import Principal, Session
 from volundr.domain.notifications import (
@@ -203,7 +209,11 @@ def create_notifications_router(
             )
         return session
 
-    @router.get("/notifications", response_model=NotificationFeedResponse)
+    @router.get(
+        "/notifications",
+        response_model=NotificationFeedResponse,
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def list_notifications(
         limit: int = Query(default=default_page_size, ge=1, le=max_page_size),
         before: int | None = Query(default=None, ge=1, description="Older than this seq"),
@@ -241,14 +251,22 @@ def create_notifications_router(
             unread_count=feed.unread_count,
         )
 
-    @router.get("/notifications/read-state", response_model=NotificationReadStateResponse)
+    @router.get(
+        "/notifications/read-state",
+        response_model=NotificationReadStateResponse,
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def get_read_state(
         principal: Principal = Depends(extract_principal),
     ) -> NotificationReadStateResponse:
         state = await notification_service.get_read_state(principal)
         return NotificationReadStateResponse.build(state)
 
-    @router.put("/notifications/read-state", response_model=NotificationReadStateResponse)
+    @router.put(
+        "/notifications/read-state",
+        response_model=NotificationReadStateResponse,
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
     async def put_read_state(
         body: NotificationReadStateUpdate,
         principal: Principal = Depends(extract_principal),
@@ -345,6 +363,7 @@ def create_notifications_router(
         "/sessions/{session_id}/notifications",
         response_model=list[NotificationResponse],
         tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
     )
     async def list_session_notifications(
         session_id: UUID = Path(description="Session id"),
@@ -365,6 +384,7 @@ def create_notifications_router(
         status_code=status.HTTP_201_CREATED,
         responses={200: {"model": NotificationResponse, "description": "Deduplicated submit"}},
         tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
     )
     async def submit_notification(
         body: NotificationSubmitRequest,
@@ -373,12 +393,24 @@ def create_notifications_router(
         principal: Principal = Depends(extract_principal),
     ) -> NotificationResponse:
         """Record a notification for a session (201), or return the one already
-        recorded for this idempotency key (200). Feed-only: ``session_seq`` is null."""
+        recorded for this idempotency key (200). Feed-only: ``session_seq`` is null.
+
+        ``source`` is ``agent`` when the session submits for itself with its own
+        session credential, ``operator`` otherwise."""
         session = await _session_for(session_id, principal, "emit_event")
         draft = NotificationDraft.model_validate(body.model_dump(exclude={"idempotency_key"}))
+        self_submitted = (
+            principal.token_use == FORGE_SESSION_TOKEN_USE
+            and principal.bound_session_id == str(session_id)
+        )
+        source = NotificationSource.AGENT if self_submitted else NotificationSource.OPERATOR
         try:
             notification, created = await notification_service.submit(
-                session, principal, draft, idempotency_key=body.idempotency_key
+                session,
+                principal,
+                draft,
+                idempotency_key=body.idempotency_key,
+                source=source,
             )
         except NotificationValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))

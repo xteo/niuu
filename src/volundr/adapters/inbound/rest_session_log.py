@@ -31,11 +31,17 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from pydantic import BaseModel, Field
 
+from niuu.domain.services.token_scope import (
+    FORGE_NOTIFY_SCOPE,
+    FORGE_SESSION_READ_SCOPE,
+    require_scope,
+)
 from niuu.domain.transcript_reducer import is_read_path_excluded
 from skuld.channels import filter_internal_blocks
+from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.domain.models import SessionLogEntry
 from volundr.domain.notifications import NotificationStoreUnavailableError
 from volundr.domain.ports import SessionEventLogRepository
@@ -299,6 +305,7 @@ def create_session_log_router(
         response_model=LogAppendResponse,
         status_code=status.HTTP_201_CREATED,
         tags=["Events"],
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
     )
     async def append_log(
         request: Request,
@@ -306,6 +313,7 @@ def create_session_log_router(
         session_id: UUID = Path(description="Session UUID to append frames for"),
     ) -> LogAppendResponse:
         """Append full-fidelity frames to the session's durable log (idempotent)."""
+        require_bound_session(request, session_id)
         session = await _check_access(request, session_id, "emit_event")
         now = datetime.now(UTC)
         entries = [
@@ -356,6 +364,7 @@ def create_session_log_router(
         "/sessions/{session_id}/log/head",
         response_model=LogHeadResponse,
         tags=["Events"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
     )
     async def log_head(
         request: Request,
@@ -370,6 +379,7 @@ def create_session_log_router(
         "/sessions/{session_id}/log",
         response_model=list[SessionLogEntryResponse],
         tags=["Events"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
     )
     async def replay_log(
         request: Request,

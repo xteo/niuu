@@ -554,6 +554,34 @@ class TestConfigMapTemplate:
         assert parsed.reply_ready.body_chars == 400
         assert parsed.sinks[0]["url"] == "https://x"
 
+    def test_forge_mcp_section_renders_into_config(self):
+        from volundr.config import ForgeMcpConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "forge_mcp" not in render()
+        config = render(
+            "--set-json",
+            'forgeMcp={"default_grants":["message"],"session_tokens":{"ttl_seconds":604800}}',
+        )
+        parsed = ForgeMcpConfig.model_validate(config["forge_mcp"])
+        assert [grant.value for grant in parsed.default_grants] == ["message"]
+        assert parsed.session_tokens.ttl_seconds == 604800
+
     def test_ci_values_run_resident_runtime_migrations(self):
         result = subprocess.run(
             [

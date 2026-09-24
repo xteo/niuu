@@ -41,6 +41,7 @@ from niuu.utils import import_class, resolve_secret_kwargs
 from sleipnir.adapters.audit_postgres import PostgresAuditRepository
 from sleipnir.adapters.audit_subscriber import AuditSubscriber
 from volundr.adapters.inbound.auth import extract_principal
+from volundr.adapters.inbound.forge_session_auth import ForgeSessionAuthMiddleware
 from volundr.adapters.inbound.rest import create_router
 from volundr.adapters.inbound.rest_admin_settings import create_admin_settings_router
 from volundr.adapters.inbound.rest_audit import (
@@ -120,6 +121,7 @@ from volundr.composition_builders import (  # noqa: F401
     _create_contributors,
     _create_credential_enrollment_runner,
     _create_external_session_providers,
+    _create_forge_session_tokens,
     _create_gateway_adapter,
     _create_http_auth_adapter,
     _create_pod_manager,
@@ -536,6 +538,8 @@ def create_app(
 
             session_persona_provider = RegistrySessionPersonaProvider(persona_registry)
             workload_identity_service = create_workload_identity_service(settings.workload_identity)
+            forge_session_tokens = _create_forge_session_tokens(settings, workload_identity_service)
+            app.state.forge_session_tokens = forge_session_tokens
             pod_manager = _create_pod_manager(settings)
             resident_controllers = _create_resident_controllers(settings, pod_manager)
             credential_refresh_lock = PostgresCredentialRefreshLock(pool)
@@ -796,6 +800,8 @@ def create_app(
                 runtime_backend=_runtime_backend(settings, pod_manager),
                 span_repository=span_repository,
                 notification_recorder=notification_service,
+                forge_session_tokens=forge_session_tokens,
+                forge_mcp_default_grants=settings.forge_mcp.default_grants,
             )
             # Local-process brokers notify the session service when they exit so
             # the DB row is reconciled promptly (pod-status authoritative) rather
@@ -1462,6 +1468,9 @@ def create_app(
     from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
 
     app.add_middleware(PATRevocationMiddleware)
+    # Verifies forge_session bearers in every identity mode and confines them to
+    # their route allow-list (volundr.adapters.inbound.forge_session_auth).
+    app.add_middleware(ForgeSessionAuthMiddleware)
 
     @app.get("/health", tags=["Health"])
     @app.get("/api/v1/forge/health", include_in_schema=False)

@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 from niuu.domain.models import Principal
 from niuu.domain.services.token_scope import (
+    VALKYRIE_BUILD_SCOPES,
     VALKYRIE_BUILD_TOKEN_USE,
     bound_workload_scopes,
 )
@@ -27,7 +28,12 @@ from niuu.ports.workload_identity import (
     IssuedWorkloadToken,
     WorkloadIdentityVerifier,
     WorkloadTokenIssuer,
+    WorkloadTokenVerificationError,
 )
+
+DEFAULT_ISSUER = "niuu-workload"
+#: Claims every token this service mints carries; verification requires them.
+_REQUIRED_CLAIMS = ("exp", "iat", "iss", "aud", "sub")
 
 
 @dataclass(frozen=True)
@@ -82,12 +88,26 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
     ) -> None:
         self._config = config
         configured_pem = signing_key_pem or str(getattr(config, "signing_key_pem", "") or "")
+        self._has_configured_key = bool(configured_pem)
         self._private_key = self._load_or_generate_key(configured_pem)
         self._verifiers = dict(verifiers or {})
 
     @property
     def enabled(self) -> bool:
         return bool(getattr(self._config, "enabled", False))
+
+    @property
+    def has_configured_key(self) -> bool:
+        """True when the signing key came from configuration.
+
+        Without one the key is generated per process, so every token it minted
+        stops verifying when the process restarts.
+        """
+        return self._has_configured_key
+
+    @property
+    def issuer(self) -> str:
+        return str(getattr(self._config, "issuer", "") or DEFAULT_ISSUER)
 
     def jwks(self) -> dict[str, Any]:
         public_numbers = self._private_key.public_key().public_numbers()
@@ -116,7 +136,7 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         if not token.strip():
             raise WorkloadIdentityError("Missing workload token")
 
-        build_scopes = bound_workload_scopes(scopes)
+        build_scopes = bound_workload_scopes(scopes, allowed=VALKYRIE_BUILD_SCOPES)
         last_error: Exception | None = None
         for mapping in getattr(self._config, "mappings", []) or []:
             verifier_name = getattr(mapping, "verifier", "kubernetes")
@@ -220,19 +240,25 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
         audiences: list[str],
         token_use: str = "",
         claims: dict[str, Any] | None = None,
+        ttl_seconds: int | None = None,
     ) -> IssuedWorkloadToken:
         """Mint a workload JWT for a principal authenticated by another adapter."""
         if not self.enabled:
             raise WorkloadIdentityError("Workload identity exchange is disabled")
         resolved_audiences = self._resolve_audiences(audiences)
         now = int(time.time())
-        expires_at = now + int(getattr(self._config, "token_ttl_seconds", 900))
+        lifetime = (
+            ttl_seconds
+            if ttl_seconds is not None
+            else int(getattr(self._config, "token_ttl_seconds", 900))
+        )
+        expires_at = now + lifetime
         resource_access = {
             audience: {"roles": principal.roles}
             for audience in _resource_access_audiences(resolved_audiences)
         }
         payload: dict[str, Any] = {
-            "iss": getattr(self._config, "issuer", "") or "niuu-workload",
+            "iss": self.issuer,
             "sub": principal.user_id,
             "aud": resolved_audiences,
             "iat": now,
@@ -267,6 +293,20 @@ class WorkloadIdentityService(WorkloadTokenIssuer):
             headers={"kid": getattr(self._config, "key_id", "niuu-workload")},
         )
         return IssuedWorkloadToken(token=token, expires_at=expires_at)
+
+    def verify_token(self, token: str) -> dict[str, Any]:
+        """Verify a token this service minted: RS256 signature, expiry, issuer, audience."""
+        try:
+            return jwt.decode(
+                token,
+                self._private_key.public_key(),
+                algorithms=["RS256"],
+                audience=self._resolve_audiences(None),
+                issuer=self.issuer,
+                options={"require": list(_REQUIRED_CLAIMS)},
+            )
+        except jwt.InvalidTokenError as exc:
+            raise WorkloadTokenVerificationError(str(exc)) from exc
 
     def _load_or_generate_key(self, pem: str) -> RSAPrivateKey:
         if pem:

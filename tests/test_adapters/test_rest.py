@@ -1688,6 +1688,16 @@ class TestFeatureFlags:
         assert data["notifications_enabled"] is True
         assert data["capabilities"]["notifications"] is True
 
+    def test_feature_flags_report_forge_mcp_credentials(self, client: TestClient):
+        """Session credentials are reported, never silently absent."""
+        capabilities = client.get("/api/v1/forge/feature-flags").json()["capabilities"]
+        assert capabilities["forge_session_tokens"] is False
+        assert capabilities["forge_session_token_key"] is None
+        client.app.state.forge_session_tokens = type("T", (), {"key_source": "key_file"})()
+        capabilities = client.get("/api/v1/forge/feature-flags").json()["capabilities"]
+        assert capabilities["forge_session_tokens"] is True
+        assert capabilities["forge_session_token_key"] == "key_file"
+
 
 class TestStatsResponse:
     """Tests for StatsResponse model."""

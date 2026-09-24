@@ -13,12 +13,20 @@ LINEAR_API_URL = "https://api.linear.app/graphql"
 
 @dataclass(frozen=True)
 class Principal:
-    """Authenticated identity extracted from JWT."""
+    """Authenticated identity extracted from JWT.
+
+    ``token_use``, ``scopes`` and ``bound_session_id`` are set only for a scoped
+    credential (e.g. a Forge ``forge_session`` token): what it may do and the one
+    session it is bound to. Human and PAT principals leave them empty.
+    """
 
     user_id: str
     email: str
     tenant_id: str
     roles: list[str]
+    token_use: str = ""
+    scopes: tuple[str, ...] = ()
+    bound_session_id: str | None = None
 
 
 class IntegrationType(StrEnum):

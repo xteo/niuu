@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import logging
 
+from niuu.adapters.workload_identity.key_file import (
+    SigningKeyFileError,
+    load_or_create_rsa_key_pem,
+)
+from niuu.config_models import WorkloadIdentityConfig
+from niuu.domain.services.forge_session_token import ForgeSessionTokenService
+from niuu.domain.services.workload_identity import WorkloadIdentityService
 from niuu.ports.http_auth import HttpAuthPort
 from niuu.utils import import_class, resolve_secret_kwargs
 from volundr.config import Settings
@@ -25,6 +32,62 @@ from volundr.domain.ports import (
 )
 
 logger = logging.getLogger(__name__)
+
+KEY_SOURCE_WORKLOAD_IDENTITY = "workload_identity"
+KEY_SOURCE_KEY_FILE = "key_file"
+
+
+def _create_forge_session_tokens(
+    settings: Settings,
+    workload_identity: WorkloadIdentityService,
+) -> ForgeSessionTokenService | None:
+    """The issuer of scoped session credentials, or ``None`` when there is none.
+
+    The workload-identity issuer signs them when it is enabled with a configured
+    key: the same key Envoy validates through the workload JWKS. Otherwise (local
+    mini mode) Forge uses its own RSA key file, generated once. When neither is
+    usable Forge mints nothing: brokers keep their own credential and the Forge MCP
+    offers no grants. That is logged once here and reported by the feature flags.
+    """
+    cfg = settings.forge_mcp.session_tokens
+    if not cfg.enabled:
+        logger.info("Forge session credentials: disabled (forge_mcp.session_tokens.enabled)")
+        return None
+    if workload_identity.enabled and workload_identity.has_configured_key:
+        logger.info("Forge session credentials: signed by the workload identity issuer")
+        return ForgeSessionTokenService(
+            workload_identity,
+            audiences=settings.workload_identity.audiences,
+            ttl_seconds=cfg.ttl_seconds,
+            key_source=KEY_SOURCE_WORKLOAD_IDENTITY,
+        )
+    try:
+        pem = load_or_create_rsa_key_pem(cfg.signing_key_file, key_size=cfg.signing_key_bits)
+    except SigningKeyFileError as exc:
+        logger.error(
+            "Forge session credentials unavailable: %s. Sessions keep their broker "
+            "credential and get no Forge MCP grants. Fix the key, configure "
+            "workload_identity with a signing key, or set "
+            "forge_mcp.session_tokens.enabled=false to silence this.",
+            exc,
+        )
+        return None
+    issuer = WorkloadIdentityService(
+        WorkloadIdentityConfig(
+            enabled=True,
+            issuer=cfg.issuer,
+            audiences=list(cfg.audiences),
+            key_id=cfg.key_id,
+        ),
+        signing_key_pem=pem,
+    )
+    logger.info("Forge session credentials: signed with the local key file")
+    return ForgeSessionTokenService(
+        issuer,
+        audiences=cfg.audiences,
+        ttl_seconds=cfg.ttl_seconds,
+        key_source=KEY_SOURCE_KEY_FILE,
+    )
 
 
 def _create_codex_credential_broker(
