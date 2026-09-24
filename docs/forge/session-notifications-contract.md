@@ -236,6 +236,28 @@ Grants come from the scoped session token (§9). Without a grant the tool return
   the same tools for external agents. It uses the caller's own auth and the
   shared tool definitions from `src/niuu/forge_mcp/`.
 
+As built (auth workstream). The operator guide is
+[`docs/operator/forge-mcp.md`](../operator/forge-mcp.md).
+
+- **Claims.** The token carries `token_use=forge_session`, `sub` (the owner),
+  `tenant_id` and `scopes`. The bound session is in `workload_session_id`, the same
+  claim OpenShell session tokens use, and the launch is in `workload_launch_id`.
+- **Lifetime.** It is tied to the launch. Every start re-mints the token and records
+  the new launch on `sessions.workload_config.forge_mcp`, which revokes the previous
+  one. Stopped, archived or deleted sessions revoke it too. `exp` is a configurable
+  backstop (30 days); there is no refresh route.
+- **Grants** persist in `sessions.workload_config.forge_mcp.grants`, so no migration
+  was needed. The session-create field is `forge_mcp: {grants: [...]}`.
+- **Enforcement.** Forge verifies the token in every identity mode, and admits it
+  only on an allow-list of routes (`niuu.domain.services.forge_session_policy`);
+  everything else is 403.
+- **Facade.** The facade applies the same allow-list, but never forwards the token
+  to a remote node. Peer supervision with a session token is limited to its own
+  node (403).
+- **Endpoint path.** The HTTP endpoint is `POST /api/v1/forge/mcp`, so the Guild
+  host's Forge route domain dispatches it. `notify` there is a feed submit and takes
+  a required `idempotency_key`.
+
 ## 10. Web (web workstream)
 
 - Inline: `NotificationCard` for tool parts named `forge_notification`, dispatched
