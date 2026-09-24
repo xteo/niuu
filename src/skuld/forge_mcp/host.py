@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 
 from niuu.build_identity import build_identity
 from niuu.domain.notifications import NotificationDraft, build_notification_turn
+from niuu.domain.services.forge_session_token import SESSION_ID_CLAIM
+from niuu.forge_mcp.credentials import is_forge_session_claims, token_scopes, unverified_claims
 from niuu.forge_mcp.models import ForgeApiError
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
 from skuld.conversation_models import ConversationTurn
@@ -37,6 +39,24 @@ _ENGINE_BY_MODULE = {
     "skuld.transports.pi": "pi",
     "skuld.transports.dsh": "dsh",
 }
+
+
+def forge_credential(token: str) -> dict[str, Any]:
+    """What credential the MCP's Forge calls use; never the token itself."""
+    claims = unverified_claims(token)
+    if not is_forge_session_claims(claims):
+        return {"kind": "broker", "note": "no session token; the broker's own credential"}
+    expires = claims.get("exp")
+    return {
+        "kind": "forge_session",
+        "session_id": claims.get(SESSION_ID_CLAIM),
+        "scopes": list(token_scopes(claims)),
+        "expires_at": (
+            datetime.fromtimestamp(int(expires), UTC).isoformat()
+            if isinstance(expires, int | float)
+            else None
+        ),
+    }
 
 
 def engine_for_adapter(adapter_path: str) -> str:
@@ -76,6 +96,7 @@ class BrokerForgeMcpHost(ForgeMcpHost):
             "skills": broker._materialized_skill_names(),
             "present_file": True,
             "durable_log": bool(settings.event_log_enabled and broker.volundr_api_url),
+            "forge_credential": forge_credential(settings.forge_mcp.token),
         }
         environment.update(await self._forge_view())
         return environment

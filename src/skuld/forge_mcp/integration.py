@@ -24,6 +24,7 @@ from typing import Any
 
 import httpx
 
+from niuu.forge_mcp.credentials import effective_grants
 from niuu.forge_mcp.models import ForgeApiError, ForgeMcpLimits
 from niuu.forge_mcp.tools import ForgeMcpToolbox
 from skuld.forge_mcp.forge_client import HttpForgeClient
@@ -178,7 +179,8 @@ class ForgeSessionMixin:
         self._forge_mcp_toolbox_cache = ForgeMcpToolbox(
             client=client,
             host=BrokerForgeMcpHost(self, client),
-            grants=cfg.grants,
+            # Display and gating only: Forge enforces the token's scopes itself.
+            grants=effective_grants(cfg.token, cfg.grants),
             limits=ForgeMcpLimits(
                 list_default_limit=cfg.list_default_limit,
                 list_max_limit=cfg.list_max_limit,

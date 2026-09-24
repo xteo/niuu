@@ -516,18 +516,22 @@ class ForgeMcpConfig(BaseModel):
         pattern=r"^[A-Za-z0-9_-]+$",
         description="MCP server name; tools appear to Claude as mcp__<name>__<tool>.",
     )
-    grants: Annotated[list[ForgeMcpGrant], NoDecode] = Field(
-        default_factory=list,
+    grants: Annotated[list[ForgeMcpGrant] | None, NoDecode] = Field(
+        default=None,
         description=(
-            "Extra tool grants: 'message' (send_message, message_status) and 'lifecycle' "
-            "(create/start/stop_session). Read tools and notify need no grant."
+            "Narrow the tool grants of the session token (SKULD__FORGE_MCP__GRANTS): "
+            "'message' (send_message, message_status) and 'lifecycle' "
+            "(create/start/stop_session). The grants themselves come from the token's "
+            "scopes; this can only remove some. Unset keeps the token's grants; without "
+            "a token no grant is offered. Read tools and notify need no grant."
         ),
     )
     token: str = Field(
         default="",
         description=(
-            "Scoped session-bound Forge token (SKULD__FORGE_MCP__TOKEN). Used only as the "
-            "bearer for MCP-proxied Forge calls; empty uses the broker's own credential."
+            "Scoped session-bound Forge token (SKULD__FORGE_MCP__TOKEN), minted by Forge "
+            "at launch. Used only as the bearer for MCP-proxied Forge calls; empty uses "
+            "the broker's own credential (and offers no grants)."
         ),
     )
     runtime_dir: str = Field(
@@ -583,7 +587,10 @@ class ForgeMcpConfig(BaseModel):
     @field_validator("grants", mode="before")
     @classmethod
     def _coerce_grants(cls, value: Any) -> Any:
-        """Accept ``message,lifecycle`` or a JSON list (env forms) as well as a list."""
+        """Accept ``message,lifecycle`` or a JSON list (env forms) as well as a list.
+
+        An empty string is an explicit empty list (narrow to no grants).
+        """
         if not isinstance(value, str):
             return value
         if value.strip().startswith("["):
