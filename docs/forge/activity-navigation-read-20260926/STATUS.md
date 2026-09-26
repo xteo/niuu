@@ -48,3 +48,30 @@ Source branch `xteo/activity-navigation-read-20260926`, isolated worktree
 `/home/thor/repos/worktrees/niuu-activity-navigation-read-20260926`.
 Worker `thor:c8103dc7-a834-5e32-a06d-1a98d7a8e2b5`. Native app follow-up lives in
 `/home/thor/repos/worktrees/lexi-ios-activities-20260926` and remains unshipped.
+
+## Deployment — September26,22:10UTC
+
+The user subsequently requested deployment. Frozen source4b44432f is live on Thor as
+`forge-activity-read-20260926`, with clean source identity and no failed plugins.
+Migration000071 applied through the existing checksum-ledger startup runner. All80 prior
+packaged ledger checksums matched; the new sequence was unused. The previous Projects
+release remains the safe source-only rollback, with the new additive table retained.
+
+[Rollout summary](deployment/rollout-summary.json):64 protected native/database/gateway
+processes,21 gateway routes and710 session identities/statuses are unchanged. The first165
+settled turns of the worker conversation match exactly. Existing units/config/launcher
+are byte-identical; the healthcheck timer is active.39 extra release-guard/composition/
+real-process preservation tests pass. Private full PG backup completed; its408-entry TOC
+and SHA were checked, not a full restore. The first TOC command lacked Docker stdin and
+failed before reading; the corrected read succeeded. No backup data is checked into Git.
+
+Backend branch is pushed; normal web build/typecheck/test coverage/format pre-push gates
+passed after installing the frozen dependencies in this worktree. No hook bypass.
+
+**Retained runtime limitation:** the API-only cutover deliberately did not restart active
+Skuld/native sessions. Existing old gateways can still return404 for original Codex reply
+IDs without source provenance. Canonical notification links resolve live; old aliases need
+an owner-approved saved-boundary gateway upgrade (or separately reviewed compatibility
+work). No guessed text/time anchor or claim that old gateway source changed.
+
+Live successful read-on-open is being validated through iOS2291 before publication.
