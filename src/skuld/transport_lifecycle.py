@@ -40,6 +40,7 @@ class TransportLifecycleMixin:
             "cli_binary": self._settings.cli_binary,
             "session_name": self._settings.session.name,
             "remote_control_permission_mode": self._settings.remote_control_permission_mode,
+            "claude_permission_mode": self._settings.claude_permission_mode,
             "agent_teams": self._settings.agent_teams,
             "system_prompt": self._settings.session.system_prompt,
             "initial_prompt": (

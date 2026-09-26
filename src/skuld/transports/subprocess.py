@@ -56,6 +56,7 @@ class SubprocessTransport(CLITransport):
         workspace_dir: str,
         model: str = "",
         skip_permissions: bool = False,
+        claude_permission_mode: str = _DEFAULT_PERMISSION_MODE,
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
@@ -67,6 +68,7 @@ class SubprocessTransport(CLITransport):
         self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
+        self._claude_permission_mode = claude_permission_mode
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
@@ -156,7 +158,7 @@ class SubprocessTransport(CLITransport):
         if self._model:
             cmd.extend(["--model", self._model])
         if self._skip_permissions:
-            cmd.extend(["--permission-mode", _DEFAULT_PERMISSION_MODE])
+            cmd.extend(["--permission-mode", self._claude_permission_mode])
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
         cmd.extend(

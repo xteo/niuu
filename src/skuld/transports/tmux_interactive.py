@@ -196,6 +196,7 @@ class TmuxInteractiveTransport(CLITransport):
         model: str = "",
         session_id: str = "",
         skip_permissions: bool = False,
+        claude_permission_mode: str = _DEFAULT_PERMISSION_MODE,
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
@@ -228,6 +229,7 @@ class TmuxInteractiveTransport(CLITransport):
         self._effort_control_timeout = effort_control_timeout_s
         self._forge_session_id = session_id or "skuld-interactive"
         self._skip_permissions = skip_permissions
+        self._claude_permission_mode = claude_permission_mode
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
@@ -2830,7 +2832,7 @@ class TmuxInteractiveTransport(CLITransport):
             # (start() never resurrects an old tmux, so there is no stale-port baking).
             cmd.extend(["--resume", self._resume_session_id])
         if self._skip_permissions:
-            cmd.extend(["--permission-mode", _DEFAULT_PERMISSION_MODE])
+            cmd.extend(["--permission-mode", self._claude_permission_mode])
         if self._remote_control:
             rc_name = self._remote_control_name()
             cmd.extend(["--remote-control", rc_name])

@@ -288,6 +288,7 @@ class SDKTransport(CLITransport):
         workspace_dir: str,
         model: str = "",
         skip_permissions: bool = False,
+        claude_permission_mode: str = _DEFAULT_PERMISSION_MODE,
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
@@ -302,6 +303,7 @@ class SDKTransport(CLITransport):
         self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
+        self._claude_permission_mode = claude_permission_mode
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
@@ -706,7 +708,7 @@ class SDKTransport(CLITransport):
             # default (non-bypass) permission path.
             option_kwargs["can_use_tool"] = self._on_can_use_tool
         if self._skip_permissions:
-            option_kwargs["permission_mode"] = _DEFAULT_PERMISSION_MODE
+            option_kwargs["permission_mode"] = self._claude_permission_mode
         if self._resume_session_id:
             # Reload the prior conversation so the agent continues where it
             # left off. ClaudeAgentOptions.resume is supported by the pinned SDK.

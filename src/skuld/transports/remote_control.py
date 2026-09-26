@@ -64,6 +64,7 @@ class RemoteControlTransport(CLITransport):
         cli_binary: str = "claude",
         session_name: str = "volundr",
         remote_control_permission_mode: str = "",
+        claude_permission_mode: str = "bypassPermissions",
         **_kwargs: object,
     ) -> None:
         super().__init__()
@@ -74,6 +75,7 @@ class RemoteControlTransport(CLITransport):
         self._cli_binary = cli_binary
         self._session_name = session_name
         self._permission_mode = remote_control_permission_mode
+        self._claude_permission_mode = claude_permission_mode
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._url: str | None = None
@@ -117,7 +119,7 @@ class RemoteControlTransport(CLITransport):
         name = f"{base}-{self._token}" if self._token else base
         # The native app uses the host permission mode for the sessions it spawns.
         perm = self._permission_mode or (
-            "bypassPermissions" if self._skip_permissions else "default"
+            self._claude_permission_mode if self._skip_permissions else "default"
         )
         return [
             binary,

@@ -320,6 +320,37 @@ session_definitions:
 
 That keeps the rest of the built-in Codex transport settings intact.
 
+#### Claude permission mode is a node setting
+
+Each Forge node decides how its unattended Claude sessions run. Skuld brokers read the node's
+config file (`NIUU_CONFIG`), so set it once there instead of on every session request:
+
+```yaml
+# Nodes where YOLO works (the default):
+claude_permission_mode: bypassPermissions
+# Nodes where it does not: Claude's classifier-gated auto mode.
+claude_permission_mode: auto
+```
+
+It applies when `skipPermissions` is on, for the tmux, persistent-subprocess, subprocess and SDK
+transports, and for Remote Control unless `remote_control_permission_mode` overrides it. Values
+Claude does not accept (`acceptEdits`, `auto`, `bypassPermissions`, `dontAsk`, `manual`, `plan`
+are valid) stop the broker at start. A definition can override a node for its own sessions with
+`defaults.broker.claudePermissionMode`. Brokers read the file when they start, so running sessions
+pick up a change on their next stop/start.
+
+Claude Code sessions should run in tmux (`TmuxInteractiveTransport`) so they stay steerable. Point
+the default definition at it:
+
+```yaml
+session_definitions:
+  skuldClaude:
+    defaults:
+      broker:
+        transport: tmux-interactive
+        transportAdapter: skuld.transports.tmux_interactive.TmuxInteractiveTransport
+```
+
 #### Remote-access URLs should use `server.external_host`
 
 When the server binds to `0.0.0.0`, that is only the listen address. It is not a usable browser-facing host for remote clients.
