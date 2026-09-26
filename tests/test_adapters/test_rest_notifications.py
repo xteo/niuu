@@ -100,6 +100,7 @@ class TestFeed:
         assert (first["head_seq"], first["read_through_seq"], first["unread_count"]) == (3, 0, 3)
         assert first["items"][0]["read"] is False
         assert "dedupe_key" not in first["items"][0]
+        assert first["items"][0]["turn_id"] == "t3"  # the transcript anchor for deep links
 
         second = client.get(
             f"{PREFIX}/notifications",
@@ -286,6 +287,7 @@ class TestSessionRoutes:
         payload = created.json()
         assert payload["title"] == "Pick a DB" and payload["source"] == "operator"
         assert payload["session_seq"] is None and payload["read"] is False
+        assert payload["turn_id"] is None  # a direct submit has no transcript turn
         again = client.post(url, json=body, headers=headers())
         assert again.status_code == 200 and again.json()["id"] == payload["id"]
         assert len(store.notifications) == 1

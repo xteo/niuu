@@ -257,6 +257,12 @@ class TestIdentities:
         assert "dedupe_key" not in wire and "metadata" not in wire
         assert wire["kind"] == "milestone" and isinstance(wire["id"], str)
 
+    def test_wire_exposes_the_anchor_turn_or_an_explicit_none(self):
+        assert _notification().wire()["turn_id"] == "x"
+        assert _notification(metadata={}).wire()["turn_id"] is None
+        assert _notification(metadata={"turn_id": ""}).turn_id is None
+        assert _notification(metadata={"turn_id": 7}).turn_id is None
+
     def test_attention_and_submit_keys(self):
         sid = uuid4()
         since = datetime(2026, 9, 23, 10, 0, tzinfo=UTC)

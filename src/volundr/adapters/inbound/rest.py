@@ -3332,11 +3332,16 @@ def create_router(
                 return payload
             all_turns = payload["turns"]
             if turn_id is not None:
-                turn = next((t for t in all_turns if t.get("id") == turn_id), None)
-                if turn is None:
+                index = next((i for i, t in enumerate(all_turns) if t.get("id") == turn_id), None)
+                if index is None:
                     raise HTTPException(404, "History item no longer exists in this projection")
+                # index/total_turns place the turn in the same absolute index space the
+                # windowed conversation read uses (limit/before/after), so a client can
+                # open the transcript at it, e.g. with after=index-1.
                 return {
-                    "turn": json_text_safe(turn),
+                    "turn": json_text_safe(all_turns[index]),
+                    "index": index,
+                    "total_turns": len(all_turns),
                     "projection_revision": payload.get("projection_revision")
                     or projection_revision(all_turns),
                 }

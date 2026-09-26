@@ -76,6 +76,14 @@ order. A reader paging with `after=<seq>` therefore never skips a notification t
 committed late. `created_at` is set from `clock_timestamp()` after the lock is taken, so it
 increases with `seq`.
 
+### Deep links into the transcript
+
+Every notification carries `turn_id` (null when it has no turn). Resolve it with
+`GET /api/v1/forge/sessions/{id}/conversation/turns/{turn_id}`: the response adds `index` and
+`total_turns`, so a client opens the conversation window at that turn with
+`?after=<index-1>`. The raw log read (`/sessions/{id}/log`) never returns
+`conversation.turn` rows by design, so do not anchor on log sequence numbers.
+
 ## Live events
 
 A new notification is broadcast on `GET /api/v1/forge/sessions/stream` as

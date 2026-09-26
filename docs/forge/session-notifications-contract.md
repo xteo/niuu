@@ -111,6 +111,14 @@ The notification JSON (`NotificationResponse`):
 ```
 `read` is computed per reader as `seq <= read_through_seq`.
 
+`turn_id` is the transcript turn the notification anchors to: the notification's own turn
+(`nt_…`) for agent notifications and the final reply turn for `reply_ready`. It is `null`
+when there is no turn (`attention`, direct submits). To open the transcript at it, call
+`GET /sessions/{id}/conversation/turns/{turn_id}`, which returns `{turn, index, total_turns,
+projection_revision}` in the same absolute index space as the windowed conversation read,
+then load the window with `after=index-1` (or `before`/`limit`). A 404 means the turn is not
+in the current projection; open the session without an anchor.
+
 | Method and path | Purpose |
 |---|---|
 | `GET /notifications` | Feed for the caller (owner-scoped; admins see all). See the query parameters below. |

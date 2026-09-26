@@ -70,12 +70,24 @@ class Notification(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
+    @property
+    def turn_id(self) -> str | None:
+        """The transcript turn this notification anchors to, or ``None`` when it has none.
+
+        Agent notifications anchor to their own notification turn and ``reply_ready`` to the
+        final reply turn; attention and directly submitted notifications have no turn.
+        """
+        value = self.metadata.get("turn_id")
+        return value if isinstance(value, str) and value else None
+
     def wire(self) -> dict[str, Any]:
         """The ``NotificationResponse`` JSON without the per-reader ``read`` flag.
 
         This is exactly the ``session_notification`` SSE payload (contract §5).
         """
-        return self.model_dump(mode="json", exclude={"dedupe_key", "metadata"})
+        data = self.model_dump(mode="json", exclude={"dedupe_key", "metadata"})
+        data["turn_id"] = self.turn_id
+        return data
 
 
 class NotificationCandidate(BaseModel):

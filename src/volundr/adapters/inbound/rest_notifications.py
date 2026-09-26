@@ -75,6 +75,13 @@ class NotificationResponse(BaseModel):
     engine: str | None = None
     model: str | None = None
     correlation_id: str | None = None
+    turn_id: str | None = Field(
+        default=None,
+        description=(
+            "Transcript turn this notification anchors to; null means it has no turn. "
+            "Resolve its position with GET /sessions/{id}/conversation/turns/{turn_id}."
+        ),
+    )
     created_at: datetime
     read: bool
 
