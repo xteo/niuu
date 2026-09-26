@@ -153,3 +153,24 @@ JSONB and `coordination` already has its revision.
 Nested projects, a project-level durable scheduler, cross-host subtree moves (remote workers of a
 moved coordinator keep their parent link and are reported), the parked Knowledge/authorship work,
 and project voice routing.
+
+---
+
+## Part 3 — Delivered (26 September 2026)
+
+| Piece | Where | Evidence |
+|---|---|---|
+| Forge contract v2 (this document) | niuu `forge/lightweight-projects` `a2abcda4` (live build + 1 commit) | 20,893 backend tests green; 7 real-PostgreSQL project tests green |
+| Live on Thor | release `forge-lightweight-projects-20260926`, drop-in `zzzzzzzzzzzzz-lightweight-projects-20260926.conf` | guarded cutover: healthy in 4 s; 54 protected processes and 656 sessions PRESERVED |
+| Live acceptance | `~/.local/share/niuu/rollouts/forge-lightweight-projects-20260926/acceptance.py` | name-only create, brief + context, attach as coordinator, worker launch with Guild-id → `thor` parent translation, parent/project filters, detach keeps workers; smoke data archived |
+| Lexi iOS + Mac | lexi-ios `xteo/lightweight-projects-20260926`, build 2288 | ForgeKit 331 tests, project unit + UI journeys, Mac compile, screenshots in `apps/chat/build-screenshots/build-2288/` |
+
+Rollback: remove the drop-in, `systemctl --user daemon-reload && systemctl --user restart
+volundr-forge.service` → `forge-session-notifications-20260926c`. A repository-less project
+created after the cutover is not readable by the older build (its `repo_url` is empty).
+
+Not yet done: Spark, Build and Build Bro still run contract 1 (the app shows "update this host"
+for the new actions there); the web UI keeps its existing assignment editor; a moved or
+re-parented session's saved launch brief is cleared (as in contract 1) and is not rebuilt on
+restart; the `forge-coordinator` skill in `xteo/project-lexi` can adopt `projects create` /
+`sessions attach` and the MCP defaults.
