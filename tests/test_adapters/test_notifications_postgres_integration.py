@@ -117,6 +117,7 @@ async def _tables(pool) -> set[str]:
 async def test_migration_is_idempotent_and_reversible(pool):
     expected = {
         "forge_notifications",
+        "forge_notification_reads",
         "forge_notification_read_states",
         "forge_notification_rules",
         "forge_notification_deliveries",
@@ -125,11 +126,17 @@ async def test_migration_is_idempotent_and_reversible(pool):
     up = (MIGRATIONS / f"{MIGRATION}.up.sql").read_text()
     down = (MIGRATIONS / f"{MIGRATION}.down.sql").read_text()
     await pool.execute(up)  # re-applying is a no-op
+    item_up = (MIGRATIONS / "000071_forge_notification_reads.up.sql").read_text()
+    item_down = (MIGRATIONS / "000071_forge_notification_reads.down.sql").read_text()
+    await pool.execute(item_up)  # both migrations are idempotent
+    await pool.execute(item_down)  # children before the parent migration
+    await pool.execute(item_down)
     await pool.execute(down)
     assert await _tables(pool) == set()
     await pool.execute(down)  # dropping twice is a no-op
     await pool.execute(up)
     await pool.execute(up)
+    await pool.execute(item_up)
     assert await _tables(pool) == expected
 
 
@@ -339,3 +346,25 @@ async def test_event_log_reads_back_exact_seqs(pool):
     rows = await log.read_seqs(sid, [9, 2, 7])
     assert [row.seq for row in rows] == [2, 9]
     assert await log.read_seqs(sid, []) == []
+
+
+async def test_individual_reads_concurrent_retry_isolation_and_watermark_cas(pool):
+    repo = PostgresNotificationRepository(pool)
+    older, opened, newer = await repo.project(
+        [candidate("read-a"), candidate("read-b"), candidate("read-c")]
+    )
+    await asyncio.gather(*(repo.mark_read(OWNER.user_id, opened.id) for _ in range(6)))
+    watermark = await repo.get_watermark(OWNER.user_id)
+    assert watermark.revision == 1 and watermark.read_through_seq == 0
+    assert await repo.read_ids(OWNER.user_id, [older.id, opened.id, newer.id]) == {opened.id}
+    assert await repo.read_ids(ADMIN.user_id, [opened.id]) == set()
+    assert await repo.feed_counts(OWNER, read_through_seq=0) == (newer.seq, 2)
+    assert await repo.feed_counts(ADMIN, read_through_seq=0) == (newer.seq, 3)
+    page = await repo.list_feed(OWNER, NotificationQuery(limit=10, unread=True), read_through_seq=0)
+    assert [n.id for n in page.items] == [newer.id, older.id]
+    with pytest.raises(NotificationReadStateConflictError):
+        await repo.advance_watermark(OWNER.user_id, read_through_seq=newer.seq, expected_revision=0)
+    await repo.advance_watermark(OWNER.user_id, read_through_seq=newer.seq, expected_revision=1)
+    assert await repo.feed_counts(OWNER, read_through_seq=newer.seq) == (newer.seq, 0)
+    await pool.execute("DELETE FROM forge_notifications WHERE id = $1", opened.id)
+    assert await repo.read_ids(OWNER.user_id, [opened.id]) == set()

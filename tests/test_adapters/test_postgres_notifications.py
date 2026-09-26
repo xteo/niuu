@@ -27,6 +27,7 @@ from volundr.domain.notifications import (
     DeliveryStatus,
     NotificationCandidate,
     NotificationDelivery,
+    NotificationNotFoundError,
     NotificationQuery,
     NotificationReadStateConflictError,
     NotificationRule,
@@ -225,16 +226,27 @@ class TestFeed:
         )
         sql, params = feed_sql(OWNER, query, read_through_seq=4)
         assert sql.startswith("SELECT * FROM forge_notifications WHERE owner_id = $1")
-        assert sql.endswith("ORDER BY seq DESC LIMIT $9")
-        assert params == ["u", ["milestone"], ["warning", "critical"], ["agent"], sid, "p", 4, 9, 6]
+        assert sql.endswith("ORDER BY seq DESC LIMIT $10")
+        assert params == [
+            "u",
+            ["milestone"],
+            ["warning", "critical"],
+            ["agent"],
+            sid,
+            "p",
+            4,
+            "u",
+            9,
+            6,
+        ]
 
     def test_admin_scope_ascending_and_read_filter(self):
         sql, params = feed_sql(
             ADMIN, NotificationQuery(limit=2, after=3, unread=False), read_through_seq=7
         )
         assert "(owner_id = $1 OR COALESCE(tenant_id, '') IN ('', $2))" in sql
-        assert "seq <= $3" in sql and "seq > $4" in sql and "ORDER BY seq ASC" in sql
-        assert params == ["a", "t", 7, 3, 3]
+        assert "seq <= $3" in sql and "seq > $5" in sql and "ORDER BY seq ASC" in sql
+        assert params == ["a", "t", 7, "a", 3, 3]
 
     async def test_list_feed_trims_the_probe_row(self):
         pool, _ = _pool()
@@ -265,7 +277,8 @@ class TestFeed:
         pool.fetchrow.return_value = {"head_seq": 9, "unread_count": 4}
         assert await repo.feed_counts(ADMIN, read_through_seq=5) == (9, 4)
         sql, *params = pool.fetchrow.await_args.args
-        assert params == ["a", "t", 5] and "seq > $3" in sql
+        assert params == ["a", "t", 5, "a"] and "seq > $3" in sql
+        assert "NOT EXISTS" in sql and "r.user_id = $4" in sql
 
 
 class TestWatermark:
@@ -416,3 +429,55 @@ async def test_event_log_reads_exact_seqs_in_one_query():
     assert "seq = ANY($2::bigint[])" in pool.fetch.await_args.args[0]
     assert pool.fetch.await_args.args[1:] == (sid, [2, 5])
     assert await log.read_seqs(sid, []) == []
+
+
+class TestIndividualRead:
+    async def test_read_ids_are_reader_and_page_scoped(self):
+        pool, _ = _pool()
+        repo = PostgresNotificationRepository(pool)
+        assert await repo.read_ids("u", []) == set()
+        pool.fetch.assert_not_awaited()
+        ids = [uuid4(), uuid4()]
+        pool.fetch.return_value = [{"notification_id": ids[1]}]
+        assert await repo.read_ids("u", ids) == {ids[1]}
+        sql, *params = pool.fetch.await_args.args
+        assert "user_id = $1" in sql and "ANY($2::uuid[])" in sql
+        assert params == ["u", ids]
+
+    @pytest.mark.parametrize("inserted", [True, False])
+    async def test_exact_id_idempotent_transaction_serializes_with_watermarks(self, inserted):
+        pool, conn = _pool()
+        nid = uuid4()
+        conn.fetchrow.side_effect = [
+            {"revision": 5},
+            {"notification_id": nid} if inserted else None,
+        ]
+        await PostgresNotificationRepository(pool).mark_read("reader", nid)
+        conn.transaction.assert_called_once()
+        assert "FOR UPDATE" in conn.fetchrow.await_args_list[0].args[0]
+        sql, *params = conn.fetchrow.await_args_list[1].args
+        assert "ON CONFLICT DO NOTHING" in sql and params == ["reader", nid]
+        assert conn.execute.await_count == (2 if inserted else 1)
+        assert all("read_through_seq" not in c.args[0] for c in conn.execute.await_args_list)
+        if inserted:
+            assert "revision = revision + 1" in conn.execute.await_args_list[1].args[0]
+
+    def test_read_filter_never_uses_another_readers_mark(self):
+        sql, params = feed_sql(OWNER, NotificationQuery(limit=10, unread=True), read_through_seq=0)
+        assert "seq > $2 AND NOT EXISTS" in sql and "r.user_id = $3" in sql
+        assert params[:3] == ["u", 0, "u"]
+        sql, params = feed_sql(ADMIN, NotificationQuery(limit=10, unread=False), read_through_seq=0)
+        assert "seq <= $3 OR EXISTS" in sql and "r.user_id = $4" in sql
+        assert params[:4] == ["a", "t", 0, "a"]
+
+
+async def test_individual_read_deleted_during_acknowledgement_rolls_back():
+    pool, conn = _pool()
+    conn.fetchrow.side_effect = [
+        {"revision": 0},
+        asyncpg.exceptions.ForeignKeyViolationError("deleted"),
+    ]
+    with pytest.raises(NotificationNotFoundError):
+        await PostgresNotificationRepository(pool).mark_read("u", uuid4())
+    assert conn.execute.await_count == 1  # no revision increment
+    assert conn.transaction.return_value.__aexit__.await_args.args[0] is NotificationNotFoundError

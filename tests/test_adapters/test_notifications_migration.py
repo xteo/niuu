@@ -65,3 +65,22 @@ def test_rate_index_is_partial_and_idempotent():
     assert "(rule_id, delivered_at)" in up and "WHERE status = 'delivered'" in up
     down = (ROOT / "migrations" / f"{RATE_INDEX}.down.sql").read_text()
     assert "DROP INDEX IF EXISTS idx_forge_notification_deliveries_rule_delivered" in down
+
+
+@pytest.mark.parametrize("direction", ["up", "down"])
+def test_individual_reads_migration_is_identical_in_all_three_locations(direction):
+    name = f"000071_forge_notification_reads.{direction}.sql"
+    source = (ROOT / "migrations" / name).read_bytes()
+    assert (ROOT / "src/cli/migrations/volundr" / name).read_bytes() == source
+    assert _chart_block(name) == source.decode().strip()
+
+
+def test_individual_reads_migration_is_additive_idempotent_and_reader_scoped():
+    up = (ROOT / "migrations/000071_forge_notification_reads.up.sql").read_text()
+    assert "CREATE TABLE IF NOT EXISTS forge_notification_reads" in up
+    assert "PRIMARY KEY (user_id, notification_id)" in up
+    assert "REFERENCES forge_notifications(id) ON DELETE CASCADE" in up
+    assert "CREATE INDEX IF NOT EXISTS" in up
+    assert not re.search(r"\b(DELETE|UPDATE|ALTER)\s+(FROM\s+)?forge_notification_read_states", up)
+    down = (ROOT / "migrations/000071_forge_notification_reads.down.sql").read_text()
+    assert down.strip() == "DROP TABLE IF EXISTS forge_notification_reads;"

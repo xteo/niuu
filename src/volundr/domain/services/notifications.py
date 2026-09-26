@@ -351,6 +351,8 @@ class NotificationService(NotificationRecorder):
             head_seq=head,
             read_through_seq=watermark.read_through_seq,
             unread_count=unread,
+            revision=watermark.revision,
+            read_ids=await self.read_ids(principal, page.items),
         )
 
     async def list_for_session(
@@ -408,6 +410,17 @@ class NotificationService(NotificationRecorder):
             unread_count=unread,
             head_seq=head,
         )
+
+    async def read_ids(self, principal: Principal, items: list[Notification]) -> set[UUID]:
+        return await self._repository.read_ids(principal.user_id, [item.id for item in items])
+
+    async def mark_read(self, principal: Principal, notification_id: UUID) -> NotificationReadState:
+        notification = await self._repository.get(notification_id)
+        scope = NotificationScope.for_principal(principal)
+        if notification is None or not scope.allows(notification.owner_id, notification.tenant_id):
+            raise NotificationNotFoundError(f"Notification not found: {notification_id}")
+        await self._repository.mark_read(principal.user_id, notification_id)
+        return await self.get_read_state(principal)
 
     async def list_deliveries(
         self, principal: Principal, notification_id: UUID

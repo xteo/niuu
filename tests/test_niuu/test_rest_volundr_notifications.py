@@ -530,3 +530,48 @@ def test_non_json_node_responses_are_gateway_errors():
     assert put.status_code == 502
     feed = client.get(URL, params={"instance_id": "remote"}, headers=_headers())
     assert feed.status_code == 502
+
+
+@respx.mock
+def test_individual_read_targets_only_selected_host_and_preserves_upstream_errors():
+    nid = "459f6fca-52a5-405d-a044-626c114f607d"
+    path = f"{URL}/{nid}/read"
+    state = {"read_through_seq": 0, "revision": 4, "unread_count": 2, "head_seq": 3}
+    remote = respx.put(f"http://remote{path}").respond(
+        200, json={"id": nid, "read": True, "read_state": state}
+    )
+    client = _client([LOCAL, REMOTE], embedded_forge_app=_embedded())
+    response = client.put(path, params={"instance_id": "remote"}, headers=_headers())
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": nid,
+        "instance_id": "remote",
+        "read": True,
+        "read_state": state,
+    }
+    assert remote.call_count == 1
+    assert "instance_id" not in remote.calls[0].request.url.params
+    for status in [403, 404, 503]:
+        remote.respond(status, json={"detail": "unavailable"})
+        assert (
+            client.put(path, params={"instance_id": "remote"}, headers=_headers()).status_code
+            == status
+        )
+    remote.respond(200, json=[])
+    assert client.put(path, params={"instance_id": "remote"}, headers=_headers()).status_code == 502
+    assert (
+        client.put(path, params={"instance_id": "unknown"}, headers=_headers()).status_code == 404
+    )
+
+
+@respx.mock
+def test_feed_propagates_optional_read_revision_and_individual_read_flag():
+    payload = _page(REMOTE_ITEMS, {})
+    payload["revision"] = 7
+    payload["items"][0] = {**payload["items"][0], "read": True}
+    respx.get(f"http://remote{URL}").respond(200, json=payload)
+    client = _client([LOCAL, REMOTE], embedded_forge_app=_embedded())
+    feed = _fleet(client).json()
+    assert feed["instances"]["remote"]["revision"] == 7
+    assert feed["instances"]["local"].get("revision") is None
+    assert feed["items"][0]["read"] is True

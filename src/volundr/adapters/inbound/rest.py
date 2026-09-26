@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
 from niuu.domain.notifications import notification_visible_to
@@ -3335,7 +3336,7 @@ def create_router(
                 return payload
             all_turns = payload["turns"]
             if turn_id is not None:
-                turn = next((t for t in all_turns if t.get("id") == turn_id), None)
+                turn = resolve_timeline_turn(all_turns, turn_id)
                 if turn is None:
                     raise HTTPException(404, "History item no longer exists in this projection")
                 return {
@@ -3701,11 +3702,12 @@ def create_router(
         )
         turns = listing.get("turns") if isinstance(listing, dict) else None
         turns = turns if isinstance(turns, list) else []
+        resolved_id = item["turn"]["id"]
         index = next(
-            (i for i, t in enumerate(turns) if isinstance(t, dict) and t.get("id") == turn_id),
+            (i for i, t in enumerate(turns) if isinstance(t, dict) and t.get("id") == resolved_id),
             None,
         )
-        return {**item, "index": index, "total_turns": len(turns)}
+        return {**item, "index": index, "total_turns": len(turns), "requested_turn_id": turn_id}
 
     async def _fetch_full_tool_result(
         request: Request,

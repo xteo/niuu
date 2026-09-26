@@ -75,6 +75,9 @@ ROUTE_POLICIES: tuple[RoutePolicy, ...] = (
     RoutePolicy("GET", f"{FORGE_PREFIX}/notifications", _READ, Binding.NONE),
     RoutePolicy("GET", f"{FORGE_PREFIX}/notifications/read-state", _READ, Binding.NONE),
     RoutePolicy("PUT", f"{FORGE_PREFIX}/notifications/read-state", _READ, Binding.NONE),
+    RoutePolicy(
+        "PUT", f"{FORGE_PREFIX}/notifications/{{notification_id}}/read", _READ, Binding.NONE
+    ),
     RoutePolicy("GET", f"{_S}/notifications", _READ, Binding.OWNED),
     # Direct submit only for the token's own session (recorded as source=agent).
     RoutePolicy("POST", f"{_S}/notifications", FORGE_NOTIFY_SCOPE, Binding.OWN),

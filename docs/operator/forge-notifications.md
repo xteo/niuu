@@ -63,7 +63,7 @@ All routes are under `/api/v1/forge`. The Guild facade serves the same paths.
 - Filters: `kind` and `source` (comma-separated), `min_severity`, `session_id`,
   `project_id`, and `unread=true|false`. Unknown values return `422`.
 - The response is `{items, next_before, head_seq, read_through_seq, unread_count}`. Each
-  item carries `read = seq <= read_through_seq`. The counters cover your whole scope and
+  item is read through the host watermark or an individual acknowledgement. The counters cover your whole scope and
   ignore the filters.
 
 **Scope.** A non-admin sees only notifications they own. A `volundr:admin` also sees every
@@ -416,3 +416,27 @@ To check them, and the dispatcher against a local webhook receiver, on a disposa
 PostgreSQL database, run:
 `FORGE_HISTORY_TEST_DATABASE_URL=postgresql://… pytest -m integration tests/test_adapters/test_notifications_postgres_integration.py tests/test_adapters/test_notification_dispatcher_postgres_integration.py`.
 The `database` lane of `scripts/verify_forge.py` includes both.
+
+
+## Individual activity reads and durable reply anchors (local follow-up)
+
+`PUT /api/v1/forge/notifications/{id}/read?instance_id=<host>` acknowledges only that
+card for the caller. No request body. The returned `id`, `instance_id`, `read: true`
+and `read_state` confirm the exact write; other cards remain unread. Repeated PUTs
+are idempotent. The legacy read-through API remains the explicit Mark all read action.
+Missing/unauthorized items are404; unsupported hosts must not trigger a read-through
+substitute. Feed/session lists, unread filters and counts all include these marks.
+
+Migration000071 adds the reader/item table and is mirrored in the Helm migration
+configmap. It is additive; no historical notifications or watermarks are rewritten.
+Check the migration number against the target deployment before integrating. Rollback
+to older binaries does not delete marks, but older clients/servers cannot display them;
+the down migration deletes item acknowledgements and is not a routine binary rollback.
+
+Reply anchors can name a durable source turn whose displayed row was split/re-IDed
+by observation-order presentation. Updated projections record source identity, and the
+turn resolver returns the unique terminal fragment plus `requested_turn_id` proof.
+Both Forge and the owning Skuld gateway need the updated code. Already-running old
+gateways and old projected-only archives without source provenance may still return404;
+never infer an anchor from a title or timestamp. Use a separately authorized rollout
+and recovery window; do not restart active sessions just to refresh this code.

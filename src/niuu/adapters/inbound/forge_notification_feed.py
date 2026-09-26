@@ -73,6 +73,7 @@ class InstancePage:
     head_seq: int
     read_through_seq: int
     unread_count: int
+    revision: int | None = None
 
 
 @dataclass
@@ -89,6 +90,7 @@ def _summaries(pages: Mapping[str, InstancePage]) -> dict[str, dict[str, int]]:
             "head_seq": page.head_seq,
             "read_through_seq": page.read_through_seq,
             "unread_count": page.unread_count,
+            **({"revision": page.revision} if page.revision is not None else {}),
         }
         for instance_id, page in pages.items()
     }

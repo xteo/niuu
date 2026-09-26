@@ -10,7 +10,7 @@ the delivery outbox rows a dispatcher settles.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import StrEnum
 from typing import Any
@@ -198,6 +198,8 @@ class NotificationFeed:
     head_seq: int
     read_through_seq: int
     unread_count: int
+    revision: int = 0
+    read_ids: set[UUID] = field(default_factory=set)
 
 
 @dataclass(frozen=True)

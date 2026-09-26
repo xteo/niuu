@@ -300,3 +300,51 @@ class TestSessionRoutes:
         ):
             assert client.post(url, json=bad, headers=headers()).status_code == 422
         assert client.post(url, json=body, headers=headers("owner-b")).status_code == 403
+
+
+class TestIndividualReads:
+    async def test_exact_read_receipt_feed_session_list_and_unread_filter(self, env):
+        client, service, _, sessions = env
+        session = await _seed(service, sessions)
+        feed_url = f"{PREFIX}/notifications"
+        items = client.get(feed_url, params={"limit": 5}, headers=headers()).json()["items"]
+        nid = items[1]["id"]
+        url = f"{feed_url}/{nid}/read"
+        response = client.put(url, headers=headers())
+        assert response.status_code == 200
+        assert response.json() == {
+            "id": nid,
+            "read": True,
+            "read_state": {"read_through_seq": 0, "head_seq": 3, "unread_count": 2, "revision": 1},
+        }
+        assert client.put(url, headers=headers()).json() == response.json()
+        feed = client.get(feed_url, params={"limit": 5}, headers=headers()).json()
+        assert [i["read"] for i in feed["items"]] == [False, True, False]
+        assert feed["revision"] == 1 and feed["unread_count"] == 2
+        unread = client.get(feed_url, params={"unread": True}, headers=headers()).json()
+        assert [i["seq"] for i in unread["items"]] == [3, 1]
+        ascending = client.get(
+            f"{PREFIX}/sessions/{session.id}/notifications", params={"limit": 5}, headers=headers()
+        ).json()
+        assert [i["read"] for i in ascending] == [False, True, False]
+        admin = client.get(
+            feed_url, params={"limit": 5}, headers=headers("root", admin=True)
+        ).json()
+        assert all(not i["read"] for i in admin["items"])
+
+    async def test_owner_visibility_identity_and_missing_item(self, env):
+        client, service, store, sessions = env
+        await _seed(service, sessions)
+        nid = client.get(f"{PREFIX}/notifications", headers=headers()).json()["items"][0]["id"]
+        url = f"{PREFIX}/notifications/{nid}/read"
+        assert client.put(url).status_code == 401
+        assert client.put(url, headers=headers("owner-b")).status_code == 404
+        assert (
+            client.put(f"{PREFIX}/notifications/{uuid4()}/read", headers=headers()).status_code
+            == 404
+        )
+        assert (
+            client.put(f"{PREFIX}/notifications/not-a-uuid/read", headers=headers()).status_code
+            == 422
+        )
+        assert not store.reads

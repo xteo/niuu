@@ -56,7 +56,7 @@ MAX_IDEMPOTENCY_KEY_CHARS = 200
 
 
 class NotificationResponse(BaseModel):
-    """One notification as a reader sees it; ``read`` is ``seq <= read_through_seq``."""
+    """Reader view: read through the host watermark or acknowledged individually."""
 
     id: UUID
     seq: int
@@ -86,11 +86,20 @@ class NotificationResponse(BaseModel):
     read: bool
 
     @classmethod
-    def build(cls, notification: Notification, read_through_seq: int) -> NotificationResponse:
-        return cls(**notification.wire(), read=notification.seq <= read_through_seq)
+    def build(
+        cls,
+        notification: Notification,
+        read_through_seq: int,
+        read_ids: set[UUID] | frozenset[UUID] = frozenset(),
+    ) -> NotificationResponse:
+        return cls(
+            **notification.wire(),
+            read=notification.seq <= read_through_seq or notification.id in read_ids,
+        )
 
 
 class NotificationFeedResponse(BaseModel):
+    revision: int = 0
     items: list[NotificationResponse]
     next_before: int | None = Field(
         default=None, description="Pass as ``before`` for the next (older) page; null at the end"
@@ -251,7 +260,11 @@ def create_notifications_router(
         )
         feed = await notification_service.list_feed(principal, query)
         return NotificationFeedResponse(
-            items=[NotificationResponse.build(n, feed.read_through_seq) for n in feed.items],
+            items=[
+                NotificationResponse.build(n, feed.read_through_seq, feed.read_ids)
+                for n in feed.items
+            ],
+            revision=feed.revision,
             next_before=feed.next_before,
             head_seq=feed.head_seq,
             read_through_seq=feed.read_through_seq,
@@ -290,6 +303,25 @@ def create_notifications_router(
         except NotificationValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
         return NotificationReadStateResponse.build(state)
+
+    @router.put(
+        "/notifications/{notification_id}/read",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
+    async def mark_notification_read(
+        notification_id: UUID,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict:
+        """Acknowledge exactly this visible activity, without advancing the watermark."""
+        try:
+            state = await notification_service.mark_read(principal, notification_id)
+        except NotificationNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return {
+            "id": str(notification_id),
+            "read": True,
+            "read_state": NotificationReadStateResponse.build(state).model_dump(),
+        }
 
     @router.get("/notifications/rules", response_model=list[NotificationRuleResponse])
     async def list_rules(
@@ -383,7 +415,8 @@ def create_notifications_router(
         items, read_through = await notification_service.list_for_session(
             principal, session_id, after=after, limit=limit
         )
-        return [NotificationResponse.build(item, read_through) for item in items]
+        read_ids = await notification_service.read_ids(principal, items)
+        return [NotificationResponse.build(item, read_through, read_ids) for item in items]
 
     @router.post(
         "/sessions/{session_id}/notifications",
@@ -424,6 +457,10 @@ def create_notifications_router(
         if not created:
             response.status_code = status.HTTP_200_OK
         read_through = await notification_service.read_through_seq(principal)
-        return NotificationResponse.build(notification, read_through)
+        return NotificationResponse.build(
+            notification,
+            read_through,
+            await notification_service.read_ids(principal, [notification]),
+        )
 
     return router

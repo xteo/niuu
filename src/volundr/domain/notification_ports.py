@@ -82,6 +82,14 @@ class NotificationRepository(ABC):
         revision is not ``expected_revision``.
         """
 
+    @abstractmethod
+    async def read_ids(self, user_id: str, notification_ids: list[UUID]) -> set[UUID]:
+        """Return individual acknowledgements among this bounded page of IDs."""
+
+    @abstractmethod
+    async def mark_read(self, user_id: str, notification_id: UUID) -> None:
+        """Idempotently acknowledge only this item; increment the reader revision atomically."""
+
 
 class NotificationRuleRepository(ABC):
     """Owner-scoped delivery rules."""

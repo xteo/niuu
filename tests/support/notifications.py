@@ -48,6 +48,7 @@ class InMemoryNotificationStore:
         self.rules: dict[UUID, NotificationRule] = {}
         self.deliveries: dict[UUID, NotificationDelivery] = {}
         self.watermarks: dict[str, ReadWatermark] = {}
+        self.reads: set[tuple[str, UUID]] = set()
         self.project_calls = 0
         self.seq = 0
         self.feed = InMemoryNotificationRepository(self)
@@ -114,7 +115,11 @@ class InMemoryNotificationRepository(NotificationRepository):
             and (not query.sources or n.source in query.sources)
             and (query.session_id is None or n.session_id == query.session_id)
             and (query.project_id is None or n.project_id == query.project_id)
-            and (query.unread is None or (n.seq > read_through_seq) == query.unread)
+            and (
+                query.unread is None
+                or (n.seq > read_through_seq and (scope.user_id, n.id) not in self.store.reads)
+                == query.unread
+            )
             and (query.before is None or n.seq < query.before)
             and (query.after is None or n.seq > query.after)
         ]
@@ -138,7 +143,11 @@ class InMemoryNotificationRepository(NotificationRepository):
     ) -> tuple[int, int]:
         items = self._visible(scope)
         head = max((n.seq for n in items), default=0)
-        return head, sum(1 for n in items if n.seq > read_through_seq)
+        return head, sum(
+            1
+            for n in items
+            if n.seq > read_through_seq and (scope.user_id, n.id) not in self.store.reads
+        )
 
     async def get_watermark(self, user_id: str) -> ReadWatermark:
         return self.store.watermarks.get(user_id, ReadWatermark())
@@ -155,6 +164,16 @@ class InMemoryNotificationRepository(NotificationRepository):
         )
         self.store.watermarks[user_id] = updated
         return updated
+
+    async def read_ids(self, user_id: str, notification_ids: list[UUID]) -> set[UUID]:
+        return {key for key in notification_ids if (user_id, key) in self.store.reads}
+
+    async def mark_read(self, user_id: str, notification_id: UUID) -> None:
+        if (user_id, notification_id) in self.store.reads:
+            return
+        self.store.reads.add((user_id, notification_id))
+        old = await self.get_watermark(user_id)
+        self.store.watermarks[user_id] = ReadWatermark(old.read_through_seq, old.revision + 1)
 
 
 class InMemoryNotificationRuleRepository(NotificationRuleRepository):

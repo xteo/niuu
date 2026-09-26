@@ -26,6 +26,7 @@ from volundr.domain.notifications import (
     Notification,
     NotificationCandidate,
     NotificationDelivery,
+    NotificationNotFoundError,
     NotificationPage,
     NotificationQuery,
     NotificationReadStateConflictError,
@@ -214,10 +215,17 @@ def feed_sql(
         conditions.append(f"session_id = {bind(query.session_id)}")
     if query.project_id is not None:
         conditions.append(f"project_id = {bind(query.project_id)}")
-    if query.unread is True:
-        conditions.append(f"seq > {bind(read_through_seq)}")
-    if query.unread is False:
-        conditions.append(f"seq <= {bind(read_through_seq)}")
+    if query.unread is not None:
+        through = bind(read_through_seq)
+        reader = bind(scope.user_id)
+        acknowledged = (
+            "EXISTS (SELECT 1 FROM forge_notification_reads r "
+            f"WHERE r.notification_id = forge_notifications.id AND r.user_id = {reader})"
+        )
+        if query.unread:
+            conditions.append(f"(seq > {through} AND NOT {acknowledged})")
+        else:
+            conditions.append(f"(seq <= {through} OR {acknowledged})")
     if query.before is not None:
         conditions.append(f"seq < {bind(query.before)}")
     if query.after is not None:
@@ -316,11 +324,15 @@ class PostgresNotificationRepository(NotificationRepository):
         clause = scope_clause(scope, params)
         params.append(read_through_seq)
         through = f"${len(params)}"
+        params.append(scope.user_id)
+        reader = f"${len(params)}"
         row = await self._pool.fetchrow(
             f"""SELECT
                 (SELECT COALESCE(MAX(seq), 0) FROM forge_notifications WHERE {clause})
                     AS head_seq,
-                (SELECT COUNT(*) FROM forge_notifications WHERE {clause} AND seq > {through})
+                (SELECT COUNT(*) FROM forge_notifications WHERE {clause} AND seq > {through}
+                 AND NOT EXISTS (SELECT 1 FROM forge_notification_reads r
+                     WHERE r.notification_id = forge_notifications.id AND r.user_id = {reader}))
                     AS unread_count""",
             *params,
         )
@@ -374,6 +386,50 @@ class PostgresNotificationRepository(NotificationRepository):
                 "Notification read state changed; refresh before changing it"
             )
         return ReadWatermark(read_through_seq=row["read_through_seq"], revision=row["revision"])
+
+    async def read_ids(self, user_id: str, notification_ids: list[UUID]) -> set[UUID]:
+        if not notification_ids:
+            return set()
+        rows = await self._pool.fetch(
+            "SELECT notification_id FROM forge_notification_reads "
+            "WHERE user_id = $1 AND notification_id = ANY($2::uuid[])",
+            user_id,
+            notification_ids,
+        )
+        return {row["notification_id"] for row in rows}
+
+    async def mark_read(self, user_id: str, notification_id: UUID) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "INSERT INTO forge_notification_read_states (user_id) VALUES ($1) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    user_id,
+                )
+                # Serialize with watermark CAS and other item acknowledgements. A retry
+                # inserts no second mark and changes neither revision nor unread count.
+                await conn.fetchrow(
+                    "SELECT revision FROM forge_notification_read_states "
+                    "WHERE user_id = $1 FOR UPDATE",
+                    user_id,
+                )
+                try:
+                    inserted = await conn.fetchrow(
+                        "INSERT INTO forge_notification_reads (user_id, notification_id) "
+                        "VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING notification_id",
+                        user_id,
+                        notification_id,
+                    )
+                except asyncpg.exceptions.ForeignKeyViolationError as exc:
+                    raise NotificationNotFoundError(
+                        f"Notification not found: {notification_id}"
+                    ) from exc
+                if inserted is not None:
+                    await conn.execute(
+                        "UPDATE forge_notification_read_states SET revision = revision + 1, "
+                        "updated_at = now() WHERE user_id = $1",
+                        user_id,
+                    )
 
 
 def _rule_args(rule: NotificationRule) -> tuple:

@@ -462,3 +462,40 @@ class TestRulesAndSinks:
             NotificationRuleSpec(name="tg", sink="telegram", integration_connection_id="tg"),
         )
         assert rule.integration_connection_id == "tg"
+
+
+class TestIndividualReads:
+    async def test_only_opened_card_clears_and_retries_do_not_advance_revision(self):
+        service, store = _service()
+        session = _session()
+        older, opened, newest = await service.project_log_entries(
+            session, [_turn_entry(session, i, f"turn-{i}") for i in range(1, 4)]
+        )
+        state = await service.mark_read(OWNER, opened.id)
+        assert (state.read_through_seq, state.revision, state.unread_count) == (0, 1, 2)
+        assert await service.mark_read(OWNER, opened.id) == state
+        feed = await service.list_feed(OWNER, NotificationQuery(limit=10))
+        assert feed.read_ids == {opened.id} and feed.revision == 1
+        unread = await service.list_feed(OWNER, NotificationQuery(limit=10, unread=True))
+        assert [n.id for n in unread.items] == [newest.id, older.id]
+        read = await service.list_feed(OWNER, NotificationQuery(limit=10, unread=False))
+        assert [n.id for n in read.items] == [opened.id]
+        assert (await service.get_read_state(ADMIN)).unread_count == 3
+        await service.mark_read(ADMIN, older.id)
+        assert (await service.get_read_state(OWNER)).unread_count == 2
+        # Legacy mark-all remains CAS guarded against concurrent individual acknowledgement.
+        with pytest.raises(NotificationReadStateConflictError):
+            await service.update_read_state(OWNER, read_through_seq=3, expected_revision=0)
+        state = await service.update_read_state(OWNER, read_through_seq=3, expected_revision=1)
+        assert state.unread_count == 0 and state.read_through_seq == 3
+        assert (await service.get_read_state(ADMIN)).unread_count == 2
+
+    async def test_missing_foreign_owner_and_foreign_tenant_are_not_acknowledged(self):
+        service, store = _service()
+        foreign = _session(owner_id="owner-b", tenant_id="tenant-b")
+        [item] = await service.project_log_entries(foreign, [_turn_entry(foreign, 1, "foreign")])
+        for reader in [OWNER, ADMIN]:
+            for nid in [uuid4(), item.id]:
+                with pytest.raises(NotificationNotFoundError):
+                    await service.mark_read(reader, nid)
+        assert not store.reads

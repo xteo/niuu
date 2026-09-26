@@ -356,6 +356,7 @@ def _instance_page(response: httpx.Response, instance: RegisteredInstance) -> In
         head_seq=counters[0],
         read_through_seq=counters[1],
         unread_count=counters[2],
+        revision=payload.get("revision") if type(payload.get("revision")) is int else None,
     )
 
 
@@ -2124,6 +2125,21 @@ def create_volundr_router(
         elif isinstance(payload, dict):
             payload = _with_instance(payload, instance, rebase_chat_endpoint=False)
         return JSONResponse(payload, status_code=remote.status_code)
+
+    @router.put("/notifications/{notification_id}/read")
+    async def mark_notification_read(
+        request: Request,
+        notification_id: UUID,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance = await _notification_target(request, principal)
+        remote = await _proxy_to(
+            instance, request, method="PUT", path=f"/notifications/{notification_id}/read"
+        )
+        payload = _remote_json(remote)
+        if not isinstance(payload, dict):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid activity read response")
+        return {**payload, "instance_id": instance.id}
 
     @router.get("/notifications/rules")
     async def list_notification_rules(

@@ -109,15 +109,22 @@ The notification JSON (`NotificationResponse`):
  "engine":"claude|codex|…|null","model":"…|null","correlation_id":null,
  "created_at":"ISO-8601","read":false,"instance_id":"<added by the Guild facade>"}
 ```
-`read` is computed per reader as `seq <= read_through_seq`.
+`read` is computed per reader as `seq <= read_through_seq` **or** an individual
+acknowledgement in `forge_notification_reads(user_id, notification_id, read_at)`.
+Opening a card must not advance the host watermark or clear other unopened cards.
 
 `turn_id` is the transcript turn the notification anchors to: the notification's own turn
 (`nt_…`) for agent notifications and the final reply turn for `reply_ready`. It is `null`
 when there is no turn (`attention`, direct submits). To open the transcript at it, call
 `GET /sessions/{id}/conversation/turns/{turn_id}`, which returns `{turn, index, total_turns,
-projection_revision}` in the same absolute index space as the windowed conversation read,
+projection_revision, requested_turn_id}` in the same absolute index space as the windowed conversation read,
 then load the window with `after=index-1` (or `before`/`limit`). A 404 means the turn is not
-in the current projection; open the session without an anchor.
+in the current projection; open the session without an anchor and explain that the exact
+location is unavailable. Observation-order display fragments retain `source_turn_id`
+and `source_turn_terminal` in `metadata.conversation_timeline`. The resolver accepts
+an exact row ID first, or the unique terminal fragment of that durable source ID.
+Clients anchor on the returned `turn.id`, requiring `requested_turn_id` to match the
+request when the IDs differ. Never guess by text, timestamp or raw log sequence.
 
 | Method and path | Purpose |
 |---|---|
@@ -126,6 +133,7 @@ in the current projection; open the session without an anchor.
 | `POST /sessions/{id}/notifications` | Direct submit (operator or external agents). Body: `NotificationDraft` + `idempotency_key` (required). Returns the notification (201, or 200 when deduped). Feed-only: `session_seq` is null. |
 | `GET /notifications/read-state` | `{read_through_seq, revision, unread_count, head_seq}` |
 | `PUT /notifications/read-state` | `{read_through_seq, expected_revision}`. The watermark only moves forward; 409 on a revision conflict. |
+| `PUT /notifications/{id}/read` | No body; acknowledge one visible notification for the caller, idempotently. Returns `{id, read: true, read_state: {read_through_seq, revision, unread_count, head_seq}}`. Missing/invisible IDs return404. |
 | `GET /notifications/rules`, `POST /notifications/rules`, `PUT /notifications/rules/{id}`, `DELETE /notifications/rules/{id}` | Owner-scoped rule CRUD. |
 | `GET /notifications/{id}/deliveries` | Delivery status rows for one notification. |
 | `GET /notifications/sinks` | Available sink names for the rule UI: `[{name, label, requires_integration}]`. |
@@ -135,7 +143,11 @@ in the current projection; open the session without an anchor.
   `after=<seq>` (ascending, for gap-fill).
 - Filters: `kind` (CSV), `min_severity`, `source` (CSV), `session_id`, `project_id`.
 - `unread=true|false`.
-- Response: `{items, next_before, head_seq, read_through_seq, unread_count}`.
+- Response: `{items, next_before, head_seq, read_through_seq, unread_count, revision}`.
+- Individual acknowledgements increment the same reader revision only on first insert;
+  retries do not increment it. Mark-all uses the existing watermark CAS, so a concurrent
+  item acknowledgement can require the usual read-and-retry on409. Both unread filters
+  and counts exclude individually acknowledged items.
 
 Rule JSON:
 ```json
@@ -169,7 +181,11 @@ An empty list in `match` means "any".
     the same for `after`.
   - It reports `X-Forge-Unavailable-Instances`.
 - Read state: `GET` aggregates `unread_count` and returns a per-instance map.
-  `PUT` accepts a per-instance map.
+  `PUT` accepts a per-instance map. Per-host feed summaries also carry optional `revision`
+  (absent on old hosts).
+- `PUT /notifications/{id}/read?instance_id=<owning-host>` goes only to that host,
+  never fans out; the receipt adds `instance_id`. An old host returns404/405/501: clients
+  must report the missing API, not substitute a watermark write.
 - Session-scoped routes go to the owning instance (`_find_session_owner`).
 - Rules and sinks go to the selected instance, local by default.
 

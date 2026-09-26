@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from niuu.build_identity import build_identity
+from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
 from niuu.domain.text_projection import projection_revision
@@ -330,9 +331,10 @@ async def get_conversation_history(
         "history_settled_tail_id": settled[-1].get("id") if settled else None,
     }
     if turn_id is not None:
-        turns = [turn for turn in turns if turn.get("id") == turn_id]
-        if not turns:
+        target = resolve_timeline_turn(turns, turn_id)
+        if target is None:
             raise HTTPException(404, "History item no longer exists in this projection")
+        turns = [target]
     last_activity = json_text_safe(last_activity)
     build_ms = (time.perf_counter() - t_build) * 1000.0
 

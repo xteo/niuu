@@ -52,6 +52,7 @@ class TestPolicyTable:
         [
             ("GET", "/notifications", FORGE_SESSION_READ_SCOPE, Binding.NONE),
             ("PUT", "/notifications/read-state", FORGE_SESSION_READ_SCOPE, Binding.NONE),
+            ("PUT", "/notifications/N/read", FORGE_SESSION_READ_SCOPE, Binding.NONE),
             ("GET", "/sessions/S/notifications", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
             ("POST", "/sessions/S/notifications", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("GET", "/sessions", FORGE_SESSION_READ_SCOPE, Binding.NONE),
