@@ -30,6 +30,7 @@ from pydantic_settings import (
 from niuu.domain.observability import ObservabilityConfig
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.mesh.config import MeshNatsConfig
+from skuld.claude_permission import DEFAULT_CLAUDE_PERMISSION_MODE
 
 
 class SkuldObservabilityConfig(ObservabilityConfig):
@@ -53,11 +54,6 @@ def _config_paths() -> list[Path]:
 CONFIG_PATHS = _config_paths()
 
 _DEFAULT_TRANSPORT_ADAPTER = "skuld.transports.sdk.SDKTransport"
-
-# Values accepted by ``claude --permission-mode`` (Claude Code 2.1.28x).
-CLAUDE_PERMISSION_MODES = frozenset(
-    {"acceptEdits", "auto", "bypassPermissions", "dontAsk", "manual", "plan"}
-)
 
 
 _DEFAULT_PARTICIPANT_COLORS = [
@@ -783,12 +779,12 @@ class SkuldSettings(BaseSettings):
     )
     # A Forge node decides how unattended Claude sessions run: YOLO where the host allows it,
     # Claude's classifier-gated ``auto`` mode elsewhere. Set it once in the node's config file
-    # (``claude_permission_mode: auto``) instead of on every session request.
+    # (``claude_permission_mode: bypassPermissions`` on YOLO hosts). Claude transports validate it.
     claude_permission_mode: str = Field(
-        default="bypassPermissions",
+        default=DEFAULT_CLAUDE_PERMISSION_MODE,
         description=(
             "Claude Code --permission-mode used when skip_permissions is on "
-            "(bypassPermissions, auto, acceptEdits, dontAsk, manual or plan)."
+            "(auto, bypassPermissions or acceptEdits)."
         ),
     )
     # Default ON: Claude tmux sessions launch with agent teams (--teammate-mode
@@ -967,17 +963,6 @@ class SkuldSettings(BaseSettings):
     mesh: MeshConfig = Field(default_factory=MeshConfig)
     workflow_trigger: WorkflowTriggerConfig = Field(default_factory=WorkflowTriggerConfig)
     workflow: WorkflowRuntimeConfig = Field(default_factory=WorkflowRuntimeConfig)
-
-    @field_validator("claude_permission_mode", mode="before")
-    @classmethod
-    def _validate_claude_permission_mode(cls, value: object) -> str:
-        mode = str(value).strip()
-        if mode not in CLAUDE_PERMISSION_MODES:
-            raise ValueError(
-                f"claude_permission_mode {mode!r} is not a Claude Code permission mode; "
-                f"set one of {', '.join(sorted(CLAUDE_PERMISSION_MODES))} in the node config"
-            )
-        return mode
 
     @model_validator(mode="after")
     def _resolve_transport_adapter(self) -> "SkuldSettings":

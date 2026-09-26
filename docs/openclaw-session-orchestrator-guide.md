@@ -322,22 +322,27 @@ That keeps the rest of the built-in Codex transport settings intact.
 
 #### Claude permission mode is a node setting
 
-Each Forge node decides how its unattended Claude sessions run. Skuld brokers read the node's
-config file (`NIUU_CONFIG`), so set it once there instead of on every session request:
+Each Forge node decides how its unattended Claude sessions run. Skuld brokers on local-process nodes read the
+node's config file (`NIUU_CONFIG`), so set it once there instead of on every session request:
 
 ```yaml
-# Nodes where YOLO works (the default):
+# YOLO hosts (Thor, DGX Spark) must say so explicitly:
 claude_permission_mode: bypassPermissions
-# Nodes where it does not: Claude's classifier-gated auto mode.
+# Every other node runs Claude's classifier-gated auto mode, which is also the default.
 claude_permission_mode: auto
 ```
 
-It applies when `skipPermissions` is on, for the tmux, persistent-subprocess, subprocess and SDK
-transports, and for Remote Control unless `remote_control_permission_mode` overrides it. Values
-Claude does not accept (`acceptEdits`, `auto`, `bypassPermissions`, `dontAsk`, `manual`, `plan`
-are valid) stop the broker at start. A definition can override a node for its own sessions with
-`defaults.broker.claudePermissionMode`. Brokers read the file when they start, so running sessions
-pick up a change on their next stop/start.
+It applies when `skipPermissions` is on, for the tmux, persistent-subprocess, subprocess and SDK transports,
+and for Remote Control unless `remote_control_permission_mode` overrides it. Accepted values are `auto`,
+`bypassPermissions` and `acceptEdits`, in any case. `plan`, `manual`, `dontAsk` and `default` need a human to
+answer prompts. Only Claude transports check the value: a typo stops that node's Claude broker at start with the
+remedy and leaves its Codex and other engines running. The broker logs the mode in effect and warns when the
+node left the default.
+
+A definition can override the node for its own sessions with `defaults.broker.claudePermissionMode`; clients
+cannot set it per request. Kubernetes-backed Forge pods do not read the node config file, so there the definition
+key is the way to set it. Brokers read the setting when they start: running sessions pick up a change on their
+next stop/start.
 
 Claude Code sessions should run in tmux (`TmuxInteractiveTransport`) so they stay steerable. Point
 the default definition at it:

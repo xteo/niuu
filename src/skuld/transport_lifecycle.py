@@ -113,7 +113,20 @@ class TransportLifecycleMixin:
             kwargs["codex_auth_provider"] = self._create_codex_auth_provider()
         filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
         logger.info("Using %s (adapter: %s)", cls.__name__, adapter_path)
+        if "claude_permission_mode" in sig.parameters:
+            self._log_claude_permission_mode()
         return cls(**filtered)
+
+    def _log_claude_permission_mode(self) -> None:
+        """Say which permission mode Claude gets and whether the node chose it."""
+        mode = self._settings.claude_permission_mode
+        if "claude_permission_mode" in self._settings.model_fields_set:
+            logger.info("Claude permission mode: %s (set by this node)", mode)
+            return
+        logger.warning(
+            "Claude permission mode: %s (default; set claude_permission_mode in the node config)",
+            mode,
+        )
 
     async def _auto_start_transport(self) -> None:
         """Background-task wrapper around ``self._transport.start()``.

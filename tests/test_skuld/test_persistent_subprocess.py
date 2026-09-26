@@ -322,8 +322,10 @@ async def test_seeded_resume_skips_initial_prompt(tmp_path) -> None:
 
 
 def test_flag_off_keeps_bypass_permissions_and_no_control_protocol() -> None:
-    """Default: classic bypassPermissions behavior, no stdio permission tool."""
-    transport = PersistentSubprocessTransport("/tmp", skip_permissions=True)
+    """A YOLO node: bypassPermissions, no stdio permission tool."""
+    transport = PersistentSubprocessTransport(
+        "/tmp", skip_permissions=True, claude_permission_mode="bypassPermissions"
+    )
 
     cmd = transport._build_command()
 
