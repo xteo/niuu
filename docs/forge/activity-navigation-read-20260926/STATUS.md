@@ -1,8 +1,11 @@
-# Individual activity reads and exact reply anchors — local validation
+# Individual activity reads — deployed; retained-gateway limits noted
 
-September26,2026. User explicitly approved a per-activity read API. This source
-also corrects durable reply IDs lost by observation-order display fragmentation.
-No live server, migration, running gateway or other runner's worktree was changed.
+September26,2026. After approving the per-activity API, the user requested deployment.
+Thor Forge4b44432f and migration000071 are live; iOS2.0(2291) is on TestFlight.
+Existing gateways/native sessions were preserved, so some older reply aliases remain
+unavailable until a safe runtime upgrade. Deployment and live acceptance are below.
+
+The following local validation preceded that separately authorized rollout.
 
 ## Behaviour
 
