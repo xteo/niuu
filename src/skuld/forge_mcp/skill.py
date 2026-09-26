@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from niuu.forge_mcp.guidance import COMPACT_NOTIFICATION_GUIDANCE
 from skuld.session_runtime import write_private_file
 
 FORGE_NOTIFY_SKILL = "forge-notify"
@@ -50,10 +51,8 @@ rules — on their phone or chat. It is how a long-running session gets the user
 
 ## How to write one
 
-- **Title**: one short line that stands alone on a lock screen ("PR #412 opened: retry budget
-  for the log flusher"), not "Update".
-- **Body**: a few sentences of markdown — what happened, why it matters, what (if anything) the
-  user should do. Not a transcript, not a diff.
+{compact_guidance}
+
 - **Links**: attach the artifact — a PR or CI URL (`kind: pr` / `url`), a file you handed over
   with `present-file` (`kind: file`, `file_id` from its output), another session (`kind: session`).
 - **correlation_id**: reuse one id (e.g. the PR number) for follow-ups about the same thing.
@@ -72,7 +71,9 @@ which session, host, project and model you are running as.
 
 
 def forge_notify_skill_markdown(server_name: str) -> str:
-    return _SKILL_TEMPLATE.format(skill=FORGE_NOTIFY_SKILL, server=server_name)
+    return _SKILL_TEMPLATE.format(
+        skill=FORGE_NOTIFY_SKILL, server=server_name, compact_guidance=COMPACT_NOTIFICATION_GUIDANCE
+    )
 
 
 def _private_dir(path: Path) -> Path:
