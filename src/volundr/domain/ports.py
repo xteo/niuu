@@ -151,9 +151,11 @@ class SessionRepository(ABC):
 
     @abstractmethod
     async def update_coordination(
-        self, session: Session, coordination: SessionCoordination
+        self, session: Session, coordination: SessionCoordination | None
     ) -> Session | None:
         """Atomically replace membership if its revision and access scope still match.
+
+        ``None`` removes the session from its project.
 
         Preserve runtime fields; invalidate the old launch brief. None means conflict.
         Ordinary updates must never overwrite this independently managed state.

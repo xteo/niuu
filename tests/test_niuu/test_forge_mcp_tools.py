@@ -332,10 +332,17 @@ class TestGrants:
             {"name": "helper", "repo": "github.com/acme/app", "branch": "fix", "model": "m"},
         )
         assert created.structured["session"]["status"] == "starting"
-        assert client.calls[0][1] == {
+        creates = [payload for name, payload in client.calls if name == "create_session"]
+        # The caller belongs to proj-1, so the new session becomes its worker.
+        assert creates[0] == {
             "name": "helper",
             "model": "m",
             "source": {"type": "git", "repo": "github.com/acme/app", "branch": "fix"},
+            "coordination": {
+                "project_id": "proj-1",
+                "role": "worker",
+                "parent": {"instance_id": "node-a", "session_id": SELF},
+            },
         }
         local = await toolbox.call("create_session", {"name": "l", "local_path": "/srv/app"})
         assert not local.is_error
@@ -348,6 +355,44 @@ class TestGrants:
         stopped = await toolbox.call("stop_session", {"session_id": PEER})
         assert started.structured["session"]["status"] == "starting"
         assert stopped.structured["session"]["status"] == "stopped"
+
+    async def test_create_session_project_membership_choices(self) -> None:
+        toolbox, client, _ = _toolbox(ForgeMcpGrant.LIFECYCLE)
+
+        async def created(arguments: dict[str, Any]) -> dict[str, Any]:
+            result = await toolbox.call("create_session", {"name": "w", **arguments})
+            assert not result.is_error, result.text
+            return [payload for name, payload in client.calls if name == "create_session"][-1]
+
+        assert "coordination" not in await created({"standalone": True})
+        other = await created({"project_id": "proj-2", "role": "coordinator", "objective": "Lead"})
+        assert other["coordination"] == {
+            "project_id": "proj-2",
+            "role": "coordinator",
+            "objective": "Lead",
+        }
+        explicit = await created({"parent_session_id": PEER, "parent_instance_id": "node-b"})
+        assert explicit["coordination"]["parent"] == {"instance_id": "node-b", "session_id": PEER}
+        client.fail = ForgeApiError("down", status=503)
+        with_unknown_caller = await toolbox._launch_coordination(
+            toolbox._specs["create_session"].args_model.model_validate({"name": "w"})
+        )
+        assert with_unknown_caller is None
+        invalid = await toolbox.call("create_session", {"name": "w", "role": "Lead"})
+        assert invalid.is_error
+
+    async def test_list_sessions_filters_by_role_and_parent(self) -> None:
+        toolbox, client, _ = _toolbox()
+        listed = await toolbox.call(
+            "list_sessions", {"role": "worker", "parent_session_id": SELF, "project_id": "p"}
+        )
+        assert listed.structured["sessions"][0].get("parent") is None
+        assert client.calls[-1][1] == {
+            "scope": "guild",
+            "project_id": "p",
+            "role": "worker",
+            "parent_session_id": SELF,
+        }
 
 
 class TestErrors:

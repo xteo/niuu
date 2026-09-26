@@ -42,6 +42,7 @@ from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
 # Wire-format patterns Forge itself enforces (request ids) or that keep ids from
 # being spliced into a REST path; they are protocol shape, not tunables.
 _REQUEST_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,200}$"
+_ROLE_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
 _INSTANCE_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,100}$"
 _MCP_REQUEST_ID_PREFIX = "fmcp-"
 _TRUNCATION_MARK = "…"
@@ -123,6 +124,8 @@ class _ListSessionsArgs(_Args):
     limit: int | None = Field(default=None, ge=1)
     status: str | None = Field(default=None, pattern=r"^[a-z_]{1,32}$")
     project_id: str | None = None
+    role: str | None = Field(default=None, pattern=_ROLE_PATTERN)
+    parent_session_id: str | None = None
     scope: str = Field(default="guild", pattern=r"^(guild|local)$")
     include_archived: bool = False
 
@@ -157,6 +160,12 @@ class _CreateSessionArgs(_Args):
     branch: str | None = None
     local_path: str | None = None
     system_prompt: str = ""
+    project_id: str | None = None
+    role: str | None = Field(default=None, pattern=_ROLE_PATTERN)
+    parent_session_id: str | None = None
+    parent_instance_id: str | None = None
+    objective: str = Field(default="", max_length=4000)
+    standalone: bool = False
 
     @field_validator("local_path")
     @classmethod
@@ -400,6 +409,11 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "e.g. running, stopped, starting, failed.",
                 },
                 "project_id": {"type": "string"},
+                "role": {"type": "string", "description": "e.g. coordinator or worker."},
+                "parent_session_id": {
+                    "type": "string",
+                    "description": "Only sessions whose coordinator/parent is this session.",
+                },
                 "scope": {"type": "string", "enum": ["guild", "local"], "default": "guild"},
                 "include_archived": {"type": "boolean", "default": False},
             }
@@ -476,7 +490,9 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "Create and start a new Forge session. Returns its launch state — creation is "
             "not completion; follow it with get_session and session_transcript. Give "
-            "either repo (+branch) or an absolute local_path as the workspace."
+            "either repo (+branch) or an absolute local_path as the workspace. When you "
+            "belong to a Forge project, the new session joins it as your worker (you are "
+            "its parent) unless you pass standalone, another project_id or a parent."
         ),
         input_schema=_object(
             {
@@ -495,6 +511,28 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "branch": {"type": "string"},
                 "local_path": {"type": "string"},
                 "system_prompt": {"type": "string"},
+                "project_id": {
+                    "type": "string",
+                    "description": "Project to join. Defaults to your own project.",
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Project role, default worker (coordinator for a new lead).",
+                },
+                "parent_session_id": {
+                    "type": "string",
+                    "description": "Coordinator of the new session. Defaults to you.",
+                },
+                "parent_instance_id": {"type": "string"},
+                "objective": {
+                    "type": "string",
+                    "description": "The assignment, recorded with the session's membership.",
+                },
+                "standalone": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Create an independent session outside any project.",
+                },
             },
             required=("name",),
         ),
@@ -565,6 +603,7 @@ def _session_summary(raw: dict[str, Any]) -> dict[str, Any]:
         "workload_type": raw.get("workload_type"),
         "project_id": coordination.get("project_id"),
         "role": coordination.get("role"),
+        "parent": coordination.get("parent") or None,
         "source": {
             key: source.get(key)
             for key in ("type", "repo", "branch", "local_path")
@@ -789,6 +828,10 @@ class ForgeMcpToolbox:
             params["status"] = args.status
         if args.project_id:
             params["project_id"] = args.project_id
+        if args.role:
+            params["role"] = args.role
+        if args.parent_session_id:
+            params["parent_session_id"] = args.parent_session_id
         if args.include_archived:
             params["include_archived"] = "true"
         sessions = await self._client.list_sessions(params)
@@ -869,8 +912,53 @@ class ForgeMcpToolbox:
                 body["source"]["branch"] = args.branch
         if args.local_path:
             body["source"] = {"type": "local_mount", "local_path": args.local_path}
+        coordination = await self._launch_coordination(args)
+        if coordination is not None:
+            body["coordination"] = coordination
         created = await self._client.create_session(body)
         return self._ok({"session": _session_summary(created)})
+
+    async def _launch_coordination(self, args: _CreateSessionArgs) -> dict[str, Any] | None:
+        """Project membership for a new session: explicit fields, else "my worker"."""
+        if args.standalone:
+            return None
+        caller = await self._own_membership()
+        project_id = args.project_id or (caller or {}).get("project_id")
+        if not project_id:
+            return None
+        coordination: dict[str, Any] = {"project_id": project_id, "role": args.role or "worker"}
+        if args.objective:
+            coordination["objective"] = args.objective
+        if args.parent_session_id:
+            parent_instance = args.parent_instance_id or (caller or {}).get("instance_id")
+            if parent_instance:
+                coordination["parent"] = {
+                    "instance_id": parent_instance,
+                    "session_id": args.parent_session_id,
+                }
+        elif caller and caller.get("project_id") == project_id and caller.get("instance_id"):
+            coordination["parent"] = {
+                "instance_id": caller["instance_id"],
+                "session_id": caller["session_id"],
+            }
+        return coordination
+
+    async def _own_membership(self) -> dict[str, Any] | None:
+        session_id = self._host.session_id
+        if not session_id:
+            return None
+        try:
+            own = await self._client.get_session(session_id, instance_id=None)
+        except ForgeApiError:
+            return None
+        coordination = own.get("coordination") if isinstance(own, dict) else None
+        if not isinstance(coordination, dict):
+            return {"session_id": session_id, "instance_id": own.get("instance_id")}
+        return {
+            "session_id": session_id,
+            "instance_id": own.get("instance_id"),
+            "project_id": coordination.get("project_id"),
+        }
 
     async def _start_session(self, args: _SessionRef) -> ToolResult:
         started = await self._client.start_session(args.session_id, instance_id=args.instance_id)

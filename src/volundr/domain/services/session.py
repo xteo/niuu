@@ -810,9 +810,12 @@ class SessionService:
         return result
 
     async def update_coordination(
-        self, session: Session, coordination: SessionCoordination, principal: Principal | None
+        self,
+        session: Session,
+        coordination: SessionCoordination | None,
+        principal: Principal | None,
     ) -> Session:
-        """Persist a validated project assignment without touching its runtime."""
+        """Persist a validated project assignment (or its removal) without touching its runtime."""
         from volundr.domain.project_ports import ProjectConflictError
 
         await self._check_access(session, principal, "update")

@@ -58,10 +58,24 @@ _FLEET_SELECTORS = frozenset({"instance_id", "all_instances", "scope"})
 
 
 class SessionProjectAssignment(BaseModel):
+    """Attach, move, re-parent or detach a session (see the host contract).
+
+    ``parent`` may name its host by Guild instance id or slug; the facade translates it
+    to that host's project instance id before forwarding.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    project_id: UUID
+    project_id: UUID | None = None
     project_instance_id: str | None = Field(default=None, min_length=1, max_length=100)
     expected_revision: int = Field(ge=0)
+    role: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,39}$")
+    parent: dict[str, Any] | None = None
+
+
+#: Public project fields a metadata replica carries; never a checkout, scope or credential.
+_PROJECT_REPLICA_FIELDS = ("id", "slug", "name", "description", "brief", "repo_url")
+#: Fields refreshed on a replica from its home copy before a launch or assignment.
+_PROJECT_SYNC_FIELDS = ("name", "description", "brief", "repo_url", "status")
 
 
 LOCAL_NODE_ONLY_DETAIL = (
@@ -1008,6 +1022,171 @@ def create_volundr_router(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    async def _host_project_instance_id(
+        instance: RegisteredInstance, request: Request
+    ) -> str | None:
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path="/feature-flags",
+            embedded_app=embedded_forge_app,
+        )
+        if response.status_code >= 400:
+            return None
+        try:
+            value = response.json().get("project_instance_id")
+        except (ValueError, AttributeError):
+            return None
+        return value if isinstance(value, str) and value else None
+
+    async def _normalize_parent(request: Request, principal: Principal, parent: Any) -> Any:
+        """Clients name hosts by Guild id or slug; project links use the host's project id."""
+        if not isinstance(parent, dict):
+            return parent
+        value = parent.get("instance_id")
+        if not isinstance(value, str) or not value:
+            return parent
+        instances = await _visible_instances(service, principal)
+        match = next((item for item in instances if value in (item.id, item.slug)), None)
+        if match is None:
+            return parent
+        project_instance = await _host_project_instance_id(match, request)
+        return {**parent, "instance_id": project_instance} if project_instance else parent
+
+    async def _locate_project(
+        request: Request,
+        principal: Principal,
+        project_id: str,
+        hint: str | None,
+        exclude: RegisteredInstance,
+    ) -> tuple[RegisteredInstance, dict[str, Any]]:
+        """The authoritative copy of a project: the hinted host, else the first home copy."""
+        path = f"/projects/{project_id}"
+        if hint:
+            holder = await _resolve_target_instance(service, principal, hint)
+            response = await _request_remote(
+                holder, request, method="GET", path=path, embedded_app=embedded_forge_app
+            )
+            _ensure_remote_success(response)
+            return holder, response.json()
+        candidates = [item for item in await _visible_instances(service, principal)]
+        candidates.sort(key=lambda item: not item.is_default)
+        found: list[tuple[RegisteredInstance, dict[str, Any]]] = []
+        for candidate in candidates:
+            if candidate.id == exclude.id:
+                continue
+            response = await _request_remote(
+                candidate, request, method="GET", path=path, embedded_app=embedded_forge_app
+            )
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            if isinstance(payload, dict):
+                found.append((candidate, payload))
+                if not payload.get("home_instance_id"):
+                    return candidate, payload
+        if found:
+            return found[0]
+        raise HTTPException(404, "Project not found on any Forge host")
+
+    async def _ensure_project_on_instance(
+        request: Request,
+        principal: Principal,
+        project_id: str,
+        target: RegisteredInstance,
+        *,
+        hint: str | None = None,
+    ) -> dict[str, Any]:
+        """Make *target* know the project before a session there joins it.
+
+        Missing: register a metadata replica pointing at its home host. Present as a
+        replica: refresh its public fields from home (best effort; an unreachable home
+        leaves the replica as it was). An independent registration is left alone.
+        """
+        path = f"/projects/{project_id}"
+        local = await _request_remote(
+            target, request, method="GET", path=path, embedded_app=embedded_forge_app
+        )
+        if local.status_code == 200:
+            copy = local.json()
+            home_id = copy.get("home_instance_id") if isinstance(copy, dict) else None
+            if not home_id or home_id == target.id:
+                return copy
+            try:
+                home, source = await _locate_project(
+                    request, principal, project_id, home_id, target
+                )
+            except HTTPException:
+                return copy
+            changes = {
+                key: source.get(key, "")
+                for key in _PROJECT_SYNC_FIELDS
+                if key in source and source.get(key, "") != copy.get(key, "")
+            }
+            if not changes:
+                return copy
+            refreshed = await _request_remote(
+                target,
+                request,
+                method="PATCH",
+                path=path,
+                json_body={**changes, "revision": copy.get("revision", 1)},
+                embedded_app=embedded_forge_app,
+            )
+            return refreshed.json() if refreshed.status_code == 200 else copy
+        if local.status_code != 404:
+            _ensure_remote_success(local)
+        holder, project = await _locate_project(request, principal, project_id, hint, target)
+        if not isinstance(project, dict) or str(project.get("id")) != str(project_id):
+            raise HTTPException(502, "Project host returned a different project")
+        if any(
+            not isinstance(project.get(key), str) or not project[key] for key in ("slug", "name")
+        ):
+            raise HTTPException(502, "Project host returned incomplete project metadata")
+        if project.get("status") != "active":
+            raise HTTPException(409, "Restore the archived project before adding sessions")
+        replica = {key: project[key] for key in _PROJECT_REPLICA_FIELDS if project.get(key)}
+        replica.update(home_instance_id=holder.id, workspace_path="")
+        registered = await _request_remote(
+            target,
+            request,
+            method="POST",
+            path="/projects",
+            json_body=replica,
+            embedded_app=embedded_forge_app,
+        )
+        if registered.status_code == 422 and project.get("repo_url"):
+            # A host from before lightweight projects: send its version-1 shape.
+            legacy = {key: project.get(key, "") for key in ("id", "slug", "name", "description")}
+            legacy.update(repo_url=project["repo_url"], workspace_path="")
+            registered = await _request_remote(
+                target,
+                request,
+                method="POST",
+                path="/projects",
+                json_body=legacy,
+                embedded_app=embedded_forge_app,
+            )
+        if registered.status_code == 422:
+            raise HTTPException(
+                501, "Update this session's Forge host to use projects without a repository"
+            )
+        if registered.status_code != 409:
+            _ensure_remote_success(registered)
+        # A simultaneous registration may have won; validate the actual record.
+        existing = await _request_remote(
+            target, request, method="GET", path=path, embedded_app=embedded_forge_app
+        )
+        _ensure_remote_success(existing)
+        local_project = existing.json()
+        if not isinstance(local_project, dict) or (
+            str(local_project.get("id")),
+            local_project.get("status"),
+        ) != (str(project_id), "active"):
+            raise HTTPException(409, "Project registration on the session host conflicts")
+        return local_project
+
     @router.get("/projects")
     async def list_projects(
         request: Request,
@@ -1349,6 +1528,31 @@ def create_volundr_router(
             body.get("persona_name") or body.get("personaName"),
             embedded_app=embedded_forge_app,
         )
+        coordination = body.get("coordination")
+        if isinstance(coordination, dict) and coordination.get("project_id"):
+            body = {
+                **body,
+                "coordination": {
+                    **coordination,
+                    **(
+                        {
+                            "parent": await _normalize_parent(
+                                request, principal, coordination["parent"]
+                            )
+                        }
+                        if coordination.get("parent")
+                        else {}
+                    ),
+                },
+            }
+            await _ensure_project_on_instance(
+                request,
+                principal,
+                str(coordination["project_id"]),
+                instance,
+                hint=body.get("project_instance_id") or None,
+            )
+            body.pop("project_instance_id", None)
         response = await _request_remote(
             instance,
             request,
@@ -2496,70 +2700,34 @@ def create_volundr_router(
         _ensure_remote_success(current)
         if current.json().get("revision") != data.expected_revision:
             raise HTTPException(409, "Session project changed; reload before assigning")
-        holder = await _resolve_target_instance(
-            service, principal, data.project_instance_id or owner.id
-        )
-        path = f"/projects/{data.project_id}"
-        project_response = await _request_remote(
-            holder, request, method="GET", path=path, embedded_app=embedded_forge_app
-        )
-        _ensure_remote_success(project_response)
-        project = project_response.json()
-        if not isinstance(project, dict) or str(project.get("id")) != str(data.project_id):
-            raise HTTPException(502, "Project host returned a different project")
-        if any(
-            not isinstance(project.get(key), str) or not project[key]
-            for key in ("slug", "name", "repo_url")
-        ):
-            raise HTTPException(502, "Project host returned incomplete project metadata")
-        if project.get("status") != "active":
-            raise HTTPException(409, "Restore the archived project before assigning sessions")
-        if holder.id != owner.id:
-            existing = await _request_remote(
-                owner, request, method="GET", path=path, embedded_app=embedded_forge_app
-            )
-            if existing.status_code == 404:
-                # Existing registration is the durable membership index. Only copy
-                # public identity, never another host's checkout, scope or credentials.
-                replica = {key: project[key] for key in ("id", "slug", "name", "repo_url")}
-                replica.update(description=project.get("description", ""), workspace_path="")
-                registered = await _request_remote(
-                    owner,
-                    request,
-                    method="POST",
-                    path="/projects",
-                    json_body=replica,
-                    embedded_app=embedded_forge_app,
-                )
-                if registered.status_code != 409:
-                    _ensure_remote_success(registered)
-                # A simultaneous registration may have won; validate the actual record.
-                existing = await _request_remote(
-                    owner, request, method="GET", path=path, embedded_app=embedded_forge_app
-                )
-            _ensure_remote_success(existing)
-            local_project = existing.json()
-            if not isinstance(local_project, dict) or (
-                str(local_project.get("id")),
-                local_project.get("repo_url"),
-                local_project.get("status"),
-            ) != (
+        if data.project_id is not None:
+            await _ensure_project_on_instance(
+                request,
+                principal,
                 str(data.project_id),
-                project.get("repo_url"),
-                "active",
-            ):
-                raise HTTPException(409, "Project registration on the session host conflicts")
+                owner,
+                hint=data.project_instance_id,
+            )
+        forwarded: dict[str, Any] = {
+            "project_id": str(data.project_id) if data.project_id is not None else None,
+            "expected_revision": data.expected_revision,
+        }
+        if data.role is not None:
+            forwarded["role"] = data.role
+        if "parent" in data.model_fields_set:
+            forwarded["parent"] = await _normalize_parent(request, principal, data.parent)
         response = await _request_remote(
             owner,
             request,
             method="PUT",
             path=f"/sessions/{session_id}/project",
-            json_body={
-                "project_id": str(data.project_id),
-                "expected_revision": data.expected_revision,
-            },
+            json_body=forwarded,
             embedded_app=embedded_forge_app,
         )
+        if response.status_code == 422 and set(forwarded) - {"project_id", "expected_revision"}:
+            raise HTTPException(
+                501, "Update this session's Forge host to set project roles and coordinators"
+            )
         _ensure_remote_success(response)
         return _with_instance(response.json(), owner)
 

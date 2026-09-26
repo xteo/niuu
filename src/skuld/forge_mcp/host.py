@@ -115,9 +115,11 @@ class BrokerForgeMcpHost(ForgeMcpHost):
                 "forge_error": exc.detail,
             }
         coordination = session.get("coordination")
-        project_id = coordination.get("project_id") if isinstance(coordination, dict) else None
+        coordination = coordination if isinstance(coordination, dict) else {}
         return {
-            "project_id": project_id,
+            "project_id": coordination.get("project_id"),
+            "project_role": coordination.get("role"),
+            "parent": coordination.get("parent") or None,
             "instance_id": session.get("instance_id"),
             "forge_reachable": True,
         }

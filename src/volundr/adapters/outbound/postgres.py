@@ -216,7 +216,7 @@ class PostgresSessionRepository(SessionRepository):
         )
 
     async def update_coordination(
-        self, session: Session, coordination: SessionCoordination
+        self, session: Session, coordination: SessionCoordination | None
     ) -> Session | None:
         row = await self._pool.fetchrow(
             """UPDATE sessions SET coordination = $2::jsonb,
@@ -228,7 +228,7 @@ class PostgresSessionRepository(SessionRepository):
                  AND tenant_id IS NOT DISTINCT FROM $6
                RETURNING *""",
             session.id,
-            coordination.model_dump_json(),
+            coordination.model_dump_json() if coordination is not None else None,
             datetime.now(UTC),
             session.coordination_revision,
             session.owner_id,

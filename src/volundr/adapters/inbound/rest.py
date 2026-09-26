@@ -1680,7 +1680,10 @@ def create_router(
             "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
             "project_assignment_enabled": project_service is not None,
-            "project_contract_version": 1 if project_service is not None else 0,
+            # 2: name-only projects, optional repository, brief, and assignment
+            # with role/parent/detach. Every version-1 request is still accepted.
+            "project_contract_version": 2 if project_service is not None else 0,
+            "project_lightweight": project_service is not None,
             "project_instance_id": project_service.instance_id if project_service else None,
         }
 
