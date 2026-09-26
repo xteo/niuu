@@ -3332,16 +3332,11 @@ def create_router(
                 return payload
             all_turns = payload["turns"]
             if turn_id is not None:
-                index = next((i for i, t in enumerate(all_turns) if t.get("id") == turn_id), None)
-                if index is None:
+                turn = next((t for t in all_turns if t.get("id") == turn_id), None)
+                if turn is None:
                     raise HTTPException(404, "History item no longer exists in this projection")
-                # index/total_turns place the turn in the same absolute index space the
-                # windowed conversation read uses (limit/before/after), so a client can
-                # open the transcript at it, e.g. with after=index-1.
                 return {
-                    "turn": json_text_safe(all_turns[index]),
-                    "index": index,
-                    "total_turns": len(all_turns),
+                    "turn": json_text_safe(turn),
                     "projection_revision": payload.get("projection_revision")
                     or projection_revision(all_turns),
                 }
@@ -3667,8 +3662,15 @@ def create_router(
         dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
     )
     async def get_conversation_item(request: Request, session_id: UUID, turn_id: str) -> dict:
-        """Explicit full-item expansion, never used for automatic history recovery."""
-        return await get_conversation(
+        """Explicit full-item expansion, never used for automatic history recovery.
+
+        Also reports where the turn sits (``index`` of ``total_turns``) in the complete
+        shallow listing, the same absolute index space the windowed read pages through, so
+        a client can open the transcript at it (``after=index-1``). A live broker may answer
+        the item request with only that turn, so the position is never taken from the item
+        response itself. ``index`` is null when the turn is outside the current listing.
+        """
+        item = await get_conversation(
             request=request,
             session_id=session_id,
             detail="full",
@@ -3681,6 +3683,26 @@ def create_router(
             cursor=None,
             turn_id=turn_id,
         )
+        listing = await get_conversation(
+            request=request,
+            session_id=session_id,
+            detail="shallow",
+            limit=0,
+            before=0,
+            after=-1,
+            max_bytes=0,
+            after_id=None,
+            history_protocol=0,
+            cursor=None,
+            turn_id=None,
+        )
+        turns = listing.get("turns") if isinstance(listing, dict) else None
+        turns = turns if isinstance(turns, list) else []
+        index = next(
+            (i for i, t in enumerate(turns) if isinstance(t, dict) and t.get("id") == turn_id),
+            None,
+        )
+        return {**item, "index": index, "total_turns": len(turns)}
 
     async def _fetch_full_tool_result(
         request: Request,
