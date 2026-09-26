@@ -75,3 +75,11 @@ an owner-approved saved-boundary gateway upgrade (or separately reviewed compati
 work). No guessed text/time anchor or claim that old gateway source changed.
 
 Live successful read-on-open is being validated through iOS2291 before publication.
+
+Live read acceptance now passes through the actual iOS2291 simulator: two unread own QA
+cards, opening one produces exactly one item mark, unread2→1 and unchanged watermark72.
+The older card stays unread; repeating the item PUT keeps revision5. Another client later
+explicitly advanced the shared watermark to74; that distinct Mark all action is retained
+and not attributed to the app item endpoint. The item mark persists through app relaunch.
+[Live evidence](deployment/live-read-acceptance.json). No new gateway/provider session
+was created. iOS release evidence is in the app's2291 report.
