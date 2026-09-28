@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.identity import EnvoyHeaderIdentityAdapter
 from volundr.adapters.inbound.rest_trace import create_trace_router
-from volundr.domain.models import SessionSpanStatus
+from volundr.domain.models import SessionSpan, SessionSpanStatus
 from volundr.domain.services.resident_runtime import ResidentRuntimeNotFoundError
 
 
@@ -79,7 +82,7 @@ def _client(
     residents = _ResidentRuntimeService(runtime_id)
     sessions = _SessionService(session_id)
     app = FastAPI()
-    app.state.identity = object()
+    app.state.identity = EnvoyHeaderIdentityAdapter(user_repository=AsyncMock())
     app.include_router(
         create_trace_router(
             repository,
@@ -122,6 +125,69 @@ def test_resident_runtime_can_emit_and_read_existing_session_trace() -> None:
     assert trace.status_code == 200
     assert trace.json()["spans"][0]["id"] == str(span_id)
     assert residents.principals[-1].user_id == "user-a"
+
+
+def test_start_span_w3c_trace_id_is_none_when_observability_disabled() -> None:
+    runtime_id = uuid4()
+    client, repository, _, _ = _client(runtime_id)
+
+    response = client.post(
+        "/api/v1/forge/spans/start",
+        headers=_headers(),
+        json={
+            "id": str(uuid4()),
+            "session_id": str(runtime_id),
+            "trace_id": str(runtime_id),
+            "kind": "turn.peer",
+            "name": "Hermes reaction",
+            "source_service": "skuld",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["w3c_trace_id"] is None
+    assert repository.spans[0].w3c_trace_id is None
+
+
+def test_start_span_carries_w3c_trace_id_from_the_active_span(monkeypatch) -> None:
+    """The W3C trace id is read server-side from the ambient span, not the body.
+
+    Once the caller's traceparent reaches this request (via the caller's own
+    instrumented httpx client and this app's FastAPI instrumentation), the
+    active span here already reflects it — nothing the poster sends.
+    """
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from niuu import observability as obs_module
+    from niuu.observability import Observability
+
+    telemetry = Observability(tracer_provider=TracerProvider(), meter_provider=MeterProvider())
+    monkeypatch.setattr(obs_module, "_active", telemetry)
+
+    runtime_id = uuid4()
+    client, repository, _, _ = _client(runtime_id)
+
+    with telemetry.span("forge.spans.start"):
+        response = client.post(
+            "/api/v1/forge/spans/start",
+            headers=_headers(),
+            json={
+                "id": str(uuid4()),
+                "session_id": str(runtime_id),
+                "trace_id": str(runtime_id),
+                "kind": "turn.peer",
+                "name": "Hermes reaction",
+                "source_service": "skuld",
+            },
+        )
+
+    assert response.status_code == 201
+    w3c_trace_id = response.json()["w3c_trace_id"]
+    assert w3c_trace_id is not None
+    assert len(w3c_trace_id) == 32
+    assert repository.spans[0].w3c_trace_id == w3c_trace_id
 
 
 def test_unknown_trace_subject_is_rejected() -> None:
@@ -321,3 +387,68 @@ def test_complete_span_derives_missing_duration_and_trace_bounds() -> None:
     )
     assert summary.status_code == 200
     assert summary.json()["total_duration_ms"] >= 250
+
+
+@pytest.mark.parametrize("clean_shutdown", [True, False])
+@pytest.mark.parametrize("resumed_work_finished", [True, False])
+def test_trace_bounds_cover_all_restart_attempts(
+    clean_shutdown: bool, resumed_work_finished: bool
+) -> None:
+    session_id = uuid4()
+    client, repository, _, _ = _client(uuid4(), session_id=session_id)
+    started_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    first = SessionSpan(
+        id=uuid4(),
+        session_id=session_id,
+        trace_id=session_id,
+        kind="session.lifecycle",
+        name="first attempt",
+        source_service="skuld",
+        started_at=started_at,
+        ended_at=started_at + timedelta(minutes=1) if clean_shutdown else None,
+        duration_ms=60_000 if clean_shutdown else None,
+    )
+    resumed = replace(
+        first,
+        id=uuid4(),
+        name="resumed attempt",
+        started_at=started_at + timedelta(minutes=5),
+        ended_at=None,
+        duration_ms=None,
+    )
+    before = replace(
+        first,
+        id=uuid4(),
+        kind="turn.peer",
+        parent_span_id=first.id,
+        ended_at=started_at + timedelta(seconds=30),
+        duration_ms=30_000,
+    )
+    after = replace(
+        resumed,
+        id=uuid4(),
+        kind="turn.peer",
+        parent_span_id=resumed.id,
+        started_at=started_at + timedelta(minutes=6),
+        ended_at=started_at + timedelta(minutes=7) if resumed_work_finished else None,
+        duration_ms=60_000 if resumed_work_finished else None,
+    )
+    # Ordering must not decide which attempt contributes to the session bounds.
+    repository.spans = [resumed, before, first, after]
+    expected_minutes = 7 if resumed_work_finished else 6
+
+    trace = client.get(f"/api/v1/forge/sessions/{session_id}/trace", headers=_headers())
+    summary = client.get(f"/api/v1/forge/sessions/{session_id}/trace/summary", headers=_headers())
+
+    assert trace.status_code == summary.status_code == 200
+    assert trace.json()["started_at"] == started_at.isoformat()
+    assert (
+        trace.json()["ended_at"] == (started_at + timedelta(minutes=expected_minutes)).isoformat()
+    )
+    assert trace.json()["duration_ms"] == expected_minutes * 60_000
+    assert summary.json()["total_duration_ms"] == expected_minutes * 60_000
+    assert summary.json()["turn_count"] == 2
+    assert {span["id"]: span["parent_span_id"] for span in trace.json()["spans"]} == {
+        str(span.id): str(span.parent_span_id) if span.parent_span_id else None
+        for span in repository.spans
+    }

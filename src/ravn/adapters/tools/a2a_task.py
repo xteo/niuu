@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -20,6 +22,8 @@ _JSONRPC_BINDING = "jsonrpc"
 _INPUT_REQUIRED_STATE = "TASK_STATE_INPUT_REQUIRED"
 _DEFAULT_RESULT_MAX_CHARS = 12_000
 _DEFAULT_MESSAGE_MAX_CHARS = 12_000
+_PERSISTED_MESSAGE_ID = object()
+_PERSISTED_AUTH_TOKEN = object()
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,7 @@ class A2ATaskTool(ToolPort):
         activity_emitter: Callable[[dict[str, object]], Awaitable[None]] | None = None,
         activity_finder: A2AActivityFinder | None = None,
         default_connection_id: str = "",
+        default_metadata: dict[str, Any] | None = None,
         push_callback_url: str = "",
     ) -> None:
         self._directory = agent_directory
@@ -51,8 +56,10 @@ class A2ATaskTool(ToolPort):
         self._message_max_chars = max(1_000, message_max_chars)
         self._activity_emitter = activity_emitter
         self._activity_finder = activity_finder
+        self._default_metadata = dict(default_metadata or {})
         self._default_connection_id = default_connection_id.strip()
         self._push_callback_url = push_callback_url.strip()
+        self._start_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -101,7 +108,10 @@ class A2ATaskTool(ToolPort):
                 "metadata": {
                     "type": "object",
                     "description": (
-                        "Optional continuation metadata returned by the peer. For a "
+                        "Launch metadata: repo is the repository URL, branch is the starting "
+                        "branch, and connectionId selects the target — if the workflow pins "
+                        "graph.placement, connectionId must satisfy it (the same instance, or "
+                        "eligible by its tags) or the launch is rejected. For a "
                         "pending question, preserve requestId. For a pending gate, send "
                         "gateId plus gateDecision=approve or request_changes; include "
                         "review notes in answer when requesting changes."
@@ -139,7 +149,11 @@ class A2ATaskTool(ToolPort):
         }
         with telemetry.span("ravn.a2a.task", attributes=attributes) as span:
             try:
-                result = await self._execute_observed(input)
+                if operation == "start":
+                    async with self._start_lock:
+                        result = await self._execute_observed(input)
+                else:
+                    result = await self._execute_observed(input)
             except Exception as exc:
                 telemetry.mark_error(span, type(exc).__name__, str(exc))
                 telemetry.event(
@@ -156,6 +170,94 @@ class A2ATaskTool(ToolPort):
                     content={"error": result.content},
                 )
             return result
+
+    async def execute_persisted_start(
+        self,
+        input: dict[str, Any],
+        *,
+        message_id: str,
+        auth_token: str = "",
+    ) -> ToolResult:
+        """Start from a durable intent using its stable protocol message identity.
+
+        The sentinel key cannot be supplied through JSON tool input, so model calls
+        cannot choose another run's idempotency identity.
+        """
+        if not message_id.strip():
+            return _error("persisted A2A start requires message_id")
+        return await self.execute(
+            {
+                **input,
+                _PERSISTED_MESSAGE_ID: message_id.strip(),
+                **({_PERSISTED_AUTH_TOKEN: auth_token.strip()} if auth_token.strip() else {}),
+            }
+        )
+
+    async def execute_persisted_reply(
+        self,
+        input: dict[str, Any],
+        *,
+        message_id: str,
+        auth_token: str = "",
+    ) -> ToolResult:
+        """Reply to a task with an identity reserved in Ting's durable ledger."""
+        if not message_id.strip():
+            return _error("persisted A2A reply requires message_id")
+        return await self.execute(
+            {
+                **input,
+                _PERSISTED_MESSAGE_ID: message_id.strip(),
+                **({_PERSISTED_AUTH_TOKEN: auth_token.strip()} if auth_token.strip() else {}),
+            }
+        )
+
+    async def execute_persisted_task_operation(
+        self,
+        input: dict[str, Any],
+        *,
+        message_id: str = "",
+        auth_token: str = "",
+    ) -> dict[str, Any]:
+        """Execute a ledger-owned task operation without model-context truncation.
+
+        This surface is for deterministic orchestration consumers that must
+        validate the exact task result. The ordinary ToolPort response remains
+        bounded before it is shown to a model.
+        """
+        operation = str(input.get("operation") or "").strip().lower()
+        if operation not in {"get", "reply", "cancel"}:
+            raise ValueError("persisted task operation must be get, reply, or cancel")
+        if operation == "reply" and not message_id.strip():
+            raise ValueError("persisted A2A reply requires message_id")
+        agent_id = str(input.get("agent_id") or "").strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        self._validate_message(agent_id, "agent_id")
+        agent = await self._directory.get_agent(agent_id)
+        if agent is None:
+            raise _A2ATaskError(f"Agent {agent_id!r} is not visible in the Guild directory")
+        endpoint = _jsonrpc_endpoint(agent)
+        if not endpoint:
+            raise _A2ATaskError(f"Agent {agent_id!r} declares no JSONRPC interface")
+        card_origin = normalize_http_origin(agent.card_url)
+        endpoint_origin = normalize_http_origin(endpoint)
+        if endpoint_origin != card_origin:
+            raise _A2ATaskError(
+                f"Agent {agent_id!r} JSONRPC interface must share its Agent Card origin"
+            )
+        if self._trusted_origins and endpoint_origin not in self._trusted_origins:
+            raise _A2ATaskError(f"Agent {agent_id!r} uses untrusted origin {endpoint_origin}")
+        request = dict(input)
+        if message_id:
+            request[_PERSISTED_MESSAGE_ID] = message_id.strip()
+        if auth_token.strip():
+            request[_PERSISTED_AUTH_TOKEN] = auth_token.strip()
+        raw = await self._execute_operation(operation, request, agent, endpoint)
+        embedded = raw.get("task")
+        task = embedded if isinstance(embedded, dict) else raw
+        if not isinstance(task, dict):
+            raise _A2ATaskError("A2A task response is not an object")
+        return task
 
     async def _execute_observed(self, input: dict) -> ToolResult:
         telemetry = get_observability()
@@ -212,6 +314,38 @@ class A2ATaskTool(ToolPort):
         if self._trusted_origins and endpoint_origin not in self._trusted_origins:
             return _error(f"Agent {agent_id!r} uses untrusted origin {endpoint_origin}")
 
+        request_fingerprint = ""
+        if operation == "start":
+            supplied = input.get("metadata")
+            metadata = {
+                **self._default_metadata,
+                **(supplied if isinstance(supplied, dict) else {}),
+            }
+            input = {**input, "metadata": metadata}
+            request_fingerprint = hashlib.sha256(
+                json.dumps(
+                    [
+                        agent_id,
+                        input.get("skill_id"),
+                        input.get("prompt"),
+                        metadata,
+                        self._default_connection_id,
+                    ],
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            if self._activity_finder is not None:
+                active = await self._activity_finder(
+                    query=request_fingerprint,
+                    active_only=True,
+                    limit=1,
+                )
+                if active:
+                    return _error(
+                        "This request already has an active A2A task. Use get or reply "
+                        "with its handle instead of starting it again: " + json.dumps(active[0])
+                    )
+
         try:
             result = await self._execute_operation(operation, input, agent, endpoint)
         except _A2ATaskError as exc:
@@ -229,7 +363,11 @@ class A2ATaskTool(ToolPort):
             push_registered = False
             if bool(agent.capabilities.get("pushNotifications")):
                 try:
-                    await self._register_push(endpoint, task_id)
+                    await self._register_push(
+                        endpoint,
+                        task_id,
+                        auth_token=str(input.get(_PERSISTED_AUTH_TOKEN) or ""),
+                    )
                     push_registered = True
                 except _A2ATaskError as exc:
                     logger.warning(
@@ -267,6 +405,7 @@ class A2ATaskTool(ToolPort):
                     500,
                 ),
                 "source_tool": self.name,
+                "request_fingerprint": request_fingerprint,
                 **({"push_registered": push_registered} if push_registered is not None else {}),
             }
         )
@@ -282,7 +421,7 @@ class A2ATaskTool(ToolPort):
             ),
         )
 
-    async def _register_push(self, endpoint: str, task_id: str) -> None:
+    async def _register_push(self, endpoint: str, task_id: str, *, auth_token: str = "") -> None:
         await self._rpc(
             endpoint,
             "CreateTaskPushNotificationConfig",
@@ -292,6 +431,7 @@ class A2ATaskTool(ToolPort):
                 "url": self._push_callback_url,
                 "authentication": {"scheme": "Bearer"},
             },
+            auth_token=auth_token,
         )
 
     async def _emit_activity(self, activity: dict[str, object]) -> None:
@@ -324,6 +464,10 @@ class A2ATaskTool(ToolPort):
             self._validate_metadata(metadata)
             metadata["skillId"] = skill_id
             if self._default_connection_id:
+                # The receiver validates this against the target workflow's
+                # graph.placement (rejecting a conflict with 422) rather than
+                # silently honoring it, so this default cannot strip a
+                # workflow's placement just by being configured.
                 metadata.setdefault("connectionId", self._default_connection_id)
             trace_context = get_observability().inject()
             if trace_context:
@@ -333,21 +477,32 @@ class A2ATaskTool(ToolPort):
                 "SendMessage",
                 {
                     "message": {
-                        "messageId": str(uuid4()),
+                        "messageId": str(input.get(_PERSISTED_MESSAGE_ID) or uuid4()),
                         "role": "ROLE_USER",
                         "parts": [{"text": prompt}],
                         "metadata": metadata,
                     }
                 },
+                auth_token=str(input.get(_PERSISTED_AUTH_TOKEN) or ""),
             )
 
         if not task_id:
             raise _A2ATaskError(f"{operation} requires task_id")
         self._validate_message(task_id, "task_id")
         if operation == "get":
-            return await self._rpc(endpoint, "GetTask", {"id": task_id})
+            return await self._rpc(
+                endpoint,
+                "GetTask",
+                {"id": task_id},
+                auth_token=str(input.get(_PERSISTED_AUTH_TOKEN) or ""),
+            )
         if operation == "cancel":
-            return await self._rpc(endpoint, "CancelTask", {"id": task_id})
+            return await self._rpc(
+                endpoint,
+                "CancelTask",
+                {"id": task_id},
+                auth_token=str(input.get(_PERSISTED_AUTH_TOKEN) or ""),
+            )
 
         answer = str(input.get("answer") or "").strip()
         if not answer:
@@ -364,13 +519,14 @@ class A2ATaskTool(ToolPort):
             "SendMessage",
             {
                 "message": {
-                    "messageId": str(uuid4()),
+                    "messageId": str(input.get(_PERSISTED_MESSAGE_ID) or uuid4()),
                     "taskId": task_id,
                     "role": "ROLE_USER",
                     "parts": [{"text": answer}],
                     "metadata": metadata,
                 }
             },
+            auth_token=str(input.get(_PERSISTED_AUTH_TOKEN) or ""),
         )
 
     def _validate_message(self, value: str, field: str) -> None:
@@ -391,6 +547,8 @@ class A2ATaskTool(ToolPort):
         endpoint: str,
         method: str,
         params: dict[str, Any],
+        *,
+        auth_token: str = "",
     ) -> dict[str, Any]:
         telemetry = get_observability()
         attributes = {
@@ -408,7 +566,14 @@ class A2ATaskTool(ToolPort):
                         "method": method,
                         "params": params,
                     },
-                    headers=_A2A_HEADERS,
+                    headers={
+                        **_A2A_HEADERS,
+                        **(
+                            {"Authorization": f"Bearer {auth_token.strip()}"}
+                            if auth_token.strip()
+                            else {}
+                        ),
+                    },
                 )
             except Exception as exc:
                 error = _A2ATaskError(f"A2A {method} transport failed: {exc}")
@@ -486,6 +651,7 @@ def _render_response_payload(
     task_id = (
         str(task.get("id") or requested_task_id) if isinstance(task, dict) else requested_task_id
     )
+    context_id = str(task.get("contextId") or task.get("context_id") or "")
     metadata = task.get("metadata") if isinstance(task, dict) else {}
     metadata = metadata if isinstance(metadata, dict) else {}
     artifacts = task.get("artifacts") if isinstance(task, dict) else []
@@ -498,6 +664,7 @@ def _render_response_payload(
         "operation": operation,
         "agent_id": agent.id,
         "task_id": task_id,
+        "context_id": context_id,
         "state": state,
         "input_required": state == _INPUT_REQUIRED_STATE,
         "pending_questions": [],
@@ -517,6 +684,11 @@ def _render_response_payload(
     message = status.get("message") or status.get("update")
     if message:
         payload["status_message"] = _truncate(str(message), 2_000)
+    result = task.get("result")
+    if not isinstance(result, dict):
+        result = metadata.get("deliveryResult")
+    if isinstance(result, dict):
+        payload["result"] = _bounded_item(result, max_chars=max(256, max_chars // 3))
 
     _append_while_fits(payload, "pending_questions", pending_questions, max_chars)
     _append_while_fits(payload, "pending_gates", pending_gates, max_chars)

@@ -15,10 +15,21 @@ Event = tuple[str, dict[str, Any]]
 Source = Callable[[], AsyncIterator[Event]]
 
 
-async def remote_events(url: str, headers: Mapping[str, str]) -> AsyncIterator[Event]:
-    """Decode complete SSE records (including multi-line data) from one host."""
-    timeout = httpx.Timeout(45, connect=5)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+async def remote_events(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Mapping[str, str],
+) -> AsyncIterator[Event]:
+    """Decode complete SSE records (including multi-line data) from one host.
+
+    *client* is the caller's, built (and closed) by the caller — for a
+    genuinely remote Guild instance that must be
+    ``niuu.adapters.outbound.guild_transport.build_guild_httpx_client()``, so
+    the same transport-policy enforcement, TLS pinning, and ``trust_env``
+    handling applies to the session stream as to every other outbound Guild
+    call; this function only ever reads from it.
+    """
+    async with client:
         async with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
             name, data = "message", []
@@ -40,10 +51,14 @@ async def remote_events(url: str, headers: Mapping[str, str]) -> AsyncIterator[E
 
 
 async def merge_events(
-    sources: Mapping[str, Source], *, retry_seconds: float = 5, keepalive_seconds: float = 15
+    sources: Mapping[str, Source],
+    *,
+    retry_seconds: float = 5,
+    keepalive_seconds: float = 15,
+    queue_maxsize: int = 256,
 ) -> AsyncIterator[bytes]:
     """A missing host cannot stall others; disconnect cancels every reader."""
-    queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=256)
+    queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=queue_maxsize)
 
     async def read(host: str, source: Source) -> None:
         while True:

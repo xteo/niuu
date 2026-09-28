@@ -1,4 +1,4 @@
-FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb AS builder
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 AS builder
 
 ARG TARGETARCH
 
@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install uv from a pinned release archive and resolve from the committed lockfile.
 RUN set -eux; \
-    UV_VERSION="0.11.10"; \
+    UV_VERSION="0.12.13"; \
     case "${TARGETARCH}" in \
-      amd64) UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"; UV_SHA256="077e1a0777bcf516e02f4ef245e269c8d1baa780438e4c50e09c5c997f85538a" ;; \
-      arm64) UV_ARCHIVE="uv-aarch64-unknown-linux-gnu.tar.gz"; UV_SHA256="91d5f4583539640765662ef86edcf3bf4db07439b622c7bed50c961240162046" ;; \
+      amd64) UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"; UV_SHA256="745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd" ;; \
+      arm64) UV_ARCHIVE="uv-aarch64-unknown-linux-gnu.tar.gz"; UV_SHA256="2eaa5d94f5db7b3a1a092156b9420459e42ab0217d917fe74a876309cef9b5e9" ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}" -o "/tmp/${UV_ARCHIVE}"; \
@@ -28,23 +28,36 @@ RUN set -eux; \
     install -m 0755 "/tmp/${UV_ARCHIVE%.tar.gz}/uv" /usr/local/bin/uv; \
     rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/${UV_ARCHIVE%.tar.gz}"
 
-# Copy volundr package and install
+# Dependency venv only. It resolves from the lockfile alone, so it survives
+# source edits; the runtime image copies it as one layer that session nodes
+# keep cached until uv.lock changes.
 WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock README.md /app/
-COPY src/ /app/src/
 # --extra dsh bundles the DeepSeek Harness runtime (single-file exe, exact-pinned)
 # for DshJsonRpcTransport; the binary needs no Node at runtime.
-RUN uv sync --frozen --no-dev --no-editable --extra otel --extra dsh
+RUN uv sync --frozen --no-dev --no-editable --no-install-project --extra otel --extra dsh
+
+# ---------------------------------------------------------------------------
+# Project wheel — the only part of the Python install a source edit changes
+# ---------------------------------------------------------------------------
+FROM builder AS project
+COPY src/ /app/src/
+# vendor/envoy_authz_protos/ provides the envoy.service.auth.v3 ext_authz
+# bindings identity/authz_main.py needs (see its README); vendored instead of
+# depending on xds-protos, which bundled a copy of opentelemetry/proto/** that
+# collided with the otel extra installed above.
+COPY vendor/ /app/vendor/
+RUN uv build --wheel --out-dir /dist
 
 # ---------------------------------------------------------------------------
 # Runtime — Node.js stays (needed for claude-code/codex CLI at runtime)
 # ---------------------------------------------------------------------------
-FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
 
 
 LABEL org.opencontainers.image.title="skuld"
-LABEL org.opencontainers.image.description="Skuld — remote AI coding session broker (Claude Code, Codex, OpenCode, DeepSeek Harness)"
+LABEL org.opencontainers.image.description="Skuld — remote AI coding session broker (Claude Code, Codex, Grok, OpenCode, DeepSeek Harness)"
 LABEL org.opencontainers.image.vendor="Niuu Labs"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/niuulabs/volundr"
@@ -52,13 +65,29 @@ LABEL org.opencontainers.image.source="https://github.com/niuulabs/volundr"
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Copy the dependency venv before the daily OS refresh below, so that refresh
+# does not rebuild (and make every session node re-pull) this large layer.
+ENV VIRTUAL_ENV=/opt/venv
+COPY --from=builder /opt/venv /opt/venv
+# Repository startup hooks also need the pinned tooling installer at runtime.
+COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# CI passes the UTC date, so the registry layer cache cannot keep this upgrade
+# (and the security fixes it pulls) for more than a day.
+ARG OS_PACKAGES_REFRESH=
+# Install runtime dependencies. The upgrade picks up base-image security
+# fixes (glibc, gnupg) published after the pinned digest was cut.
+# bubblewrap: Codex looks for bwrap on PATH at startup for its Linux sandbox.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    bubblewrap \
     curl \
     ca-certificates \
     git \
+    file \
     iproute2 \
     jq \
+    libatomic1 \
     tmux \
     vim \
     python3 \
@@ -73,28 +102,51 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     && apt-get update && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# GitHub CLI (gh) from GitHub's apt repository: sessions open and inspect PRs with it.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod 0644 /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && gh --version
+
+# GitLab CLI (glab), pinned release .deb per architecture: the GitLab counterpart of gh.
+# ARG values do not cross stages; TARGETARCH must be declared again here.
+ARG TARGETARCH
+ARG GLAB_VERSION=1.119.0
+RUN curl -fsSL -o /tmp/glab.deb \
+    "https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/packages/generic/glab/${GLAB_VERSION}/glab_${GLAB_VERSION}_linux_${TARGETARCH}.deb" \
+    && dpkg -i /tmp/glab.deb && rm -f /tmp/glab.deb \
+    && glab --version
+
 # Upgrade npm and install the CLI tools from checked-in lockfiles.
 COPY containers/node/npm-bootstrap/package.json containers/node/npm-bootstrap/package-lock.json /opt/npm-bootstrap/
 COPY containers/skuld/npm-tools/package.json containers/skuld/npm-tools/package-lock.json /opt/skuld-tools/
 RUN cd /opt/npm-bootstrap \
-    && npm ci --omit=dev \
+    && GROK_HOME=/tmp/grok-install npm ci --omit=dev --libc=glibc --cache /tmp/npm-cache \
+    && rm -rf /tmp/npm-cache /tmp/grok-install \
     && rm -rf /usr/lib/node_modules/npm \
     && ln -s /opt/npm-bootstrap/node_modules/npm /usr/lib/node_modules/npm \
     && ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && cd /opt/skuld-tools \
-    && npm ci --omit=dev \
+    && GROK_HOME=/tmp/grok-install npm ci --omit=dev --libc=glibc --cache /tmp/npm-cache \
+    && rm -rf /tmp/npm-cache /tmp/grok-install \
     && ln -sf /opt/skuld-tools/node_modules/.bin/claude /usr/local/bin/claude \
     && ln -sf /opt/skuld-tools/node_modules/.bin/codex /usr/local/bin/codex \
-    && ln -sf /opt/skuld-tools/node_modules/.bin/opencode /usr/local/bin/opencode
+    && ln -sf /opt/skuld-tools/node_modules/.bin/opencode /usr/local/bin/opencode \
+    && ln -sf /opt/skuld-tools/node_modules/.bin/grok /usr/local/bin/grok \
+    && ln -sf /opt/skuld-tools/node_modules/.bin/pi /usr/local/bin/pi
 
-# Grok Build CLI (ACP stdio transport — Scaldy / Grok pipeline) is NOT pre-installed:
-# it is a large arch-specific binary distributed via the official xAI installer.
-# Provide it at deploy time via one of:
-#   - volumeMount the `grok` binary into PATH inside the pod, or
-#   - a custom image extending this one that runs the xAI grok installer, plus
-#   - XAI_API_KEY (and optional XAI_BASE_URL for the dev API) — see entrypoint.sh.
-# GrokACPTransport fails gracefully at start() if `grok` is missing from PATH.
+# Grok Build CLI (ACP stdio transport and the xAI device sign-in) ships from the
+# @xai-official/grok npm package above. Sessions authenticate with XAI_API_KEY or
+# the ~/.grok/auth.json the platform mounts after a wizard sign-in.
+
+# Pinned Muse is shared with the OpenShell image.
+COPY containers/skuld/install-muse.sh /tmp/install-muse.sh
+RUN sh /tmp/install-muse.sh "$TARGETARCH" && rm /tmp/install-muse.sh
 
 # Create app user with UID 1000 (matches helm chart runAsUser)
 RUN existing=$(getent passwd 1000 | cut -d: -f1) && \
@@ -102,11 +154,6 @@ RUN existing=$(getent passwd 1000 | cut -d: -f1) && \
     useradd -m -s /bin/bash -u 1000 skuld && \
     groupadd -r sandbox && \
     useradd -m -s /bin/bash -g sandbox sandbox
-
-# Copy the pre-built venv from builder.
-ENV VIRTUAL_ENV=/opt/venv
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Copy entrypoint
 COPY containers/skuld/entrypoint.sh /app/entrypoint.sh
@@ -124,8 +171,21 @@ RUN chmod +x /usr/local/bin/openshell-run-installed-skuld
 # Set working directory
 WORKDIR /app
 
+# Install the project last, into the dependency venv: a source edit then ships
+# only this small layer. Dependencies are already present from the lockfile.
+RUN --network=none --mount=type=bind,from=project,source=/dist,target=/tmp/dist \
+    uv pip install --python /opt/venv/bin/python --no-deps --no-cache --offline /tmp/dist/*.whl
+
+# Fail the image build if an advertised CLI is missing or cannot execute.
+RUN claude --version && codex --version && opencode --version && grok --version && pi --version && muse --version \
+    && bwrap --version
+
 # Switch to non-root user
 USER skuld
+RUN --network=none --mount=type=bind,source=tests/container/mesh_runtime.py,target=/tmp/verify_mesh.py \
+    python /tmp/verify_mesh.py
+RUN --network=none --mount=type=bind,source=tests/container/observability_runtime.py,target=/tmp/verify_observability.py \
+    python /tmp/verify_observability.py
 
 # Expose broker port (nginx is the entry point at 8080)
 EXPOSE 8081

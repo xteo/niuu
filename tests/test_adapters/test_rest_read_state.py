@@ -10,7 +10,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from niuu.domain.models import Principal
-from tests.conftest import InMemorySessionRepository, MockPodManager
+from tests.conftest import (
+    InMemorySessionRepository,
+    MockPodManager,
+    make_session_participant_service,
+)
 from volundr.adapters.inbound.rest import create_router
 from volundr.domain.models import GitSource, Session, SessionStatus
 from volundr.domain.services.session import SessionService
@@ -36,13 +40,20 @@ def inbox():
         )
         for reader in ["reader-a", "reader-b"]
     }
-    authz = SimpleNamespace(is_allowed=AsyncMock(return_value=True))
+    authz = SimpleNamespace(
+        is_allowed=AsyncMock(return_value=True),
+        filter_allowed=AsyncMock(side_effect=lambda principal, action, resources: resources),
+    )
     broadcaster = SimpleNamespace(publish=AsyncMock())
     service = SessionService(repo, MockPodManager(), authorization=authz, broadcaster=broadcaster)
     app = FastAPI()
     app.state.identity = SimpleNamespace(get_or_provision_user=AsyncMock())
     app.state.settings = SimpleNamespace()
-    app.include_router(create_router(service))
+    app.include_router(
+        create_router(
+            service, session_participant_service=make_session_participant_service(service)
+        )
+    )
     principal = Principal(
         user_id="reader-a", email="reader@example.test", tenant_id="tenant", roles=[]
     )
@@ -155,11 +166,13 @@ def test_invalid_or_future_mutation_is_not_committed(inbox, body):
     assert client.get(path).json()["revision"] == 0
 
 
-def test_hint_failure_does_not_turn_committed_mutation_into_http_error(inbox):
-    client, _, session, _, _, broadcaster, _ = inbox
+def test_hint_publish_failure_raises_instead_of_being_swallowed(inbox):
+    client, repo, session, _, _, broadcaster, _ = inbox
     broadcaster.publish.side_effect = RuntimeError("hint transport unavailable")
-    response = client.patch(
-        f"/api/v1/forge/sessions/{session.id}/read-state",
-        json={"state": "read", "through_seq": 20, "expected_revision": 0},
-    )
-    assert response.status_code == 200 and not response.json()["is_unread"]
+    with pytest.raises(RuntimeError, match="hint transport unavailable"):
+        client.patch(
+            f"/api/v1/forge/sessions/{session.id}/read-state",
+            json={"state": "read", "through_seq": 20, "expected_revision": 0},
+        )
+    # The durable CAS mutation already committed before the hint publish raised.
+    assert not repo.read_markers[(session.id, "reader-a")].is_unread

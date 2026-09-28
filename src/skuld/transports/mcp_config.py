@@ -7,18 +7,26 @@ shape:
 * Claude Code ``--mcp-config`` JSON and the Claude Agent SDK ``mcp_servers``
   dict: ``{"type": "stdio"|"http"|"sse", "command"/"args"/"env" | "url"/"headers"}``.
   Claude expands ``${VAR}`` in ``headers``, so a ``bearer_token_env_var`` becomes
-  an ``Authorization: Bearer ${VAR}`` header and the secret never enters argv.
+  an ``Authorization: Bearer ${VAR}`` header and the secret never enters argv. A
+  rotating ``credential_file``/``credential_env`` becomes a ``headersHelper``.
 * Codex ``-c key=value`` overrides (0.154): ``mcp_servers.<name>.url``,
-  ``bearer_token_env_var`` and ``http_headers`` for streamable HTTP, or
-  ``command``/``args``/``env``/``cwd`` for stdio. Values are TOML.
+  ``bearer_token_env_var``, ``http_headers_helper`` and ``http_headers`` for
+  streamable HTTP, or ``command``/``args``/``env``/``env_vars``/``cwd`` for stdio.
+  Values are TOML.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
+import shlex
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+
+from skuld import mcp_credentials
 
 # Streamable HTTP is the current MCP network transport; SSE is legacy. A URL
 # server that does not declare its transport is treated as streamable HTTP by
@@ -33,12 +41,55 @@ _URL_TRANSPORT_ALIASES = {
 }
 _TIMEOUT_KEYS = ("startup_timeout_sec", "tool_timeout_sec")
 _AUTHORIZATION_HEADER = "Authorization"
+_CREDENTIAL_KEYS = (
+    "credential_file",
+    "credential_env",
+    "credential_format",
+    "auth_header",
+    "auth_prefix",
+)
+_TOOL_APPROVAL_MODES = frozenset({"auto", "prompt", "writes", "approve"})
+_TOOL_FILTER_KEYS = ("enabled_tools", "disabled_tools")
+
+# Run the credential helper as a FILE, not as `-m skuld.mcp_credentials`.
+# Importing the `skuld` package costs ~6.6s in the session image, and the helper
+# is invoked per MCP connection: Codex gives its `http_headers_helper` 10s and
+# opens connections concurrently, so the module form times out and the server is
+# dropped. Executing the file skips the package import and runs in ~0.1s.
+_CREDENTIALS_SCRIPT = str(Path(mcp_credentials.__file__).resolve())
+_CODEX_MCP_SERVER_NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def _string_map(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     return {str(key): str(value) for key, value in raw.items() if str(key)}
+
+
+def require_connected_mcp_servers(statuses: object, required_names: set[str]) -> None:
+    """Fail unless every required MCP server completed its startup handshake."""
+    if not required_names:
+        return
+    if not isinstance(statuses, list):
+        raise RuntimeError("Claude did not report required MCP server startup status")
+
+    reported = {
+        str(item.get("name") or ""): item
+        for item in statuses
+        if isinstance(item, dict) and item.get("name")
+    }
+    failures: list[str] = []
+    for name in sorted(required_names):
+        status = reported.get(name)
+        if status is None:
+            failures.append(f"{name}: missing")
+            continue
+        state = str(status.get("status") or "unknown")
+        if state != "connected":
+            detail = str(status.get("error") or "").strip()
+            failures.append(f"{name}: {state}" + (f" ({detail})" if detail else ""))
+    if failures:
+        raise RuntimeError("Required MCP server startup failed: " + ", ".join(failures))
 
 
 def normalize_mcp_servers(raw_servers: object) -> list[dict[str, Any]]:
@@ -62,6 +113,8 @@ def normalize_mcp_servers(raw_servers: object) -> list[dict[str, Any]]:
             entry["url"] = str(raw["url"])
         if isinstance(raw.get("args"), list):
             entry["args"] = [str(arg) for arg in raw["args"]]
+        if isinstance(raw.get("env_vars"), list):
+            entry["env_vars"] = [str(name) for name in raw["env_vars"]]
         if isinstance(raw.get("env"), dict):
             entry["env"] = _string_map(raw["env"])
         headers = _string_map(raw.get("headers"))
@@ -70,10 +123,26 @@ def normalize_mcp_servers(raw_servers: object) -> list[dict[str, Any]]:
         bearer_env = str(raw.get("bearer_token_env_var") or "").strip()
         if bearer_env:
             entry["bearer_token_env_var"] = bearer_env
+        for key in _CREDENTIAL_KEYS:
+            if key in raw:
+                entry[key] = str(raw[key])
         if raw.get("description"):
             entry["description"] = str(raw["description"])
         if raw.get("cwd"):
             entry["cwd"] = str(raw["cwd"])
+        if isinstance(raw.get("required"), bool):
+            entry["required"] = raw["required"]
+        approval_mode = raw.get("default_tools_approval_mode")
+        if approval_mode is not None:
+            approval_mode = str(approval_mode)
+            if approval_mode not in _TOOL_APPROVAL_MODES:
+                raise ValueError(
+                    f"invalid MCP default_tools_approval_mode for {name}: {approval_mode}"
+                )
+            entry["default_tools_approval_mode"] = approval_mode
+        for tool_filter in _TOOL_FILTER_KEYS:
+            if isinstance(raw.get(tool_filter), list):
+                entry[tool_filter] = [str(tool) for tool in raw[tool_filter]]
         for timeout_key in _TIMEOUT_KEYS:
             timeout = raw.get(timeout_key)
             if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
@@ -100,12 +169,21 @@ def url_transport(server: dict[str, Any]) -> str:
     return _URL_TRANSPORT_ALIASES.get(declared, _DEFAULT_URL_TRANSPORT)
 
 
+def _has_credential_source(server: dict[str, Any]) -> bool:
+    """True when a rotating credential (file or env) is read by the header helper."""
+    return bool(server.get("credential_file") or server.get("credential_env"))
+
+
 def _claude_headers(server: dict[str, Any]) -> dict[str, str]:
-    """Headers for Claude URL servers; the bearer env var is left for Claude to expand."""
+    """Static headers for Claude URL servers; the bearer env var is left for Claude to expand.
+
+    A credential helper owns the auth header, so the bearer env var is not turned into
+    one alongside it.
+    """
     headers = dict(server.get("headers") or {})
     bearer_env = server.get("bearer_token_env_var")
     has_authorization = any(key.lower() == "authorization" for key in headers)
-    if bearer_env and not has_authorization:
+    if bearer_env and not has_authorization and not _has_credential_source(server):
         headers[_AUTHORIZATION_HEADER] = f"Bearer ${{{bearer_env}}}"
     return headers
 
@@ -117,6 +195,9 @@ def _claude_server_entry(server: dict[str, Any]) -> dict[str, Any]:
         headers = _claude_headers(server)
         if headers:
             entry["headers"] = headers
+        if _has_credential_source(server):
+            # Claude merges the helper's output over the static headers per connection.
+            entry["headersHelper"] = _header_helper(server)
         return entry
 
     entry = {"command": server.get("command") or ""}
@@ -207,6 +288,12 @@ def build_codex_mcp_overrides(raw_servers: object) -> list[tuple[str, str]]:
                 overrides.append(
                     (f"{base}.bearer_token_env_var", toml_value(server["bearer_token_env_var"]))
                 )
+            if _has_credential_source(server):
+                overrides.append(
+                    (f"{base}.http_headers_helper", toml_value(_header_helper(server)))
+                )
+            # Codex splits ``-c`` key paths on dots without honouring TOML quoting, so the
+            # header name stays bare: a quoted key would reach the server with its quotes.
             for header, header_value in dict(server.get("headers") or {}).items():
                 overrides.append((f"{base}.http_headers.{header}", toml_value(header_value)))
         else:
@@ -214,12 +301,74 @@ def build_codex_mcp_overrides(raw_servers: object) -> list[tuple[str, str]]:
             overrides.append((f"{base}.args", toml_value(list(server.get("args") or []))))
             for env_key, env_value in dict(server.get("env") or {}).items():
                 overrides.append((f"{base}.env.{env_key}", toml_value(env_value)))
+            if server.get("env_vars"):
+                overrides.append((f"{base}.env_vars", toml_value(server["env_vars"])))
             if server.get("cwd"):
                 overrides.append((f"{base}.cwd", toml_value(server["cwd"])))
         for timeout_key in _TIMEOUT_KEYS:
             if timeout_key in server:
                 overrides.append((f"{base}.{timeout_key}", toml_value(server[timeout_key])))
+        if "required" in server:
+            overrides.append((f"{base}.required", toml_value(server["required"])))
+        if "default_tools_approval_mode" in server:
+            overrides.append(
+                (
+                    f"{base}.default_tools_approval_mode",
+                    toml_value(server["default_tools_approval_mode"]),
+                )
+            )
+        for tool_filter in _TOOL_FILTER_KEYS:
+            if tool_filter in server:
+                overrides.append((f"{base}.{tool_filter}", toml_value(server[tool_filter])))
     return overrides
+
+
+def build_codex_mcp_isolation_overrides(
+    catalog: object, *, allowed_names: set[str]
+) -> list[tuple[str, str]]:
+    """Disable every resolved Codex MCP server outside an explicit allow-list.
+
+    ``codex mcp list --json`` resolves user, project, cloud, and system config
+    layers.  Read-only runtimes use that authoritative catalog because a
+    top-level ``mcp_servers={}`` CLI override is merged with lower layers and
+    does not clear them.
+    """
+    if not isinstance(catalog, list):
+        raise RuntimeError("Codex did not return an MCP server catalog")
+    configured: set[str] = set()
+    for item in catalog:
+        if not isinstance(item, dict):
+            raise RuntimeError("Codex returned a malformed MCP server catalog")
+        name = str(item.get("name") or "").strip()
+        if not name or not _CODEX_MCP_SERVER_NAME.fullmatch(name):
+            raise RuntimeError(f"Codex MCP server name cannot be isolated safely: {name!r}")
+        configured.add(name)
+    missing = allowed_names - configured
+    if missing:
+        raise RuntimeError(
+            "Required Codex MCP server missing from resolved config: " + ", ".join(sorted(missing))
+        )
+    return [
+        (f"mcp_servers.{name}.enabled", "true" if name in allowed_names else "false")
+        for name in sorted(configured)
+    ]
+
+
+def _header_helper(server: dict[str, Any]) -> str:
+    """Shell command that prints the current auth header for a credential-backed server."""
+    args = [
+        sys.executable or "python3",
+        _CREDENTIALS_SCRIPT,
+        "--env" if server.get("credential_env") else "--file",
+        server.get("credential_env") or server["credential_file"],
+        "--header",
+        server.get("auth_header", "Authorization"),
+        "--prefix",
+        server.get("auth_prefix", "Bearer "),
+    ]
+    if server.get("credential_format") == "oauth":
+        args.append("--oauth")
+    return shlex.join(args)
 
 
 def mcp_server_names(raw_servers: object) -> list[str]:

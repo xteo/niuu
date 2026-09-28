@@ -46,13 +46,37 @@ from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.codex_auth import CodexAuthProviderError, CodexAuthProviderPort, HostCodexAuthProvider
 from skuld.tool_images import image_payloads
 from skuld.transports.codex import _map_codex_tool, resolve_codex_cli
-from skuld.transports.mcp_config import build_codex_mcp_overrides
+from skuld.transports.mcp_config import (
+    build_codex_mcp_isolation_overrides,
+    build_codex_mcp_overrides,
+)
 from skuld.transports.owned_codex_process import OwnedCodexProcess, OwnedProcessError
 from skuld.transports.session_env import session_process_env
 from skuld.transports.session_tools import SessionTools
 from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
+
+# Codex config for the platform's model gateway: a Responses-API provider (the
+# only wire format current Codex accepts) whose key comes from
+# CODEX_GATEWAY_TOKEN_ENV, selected with `model_provider`.
+CODEX_GATEWAY_PROVIDER = "niuu"
+CODEX_GATEWAY_TOKEN_ENV = "NIUU_MODEL_GATEWAY_TOKEN"
+
+
+def codex_gateway_overrides(gateway_url: str) -> list[tuple[str, str]]:
+    """``codex -c key=value`` pairs that point Codex at the model gateway."""
+    url = gateway_url.strip().rstrip("/")
+    if not url:
+        return []
+    base = f"model_providers.{CODEX_GATEWAY_PROVIDER}"
+    return [
+        ("model_provider", json.dumps(CODEX_GATEWAY_PROVIDER)),
+        (f"{base}.name", json.dumps("Niuu model gateway")),
+        (f"{base}.base_url", json.dumps(f"{url}/v1")),
+        (f"{base}.env_key", json.dumps(CODEX_GATEWAY_TOKEN_ENV)),
+        (f"{base}.wire_api", json.dumps("responses")),
+    ]
 
 
 @dataclass(frozen=True)
@@ -160,11 +184,12 @@ _CODEX_APP_SERVER_SLASH_BY_NAME = {
 _next_id = count(1)
 
 # Codex models whose app-server build accepts the `ultra` reasoning effort.
-# GPT-5.6 Sol introduced Ultra (subagent-parallel reasoning); GPT-6 Astra keeps
-# it (its bundled Codex metadata lists low/medium/high/xhigh/max/ultra, where
-# ultra = maximum reasoning with automatic task delegation). Every earlier
-# Codex model tops out at `high`, so `ultra` must be clamped for them.
-_ULTRA_EFFORT_MODELS = ("gpt-5.6-sol", "gpt-6-astra")
+# GPT-5.6 Sol introduced Ultra (subagent-parallel reasoning); GPT-6 Astra and
+# GPT-6 Sol keep it (their bundled Codex metadata lists
+# low/medium/high/xhigh/max/ultra, where ultra = maximum reasoning with automatic
+# task delegation). GPT-6 Luna tops out at `max`, and every earlier Codex model
+# at `high`, so `ultra` must be clamped for them.
+_ULTRA_EFFORT_MODELS = ("gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol")
 
 
 def _model_supports_ultra(model: str) -> bool:
@@ -189,7 +214,7 @@ def _mcp_tool_name(server: object, tool: object) -> str:
 def _codex_effort_for_model(model: str) -> str:
     """Default reasoning effort to push a new Codex session to, by model.
 
-    GPT-6 Astra and GPT-5.6 Sol default to the ``ultra`` effort; every other
+    GPT-6 Astra, GPT-6 Sol and GPT-5.6 Sol default to the ``ultra`` effort; every other
     Codex model keeps the ``high`` default (their app-server build has no
     ultra tier).
     """
@@ -289,17 +314,23 @@ class CodexWebSocketTransport(CLITransport):
         skip_permissions: bool = False,
         approval_policy: str = "",
         sandbox: str = "",
+        shell_tool_enabled: bool | None = None,
+        multi_agent_enabled: bool | None = None,
+        read_only_mcp_only: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
         codex_port: int = 0,
         codex_receive_max_bytes: int = _DEFAULT_MAX_WS_MESSAGE_BYTES,
         live_frame_max_bytes: int = 900 * 1024,
+        mcp_startup_timeout_seconds: float = 30.0,
         mcp_servers: list[dict] | None = None,
         resume_session_id: str = "",
         reasoning_effort: str = "",
         service_tier: str | None = None,
         max_ws_message_bytes: int | None = None,
         codex_auth_provider: CodexAuthProviderPort | None = None,
+        model_gateway_url: str = "",
+        model_gateway_token: str = "",
         session_id: str = "",
         session_tools: SessionTools | None = None,
         **_kwargs: object,
@@ -308,16 +339,24 @@ class CodexWebSocketTransport(CLITransport):
         self.workspace_dir = workspace_dir
         self._session_tools = session_tools
         self._model = model
-        # Default reasoning effort by model when none is specified — GPT-6 Astra
-        # and GPT-5.6 Sol launch at the `ultra` tier, every other Codex model at
-        # `high`.
-        self._reasoning_effort = reasoning_effort or _codex_effort_for_model(model)
+        self._model_gateway_url = model_gateway_url.strip()
+        self._model_gateway_token = model_gateway_token
+        self._gateway_overrides = codex_gateway_overrides(self._model_gateway_url)
+        # Default every OpenAI Codex model to high unless launch configuration
+        # overrides it. A model behind the gateway is whatever the operator
+        # serves; only an explicit session setting asks it for reasoning.
+        self._reasoning_effort = reasoning_effort or (
+            "" if self._model_gateway_url else _codex_effort_for_model(model)
+        )
         self._service_tier = service_tier
         self._runtime_models: list[dict] | None = None
         self._runtime_options_lock = asyncio.Lock()
         self._skip_permissions = skip_permissions
         self._approval_policy = approval_policy.strip()
         self._sandbox = sandbox.strip()
+        self._shell_tool_enabled = shell_tool_enabled
+        self._multi_agent_enabled = multi_agent_enabled
+        self._read_only_mcp_only = read_only_mcp_only
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
         self._codex_port = codex_port or _pick_free_port()
@@ -334,6 +373,9 @@ class CodexWebSocketTransport(CLITransport):
         if live_frame_max_bytes <= 0:
             raise ValueError("live_frame_max_bytes must be positive")
         self._live_frame_max_bytes = live_frame_max_bytes
+        if mcp_startup_timeout_seconds <= 0:
+            raise ValueError("mcp_startup_timeout_seconds must be positive")
+        self._mcp_startup_timeout_seconds = mcp_startup_timeout_seconds
         self._mcp_servers = list(mcp_servers or [])
         self._mcp_overrides = build_codex_mcp_overrides(self._mcp_servers)
         self._resume_session_id = (resume_session_id or "").strip() or None
@@ -437,16 +479,16 @@ class CodexWebSocketTransport(CLITransport):
 
     @staticmethod
     def _ensure_codex_home(env: dict[str, str]) -> None:
-        """Make the user's Codex config path explicit for spawned app-server."""
-        if env.get("CODEX_HOME"):
-            return
+        """Make the user's Codex config path explicit for the spawned app-server.
 
-        home = env.get("HOME")
-        if home:
-            env["CODEX_HOME"] = str(Path(home).expanduser() / ".codex")
-            return
-
-        env["CODEX_HOME"] = str(Path.home() / ".codex")
+        The Codex CLI refuses to start when ``CODEX_HOME`` names a directory
+        that does not exist, and a fresh session sandbox has none, so the
+        directory is created here as well.
+        """
+        if not env.get("CODEX_HOME"):
+            home = env.get("HOME")
+            env["CODEX_HOME"] = str((Path(home).expanduser() if home else Path.home()) / ".codex")
+        Path(env["CODEX_HOME"]).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -479,6 +521,7 @@ class CodexWebSocketTransport(CLITransport):
             # A competing or unverifiable writer must never trigger a fresh-thread fallback.
             raise
         except Exception as exc:
+            await self._emit({"type": "error", "error": f"Codex app-server failed to start: {exc}"})
             # A different adapter cannot preserve app-server permissions,
             # capabilities or conversation identity, even on a fresh launch.
             await self.stop()
@@ -559,18 +602,62 @@ class CodexWebSocketTransport(CLITransport):
         if shim_env:
             self._env.update(shim_env)
 
+        env = dict(self._env)
+        self._ensure_codex_home(env)
+        mcp_overrides = list(self._mcp_overrides)
+        if self._read_only_mcp_only:
+            catalog = await self._resolved_mcp_catalog(
+                codex_cli,
+                env=env,
+                overrides=mcp_overrides,
+            )
+            mcp_overrides.extend(
+                build_codex_mcp_isolation_overrides(
+                    catalog,
+                    allowed_names={
+                        str(server.get("name") or "")
+                        for server in self._mcp_servers
+                        if server.get("name")
+                    },
+                )
+            )
+
         cmd = [
             codex_cli,
             "app-server",
             "--listen",
             listen_url,
         ]
-        for key, value in self._mcp_overrides:
+        for key, value in mcp_overrides:
             cmd.extend(["-c", f"{key}={value}"])
+        for key, value in self._gateway_overrides:
+            cmd.extend(["-c", f"{key}={value}"])
+        if self._shell_tool_enabled is not None:
+            cmd.extend(["-c", f"features.shell_tool={str(self._shell_tool_enabled).lower()}"])
+        if self._multi_agent_enabled is not None:
+            cmd.extend(["-c", f"features.multi_agent={str(self._multi_agent_enabled).lower()}"])
+        if self._read_only_mcp_only:
+            # Account connectors, installed plugins and tool suggestions are
+            # separate native capability sources. A read-only workflow uses
+            # only its exact persona-filtered ravn-tools MCP registry.
+            for feature in ("apps", "plugins", "tool_suggest"):
+                cmd.extend(["-c", f"features.{feature}=false"])
 
-        env = dict(self._env)
-        self._ensure_codex_home(env)
-        if "OPENAI_API_KEY" not in env:
+        if self._model_gateway_url:
+            if not self._model_gateway_token.strip():
+                raise ValueError(
+                    f"Model gateway URL {self._model_gateway_url!r} is set but "
+                    "model_gateway_token is blank. Codex reads NIUU_MODEL_GATEWAY_TOKEN "
+                    "as its provider key and refuses an empty value — never a silent, "
+                    "unauthenticated session. Configure model_gateway.token (see "
+                    "skuld.config.ModelGatewayConfig), or fix the session contributor "
+                    "that should have supplied one (volundr.adapters.outbound."
+                    "contributors.model_gateway)."
+                )
+            # The provider block names this env var as its key source.
+            env[CODEX_GATEWAY_TOKEN_ENV] = self._model_gateway_token
+            logger.info("Codex routed through the model gateway at %s", self._model_gateway_url)
+        elif "OPENAI_API_KEY" not in env:
             logger.info(
                 "OPENAI_API_KEY not found — relying on Codex CLI auth state for app-server access"
             )
@@ -594,6 +681,45 @@ class CodexWebSocketTransport(CLITransport):
 
         asyncio.create_task(_drain_stream(self._process.stdout, "codex-app-stdout"))
         asyncio.create_task(_drain_stream(self._process.stderr, "codex-app-stderr"))
+
+    async def _resolved_mcp_catalog(
+        self,
+        codex_cli: str,
+        *,
+        env: dict[str, str],
+        overrides: list[tuple[str, str]],
+    ) -> object:
+        """Resolve every active config layer without starting any MCP server."""
+        cmd = [codex_cli, "mcp", "list", "--json"]
+        for feature in ("apps", "plugins", "tool_suggest"):
+            cmd.extend(["-c", f"features.{feature}=false"])
+        for key, value in overrides:
+            cmd.extend(["-c", f"{key}={value}"])
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=self.workspace_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._mcp_startup_timeout_seconds
+            )
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            raise RuntimeError("Timed out resolving Codex MCP configuration") from None
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Could not resolve Codex MCP configuration "
+                f"(Codex exited with status {proc.returncode})"
+            )
+        try:
+            return json.loads(stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Codex returned an invalid MCP server catalog") from exc
 
     async def _connect_ws(self) -> None:
         """Connect to the Codex app-server with retries."""
@@ -673,6 +799,8 @@ class CodexWebSocketTransport(CLITransport):
         logger.info("Codex initialize response: %s", result)
 
         await self._send_notification("initialized")
+        if self._read_only_mcp_only:
+            await self._verify_read_only_mcp_servers()
         await self._authenticate_codex()
         await self._register_session_skills()
 
@@ -746,6 +874,57 @@ class CodexWebSocketTransport(CLITransport):
             }
         )
 
+    async def _verify_read_only_mcp_servers(self) -> None:
+        """Fail before thread creation if Codex initialized an unapproved server."""
+        expected = {
+            str(server.get("name") or "") for server in self._mcp_servers if server.get("name")
+        }
+        reported: dict[str, dict] = {}
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            params: dict[str, object] = {"limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._send_rpc("mcpServerStatus/list", params)
+            data = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(data, list):
+                raise RuntimeError("Codex did not report MCP server startup status")
+            for item in data:
+                if not isinstance(item, dict) or not item.get("name"):
+                    raise RuntimeError("Codex reported malformed MCP server startup status")
+                name = str(item["name"])
+                if name in reported:
+                    raise RuntimeError("Codex reported duplicate MCP server startup status")
+                reported[name] = item
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or cursor in seen:
+                raise RuntimeError("Codex returned an invalid or repeated MCP status cursor")
+            seen.add(cursor)
+        disconnected = sorted(
+            name
+            for name in expected
+            if name not in reported or not isinstance(reported[name].get("serverInfo"), dict)
+        )
+        exposed = sorted(
+            name
+            for name, item in reported.items()
+            if name not in expected
+            and not (
+                item.get("serverInfo") is None
+                and item.get("tools") == {}
+                and item.get("resources") == []
+                and item.get("resourceTemplates") == []
+            )
+        )
+        if disconnected or exposed:
+            raise RuntimeError(
+                "Codex read-only MCP isolation failed; disconnected allowed servers "
+                f"{disconnected}, capability-bearing unexpected servers {exposed}"
+            )
+
     @staticmethod
     def _thread_response_id(result: dict, *, expected: str | None = None) -> str:
         """Bind only an identified native conversation, never an invented one."""
@@ -768,6 +947,9 @@ class CodexWebSocketTransport(CLITransport):
 
     async def _authenticate_codex(self) -> None:
         """Select host-managed or externally managed auth through the configured port."""
+        if self._model_gateway_url:
+            # The gateway provider authenticates with its own key; no ChatGPT login.
+            return
         tokens = await self._codex_auth_provider.get_tokens()
         if tokens is None:
             return
@@ -993,6 +1175,14 @@ class CodexWebSocketTransport(CLITransport):
         # --- Server requests (need a response) ---
         if "id" in data:
             await self._handle_server_request(data)
+            return
+
+        # Nested Codex agents share this connection. Their notifications must
+        # not replace the primary thread or complete its in-progress turn.
+        thread_id = params.get("threadId")
+        if method == "thread/started":
+            thread_id = params.get("thread", {}).get("id")
+        if self._thread_id and thread_id and thread_id != self._thread_id:
             return
 
         # --- Streaming text ---
@@ -2132,18 +2322,30 @@ class CodexWebSocketTransport(CLITransport):
         if not isinstance(answers, list) or not answers:
             raise ValueError("Codex question requires explicit answers")
         mapped = {}
-        for question in questions:
-            match = next(
-                (
-                    answer
-                    for answer in answers
-                    if isinstance(answer, dict)
-                    and (
-                        answer.get("question_id") == question["id"]
-                        or answer.get("question") in {question["id"], question["question"]}
-                    )
-                ),
-                None,
+        # Browsers (Niuu's own chat UI, Smidja) answer positionally, one {"answer": …}
+        # per question in the order they were asked, with no question_id. Accept that
+        # when no answer names its question and the counts match; labelled answers
+        # are still matched by question_id / question text.
+        positional = len(answers) == len(questions) and all(
+            isinstance(answer, dict) and "question_id" not in answer and "question" not in answer
+            for answer in answers
+        )
+        for index, question in enumerate(questions):
+            match = (
+                answers[index]
+                if positional
+                else next(
+                    (
+                        answer
+                        for answer in answers
+                        if isinstance(answer, dict)
+                        and (
+                            answer.get("question_id") == question["id"]
+                            or answer.get("question") in {question["id"], question["question"]}
+                        )
+                    ),
+                    None,
+                )
             )
             if match is None:
                 raise ValueError(f"Missing answer for Codex question {question['id']}")
@@ -2460,6 +2662,7 @@ class CodexWebSocketTransport(CLITransport):
             try:
                 self._pending_prompt_correlations.remove((msg_id, request_id))
             except ValueError:
+                # A turn/started event may already have consumed this correlation.
                 pass
             raise
 

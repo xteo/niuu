@@ -13,6 +13,7 @@ import {
 } from './LaunchWizardSteps';
 export * from './LaunchWizardSteps';
 import { useLaunchWizard } from './useLaunchWizard';
+import { LinkedText } from './LinkedText';
 
 export function AdvancedLaunchWizard(props: LaunchWizardProps) {
   const { open, onOpenChange } = props;
@@ -30,15 +31,22 @@ export function AdvancedLaunchWizard(props: LaunchWizardProps) {
     handleBack,
     handleNext,
     handleSavePreset,
+    integrationCatalog,
     integrations,
     isLastStep,
     launchError,
     launching,
     manualBranches,
+    branchesLoading,
+    branchesError,
+    optionsLoading,
+    reposLoading,
+    reposError,
     models,
     navigate,
     personas,
     presets,
+    providerError,
     repos,
     sessionDefinitions,
     step,
@@ -60,17 +68,19 @@ export function AdvancedLaunchWizard(props: LaunchWizardProps) {
           {/* Step indicator */}
           {step !== 'booting' && <StepIndicator current={step} steps={STEPS} />}
 
+          {optionsLoading && <p role="status">Loading launch options…</p>}
           {/* Step content */}
           {step === 'source' && (
             <SourceStep
               form={form}
               update={update}
               repos={repos}
-              branchOptions={
-                repos.find((repo) => repo.cloneUrl === form.repo)?.branches.length
-                  ? (repos.find((repo) => repo.cloneUrl === form.repo)?.branches ?? [])
-                  : manualBranches
-              }
+              integrations={integrations}
+              branchOptions={manualBranches}
+              branchesLoading={branchesLoading}
+              branchesError={branchesError}
+              reposLoading={reposLoading}
+              reposError={reposError}
               trackerResults={trackerResults}
               trackerLoading={trackerLoading}
             />
@@ -94,6 +104,8 @@ export function AdvancedLaunchWizard(props: LaunchWizardProps) {
               sessionDefinitions={
                 sessionDefinitions.length > 0 ? sessionDefinitions : FALLBACK_SESSION_DEFINITIONS
               }
+              integrationCatalog={integrationCatalog}
+              providerError={providerError}
               onApplyPreset={handleApplyPreset}
               onSavePreset={handleSavePreset}
             />
@@ -115,7 +127,7 @@ export function AdvancedLaunchWizard(props: LaunchWizardProps) {
               className="niuu:rounded niuu:border niuu:border-danger niuu:bg-bg-secondary niuu:px-3 niuu:py-2 niuu:text-xs niuu:text-danger"
               data-testid="wizard-error"
             >
-              {launchError}
+              <LinkedText text={launchError} />
             </div>
           ) : null}
 

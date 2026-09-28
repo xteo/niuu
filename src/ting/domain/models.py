@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from ravn.domain.persona_document import PersonaDependency
 from ting.domain.exceptions import InvalidStateTransitionError
 
 # ---------------------------------------------------------------------------
@@ -36,20 +37,6 @@ class RunStatus(StrEnum):
     ESCALATED = "ESCALATED"
     MERGED = "MERGED"
     FAILED = "FAILED"
-
-
-class ConfidenceEventType(StrEnum):
-    CI_PASS = "ci_pass"
-    CI_FAIL = "ci_fail"
-    SCOPE_BREACH = "scope_breach"
-    RETRY = "retry"
-    HUMAN_REJECT = "human_reject"
-    HUMAN_APPROVED = "human_approved"
-    AUTO_APPROVED = "auto_approved"
-    PR_CONFLICT = "pr_conflict"
-    PR_MERGEABLE = "pr_mergeable"
-    MESSAGE_SENT = "message_sent"
-    REVIEWER_SCORE = "reviewer_score"
 
 
 class WorkflowScope(StrEnum):
@@ -110,11 +97,12 @@ class Saga:
     repos: list[str]
     feature_branch: str
     status: SagaStatus
-    confidence: float
     created_at: datetime
     base_branch: str
+    tracker_connection_id: str = ""
     repo_branches: dict[str, str] = field(default_factory=dict)
     owner_id: str = ""
+    tenant_id: str = ""
     workflow_id: UUID | None = None
     workflow_version: str | None = None
     workflow_snapshot: dict[str, Any] | None = None
@@ -131,7 +119,6 @@ class Phase:
     number: int
     name: str
     status: PhaseStatus
-    confidence: float
 
 
 @dataclass(frozen=True)
@@ -145,7 +132,6 @@ class Run:
     declared_files: list[str]
     estimate_hours: float | None
     status: RunStatus
-    confidence: float
     session_id: str | None
     branch: str | None
     chronicle_summary: str | None
@@ -160,16 +146,6 @@ class Run:
     review_round: int = 0
     structured_outcome: dict[str, Any] | None = None
     outcome_event_type: str | None = None
-
-
-@dataclass(frozen=True)
-class ConfidenceEvent:
-    id: UUID
-    run_id: UUID
-    event_type: ConfidenceEventType
-    delta: float
-    score_after: float
-    created_at: datetime
 
 
 @dataclass(frozen=True)
@@ -223,7 +199,6 @@ class DispatcherState:
     id: UUID
     owner_id: str
     running: bool
-    threshold: float
     max_concurrent_runs: int
     auto_continue: bool
     updated_at: datetime
@@ -233,6 +208,36 @@ class DispatcherState:
 class SessionInfo:
     session_id: str
     status: str
+
+
+@dataclass(frozen=True)
+class WorkflowDependency:
+    """Exact immutable dependency on another workflow template."""
+
+    id: UUID
+    revision: str
+    digest: str
+    path: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> WorkflowDependency:
+        """Deserialize a persisted dependency; portable parsing performs stricter validation."""
+        return cls(
+            id=UUID(str(value["id"])),
+            revision=str(value["revision"]),
+            digest=str(value["digest"]),
+            path=str(value["path"]) if value.get("path") is not None else None,
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        value = {
+            "id": str(self.id),
+            "revision": self.revision,
+            "digest": self.digest,
+        }
+        if self.path is not None:
+            value["path"] = self.path
+        return value
 
 
 @dataclass(frozen=True)
@@ -246,6 +251,37 @@ class WorkflowDefinition:
     graph: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+    tenant_id: str = ""
+    persona_dependencies: dict[str, PersonaDependency] = field(default_factory=dict)
+    revision: str | None = None
+    read_only: bool = False
+    source: str | None = None
+    persona_definitions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    requirements: list[dict[str, Any]] = field(default_factory=list)
+    schema_version: int = 1
+    workflow_dependencies: dict[str, WorkflowDependency] = field(default_factory=dict)
+    workflow_definitions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # ``revision`` is the latest-head compare-and-swap token, even when this
+    # value represents a historical version. ``document_revision`` identifies
+    # the selected immutable canonical document.
+    document_revision: str | None = None
+    is_head: bool = True
+    origin: str = "authored"
+    based_on_revision: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowVersionSummary:
+    """Small immutable catalog projection for a workflow's version picker."""
+
+    workflow_id: UUID
+    version: str
+    document_revision: str
+    created_at: datetime
+    is_head: bool
+    based_on_revision: str | None = None
+    origin: str = "authored"
 
 
 @dataclass(frozen=True)
@@ -283,6 +319,8 @@ class WorkflowCampaign:
     # non-default cluster is invisible to the default one.
     connection_id: str | None = None
 
+    tenant_id: str = ""
+
 
 @dataclass(frozen=True)
 class PRStatus:
@@ -313,6 +351,9 @@ class TrackerProject:
     progress: float = 0.0
     start_date: str | None = None
     target_date: str | None = None
+    tracker_connection_id: str = ""
+    tracker_type: str = ""
+    tracker_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -326,6 +367,9 @@ class TrackerMilestone:
     sort_order: int
     progress: float
     target_date: str | None = None
+    tracker_connection_id: str = ""
+    tracker_type: str = ""
+    tracker_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -345,6 +389,9 @@ class TrackerIssue:
     estimate: float | None = None
     url: str = ""
     milestone_id: str | None = None
+    tracker_connection_id: str = ""
+    tracker_type: str = ""
+    tracker_name: str = ""
 
 
 # ---------------------------------------------------------------------------

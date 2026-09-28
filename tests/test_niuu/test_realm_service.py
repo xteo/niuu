@@ -34,6 +34,11 @@ class InMemoryRealmRepository(RealmRepository):
         self.realms[realm.id] = realm
         return realm
 
+    async def delete_realm(self, realm_id: UUID) -> None:
+        self.realms.pop(realm_id, None)
+        self.grants = {k: g for k, g in self.grants.items() if g.realm_id != realm_id}
+        self.capabilities = {k: c for k, c in self.capabilities.items() if c.realm_id != realm_id}
+
     async def list_trust_grants(self, realm_id: UUID) -> list[TrustGrant]:
         return [g for g in self.grants.values() if g.realm_id == realm_id]
 
@@ -74,6 +79,28 @@ def service() -> RealmService:
     return RealmService(InMemoryRealmRepository())
 
 
+@pytest.mark.asyncio
+async def test_delete_realm_removes_realm_grants_and_capabilities(
+    service: RealmService,
+) -> None:
+    realm = await service.create_realm("forge", "Forge")
+    await service.grant_trust(realm.id, "build", level=2)
+    await service.record_capability(realm.id, "grep-tool", "tool")
+
+    deleted = await service.delete_realm("forge")
+
+    assert deleted is not None and deleted.id == realm.id
+    assert await service.get_realm("forge") is None
+    assert await service.list_trust_grants(realm.id) == []
+    assert await service.list_capabilities(realm.id) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_realm_unknown_returns_none(service: RealmService) -> None:
+    assert await service.delete_realm("ghost") is None
+    assert await service.delete_realm(uuid4()) is None
+
+
 # ---------------------------------------------------------------------------
 # create_realm / get_realm / list_realms
 # ---------------------------------------------------------------------------
@@ -104,6 +131,36 @@ async def test_create_realm_with_all_fields(service: RealmService) -> None:
     assert realm.owner_id == "user-1"
     assert realm.instance_id == "inst-9"
     assert realm.autonomy_profile == "autonomous"
+
+
+async def test_upsert_realm_creates_at_the_given_id(service: RealmService) -> None:
+    realm_id = uuid4()
+
+    realm = await service.upsert_realm(realm_id, slug="workshop", name="Workshop")
+
+    assert realm.id == realm_id
+    assert realm.slug == "workshop"
+    assert realm.created_at == realm.updated_at
+    assert await service.get_realm(realm_id) is not None
+
+
+async def test_upsert_realm_replaces_an_existing_row_without_changing_created_at(
+    service: RealmService,
+) -> None:
+    created = await service.upsert_realm(uuid4(), slug="workshop", name="Workshop")
+
+    updated = await service.upsert_realm(
+        created.id,
+        slug="workshop",
+        name="Workshop Renamed",
+        owner_id="user-9",
+    )
+
+    assert updated.id == created.id
+    assert updated.name == "Workshop Renamed"
+    assert updated.owner_id == "user-9"
+    assert updated.created_at == created.created_at
+    assert updated.updated_at >= created.updated_at
 
 
 async def test_get_realm_by_slug(service: RealmService) -> None:

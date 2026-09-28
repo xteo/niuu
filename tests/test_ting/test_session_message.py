@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from ting.adapters.memory_event_bus import InMemoryEventBus
 from ting.api.runs import (
     create_runs_router,
@@ -21,7 +22,6 @@ from ting.api.runs import (
 from ting.config import AuthConfig, ReviewConfig
 from ting.domain.exceptions import RunNotFoundError
 from ting.domain.models import (
-    ConfidenceEventType,
     RunStatus,
     SessionMessage,
 )
@@ -120,6 +120,7 @@ def client(
     event_bus: InMemoryEventBus,
 ) -> TestClient:
     app = FastAPI()
+    app.state.authorization = AllowAllAuthorizationAdapter()
     app.include_router(create_runs_router())
     app.dependency_overrides[resolve_tracker] = lambda: tracker
     app.dependency_overrides[resolve_volundr] = lambda: volundr
@@ -165,13 +166,6 @@ class TestSessionMessageService:
         messages = tracker.messages.get(run.id, [])
         assert len(messages) == 1
         assert messages[0].content == "Fix the failing test"
-
-        # Verify confidence event recorded
-        events = tracker.events.get(run.tracker_id, [])
-        assert len(events) == 1
-        assert events[0].event_type == ConfidenceEventType.MESSAGE_SENT
-        assert events[0].delta == 0.0
-        assert events[0].score_after == run.confidence
 
     @pytest.mark.asyncio
     async def test_send_message_with_auth_token(
@@ -525,6 +519,7 @@ class TestListMessagesEndpoint:
         tracker.runs[run.id] = run
 
         app = FastAPI()
+        app.state.authorization = AllowAllAuthorizationAdapter()
         app.include_router(create_runs_router())
         app.dependency_overrides[resolve_tracker] = lambda: tracker
         app.dependency_overrides[resolve_volundr] = lambda: volundr
@@ -656,7 +651,3 @@ class TestSessionMessageModel:
         )
         with pytest.raises(AttributeError):
             msg.content = "changed"  # type: ignore[misc]
-
-    def test_message_sent_event_type(self):
-        assert ConfidenceEventType.MESSAGE_SENT == "message_sent"
-        assert ConfidenceEventType.MESSAGE_SENT.value == "message_sent"

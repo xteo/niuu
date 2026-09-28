@@ -50,6 +50,7 @@ def _campaign() -> WorkflowCampaign:
 def _row(campaign: WorkflowCampaign) -> dict:
     stage = campaign.stage_state[0]
     return {
+        "tenant_id": campaign.tenant_id,
         "id": campaign.id,
         "slug": campaign.slug,
         "name": campaign.name,
@@ -103,12 +104,13 @@ async def test_lists_campaigns_and_active_owners() -> None:
 async def test_gets_active_campaign_by_owner_and_session() -> None:
     campaign = _campaign()
     pool = AsyncMock()
-    pool.fetchrow.side_effect = [_row(campaign), None]
+    pool.fetch.side_effect = [[_row(campaign)], []]
     repo = PostgresWorkflowCampaignRepository(pool)
 
     found = await repo.get_active_campaign_by_session(
         owner_id=campaign.owner_id,
         session_id=campaign.session_id,
+        connection_id=campaign.connection_id,
     )
     missing = await repo.get_active_campaign_by_session(
         owner_id=campaign.owner_id,
@@ -117,9 +119,10 @@ async def test_gets_active_campaign_by_owner_and_session() -> None:
 
     assert found == campaign
     assert missing is None
-    assert pool.fetchrow.await_args_list[0].args[-2:] == (
+    assert pool.fetch.await_args_list[0].args[-3:] == (
         campaign.owner_id,
         campaign.session_id,
+        campaign.connection_id,
     )
 
 

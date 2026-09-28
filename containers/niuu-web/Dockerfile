@@ -1,34 +1,35 @@
 # Stage 1: Build the next-generation Niuu web UI
-FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS build
+FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build
 
 WORKDIR /app
 
 RUN corepack enable
 
-# Copy workspace manifests for dependency resolution
-COPY web-next/package.json ./
-COPY web-next/pnpm-lock.yaml ./
-COPY web-next/pnpm-workspace.yaml ./
-COPY web-next/tsconfig.base.json ./
-COPY web-next/tsconfig.json ./
-COPY web-next/build ./build
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 
-# Copy the app and workspace packages
+# Fetch needs only the lockfile, so the package store survives source edits.
+COPY web-next/package.json web-next/pnpm-lock.yaml web-next/pnpm-workspace.yaml ./
+RUN pnpm fetch
+
+COPY web-next/tsconfig.base.json web-next/tsconfig.json ./
+COPY web-next/build ./build
 COPY web-next/apps ./apps
 COPY web-next/packages ./packages
+RUN pnpm install --frozen-lockfile --offline
 
+# Declared last: callers pass the commit sha, which must not invalidate the install.
 ARG APP_VERSION=dev
-ENV NODE_OPTIONS="--max-old-space-size=4096"
 ENV VITE_APP_VERSION=${APP_VERSION}
-
-RUN pnpm install --frozen-lockfile
 RUN pnpm build
 
 # Stage 2: Serve with nginx
-FROM nginx:1.31.3-alpine@sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752
+FROM nginx:1.31.6-alpine@sha256:adad2ae9204d0fd7a34f40299bc838c3782be1293b10005eac4315ff5a1abf4e
 
-# Patch base image vulnerabilities (CVE-2026-22184: zlib).
-RUN apk upgrade --no-cache zlib
+# CI passes the UTC date, so the registry layer cache cannot keep this upgrade
+# (and the security fixes it pulls) for more than a day.
+ARG OS_PACKAGES_REFRESH=
+# Apply security updates to all packages inherited from the pinned base.
+RUN apk upgrade --no-cache
 
 LABEL org.opencontainers.image.title="niuu-web"
 LABEL org.opencontainers.image.description="Niuu Web — composable plugin-based platform UI"
@@ -42,7 +43,7 @@ RUN addgroup -g 1001 -S volundr && \
     touch /var/run/nginx.pid && \
     chown volundr:volundr /var/run/nginx.pid
 
-COPY containers/volundr-web/nginx.conf /etc/nginx/conf.d/default.conf
+COPY containers/niuu-web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/apps/niuu/dist /usr/share/nginx/html
 
 RUN echo "OK" > /usr/share/nginx/html/health

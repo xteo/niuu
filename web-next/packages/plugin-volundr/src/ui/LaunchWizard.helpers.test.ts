@@ -1,3 +1,4 @@
+import { withDefaultSourceControlIntegrations } from './launchWizardModel';
 import { describe, expect, it } from 'vitest';
 import type {
   ClusterResourceInfo,
@@ -147,6 +148,13 @@ describe('LaunchWizard helpers', () => {
       adapter: 'github',
       status: 'connected',
     };
+    const mcp = {
+      ...integration,
+      slug: 'mcp',
+      config: { name: 'Linear', mcp_url: 'https://mcp.linear.app/mcp' },
+    };
+    expect(formatIntegrationLabel(mcp)).toBe('Linear');
+    expect(formatIntegrationMeta(mcp)).toBe('https://mcp.linear.app/mcp');
     expect(formatIntegrationLabel(integration)).toBe('Github App · prod-github');
     expect(formatIntegrationMeta(integration)).toBe('source control · prod-github');
     expect(formatIntegrationMeta({ ...integration, credentialName: null })).toBe('source control');
@@ -322,6 +330,9 @@ describe('LaunchWizard helpers', () => {
   it('slugifies and validates session names', () => {
     expect(slugifySessionName(' Feature / Branch ')).toBe('feature-branch');
     expect(slugifySessionName('UPPER_and spaces')).toBe('upper-and-spaces');
+    expect(slugifySessionName('---lead--and--trail---')).toBe('lead-and-trail');
+    expect(slugifySessionName('-'.repeat(200))).toBe('');
+    expect(slugifySessionName(`${'-'.repeat(200)}tail`)).toBe('tail');
     expect(validateSessionName('')).toBeNull();
     expect(validateSessionName('x'.repeat(64))).toBe('Session name must be 63 characters or fewer');
     expect(validateSessionName('Bad Name')).toBe('Session name must be lowercase');
@@ -511,5 +522,41 @@ describe('LaunchWizard helpers', () => {
       envVars: { LOG_LEVEL: 'debug' },
       source: { type: 'git', repo: 'github.com/niuulabs/volundr', branch: 'main' },
     });
+  });
+});
+
+describe('default source-control integrations', () => {
+  const integrations: IntegrationConnection[] = [
+    {
+      id: 'github',
+      integrationType: 'source_control',
+      enabled: true,
+      createdAt: '',
+      updatedAt: '',
+    },
+    {
+      id: 'disabled',
+      integrationType: 'source_control',
+      enabled: false,
+      createdAt: '',
+      updatedAt: '',
+    },
+    { id: 'claude', integrationType: 'ai_provider', enabled: true, createdAt: '', updatedAt: '' },
+  ];
+
+  it('adds enabled Git credentials to an existing AI-only selection', () => {
+    expect(withDefaultSourceControlIntegrations(['claude'], integrations)).toEqual([
+      'claude',
+      'github',
+    ]);
+    expect(withDefaultSourceControlIntegrations([], integrations)).toEqual(['github']);
+  });
+
+  it('preserves an explicit source-control choice without duplicates', () => {
+    expect(withDefaultSourceControlIntegrations(['github', 'claude'], integrations)).toEqual([
+      'github',
+      'claude',
+    ]);
+    expect(withDefaultSourceControlIntegrations(['disabled'], integrations)).toEqual(['disabled']);
   });
 });

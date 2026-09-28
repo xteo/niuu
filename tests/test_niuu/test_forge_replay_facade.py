@@ -1,17 +1,57 @@
 """The public Forge facade must carry replay WebSockets, including owner auth."""
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import respx
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.testclient import TestClient
 from httpx import Response
+from starlette.datastructures import QueryParams
 from starlette.websockets import WebSocketDisconnect
 
-from niuu.adapters.inbound.ws_forge_replay import _relay
-from tests.test_niuu.test_rest_volundr import _client, _headers, _instance
+from niuu.adapters.inbound.rest_volundr import create_volundr_router
+from niuu.adapters.inbound.ws_forge_replay import _relay, forward_replay
+from niuu.adapters.outbound import guild_transport
+from niuu.domain.models import Principal
+from niuu.ports.identity import HeaderAuthenticationPort, InvalidTokenError
+from tests.test_niuu.test_guild_transport import _LEAF_CERT_DER, _LEAF_FINGERPRINT
+from tests.test_niuu.test_rest_volundr import StubInstanceService, _client, _headers, _instance
+
+QUERY_JWT = "query-jwt"
+
+
+class _BearerOnlyIdentity(HeaderAuthenticationPort):
+    """Production-shaped header auth: only a valid Authorization bearer passes."""
+
+    async def validate_headers(self, headers: dict[str, str]) -> Principal:
+        if headers.get("authorization") != f"Bearer {QUERY_JWT}":
+            raise InvalidTokenError("missing or invalid bearer")
+        return Principal(user_id="user-a", email="", tenant_id="tenant-a", roles=[])
+
+
+def _bearer_only_client(instances, *, embedded_forge_app=None) -> TestClient:
+    app = FastAPI()
+    app.state.identity = _BearerOnlyIdentity()
+    app.include_router(
+        create_volundr_router(StubInstanceService(instances), embedded_forge_app=embedded_forge_app)
+    )
+    return TestClient(app)
+
+
+def _owner_probe(owns: bool):
+    """A remote Volundr that, like Envoy, answers 401 to a probe with no bearer."""
+
+    def respond(request: httpx.Request) -> Response:
+        if request.headers.get("authorization") != f"Bearer {QUERY_JWT}":
+            return Response(401)
+        return Response(200, json={"id": "s1"}) if owns else Response(404)
+
+    return respond
 
 
 def test_embedded_replay_preserves_frames_controls_identity_and_cursor():
@@ -109,7 +149,182 @@ def test_remote_replay_uses_owner_url_and_forwards_auth_and_parameters(monkeypat
             assert ws.receive_json() == {"type": "result"}
     assert seen["url"] == "wss://owner/api/v1/forge/sessions/s1/replay?after=42&speed=4"
     assert seen["additional_headers"]["authorization"] == "Bearer test-token"
+    # A remote Guild instance never sees a client-supplied x-auth-* header,
+    # even though _headers() below asserts one.
+    assert "x-auth-user-id" not in seen["additional_headers"]
+    assert "x-auth-tenant" not in seen["additional_headers"]
     assert seen["closed"]
+
+
+@pytest.mark.parametrize("param", ["token", "access_token"])
+@respx.mock
+def test_query_token_replay_resolves_its_remote_owner_and_bridges_with_a_header(monkeypatch, param):
+    """Browsers cannot set Authorization on a WebSocket, so an external client
+    sends ``?token=``. That bearer must reach every owner probe and the bridged
+    socket as a header — and never be repeated in the outbound URL."""
+    other = respx.get("https://other/api/v1/forge/sessions/s1").mock(
+        side_effect=_owner_probe(owns=False)
+    )
+    owner = respx.get("https://owner/api/v1/forge/sessions/s1").mock(
+        side_effect=_owner_probe(owns=True)
+    )
+    seen = {}
+
+    class Remote:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def __aiter__(self):
+            return self.frames()
+
+        async def frames(self):
+            yield '{"type":"result"}'
+
+        async def send(self, message):
+            return None
+
+    def connect(url, **kwargs):
+        seen.update(url=url, **kwargs)
+        return Remote()
+
+    monkeypatch.setattr("niuu.adapters.inbound.ws_forge_replay.connect", connect)
+    instances = [
+        _instance("other", base_url="https://other"),
+        _instance("remote", base_url="https://owner"),
+    ]
+    with _bearer_only_client(instances) as client:
+        with client.websocket_connect(
+            f"/api/v1/forge/sessions/s1/replay?after=7&{param}={QUERY_JWT}"
+        ) as ws:
+            assert ws.receive_json() == {"type": "result"}
+
+    assert owner.called and other.called
+    for route in (owner, other):
+        assert route.calls.last.request.headers["authorization"] == f"Bearer {QUERY_JWT}"
+        assert QUERY_JWT not in str(route.calls.last.request.url)
+    assert seen["url"] == "wss://owner/api/v1/forge/sessions/s1/replay?after=7"
+    assert seen["additional_headers"] == {"authorization": f"Bearer {QUERY_JWT}"}
+
+
+def test_query_token_replay_resolves_its_embedded_owner():
+    embedded = FastAPI()
+    observed = {}
+
+    @embedded.get("/api/v1/forge/sessions/{sid}")
+    async def session(sid: str, request: Request):
+        observed["probe"] = request.headers.get("authorization")
+        return {"id": sid}
+
+    @embedded.websocket("/api/v1/forge/sessions/{sid}/replay")
+    async def replay(ws: WebSocket, sid: str):
+        # Same process: the scope passes through, so the backing adapter still
+        # authenticates the original query credential itself.
+        observed["replay_token"] = ws.query_params.get("token")
+        await ws.accept()
+        await ws.send_json({"type": "result"})
+        await ws.close()
+
+    instance = _instance("local", base_url="embedded://local", config={"transport": "embedded"})
+    with _bearer_only_client([instance], embedded_forge_app=embedded) as client:
+        with client.websocket_connect(f"/api/v1/forge/sessions/s1/replay?token={QUERY_JWT}") as ws:
+            assert ws.receive_json() == {"type": "result"}
+    assert observed == {"probe": f"Bearer {QUERY_JWT}", "replay_token": QUERY_JWT}
+
+
+def test_replay_without_any_credential_is_still_refused():
+    instance = _instance("remote", base_url="https://owner")
+    with _bearer_only_client([instance]) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/v1/forge/sessions/s1/replay"):
+                pytest.fail("an unauthenticated replay was accepted")
+
+
+@respx.mock
+def test_remote_replay_owner_lookup_fails_closed_on_a_tls_pin_mismatch(monkeypatch):
+    """The owner lookup (_find_session_owner -> _request_remote) is the
+    first outbound leg and shares the same TLS-pinning factory as
+    forward_replay, so a pin mismatch is already caught here — before
+    forward_replay's own connect() is ever reached. See
+    test_forward_replay_closes_on_its_own_pin_mismatch below for a direct,
+    isolated test of forward_replay's own mismatch handling instead."""
+
+    def _unexpected_connect(url, **kwargs):
+        raise AssertionError("must not connect on a TLS pin mismatch")
+
+    monkeypatch.setattr("niuu.adapters.inbound.ws_forge_replay.connect", _unexpected_connect)
+    monkeypatch.setattr(
+        "niuu.adapters.outbound.guild_transport.fetch_leaf_certificate_der",
+        lambda *a, **k: b"not the pinned certificate",
+    )
+    pinned_fingerprint = "ab" * 32
+    instance = _instance(
+        "remote", base_url="https://owner", config={"tls_fingerprint": pinned_fingerprint}
+    )
+    with _client([instance]) as client:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect("/api/v1/forge/sessions/s1/replay", headers=_headers()):
+                pytest.fail("pin mismatch did not close the socket")
+        assert closed.value.code == 1008
+
+
+async def test_forward_replay_pins_a_matching_certificate_and_bridges(monkeypatch):
+    """A direct, isolated call to forward_replay (bypassing the router-level
+    owner lookup, which does its own separate pin check first) — proves the
+    pinned-success branch is actually reached: a real SSLContext is resolved
+    against a real loopback-verified certificate and passed into connect()."""
+    monkeypatch.setattr(
+        guild_transport, "fetch_leaf_certificate_der", lambda *a, **k: _LEAF_CERT_DER
+    )
+    captured: dict = {}
+
+    def _connect(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        raise OSError("stop after capturing connect() kwargs")
+
+    monkeypatch.setattr("niuu.adapters.inbound.ws_forge_replay.connect", _connect)
+    instance = _instance(
+        "remote", base_url="https://owner", config={"tls_fingerprint": _LEAF_FINGERPRINT}
+    )
+    websocket = SimpleNamespace(query_params=QueryParams({}), close=AsyncMock(), accept=AsyncMock())
+
+    await forward_replay(websocket, instance, "s1", headers={}, embedded_app=None)
+
+    assert "ssl" in captured
+    websocket.close.assert_awaited_once_with(code=1011)
+
+
+async def test_forward_replay_closes_on_its_own_pin_mismatch(monkeypatch, caplog):
+    """A direct, isolated call to forward_replay proving its own mismatch
+    branch (except GuildTransportError: close(1011)) is reached, that
+    connect() is never attempted on a mismatch, and — unlike the old silent
+    close — that the refusal is logged with the instance and session it
+    refused, so an operator can tell a policy refusal from a network blip."""
+    monkeypatch.setattr(
+        guild_transport,
+        "fetch_leaf_certificate_der",
+        lambda *a, **k: b"not the pinned certificate",
+    )
+
+    def _unexpected_connect(url, **kwargs):
+        raise AssertionError("must not connect on a TLS pin mismatch")
+
+    monkeypatch.setattr("niuu.adapters.inbound.ws_forge_replay.connect", _unexpected_connect)
+    pinned_fingerprint = hashlib.sha256(b"the actual expected certificate").hexdigest()
+    instance = _instance(
+        "remote", base_url="https://owner", config={"tls_fingerprint": pinned_fingerprint}
+    )
+    websocket = SimpleNamespace(query_params=QueryParams({}), close=AsyncMock(), accept=AsyncMock())
+
+    with caplog.at_level("WARNING", logger="niuu.adapters.inbound.ws_forge_replay"):
+        await forward_replay(websocket, instance, "s1", headers={}, embedded_app=None)
+
+    websocket.close.assert_awaited_once_with(code=1011)
+    websocket.accept.assert_not_awaited()
+    assert "remote" in caplog.text
+    assert "s1" in caplog.text
 
 
 async def test_client_disconnect_cancels_a_sleeping_remote_replay():

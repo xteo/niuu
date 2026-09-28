@@ -32,6 +32,9 @@ const tingMocks = vi.hoisted(() => ({
   buildTingSessionHttpAdapter: vi.fn((client) => ({ kind: 'sessions', client })),
   buildTrackerHttpAdapter: vi.fn((client) => ({ kind: 'tracker', client })),
   buildWorkflowHttpAdapter: vi.fn((client) => ({ kind: 'workflows', client })),
+  buildWorkHttpAdapter: vi.fn((client) => ({ kind: 'work', client })),
+  buildWorkflowExecutionHttpAdapter: vi.fn((client) => ({ kind: 'workflow-executions', client })),
+  buildDeliveryExecutionHttpAdapter: vi.fn((client) => ({ kind: 'delivery-executions', client })),
   buildResearchHttpAdapter: vi.fn((client) => ({ kind: 'research', client })),
   buildSpecsHttpAdapter: vi.fn((client) => ({ kind: 'specs', client })),
   buildDispatchBusHttpAdapter: vi.fn((client) => ({ kind: 'dispatch', client })),
@@ -128,6 +131,10 @@ vi.mock('@niuulabs/plugin-ravn', () => ravnMocks);
 vi.mock('@niuulabs/plugin-mimir', () => ({
   createMimirMockAdapter: vi.fn(() => ({})),
   buildMimirHttpAdapter: vi.fn(() => ({})),
+}));
+vi.mock('@niuulabs/plugin-setup', () => ({
+  createMockSetupService: vi.fn(() => ({})),
+  buildSetupHttpAdapter: vi.fn(() => ({})),
 }));
 vi.mock('@niuulabs/plugin-observatory', () => observatoryMocks);
 vi.mock('@niuulabs/plugin-valkyrie', () => valkyrieMocks);
@@ -300,6 +307,53 @@ describe('resolveNiuuRegistryBase', () => {
 });
 
 describe('resolveSettingsServiceBase', () => {
+  it('resolves the host runtime settings from the setup API', () => {
+    expect(
+      resolveSettingsServiceBase(
+        {
+          services: {
+            niuu: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/niuu' },
+          },
+        } as any,
+        'runtime',
+      ),
+    ).toBe('http://localhost:8080/api/v1/niuu/setup');
+    expect(
+      resolveSettingsServiceBase(
+        {
+          services: {
+            setup: { mode: 'http', baseUrl: 'http://localhost:9090/api/v1/niuu/setup' },
+          },
+        } as any,
+        'runtime',
+      ),
+    ).toBe('http://localhost:9090/api/v1/niuu/setup');
+  });
+
+  it('resolves volundr settings from the forge base, where the settings router lives', () => {
+    expect(
+      resolveSettingsServiceBase(
+        {
+          services: {
+            forge: { mode: 'http', baseUrl: '/api/v1/forge' },
+            volundr: { mode: 'http', baseUrl: '/api/v1/volundr' },
+          },
+        } as any,
+        'volundr',
+      ),
+    ).toBe('/api/v1/forge');
+    expect(
+      resolveSettingsServiceBase(
+        {
+          services: {
+            volundr: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/volundr' },
+          },
+        } as any,
+        'volundr',
+      ),
+    ).toBe('http://localhost:8080/api/v1/forge');
+  });
+
   it('resolves identity settings from the canonical identity base', () => {
     expect(
       resolveSettingsServiceBase(
@@ -445,6 +499,26 @@ describe('buildServices live base selection', () => {
 
     expect(observatoryMocks.createMockAgentDirectory).toHaveBeenCalled();
     expect(services['observatory.agents']).toEqual({ kind: 'mock-observatory-agents' });
+  });
+
+  it('locates session history on the Forge API rather than the session gateway host', () => {
+    const services = buildServices({
+      demoMode: true,
+      services: { forge: { mode: 'http', baseUrl: 'https://app.test/api/v1/forge' } },
+    } as any);
+    const locator = services['forge.history'] as {
+      historyEndpoint(url: string | null): string | null;
+    };
+
+    expect(locator.historyEndpoint('wss://sessions.cluster.test/s/abc/session')).toBe(
+      'https://app.test/api/v1/forge/sessions/abc/conversation',
+    );
+  });
+
+  it('registers no history locator without a live Forge base', () => {
+    const services = buildServices({ demoMode: true, services: {} } as any);
+
+    expect(services['forge.history']).toBeUndefined();
   });
 
   it('leaves the agent directory unavailable outside demo mode', () => {
@@ -902,6 +976,10 @@ describe('buildServices', () => {
           mode: 'http',
           baseUrl: 'http://localhost:8080/api/v1/ting/workflows',
         },
+        'ting.work': {
+          mode: 'http',
+          baseUrl: 'http://localhost:8080/api/v1/ting/work',
+        },
         'ting.research': {
           mode: 'http',
           baseUrl: 'http://localhost:8080/api/v1/ting/research',
@@ -926,6 +1004,9 @@ describe('buildServices', () => {
       basePath: 'http://localhost:8080/api/v1/ting',
     });
     expect(tingMocks.buildWorkflowHttpAdapter).toHaveBeenCalledWith({
+      basePath: 'http://localhost:8080/api/v1/ting',
+    });
+    expect(tingMocks.buildWorkHttpAdapter).toHaveBeenCalledWith({
       basePath: 'http://localhost:8080/api/v1/ting',
     });
     expect(tingMocks.buildResearchHttpAdapter).toHaveBeenCalledWith({
@@ -1228,6 +1309,17 @@ describe('buildServices', () => {
         state: 'archived',
       }),
     );
+    await expect(
+      sessionStore.getSession('sess-archived', { instanceId: 'thor', signal }),
+    ).resolves.toEqual(expect.objectContaining({ id: 'sess-archived' }));
+    expect(liveVolundr.getSession).toHaveBeenLastCalledWith('sess-archived', {
+      instanceId: 'thor',
+      signal,
+    });
+    expect(liveVolundr.listArchivedSessions).toHaveBeenLastCalledWith({
+      instanceId: 'thor',
+      signal,
+    });
     await sessionStore.deleteSession('sess-live');
     expect(liveVolundr.deleteSession).toHaveBeenCalledWith('sess-live', undefined);
   });
@@ -1996,4 +2088,21 @@ describe('buildServices', () => {
       'http://localhost:8080/api/v1/ravn/odin-custom',
     );
   });
+});
+
+it('uses Guild for knowledge deployment discovery and actions', async () => {
+  const { buildMimirHttpAdapter } = await import('@niuulabs/plugin-mimir');
+  buildServices({
+    demoMode: true,
+    theme: 'ice',
+    plugins: {},
+    services: {
+      niuu: { mode: 'http', baseUrl: 'https://guild.test/api/v1/niuu' },
+      mimir: { mode: 'http', baseUrl: 'https://memory.test/api/v1/mimir' },
+    },
+  } as any);
+  expect(buildMimirHttpAdapter).toHaveBeenCalledWith(
+    { basePath: 'https://memory.test/api/v1/mimir' },
+    { basePath: 'https://guild.test/api/v1/niuu/knowledge' },
+  );
 });

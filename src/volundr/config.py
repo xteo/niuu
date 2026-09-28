@@ -16,9 +16,9 @@ All configuration MUST flow through the Settings class.
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -44,9 +44,14 @@ from niuu.config_models import (
     WorkloadIdentityConfig,
     default_session_definitions,
 )
+from niuu.domain.delivery import AcceptancePolicy
 from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
+from niuu.domain.observability import ObservabilityConfig
 from niuu.forge_mcp.models import ForgeMcpGrant
-from ravn.config import PersonaSourceConfig
+from ravn.config import LLMConfig, PersonaSourceConfig
+from volundr.compute.config import ComputeConfig
+from volundr.domain.mcp_hosts import normalize_internal_host_pattern
+from volundr.domain.model_gateway import MODEL_GATEWAY_TOKEN_ENV
 from volundr.domain.models import (
     IntegrationType,
     ResidentBackend,
@@ -83,6 +88,45 @@ class LocalGitConfig(BaseModel):
         default=30.0,
         description="Maximum time in seconds a git/gh subprocess may run before being killed.",
     )
+
+
+class DeliveryConfig(BaseModel):
+    """Explicit deployment policy for evidence-backed developer delivery."""
+
+    enabled: bool = False
+    authenticator: DynamicAdapterConfig = Field(default_factory=DynamicAdapterConfig)
+    workstreams: DynamicAdapterConfig = Field(default_factory=DynamicAdapterConfig)
+    authorizer: DynamicAdapterConfig = Field(default_factory=DynamicAdapterConfig)
+    forge: DynamicAdapterConfig = Field(
+        default_factory=lambda: DynamicAdapterConfig(
+            adapter="volundr.adapters.outbound.user_delivery_forge.UserDeliveryForgeProvider"
+        )
+    )
+    producer_id: str = "forge-service"
+    workstream_producer_id: str = "workstream-runner"
+    trusted_producers: tuple[str, ...] = ()
+    policies: dict[str, AcceptancePolicy] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def require_explicit_delivery_configuration(self):
+        if self.enabled:
+            if (
+                not self.authenticator.adapter
+                or not self.workstreams.adapter
+                or not self.forge.adapter
+            ):
+                raise ValueError(
+                    "Enabled delivery requires authenticator, workstreams, and forge adapters"
+                )
+            if not self.trusted_producers or not self.policies:
+                raise ValueError(
+                    "Enabled delivery requires pinned producers and acceptance policies"
+                )
+            if not self.producer_id.strip() or not self.workstream_producer_id.strip():
+                raise ValueError("Enabled delivery requires forge and workstream producer IDs")
+            if not self.authorizer.adapter:
+                raise ValueError("Enabled delivery requires an execution authorizer adapter")
+        return self
 
 
 class LocalMountsConfig(BaseModel):
@@ -245,6 +289,12 @@ class LoggingConfig(BaseSettings):
     format: str = Field(default="text", validation_alias=AliasChoices("format", "LOG_FORMAT"))
 
 
+class VolundrObservabilityConfig(ObservabilityConfig):
+    """OpenTelemetry settings with Volundr's stable service identity."""
+
+    service_name: str = Field(default="volundr")
+
+
 class PodManagerConfig(BaseModel):
     """Dynamic pod manager adapter configuration.
 
@@ -263,6 +313,42 @@ class PodManagerConfig(BaseModel):
     adapter: str = Field(
         default="volundr.adapters.outbound.flux.FluxPodManager",
         description="Fully-qualified class path for the PodManager adapter.",
+    )
+    runtime_backend: str | None = Field(
+        default=None,
+        description="Explicit contributor backend identity; VM deployments use vm.",
+    )
+    room_role_source: Literal["deployment", "remote"] = Field(
+        default="deployment",
+        description=(
+            "ws_auth.room_role_source Volundr renders into this backend's session "
+            "pods (kubernetes only — see charts/skuld/values.yaml's wsAuth and "
+            "volundr/adapters/outbound/contributors/room_role.py). 'deployment' "
+            "(the default): unchanged pre-session_participants behavior — a caller "
+            "reaching the pod at all is owner, and session_participants invites are "
+            "refused with 409 for this backend (see rest_session_participants.py's "
+            "REMOTE_CAPABLE_RUNTIME_BACKENDS). 'remote': pods are deployed with "
+            "ws_auth.room_role_source: remote and a wsAuth.room_role_remote adapter "
+            "(RemoteAuthorizationAdapter) that asks Forge for each caller's grant, "
+            "so session_participants invites are honoured and the 409 is lifted. "
+            "Also requires wsAuth.enforce_ownership: false (the chart's Helm render "
+            "fails otherwise — the ext_authz sidecar's owner/admin-only 'start' gate "
+            "would block every participant before a remote lookup ever ran). This is "
+            "a property of the WHOLE deployment, not a per-session choice — flipping "
+            "it changes every future session pod's trust boundary, so it must be set "
+            "deliberately, verified in a non-production cluster first, and never "
+            "enabled by inference from other settings."
+        ),
+    )
+    room_role_cache_ttl_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Rendered as room_role_remote.kwargs.cache_ttl_seconds when "
+            "room_role_source is 'remote' — how long RemoteAuthorizationAdapter "
+            "caches a resolved role before re-asking Forge, bounding how quickly "
+            "a revoked or demoted grant takes effect on an already-open connection."
+        ),
     )
     kwargs: dict[str, Any] = Field(
         default_factory=dict,
@@ -464,7 +550,7 @@ def _default_launch_specs() -> list[LaunchSpecConfig]:
             description="Default Codex session for OpenAI-backed coding work.",
             session_definition="skuldCodex",
             workload_type="session",
-            model="gpt-5.4",
+            model="gpt-5.6-terra",
             resource_config={"cpu": "1", "memory": "2Gi"},
             cli_tool="codex",
         ),
@@ -518,7 +604,30 @@ class RabbitMQConfig(BaseModel):
 
 
 class OtelConfig(BaseModel):
-    """OpenTelemetry event sink configuration.
+    """OpenTelemetry event *sink* configuration — GenAI spans from durable
+    ``SessionEvent`` rows, one span per already-recorded event
+    (``OtelEventSink``, wired via ``event_pipeline.otel``).
+
+    Distinct from top-level ``observability`` (``VolundrObservabilityConfig``,
+    on ``Settings.observability``), which drives the shared
+    ``niuu.observability`` facade: the FastAPI/httpx auto-instrumentation and
+    every ``get_observability()`` call site across the codebase (Ravn LLM
+    adapters, Bifröst, session contributors, ...). Two separate OTel
+    pipelines, each with its own ``TracerProvider``/exporter, because they
+    serve different questions:
+
+    * ``observability`` (this process's server/client spans) answers "what
+      did this request do, and in what larger trace" — real-time, one trace
+      id follows the work end to end.
+    * ``event_pipeline.otel`` (this sink) answers "replay this session's
+      already-recorded event history as spans" — after the fact, from
+      Postgres, keyed by ``session_id``, not tied to any live trace context.
+
+    Not consolidated into one pipeline: they run on different triggers (live
+    request vs. durable event replay) and would need one to synthesize
+    context for the other's spans to nest correctly, which neither
+    currently does. If you only want live traces, ``observability.enabled``
+    alone is enough — leave this at its default (disabled).
 
     Follows OTel GenAI semantic conventions (v1.39+).
     The exporter endpoint should point at an OTLP-compatible collector
@@ -1230,6 +1339,40 @@ class SessionContributorConfig(BaseModel):
     )
 
 
+class WorkflowExecutionCredentialsConfig(BaseModel):
+    """Rotation of scoped coordinator credentials for developer workflows."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Project and rotate exact-scope credentials for developer coordinators.",
+    )
+    projection_adapter: str = Field(
+        default="",
+        description="Fully-qualified ExecutionCredentialProjectionPort adapter class.",
+    )
+    projection_kwargs: dict[str, Any] = Field(default_factory=dict)
+    projection_secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
+    refresh_interval_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description="Seconds between active-session token replacement cycles.",
+    )
+    admission_roles: tuple[str, ...] = Field(
+        default=("volundr:developer",),
+        description=(
+            "Gateway admission roles on the scoped JWT; route scope still limits authority."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _configured_adapter(self) -> "WorkflowExecutionCredentialsConfig":
+        if self.enabled and not self.projection_adapter.strip():
+            raise ValueError(
+                "workflow_execution_credentials.projection_adapter is required when enabled"
+            )
+        return self
+
+
 class OAuthSpecConfig(BaseModel):
     """OAuth2 provider specification in config."""
 
@@ -1240,20 +1383,55 @@ class OAuthSpecConfig(BaseModel):
     token_field_mapping: dict[str, str] = Field(default_factory=dict)
     extra_authorize_params: dict[str, str] = Field(default_factory=dict)
     extra_token_params: dict[str, str] = Field(default_factory=dict)
+    token_request_format: Literal["form", "json"] = Field(
+        default="form",
+        description="Encoding used by the provider's token endpoint.",
+    )
+    client_secret_required: bool = Field(
+        default=False,
+        description="Whether every OAuth application must provide a client secret.",
+    )
+    device_authorization_url: str = Field(
+        default="",
+        description="RFC 8628 device authorization endpoint; enables sign-in without a callback.",
+    )
 
 
 class OAuthClientConfig(BaseModel):
-    """Client credentials for a single OAuth integration."""
+    """Client credentials for a single OAuth integration.
+
+    The device flow only needs the (public) client id; the secret is for the
+    authorization-code flow behind a callback URL.
+    """
 
     client_id: str
-    client_secret: str
+    client_secret: str = ""
+    base_url: str = ""
 
 
 class OAuthConfig(BaseModel):
     """Top-level OAuth configuration."""
 
+    mini_mode_refresh_enabled: bool = Field(
+        default=True, description="Run the legacy OAuth refresher only in mini-mode."
+    )
     redirect_base_url: str = ""
+    mcp_request_timeout_seconds: float = Field(default=15.0, gt=0)
+    mcp_state_ttl_seconds: int = Field(default=600, gt=0)
+    mcp_internal_hosts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Hostnames of your own MCP servers and their OAuth issuers that may resolve "
+            "to private addresses: exact names or '*.domain' suffixes, e.g. "
+            "'*.asgard.niuu.world'. Every other MCP host must resolve publicly."
+        ),
+    )
     clients: dict[str, OAuthClientConfig] = Field(default_factory=dict)
+
+    @field_validator("mcp_internal_hosts")
+    @classmethod
+    def _normalize_mcp_internal_hosts(cls, patterns: list[str]) -> list[str]:
+        return [normalize_internal_host_pattern(pattern) for pattern in patterns]
 
 
 class IntegrationDefinitionConfig(BaseModel):
@@ -1269,19 +1447,81 @@ class IntegrationDefinitionConfig(BaseModel):
     config_schema: dict[str, Any] = Field(default_factory=dict)
     mcp_server: dict[str, Any] | None = None
     env_from_credentials: dict[str, str] = Field(default_factory=dict)
+    env_from_config: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Session environment variables taken from the connection's (non-secret) config, "
+            "env var name → config key. A missing key fails the launch."
+        ),
+    )
     auth_type: str = "api_key"
     oauth: OAuthSpecConfig | None = None
     file_mounts: dict[str, str] = Field(default_factory=dict)
     credential_enrollment: dict[str, str] | None = None
+    model_vendor: str = Field(
+        default="",
+        description=(
+            "Model vendor an AI provider connection unlocks (anthropic, openai, xai, "
+            "deepseek). Session definitions name the vendors they accept in "
+            "compatible_providers, so this is what decides which engines a connected "
+            "account makes launchable."
+        ),
+    )
+    key_probe: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Cheap authenticated request that proves an API key works: url, auth "
+            "('bearer' or a header name) and optional extra headers."
+        ),
+    )
+
+
+GITHUB_DEVICE_AUTHORIZATION_URL = "https://github.com/login/device/code"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITLAB_DEVICE_AUTHORIZATION_URL = "https://gitlab.com/oauth/authorize_device"
+GITLAB_TOKEN_URL = "https://gitlab.com/oauth/token"
+
+
+# The seeded "Model server" provider (see cli.commands.platform) and the env
+# vars that tell a session's Skuld to route Claude Code and Codex through the
+# gateway. MODEL_GATEWAY_TOKEN_ENV is imported from the contributor that owns
+# it (volundr.adapters.outbound.contributors.model_gateway) rather than
+# duplicated as a literal string here. The IntegrationContributor's
+# env_from_config path below (not ModelGatewayContributor, which isn't wired
+# in docker/mini mode) is what actually emits both env vars for a seeded
+# "model-server" connection — see model_server_seed_connections() in
+# cli.commands.platform, which supplies the "gateway_url" and "token" config
+# keys these map to. A connection missing either key fails loudly at session
+# creation (IntegrationContributor.contribute) rather than spawning a session
+# that can't reach the gateway.
+MODEL_SERVER_SLUG = "model-server"
+MODEL_GATEWAY_URL_ENV = "SKULD__MODEL_GATEWAY__URL"
 
 
 def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
     """Return the built-in integration catalog entries."""
     return [
         IntegrationDefinitionConfig(
+            slug="mcp",
+            name="MCP server",
+            description="Connect an MCP server using OAuth or an API token",
+            integration_type="mcp",
+            credential_schema={
+                "required": ["access_token"],
+                "properties": {"access_token": {"label": "API token", "type": "password"}},
+            },
+            config_schema={
+                "required": ["mcp_url"],
+                "properties": {
+                    "mcp_url": {"label": "MCP server URL", "type": "string"},
+                    "name": {"label": "Display name", "type": "string"},
+                },
+            },
+        ),
+        IntegrationDefinitionConfig(
             slug="github",
             name="GitHub",
-            description="GitHub source control — repo browsing, clone, PRs, and MCP server",
+            description="GitHub source control — repo browsing, clone, PRs, and gh CLI",
             integration_type="source_control",
             adapter="volundr.adapters.outbound.github.GitHubProvider",
             icon="github",
@@ -1302,17 +1542,31 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
                     "orgs": {"label": "Organizations", "type": "string[]"},
                 },
             },
-            mcp_server={
-                "name": "github",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-github"],
-                "env_from_credentials": {"GITHUB_PERSONAL_ACCESS_TOKEN": "token"},
+            # gh in the session image signs in with GH_TOKEN.
+            env_from_credentials={"GH_TOKEN": "token"},
+            # Sign in with GitHub: device flow of an OAuth App the person owns
+            # (client id registered from the wizard or under oauth.clients.github;
+            # no secret, no callback). Without scopes GitHub hands out a token
+            # that only reads public data, so sessions could neither see private
+            # or organisation repositories nor push: `repo` covers code and pull
+            # requests everywhere the account can reach, `read:org` the
+            # organisation membership, `workflow` files under .github/workflows.
+            oauth=OAuthSpecConfig(
+                authorize_url="https://github.com/login/oauth/authorize",
+                token_url=GITHUB_TOKEN_URL,
+                device_authorization_url=GITHUB_DEVICE_AUTHORIZATION_URL,
+                scopes=["repo", "read:org", "workflow"],
+            ),
+            credential_enrollment={
+                "method": "oauth_device",
+                "credential_field": "token",
+                "default_credential_name": "github-signin",
             },
         ),
         IntegrationDefinitionConfig(
             slug="gitlab",
             name="GitLab",
-            description="GitLab source control — repo browsing, clone, MRs, and MCP server",
+            description="GitLab source control — repo browsing, clone, MRs, and glab CLI",
             integration_type="source_control",
             adapter="volundr.adapters.outbound.gitlab.GitLabProvider",
             icon="gitlab",
@@ -1333,11 +1587,92 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
                     "groups": {"label": "Groups", "type": "string[]"},
                 },
             },
-            mcp_server={
-                "name": "gitlab",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-gitlab"],
-                "env_from_credentials": {"GITLAB_PERSONAL_ACCESS_TOKEN": "token"},
+            # glab in the session image signs in with GITLAB_TOKEN.
+            env_from_credentials={"GITLAB_TOKEN": "token"},
+            # Sign in with GitLab (17.2+): device grant of an application whose
+            # public client id is configured under oauth.clients.gitlab.
+            oauth=OAuthSpecConfig(
+                authorize_url="https://gitlab.com/oauth/authorize",
+                token_url=GITLAB_TOKEN_URL,
+                device_authorization_url=GITLAB_DEVICE_AUTHORIZATION_URL,
+                scopes=["api"],
+            ),
+            credential_enrollment={
+                "method": "oauth_device",
+                "credential_field": "token",
+                "default_credential_name": "gitlab-signin",
+            },
+        ),
+        IntegrationDefinitionConfig(
+            slug="jira",
+            name="Jira Cloud",
+            description="Jira Cloud issue tracking — search, issue browsing, and status updates",
+            integration_type="issue_tracker",
+            adapter="volundr.adapters.outbound.jira.JiraAdapter",
+            icon="jira",
+            credential_schema={
+                "required": ["email", "api_token"],
+                "properties": {
+                    "email": {"label": "Atlassian account email", "type": "string"},
+                    "api_token": {"label": "API token", "type": "password"},
+                },
+            },
+            config_schema={
+                "required": ["site_url"],
+                "properties": {
+                    "site_url": {
+                        "label": "Jira site URL",
+                        "type": "url",
+                    },
+                    "cloud_id": {
+                        "label": "Cloud ID (scoped API tokens only)",
+                        "type": "string",
+                    },
+                    "project_keys": {
+                        "label": "Allowed project keys",
+                        "type": "string[]",
+                        "description": (
+                            "Optional. Only expose issues from these Jira projects, "
+                            "for example NIUU, PLATFORM."
+                        ),
+                    },
+                    "labels": {
+                        "label": "Allowed issue labels",
+                        "type": "string[]",
+                        "description": (
+                            "Optional. Only expose issues carrying at least one of these labels."
+                        ),
+                    },
+                    "issue_type": {
+                        "label": "Issue type for new work",
+                        "type": "string",
+                        "description": (
+                            "Issue type used when Ting creates Jira work. Defaults to Task."
+                        ),
+                    },
+                },
+            },
+            auth_type="api_key",
+            oauth=OAuthSpecConfig(
+                authorize_url="https://auth.atlassian.com/authorize",
+                token_url="https://auth.atlassian.com/oauth/token",
+                scopes=[
+                    "read:jira-work",
+                    "write:jira-work",
+                    "read:jira-user",
+                    "offline_access",
+                ],
+                extra_authorize_params={
+                    "audience": "api.atlassian.com",
+                    "prompt": "consent",
+                },
+                token_request_format="json",
+                client_secret_required=True,
+            ),
+            credential_enrollment={
+                "method": "oauth_authorization_code",
+                "credential_field": "access_token",
+                "default_credential_name": "jira-signin",
             },
         ),
         IntegrationDefinitionConfig(
@@ -1353,9 +1688,9 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             },
             mcp_server={
                 "name": "linear",
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-linear"],
-                "env_from_credentials": {"LINEAR_API_KEY": "api_key"},
+                "transport": "http",
+                "url": "https://mcp.linear.app/mcp",
+                "token_field": "api_key",
             },
             auth_type="api_key",
         ),
@@ -1364,30 +1699,113 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             name="Anthropic (Claude API)",
             description="Anthropic API key for Claude models",
             integration_type="ai_provider",
+            model_vendor="anthropic",
             icon="anthropic",
             credential_schema={
                 "required": ["api_key"],
                 "properties": {"api_key": {"label": "API Key", "type": "password"}},
             },
             env_from_credentials={"ANTHROPIC_API_KEY": "api_key"},
+            key_probe={
+                "url": "https://api.anthropic.com/v1/models",
+                "auth": "x-api-key",
+                "headers": {"anthropic-version": "2023-06-01"},
+            },
         ),
         IntegrationDefinitionConfig(
             slug="openai",
             name="OpenAI",
             description="OpenAI API key for GPT/Codex models",
             integration_type="ai_provider",
+            model_vendor="openai",
             icon="openai",
             credential_schema={
                 "required": ["api_key"],
                 "properties": {"api_key": {"label": "API Key", "type": "password"}},
             },
             env_from_credentials={"OPENAI_API_KEY": "api_key"},
+            key_probe={"url": "https://api.openai.com/v1/models", "auth": "bearer"},
+        ),
+        IntegrationDefinitionConfig(
+            slug="xai",
+            name="xAI (Grok)",
+            description="xAI API key for Grok models",
+            integration_type="ai_provider",
+            model_vendor="xai",
+            icon="xai",
+            credential_schema={
+                "required": ["api_key"],
+                "properties": {"api_key": {"label": "API Key", "type": "password"}},
+            },
+            env_from_credentials={"XAI_API_KEY": "api_key"},
+            key_probe={"url": "https://api.x.ai/v1/models", "auth": "bearer"},
+        ),
+        IntegrationDefinitionConfig(
+            slug="meta",
+            name="Meta (Muse)",
+            description="Meta API key for Muse Code sessions",
+            integration_type="ai_provider",
+            model_vendor="meta",
+            icon="meta",
+            credential_schema={
+                "required": ["api_key"],
+                "properties": {"api_key": {"label": "API Key", "type": "password"}},
+            },
+            env_from_credentials={"META_API_KEY": "api_key"},
+        ),
+        IntegrationDefinitionConfig(
+            slug="grok-build",
+            name="Grok Build (xAI sign-in)",
+            description="Sign in with your SuperGrok or X Premium+ account for Grok Build sessions",
+            integration_type="ai_provider",
+            model_vendor="xai",
+            icon="xai",
+            credential_schema={},
+            auth_type="device_code",
+            credential_enrollment={
+                "method": "grok_device",
+                "credential_field": "auth.json",
+                "default_credential_name": "grok-credentials",
+            },
+            # The grok CLI reads its session from ~/.grok/auth.json.
+            file_mounts={"/home/skuld/.grok/auth.json": "auth.json"},
+        ),
+        IntegrationDefinitionConfig(
+            slug="deepseek",
+            name="DeepSeek",
+            description="DeepSeek API key for DeepSeek models and the DeepSeek Harness runtime",
+            integration_type="ai_provider",
+            model_vendor="deepseek",
+            icon="deepseek",
+            credential_schema={
+                "required": ["api_key"],
+                "properties": {"api_key": {"label": "API Key", "type": "password"}},
+            },
+            env_from_credentials={"DEEPSEEK_API_KEY": "api_key"},
+            key_probe={"url": "https://api.deepseek.com/models", "auth": "bearer"},
+        ),
+        IntegrationDefinitionConfig(
+            slug="claude-code",
+            name="Claude Code (subscription)",
+            description="Connect your Claude subscription for Claude Code sessions",
+            integration_type="ai_provider",
+            model_vendor="anthropic",
+            icon="anthropic",
+            credential_schema={},
+            auth_type="browser_login",
+            credential_enrollment={
+                "method": "claude_setup",
+                "credential_field": "token",
+                "default_credential_name": "claude-code-credentials",
+            },
+            env_from_credentials={"CLAUDE_CODE_OAUTH_TOKEN": "token"},
         ),
         IntegrationDefinitionConfig(
             slug="codex",
             name="OpenAI Codex (ChatGPT)",
             description="User-scoped ChatGPT subscription login for Codex runtimes",
             integration_type="ai_provider",
+            model_vendor="openai",
             icon="openai",
             credential_schema={},
             auth_type="device_code",
@@ -1395,6 +1813,32 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
                 "method": "codex_device",
                 "credential_field": "auth.json",
                 "default_credential_name": "codex-credentials",
+            },
+        ),
+        IntegrationDefinitionConfig(
+            slug=MODEL_SERVER_SLUG,
+            name="Model server",
+            description=(
+                "A model you serve yourself (vLLM, sparkrun, Ollama, anything "
+                "OpenAI-compatible), reached through the platform's model gateway. "
+                "Registered from Settings → Runtime → Model server, not added here."
+            ),
+            integration_type="ai_provider",
+            model_vendor="local",
+            icon="server",
+            auth_type="none",
+            credential_schema={},
+            config_schema={
+                "properties": {
+                    "provider": {"label": "Gateway provider", "type": "string"},
+                    "gateway_url": {"label": "Gateway URL", "type": "string"},
+                    "token": {"label": "Gateway token", "type": "string"},
+                    "models": {"label": "Models", "type": "list"},
+                },
+            },
+            env_from_config={
+                MODEL_GATEWAY_URL_ENV: "gateway_url",
+                MODEL_GATEWAY_TOKEN_ENV: "token",
             },
         ),
         IntegrationDefinitionConfig(
@@ -1426,11 +1870,55 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
     ]
 
 
+class SessionRoomConfig(BaseModel):
+    """How the platform reaches a session's broker for room and route calls."""
+
+    internal_base_url: str = Field(
+        default="",
+        description=(
+            "Origin to dial instead of the session's public chat endpoint origin, "
+            "e.g. http://127.0.0.1:8080 when the public address is not reachable "
+            "from the platform process itself (single-host Docker). Empty = public."
+        ),
+    )
+
+
 class IntegrationsConfig(BaseModel):
     """Integration catalog configuration."""
 
+    repository: DynamicAdapterConfig | None = None
+
+    database_name: str = Field(
+        default="",
+        description=(
+            "Shared integration database on the configured PostgreSQL server; "
+            "empty uses the service database."
+        ),
+    )
     definitions: list[IntegrationDefinitionConfig] = Field(
         default_factory=_default_integration_definitions,
+    )
+    definition_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "YAML or JSON files containing additional integration definitions. "
+            "Files are loaded at startup and merged with the configured catalog."
+        ),
+    )
+    module_manifest_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Versioned manifests for trusted external packages. Manifest components "
+            "are contract-checked at startup but remain inactive until selected by config."
+        ),
+    )
+    allow_definition_overrides: bool = Field(
+        default=False,
+        description=(
+            "Allow a definition loaded from a later external file to replace an "
+            "existing definition with the same slug. Duplicate slugs fail startup "
+            "when this is false."
+        ),
     )
     seed_connections: list["SeededIntegrationConnectionConfig"] = Field(
         default_factory=list,
@@ -1501,6 +1989,11 @@ class SeededIntegrationConnectionConfig(BaseModel):
         default=None,
         description="Optional credential payload to seed before creating the connection.",
     )
+
+
+# The seed list is declared before its item type; resolve the forward reference
+# so settings sources (env, files) can parse it instead of warning.
+IntegrationsConfig.model_rebuild()
 
 
 class FeatureModuleConfig(BaseModel):
@@ -1708,6 +2201,10 @@ def _default_feature_modules() -> list[FeatureModuleConfig]:
 class PATConfig(BaseModel):
     """Personal access token configuration."""
 
+    service_adapter: str = "niuu.domain.services.pat.PATService"
+    service_kwargs: dict = Field(default_factory=dict)
+    validator_adapter: str = "niuu.domain.services.pat_validator.PATValidator"
+    validator_kwargs: dict = Field(default_factory=dict)
     token_issuer_adapter: str = Field(
         default="niuu.adapters.memory_token_issuer.MemoryTokenIssuer",
         description="Fully-qualified class path for the token issuer adapter.",
@@ -1723,6 +2220,12 @@ class PATConfig(BaseModel):
     revocation_cache_ttl: float = Field(
         default=300.0,
         description="Seconds to cache valid-token lookups before re-checking the DB.",
+    )
+    websocket_check_interval: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds between revocation checks on open WebSockets; expiry is immediate.",
     )
     revoked_cache_ttl: float = Field(
         default=60.0,
@@ -1829,6 +2332,14 @@ class VolundrBifrostConfig(BifrostConfig):
         default=60.0,
         gt=0,
         description="Interval between successful Bifrost catalog refreshes.",
+    )
+    session_gateway_url: str = Field(
+        default="",
+        description=(
+            "Bifrost URL as reachable from a session pod. When set, sessions on a "
+            "model the catalog marks provider=local get SKULD__MODEL_GATEWAY__URL "
+            "pointing here. Empty disables it."
+        ),
     )
     auth: HttpAuthAdapterConfig = Field(default_factory=HttpAuthAdapterConfig)
 
@@ -1960,8 +2471,69 @@ class Settings(BaseSettings):
     )
 
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    observability: VolundrObservabilityConfig = Field(default_factory=VolundrObservabilityConfig)
+    compute: ComputeConfig | None = None
+
     projects: ProjectsConfig = Field(default_factory=ProjectsConfig)
     runtime_health_timeout_seconds: float = Field(default=3.0, gt=0)
+    forge_stream_remote_timeout_seconds: float = Field(
+        default=45.0,
+        gt=0,
+        description="Total httpx timeout for reading a remote Guild member's session SSE stream.",
+    )
+    forge_stream_remote_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Connect timeout for opening a remote Guild member's session SSE stream.",
+    )
+    forge_stream_retry_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Delay before retrying a disconnected host in the merged session stream.",
+    )
+    forge_stream_keepalive_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description="Idle interval before the merged session stream sends a keepalive comment.",
+    )
+    forge_stream_queue_maxsize: int = Field(
+        default=256,
+        gt=0,
+        description="Bound on the in-memory queue merging per-host session stream events.",
+    )
+    guild_transport_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Ceiling for the connect leg of every outbound Guild call "
+            "(niuu.adapters.outbound.guild_transport), and the timeout for the bare "
+            "handshake that fetches a pinned instance's live certificate."
+        ),
+    )
+    guild_owner_probe_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description=(
+            "Timeout for the Ravn resident/session proxy's owner-probe HTTP GET "
+            "(niuu.adapters.inbound.rest_ravn) and its TLS-pin handshake."
+        ),
+    )
+    guild_transport_trusted_plaintext_host_suffixes: list[str] = Field(
+        default_factory=lambda: [".svc.cluster.local", ".svc"],
+        description=(
+            "Host suffixes (label-boundary match, e.g. a host ending in "
+            "'.svc.cluster.local') exempt from the https-unless-allow_plaintext "
+            "policy in niuu.domain.transport_security, the same way localhost is: "
+            "in-cluster Kubernetes service DNS never leaves the cluster's pod "
+            "network, so an operator does not have to set config.allow_plaintext "
+            "on every in-cluster seed. Applies at both registration/seed-time "
+            "validation and outbound call-time enforcement — the same choke "
+            "point Ting's Volundr calls also go through. Set to [] to require "
+            "the explicit allow_plaintext opt-in everywhere, including "
+            "in-cluster addresses. Never exempts config.tls_fingerprint pinning, "
+            "which always requires https:// regardless of hostname."
+        ),
+    )
     conversation_recent_max_turns: int = Field(default=15, gt=0)
     conversation_recent_max_bytes: int = Field(default=256 * 1024, ge=4096)
     server_host: str = Field(
@@ -1984,6 +2556,16 @@ class Settings(BaseSettings):
         le=65535,
         validation_alias=AliasChoices("server_port", "NIUU_SERVER_PORT"),
         description="Port of the shared Niuu host used by local session brokers.",
+    )
+    preview_cache_dir: str = Field(
+        default="~/.niuu/preview-cache",
+        validation_alias=AliasChoices("preview_cache_dir", "PREVIEW_CACHE_DIR"),
+        description=(
+            "Directory for generated tool-result image preview JPEGs (~ is "
+            "expanded). Must be writable; startup fails otherwise. Kubernetes pods "
+            "have a read-only root filesystem, so the chart points this at an "
+            "emptyDir mount (previewCache.mountPath)."
+        ),
     )
     openshell_internal_gateway_url: str = Field(
         default="http://openshell.openshell.svc.cluster.local:8080",
@@ -2052,6 +2634,18 @@ class Settings(BaseSettings):
     forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)
+    auth_mode: str = Field(
+        default="envoy",
+        description=(
+            "How this host trusts identity: 'envoy' (default — an Envoy sidecar "
+            "verifies JWTs and forwards trusted x-auth-* headers; unchanged "
+            "Kubernetes behaviour), 'none' (explicit no-auth for a host without "
+            "Envoy — mini/docker mode's default), or 'oidc' (in-process JWT "
+            "verification for a host without Envoy). Set by the mini/docker CLI "
+            "host from auth.mode (cli.config.AuthConfig); Kubernetes deployments "
+            "leave this at its default."
+        ),
+    )
     credential_store: CredentialStoreConfig = Field(default_factory=CredentialStoreConfig)
     codex_credential_broker: DynamicAdapterConfig = Field(
         default_factory=_default_codex_credential_broker,
@@ -2072,7 +2666,11 @@ class Settings(BaseSettings):
     linear: LinearConfig = Field(default_factory=LinearConfig)
     pat: PATConfig = Field(default_factory=PATConfig)
     workload_identity: WorkloadIdentityConfig = Field(default_factory=WorkloadIdentityConfig)
+    workflow_execution_credentials: WorkflowExecutionCredentialsConfig = Field(
+        default_factory=WorkflowExecutionCredentialsConfig
+    )
     auth_discovery: AuthDiscoveryConfig = Field(default_factory=AuthDiscoveryConfig)
+    session_room: SessionRoomConfig = Field(default_factory=SessionRoomConfig)
     integrations: IntegrationsConfig = Field(default_factory=IntegrationsConfig)
     oauth: OAuthConfig = Field(default_factory=OAuthConfig)
     provisioning: ProvisioningConfig = Field(default_factory=ProvisioningConfig)
@@ -2081,6 +2679,7 @@ class Settings(BaseSettings):
         description="Server-side allow/deny policy for permission request auto approvals.",
     )
     local_git: LocalGitConfig = Field(default_factory=LocalGitConfig)
+    delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     local_mounts: LocalMountsConfig = Field(default_factory=LocalMountsConfig)
     external_sessions: ExternalSessionsConfig = Field(default_factory=ExternalSessionsConfig)
     telegram_ingress: TelegramIngressConfig = Field(default_factory=TelegramIngressConfig)
@@ -2088,7 +2687,7 @@ class Settings(BaseSettings):
     ravn_flock_image: str = Field(
         default="",
         description=(
-            "Optional image used for auto-wired Ravn flock sidecars. "
+            "Optional image used for auto-wired regular Ravn flock containers. "
             "When empty, the contributor's built-in default is used."
         ),
     )
@@ -2097,6 +2696,16 @@ class Settings(BaseSettings):
         description=(
             "Optional image used by Ravn flock init containers that write per-persona "
             "config files. When empty, the contributor's built-in default is used."
+        ),
+    )
+    ravn_flock_llm_config: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Default LLM for the Ravn nodes of flock sessions, in Ravn's `llm:` shape "
+            "(model, max_tokens, timeout, provider). It is the base layer: "
+            "workload_config.llm_config and per-persona llm overrides are merged over "
+            "it. When empty, every flock session must name its own model or its "
+            "launch fails."
         ),
     )
     session_definitions: dict[str, SessionDefinitionConfig] = Field(
@@ -2119,6 +2728,14 @@ class Settings(BaseSettings):
     )
     ravn: RavnConfig = Field(default_factory=RavnConfig)
     observatory: ObservatoryConfig = Field(default_factory=ObservatoryConfig)
+
+    @field_validator("ravn_flock_llm_config")
+    @classmethod
+    def _validate_ravn_flock_llm_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Reject a flock LLM default Ravn could not load, at startup, not per node."""
+        if value:
+            LLMConfig.model_validate(value)
+        return value
 
     @model_validator(mode="after")
     def _merge_built_in_session_definitions(self) -> "Settings":

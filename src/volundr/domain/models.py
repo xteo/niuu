@@ -427,7 +427,7 @@ class Session(BaseModel):
     )
     error: str | None = Field(
         default=None,
-        description="Error message if the session is in a failed state",
+        description="Failure reason or non-terminal runtime status detail",
     )
     tracker_issue_id: str | None = Field(
         default=None,
@@ -563,11 +563,13 @@ class Session(BaseModel):
         return self.status in (SessionStatus.CREATED, SessionStatus.STOPPED, SessionStatus.FAILED)
 
     def can_stop(self) -> bool:
-        """Check if session can be stopped."""
+        """Allow cleanup after failure; a failed runtime may still own resources."""
         return self.status in (
+            SessionStatus.FAILED,
             SessionStatus.STARTING,
             SessionStatus.RUNNING,
             SessionStatus.PROVISIONING,
+            SessionStatus.FAILED,
         )
 
     def with_status(self, status: SessionStatus) -> Session:
@@ -872,6 +874,14 @@ class Chronicle(BaseModel):
         default=None,
         description="Parent chronicle ID for reforge chains",
     )
+    owner_id: str | None = Field(
+        default=None,
+        description="Owner of the session that produced this chronicle",
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description="Tenant of the session that produced this chronicle",
+    )
     created_at: datetime = Field(
         default_factory=_utc_now,
         description="Timestamp when the chronicle was created",
@@ -1006,6 +1016,11 @@ class SessionSpan:
     actor_id: str | None = None
     actor_label: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
+    #: The W3C trace id (32 lowercase hex chars) active when this span was
+    #: recorded, when observability was enabled — distinct from ``trace_id``
+    #: above, which is this Forge trace system's own id (the session UUID).
+    #: ``None`` when observability was disabled or no span was active.
+    w3c_trace_id: str | None = None
 
 
 class PromptScope(StrEnum):
@@ -1068,11 +1083,22 @@ class MCPServerSpec:
     """
 
     name: str
-    command: str
+    command: str = ""
+    transport: str = "stdio"
+    url: str = ""
+    token_field: str = ""
+    auth_header: str = "Authorization"
+    auth_prefix: str = "Bearer "
     args: tuple[str, ...] = ()
     env_from_credentials: dict[str, str] = ()  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        if self.transport not in {"stdio", "http", "sse"}:
+            raise ValueError("Unsupported MCP transport")
+        if self.transport != "stdio" and not self.url.startswith("https://"):
+            raise ValueError("Remote integration MCP servers require an HTTPS URL")
+        if self.transport == "stdio" and self.token_field:
+            raise ValueError("MCP token_field requires an HTTP transport; use stdio env mappings")
         if not isinstance(self.args, tuple):
             object.__setattr__(self, "args", tuple(self.args))
         if not isinstance(self.env_from_credentials, dict):
@@ -1093,7 +1119,11 @@ class OAuthSpec:
     scopes: tuple[str, ...] = ()
     token_field_mapping: dict[str, str] = ()  # type: ignore[assignment]
     extra_authorize_params: dict[str, str] = ()  # type: ignore[assignment]
+    # RFC 8628 device authorization endpoint; empty when the provider has none.
+    device_authorization_url: str = ""
     extra_token_params: dict[str, str] = ()  # type: ignore[assignment]
+    token_request_format: Literal["form", "json"] = "form"
+    client_secret_required: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.scopes, tuple):
@@ -1154,6 +1184,8 @@ class CredentialEnrollmentPoll:
     state: CredentialEnrollmentState
     credential_data: dict[str, str] = field(default_factory=dict)
     error_code: str = ""
+    verification_uri: str = ""
+    user_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -1178,10 +1210,19 @@ class IntegrationDefinition:
     config_schema: dict = ()  # type: ignore[assignment]
     mcp_server: MCPServerSpec | None = None
     env_from_credentials: dict[str, str] = ()  # type: ignore[assignment]
+    # Session env taken from the connection's non-secret config: env var → config key.
+    env_from_config: dict[str, str] = ()  # type: ignore[assignment]
     auth_type: str = "api_key"
     oauth: OAuthSpec | None = None
     file_mounts: dict[str, str] = ()  # type: ignore[assignment]
     credential_enrollment: CredentialEnrollmentSpec | None = None
+    # Model vendor an AI provider connection unlocks ("anthropic", "openai", ...);
+    # matched against SessionDefinitionConfig.compatible_providers. Empty for
+    # anything that is not an AI provider.
+    model_vendor: str = ""
+    # How to check an API key works: {"url", "auth": "bearer" | "<header name>",
+    # "headers": {...}}. Empty when the provider offers no cheap probe.
+    key_probe: dict[str, Any] = ()  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if not isinstance(self.credential_schema, dict):
@@ -1190,6 +1231,8 @@ class IntegrationDefinition:
             object.__setattr__(self, "config_schema", dict(self.config_schema))
         if not isinstance(self.env_from_credentials, dict):
             object.__setattr__(self, "env_from_credentials", dict(self.env_from_credentials))
+        if not isinstance(self.env_from_config, dict):
+            object.__setattr__(self, "env_from_config", dict(self.env_from_config))
         if not isinstance(self.file_mounts, dict):
             object.__setattr__(self, "file_mounts", dict(self.file_mounts))
 
@@ -1208,6 +1251,11 @@ class CredentialMapping:
     credential_name: str
     env_mappings: dict[str, str] = ()  # type: ignore[assignment]
     file_mappings: dict[str, str] = ()  # type: ignore[assignment]
+
+    oauth_tenant_id: str = ""
+    oauth_token_field: str = ""
+    oauth_token_documents: tuple[str, ...] = ()
+    provider: dict | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.env_mappings, dict):
@@ -1517,6 +1565,7 @@ class ResidentRuntime(BaseModel):
     flock_member_id: UUID | None = None
     flock_role: str = Field(default="", max_length=100)
     flock_peer_id: str = Field(default="", max_length=255)
+    realm_id: UUID | None = None
     desired_state: ResidentDesiredState = ResidentDesiredState.RUNNING
     observed_state: ResidentObservedState = ResidentObservedState.PENDING
     backend_ref: dict[str, Any] = Field(default_factory=dict)
@@ -1644,6 +1693,9 @@ def _deep_merge(base: dict, override: dict) -> None:
         if key == "mcpServers" and isinstance(base.get(key), list) and isinstance(value, list):
             base[key] = _merge_mcp_server_lists(base[key], value)
             continue
+        if key == "envVars" and isinstance(base.get(key), list) and isinstance(value, list):
+            base[key] = _merge_env_var_lists(base[key], value)
+            continue
         if (
             key == "credentialMappings"
             and isinstance(base.get(key), list)
@@ -1655,6 +1707,35 @@ def _deep_merge(base: dict, override: dict) -> None:
             _deep_merge(base[key], value)
         else:
             base[key] = value
+
+
+def _merge_env_var_lists(existing: list, override: list) -> list:
+    """Merge env var lists by ``name``, preserving order and later overrides.
+
+    Plain assignment used to win here, so a contributor that emitted any env at
+    all (integrations always emits ``SKULD__CLAUDE_AUTH``) silently discarded
+    everything a session definition or launch spec had set. The loss happened
+    after the values were already visible in the rendered ConfigMap and the
+    HelmRelease, so the only place it showed up was the running pod.
+    """
+    merged: list = []
+    index_by_name: dict[str, int] = {}
+
+    for entry in list(existing) + list(override):
+        if not isinstance(entry, dict):
+            merged.append(entry)
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            merged.append(dict(entry))
+            continue
+        if name in index_by_name:
+            merged[index_by_name[name]] = dict(entry)
+            continue
+        index_by_name[name] = len(merged)
+        merged.append(dict(entry))
+
+    return merged
 
 
 def _merge_mcp_server_lists(existing: list, override: list) -> list:

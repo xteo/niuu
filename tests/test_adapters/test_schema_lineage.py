@@ -91,7 +91,7 @@ async def test_numbered_overlap_applies_prerequisites_without_resetting_cursor(v
 
 
 @pytest.mark.parametrize(
-    "row", [None, {"version": 48, "dirty": False}, {"version": 65, "dirty": False}]
+    "row", [None, {"version": 48, "dirty": False}, {"version": 67, "dirty": False}]
 )
 async def test_numbered_other_versions_need_no_preparation(row):
     conn = connection()
@@ -135,3 +135,40 @@ def test_aliases_are_identical_sql_in_source_package_and_chart():
     for canonical, aliases in manifest.items():
         digest = hashlib.sha256((MIGRATIONS / canonical).read_bytes()).hexdigest()
         assert all(entry["sha256"] == digest for entry in aliases)
+
+
+@pytest.mark.parametrize("version", range(62, 67))
+async def test_later_forge_cursor_repairs_upstream_authority_and_compute(version):
+    conn = connection()
+    conn.fetchval.return_value = True
+    conn.fetchrow.return_value = {"version": version, "dirty": False}
+    with patch("volundr.schema_bridge.apply_startup_migrations", new_callable=AsyncMock) as apply:
+        assert await prepare_numbered_migrations(conn, MIGRATIONS) == 4 + version - 61
+    names = {p.name for p in apply.await_args.args[1]}
+    assert "000062_pat_authority.up.sql" in names
+    assert ("000066_compute_leases.up.sql" in names) == (version == 66)
+    assert all(int(name[:6]) <= version for name in names)
+    conn.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("canonical", "historical"),
+    [
+        ("000074_session_coordination_revision", "000068_session_coordination_revision"),
+        ("000075_session_read_state", "000067_session_read_state"),
+        ("000084_forge_notifications", "000069_forge_notifications"),
+        (
+            "000085_forge_notification_delivery_rate_index",
+            "000070_forge_notification_delivery_rate_index",
+        ),
+        ("000086_forge_notification_reads", "000071_forge_notification_reads"),
+    ],
+)
+def test_renumbered_fork_migrations_alias_their_applied_filenames(canonical, historical):
+    """Forge installs applied these under fork numbers; the canonical file must adopt them."""
+    digest = hashlib.sha256((MIGRATIONS / f"{canonical}.up.sql").read_bytes()).hexdigest()
+    entry = {"filename": f"{historical}.up.sql", "sha256": digest}
+    for directory in (MIGRATIONS, MIGRATIONS.parent / "src/cli/migrations/volundr"):
+        aliases = json.loads((directory / "lineage-aliases.json").read_text())
+        assert entry in aliases[f"{canonical}.up.sql"]
+    assert not (MIGRATIONS / f"{historical}.up.sql").exists()

@@ -35,6 +35,7 @@ from ting.domain.models import (
     Saga,
     SagaStatus,
 )
+from ting.domain.services.dispatch_service import select_adapter_by_tags
 from ting.domain.templates import (
     BUNDLED_TEMPLATES_DIR,
     SagaTemplate,
@@ -123,7 +124,6 @@ class EventTriggerAdapter:
         owner_id: str,
         default_model: str = "claude-sonnet-4-6",
         dedup_cache_size: int = 10_000,
-        initial_confidence: float = 0.5,
     ) -> None:
         self._subscriber = subscriber
         self._saga_repo = saga_repo
@@ -134,7 +134,6 @@ class EventTriggerAdapter:
         self._owner_id = owner_id
         self._default_model = default_model
         self._dedup_cache_size = dedup_cache_size
-        self._initial_confidence = initial_confidence
 
         self._subscription: Subscription | None = None
         self._seen: deque[str] = deque(maxlen=dedup_cache_size)
@@ -244,13 +243,13 @@ class EventTriggerAdapter:
             id=saga_id,
             tracker_id=str(saga_id),
             tracker_type="native",
+            tracker_connection_id="native",
             slug=slug,
             name=template.name,
             repos=template.repos,
             feature_branch=template.feature_branch,
             base_branch=template.base_branch,
             status=SagaStatus.ACTIVE,
-            confidence=self._initial_confidence,
             created_at=now,
             owner_id=self._owner_id,
         )
@@ -319,7 +318,6 @@ class EventTriggerAdapter:
                 number=phase_num,
                 name=tpl_phase.name,
                 status=phase_status,
-                confidence=self._initial_confidence,
             )
             await self._saga_repo.save_phase(phase)
 
@@ -336,7 +334,6 @@ class EventTriggerAdapter:
                     declared_files=tpl_run.declared_files,
                     estimate_hours=tpl_run.estimate_hours,
                     status=RunStatus.PENDING,
-                    confidence=self._initial_confidence,
                     session_id=None,
                     branch=None,
                     chronicle_summary=None,
@@ -370,7 +367,6 @@ class EventTriggerAdapter:
                 number=phase.number,
                 name=phase.name,
                 status=PhaseStatus.GATED,
-                confidence=phase.confidence,
             )
             await self._saga_repo.save_phase(gated_phase)
             await self._event_bus.emit(
@@ -394,8 +390,8 @@ class EventTriggerAdapter:
             )
             return
 
-        volundr = await self._volundr_factory.primary_for_owner(self._owner_id)
-        if volundr is None:
+        adapters = await self._volundr_factory.for_owner(self._owner_id)
+        if not adapters:
             logger.error(
                 "EventTriggerAdapter: no Volundr adapter for owner %s, cannot dispatch phase '%s'",
                 self._owner_id,
@@ -404,6 +400,12 @@ class EventTriggerAdapter:
             return
 
         for run, tpl_run in zip(runs, tpl_phase.runs):
+            volundr = select_adapter_by_tags(
+                adapters,
+                saga.target_tags,
+                saga.target_match,
+                connection_id=saga.instance_id if not saga.target_tags else None,
+            )
             await self._spawn_run(volundr, saga, phase, run, tpl_run)
 
     async def advance_phase(self, saga_id: str) -> None:
@@ -461,7 +463,6 @@ class EventTriggerAdapter:
             number=next_phase.number,
             name=next_phase.name,
             status=PhaseStatus.ACTIVE,
-            confidence=next_phase.confidence,
         )
         phases[idx] = (activated, next_runs, next_tpl)
 
@@ -484,7 +485,6 @@ class EventTriggerAdapter:
                 number=activated.number,
                 name=activated.name,
                 status=PhaseStatus.GATED,
-                confidence=activated.confidence,
             )
             phases[idx] = (gated, next_runs, next_tpl)
 
@@ -532,7 +532,6 @@ class EventTriggerAdapter:
                 declared_files=run.declared_files,
                 estimate_hours=run.estimate_hours,
                 status=RunStatus.RUNNING,
-                confidence=run.confidence,
                 session_id=session.id,
                 branch=run.branch,
                 chronicle_summary=run.chronicle_summary,
@@ -624,7 +623,6 @@ def build_event_trigger_adapter(
     volundr_factory: VolundrFactory,
     event_bus: EventBusPort,
     config: object,  # ting.config.EventTriggerConfig
-    initial_confidence: float,
 ) -> EventTriggerAdapter:
     """Construct an EventTriggerAdapter from application config.
 
@@ -655,5 +653,4 @@ def build_event_trigger_adapter(
         owner_id=cfg.owner_id,
         default_model=cfg.default_model,
         dedup_cache_size=cfg.dedup_cache_size,
-        initial_confidence=initial_confidence,
     )

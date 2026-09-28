@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,6 +14,7 @@ from volundr.config import (
     IntegrationsConfig,
     LinearConfig,
     LocalMountsConfig,
+    OAuthConfig,
     SeededIntegrationConnectionConfig,
     Settings,
 )
@@ -90,13 +90,16 @@ def test_identity_service_app_initializes_state_and_routes(monkeypatch) -> None:
         "create_pat_validator",
         lambda _settings, _repo: pat_validator,
     )
-    monkeypatch.setattr(identity_app, "import_class", lambda _path: DummyTokenIssuer)
-    monkeypatch.setattr(identity_app, "TenantService", DummyTenantService)
     monkeypatch.setattr(
         identity_app,
-        "PATService",
-        lambda **kwargs: (captured.setdefault("pat_service_kwargs", kwargs), pat_service)[-1],
+        "import_class",
+        lambda path: (
+            (lambda **kwargs: (captured.setdefault("pat_service_kwargs", kwargs), pat_service)[-1])
+            if path.endswith(".PATService")
+            else DummyTokenIssuer
+        ),
     )
+    monkeypatch.setattr(identity_app, "TenantService", DummyTenantService)
     monkeypatch.setattr(
         identity_app,
         "create_identity_router",
@@ -270,6 +273,7 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
     from integrations import app as integrations_app
 
     settings = Settings(
+        oauth=OAuthConfig(mcp_internal_hosts=["*.asgard.niuu.world"]),
         integrations=IntegrationsConfig(
             seed_connections=[
                 SeededIntegrationConnectionConfig(
@@ -287,11 +291,6 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
     seed_linear = AsyncMock()
     captured: dict[str, object] = {}
     released: list[Settings] = []
-    reconciled: list[object] = []
-
-    async def _never_ending_reconcile(service: object) -> None:
-        reconciled.append(service)
-        await asyncio.Event().wait()
 
     monkeypatch.setattr(integrations_app, "database_pool", _fake_db_pool)
     monkeypatch.setattr(integrations_app, "configure_logging", lambda _logging: None)
@@ -340,6 +339,21 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
         "_create_credential_enrollment_runner",
         lambda _settings: SimpleNamespace(supports_enrollment=lambda _method: False),
     )
+
+    async def _no_registered_clients() -> None:
+        return None
+
+    oauth_client_registry = SimpleNamespace(load=_no_registered_clients)
+    monkeypatch.setattr(
+        integrations_app,
+        "create_oauth_client_registry",
+        lambda _settings, **kwargs: oauth_client_registry,
+    )
+    monkeypatch.setattr(
+        integrations_app,
+        "with_oauth_device_runner",
+        lambda runner, _clients, _registry: runner,
+    )
     monkeypatch.setattr(
         integrations_app,
         "CredentialEnrollmentService",
@@ -348,11 +362,6 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
             SimpleNamespace(),
         )[-1],
     )
-    monkeypatch.setattr(
-        integrations_app,
-        "reconcile_credential_enrollments_loop",
-        _never_ending_reconcile,
-    )
 
     def _capture_integrations_router(
         integration_repo: object,
@@ -360,7 +369,11 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
         registry: object,
         credential_store: object,
         credential_enrollment_service: object,
+        oauth_clients: object,
+        mcp_internal_hosts: object,
     ) -> APIRouter:
+        captured["integrations_router_oauth_clients"] = oauth_clients
+        captured["integrations_router_mcp_internal_hosts"] = mcp_internal_hosts
         captured["integrations_router_repo"] = integration_repo
         captured["integrations_router_registry"] = registry
         captured["integrations_router_enrollment_service"] = credential_enrollment_service
@@ -371,13 +384,16 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
         "create_canonical_integrations_router",
         _capture_integrations_router,
     )
+
+    def _capture_oauth_router(**kwargs) -> APIRouter:
+        captured["oauth_router_registry"] = kwargs["integration_registry"]
+        captured["oauth_router_clients"] = kwargs["oauth_clients"]
+        return _probe_router("/api/v1/integrations/oauth-probe")
+
     monkeypatch.setattr(
         integrations_app,
         "create_canonical_oauth_router",
-        lambda oauth_config, integration_registry, credential_store, integration_repo: (
-            captured.setdefault("oauth_router_registry", integration_registry),
-            _probe_router("/api/v1/integrations/oauth-probe"),
-        )[-1],
+        _capture_oauth_router,
     )
     monkeypatch.setattr(
         integrations_app,
@@ -398,10 +414,11 @@ def test_integrations_service_app_seeds_connections_and_linear(monkeypatch) -> N
     # The shared integrations API owns interactive enrollment: without the service
     # the Codex device login answers 503 no matter how the cluster is configured.
     assert captured["integrations_router_enrollment_service"] is not None
+    assert captured["oauth_router_clients"] is oauth_client_registry
+    assert captured["integrations_router_mcp_internal_hosts"] == ["*.asgard.niuu.world"]
     enrollment_kwargs = captured["enrollment_service_kwargs"]
     assert enrollment_kwargs["repository"][0] == "credential-enrollments"  # type: ignore[index]
     assert enrollment_kwargs["integration_repository"][0] == "integrations"  # type: ignore[index]
-    assert reconciled == [captured["integrations_router_enrollment_service"]]
 
 
 def test_tracker_service_app_uses_linear_default_tracker(monkeypatch) -> None:

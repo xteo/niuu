@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from niuu.adapters.workload_identity.key_file import (
     SigningKeyFileError,
@@ -11,18 +12,22 @@ from niuu.adapters.workload_identity.key_file import (
 from niuu.config_models import WorkloadIdentityConfig
 from niuu.domain.services.forge_session_token import ForgeSessionTokenService
 from niuu.domain.services.workload_identity import WorkloadIdentityService
+from niuu.ports.credentials import CredentialRefreshLockPort
 from niuu.ports.http_auth import HttpAuthPort
 from niuu.utils import import_class, resolve_secret_kwargs
+from volundr.adapters.outbound.contributors.workflow_execution_credentials import (
+    WorkflowExecutionCredentialContributor,
+)
 from volundr.config import Settings
 from volundr.domain.ports import (
     ArchiveStorePort,
     AuthorizationPort,
     CodexCredentialBrokerPort,
     CredentialEnrollmentRunnerPort,
-    CredentialRefreshLockPort,
     CredentialStorePort,
     ExternalSessionProvider,
     GatewayPort,
+    IntegrationRepository,
     PodManager,
     ResidentRuntimeController,
     ResidentSessionController,
@@ -30,6 +35,17 @@ from volundr.domain.ports import (
     SecretInjectionPort,
     SessionContributor,
 )
+from volundr.domain.services.integration_registry import IntegrationRegistry
+from volundr.domain.services.oauth_clients import (
+    SOURCE_CONFIGURED,
+    OAuthClient,
+    OAuthClientRegistry,
+)
+from volundr.domain.services.oauth_token_refresh import OAuthTokenRefreshService
+from volundr.domain.services.workflow_execution_credentials import (
+    WorkflowExecutionCredentialService,
+)
+from volundr.ports.workflow_execution_credentials import ExecutionCredentialProjectionPort
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +106,67 @@ def _create_forge_session_tokens(
     )
 
 
+def _create_workflow_execution_credential_service(
+    settings: Settings,
+    *,
+    repository,
+    token_issuer,
+    runtime_backend: str,
+) -> WorkflowExecutionCredentialService | None:
+    """Compose the configured rotation service without selecting adapters in code."""
+    config = settings.workflow_execution_credentials
+    if not config.enabled:
+        return None
+    if config.refresh_interval_seconds >= settings.workload_identity.token_ttl_seconds:
+        raise ValueError(
+            "workflow_execution_credentials.refresh_interval_seconds must be less than "
+            "workload_identity.token_ttl_seconds"
+        )
+    projection_class = import_class(config.projection_adapter)
+    projection_kwargs = resolve_secret_kwargs(
+        config.projection_kwargs,
+        config.projection_secret_kwargs_env,
+    )
+    projection = projection_class(**projection_kwargs)
+    if not isinstance(projection, ExecutionCredentialProjectionPort):
+        raise TypeError(
+            f"Developer credential projection {config.projection_adapter} must implement "
+            "ExecutionCredentialProjectionPort"
+        )
+    service = WorkflowExecutionCredentialService(
+        repository=repository,
+        token_issuer=token_issuer,
+        projection=projection,
+        runtime_backend=runtime_backend,
+        refresh_interval_seconds=config.refresh_interval_seconds,
+        trusted_signing_configured=bool(getattr(token_issuer, "trusted_signing_configured", False)),
+        admission_roles=config.admission_roles,
+    )
+    logger.info(
+        "Developer execution credential projection: %s",
+        config.projection_adapter.rsplit(".", 1)[-1],
+    )
+    return service
+
+
+@asynccontextmanager
+async def integration_database_pool(settings: Settings, service_pool):
+    """Use the same connection records as the integrations-serving API."""
+    name = settings.integrations.database_name
+    if not name or name == settings.database.name:
+        yield service_pool
+        return
+    from niuu.service_database import database_pool
+
+    async with database_pool(settings.database.model_copy(update={"name": name})) as pool:
+        yield pool
+
+
 def _create_codex_credential_broker(
     settings: Settings,
     *,
     credential_store: CredentialStorePort,
-    refresh_lock: CredentialRefreshLockPort,
+    refresh_lock: CredentialRefreshLockPort | None = None,
 ) -> CodexCredentialBrokerPort:
     """Create the configured central Codex token broker adapter."""
     config = settings.codex_credential_broker
@@ -102,6 +174,7 @@ def _create_codex_credential_broker(
     kwargs = resolve_secret_kwargs(config.kwargs, config.secret_kwargs_env)
     instance = cls(
         credential_store=credential_store,
+        mini_mode=settings.local_mounts.mini_mode,
         refresh_lock=refresh_lock,
         **kwargs,
     )
@@ -128,6 +201,69 @@ def _create_credential_enrollment_runner(settings: Settings) -> CredentialEnroll
     return instance
 
 
+def create_oauth_client_registry(
+    settings: Settings,
+    *,
+    credential_store: CredentialStorePort,
+    integration_registry: IntegrationRegistry,
+) -> OAuthClientRegistry:
+    """The install's OAuth applications: ``oauth.clients`` plus those registered in the wizard."""
+    from niuu.ports.credentials import OAuthApplicationStorePort
+
+    application_store = (
+        credential_store
+        if isinstance(credential_store, OAuthApplicationStorePort)
+        and credential_store.manages_oauth_applications
+        else None
+    )
+    return OAuthClientRegistry(
+        application_store=application_store,
+        credential_store=credential_store,
+        integration_registry=integration_registry,
+        configured={
+            slug: OAuthClient(
+                slug=slug,
+                client_id=client.client_id,
+                client_secret=client.client_secret,
+                source=SOURCE_CONFIGURED,
+                base_url=client.base_url,
+            )
+            for slug, client in settings.oauth.clients.items()
+        },
+    )
+
+
+def create_oauth_token_refresh_service(
+    *,
+    integration_repository: IntegrationRepository,
+    integration_registry: IntegrationRegistry,
+    credential_store: CredentialStorePort,
+    oauth_clients: OAuthClientRegistry,
+) -> OAuthTokenRefreshService:
+    """Refresher for OAuth sign-in tokens (device and authorization-code grants)."""
+    return OAuthTokenRefreshService(
+        integration_repository=integration_repository,
+        integration_registry=integration_registry,
+        credential_store=credential_store,
+        clients=oauth_clients,
+    )
+
+
+def with_oauth_device_runner(
+    runner: CredentialEnrollmentRunnerPort,
+    oauth_clients: OAuthClientRegistry,
+    registry: IntegrationRegistry,
+) -> CredentialEnrollmentRunnerPort:
+    """Add the in-process OAuth device grant (GitHub, GitLab) next to the CLI runner."""
+    from volundr.adapters.outbound.oauth_device_runner import (
+        CompositeCredentialEnrollmentRunner,
+        OAuthDeviceFlowRunner,
+    )
+
+    device = OAuthDeviceFlowRunner(registry=registry, clients=oauth_clients)
+    return CompositeCredentialEnrollmentRunner([runner, device])
+
+
 def _create_pod_manager(settings: Settings) -> PodManager:
     """Create the PodManager adapter from dynamic config."""
     pm_cfg = settings.pod_manager
@@ -145,6 +281,54 @@ def _create_pod_manager(settings: Settings) -> PodManager:
     instance = cls(**kwargs)
     logger.info("Pod manager: %s", pm_cfg.adapter.rsplit(".", 1)[-1])
     return instance
+
+
+_OPENBAO_SECRET_INJECTION_ADAPTER = (
+    "volundr.adapters.outbound.openbao_secret_injection.OpenBaoAgentInjectionAdapter"
+)
+
+
+def _validate_remote_room_role_config(settings: Settings, runtime_backend: str) -> None:
+    """Fail fast at startup rather than shipping a 'remote' config that can never work.
+
+    ``pod_manager.room_role_source`` is a whole-deployment decision (see its
+    own field description in ``volundr/config.py``) — every future session
+    pod's trust boundary changes with it, so refusing an impossible
+    combination once at process startup is far better than letting it
+    render broken session pods one at a time, discovered only when the
+    first invited participant can never attach.
+    """
+    if settings.pod_manager.room_role_source != "remote":
+        return
+    if runtime_backend != "kubernetes":
+        return
+    session_defaults = settings.pod_manager.kwargs.get("session_defaults") or {}
+    ws_auth_defaults = session_defaults.get("wsAuth") or {}
+    if ws_auth_defaults.get("enforce_ownership"):
+        raise ValueError(
+            "pod_manager.room_role_source is 'remote' but pod_manager.kwargs."
+            "session_defaults.wsAuth.enforce_ownership is true — the pod-local "
+            "ext_authz sidecar (identity.adapters.envoy_authz) would gate every "
+            "connection to Cedar's owner/admin-only 'start' action before a "
+            "remote room-role lookup ever ran, so a participant could never "
+            "attach. Set pod_manager.kwargs.session_defaults.wsAuth"
+            ".enforce_ownership: false, or set pod_manager.room_role_source "
+            "back to 'deployment'."
+        )
+    if settings.secret_injection.adapter != _OPENBAO_SECRET_INJECTION_ADAPTER:
+        raise ValueError(
+            "pod_manager.room_role_source is 'remote' but secret_injection.adapter "
+            f"is {settings.secret_injection.adapter!r}, not "
+            f"{_OPENBAO_SECRET_INJECTION_ADAPTER!r} — "
+            "skuld.room_role_remote.RemoteAuthorizationAdapter's session-binding "
+            "check (see rest_session_participants._require_session_scoped_"
+            "workload_credential) trusts the openbao-session-{id} service "
+            "account OpenBaoAgentInjectionAdapter creates per session; without "
+            "it, session pods have no per-session service account for Forge's "
+            "role endpoint to bind a workload credential to. Configure "
+            f"secret_injection.adapter: {_OPENBAO_SECRET_INJECTION_ADAPTER!r}, "
+            "or set pod_manager.room_role_source back to 'deployment'."
+        )
 
 
 def _create_resident_controllers(
@@ -204,6 +388,8 @@ def _create_resident_session_controllers(
 
 
 def _runtime_backend(settings: Settings, pod_manager: PodManager) -> str:
+    if settings.pod_manager.runtime_backend:
+        return settings.pod_manager.runtime_backend
     if isinstance(pod_manager.runtime_backend, str) and pod_manager.runtime_backend:
         return pod_manager.runtime_backend
     adapter = settings.pod_manager.adapter.rsplit(".", 1)[-1].lower()
@@ -305,6 +491,7 @@ def _create_contributors(
     can accept the ports they need and ignore others via **_extra.
     """
     from volundr.adapters.outbound.contributors.local_mount import LocalMountContributor
+    from volundr.adapters.outbound.contributors.room_role import RoomRoleSourceContributor
     from volundr.adapters.outbound.contributors.session_def import SessionDefinitionContributor
     from volundr.adapters.outbound.contributors.workload_config import WorkloadConfigContributor
     from volundr.adapters.outbound.contributors.workload_identity import (
@@ -312,6 +499,14 @@ def _create_contributors(
     )
 
     contributors: list[SessionContributor] = []
+    execution_credential_service = ports.get("execution_credential_service")
+    if execution_credential_service is not None:
+        contributors.append(
+            WorkflowExecutionCredentialContributor(
+                execution_credential_service=execution_credential_service
+            )
+        )
+        logger.info("Session contributor: workflow_execution_credentials (auto-wired)")
 
     def _has_contributor(name: str) -> bool:
         return any(contributor.name == name for contributor in contributors)
@@ -351,6 +546,46 @@ def _create_contributors(
     if not _has_contributor("workload_identity"):
         contributors.append(WorkloadIdentityContributor())
         logger.info("Session contributor: workload_identity (auto-wired)")
+
+    if not _has_contributor("room_role_source"):
+        contributors.append(
+            RoomRoleSourceContributor(
+                room_role_source=settings.pod_manager.room_role_source,
+                cache_ttl_seconds=settings.pod_manager.room_role_cache_ttl_seconds,
+            )
+        )
+        logger.info(
+            "Session contributor: room_role_source (auto-wired, %s)",
+            settings.pod_manager.room_role_source,
+        )
+
+    # The integrations a launch attaches carry more than credentials: the
+    # Claude auth mode, MCP servers, and the model gateway URL of a self-hosted
+    # model server. Wire the contributor whenever a catalog is present, so a
+    # docker or host install behaves like the Helm chart, which lists it.
+    if not _has_contributor("integrations") and ports.get("integration_registry") is not None:
+        from volundr.adapters.outbound.contributors.integrations import IntegrationContributor
+
+        contributors.append(IntegrationContributor(**ports))
+        logger.info("Session contributor: integrations (auto-wired)")
+
+    if (
+        not _has_contributor("model_gateway")
+        and settings.bifrost.session_gateway_url
+        and ports.get("pricing_provider") is not None
+    ):
+        from volundr.adapters.outbound.contributors.model_gateway import (
+            ModelGatewayContributor,
+        )
+
+        contributors.append(
+            ModelGatewayContributor(
+                gateway_url=settings.bifrost.session_gateway_url,
+                auth_mode=settings.auth_mode,
+                **ports,
+            )
+        )
+        logger.info("Session contributor: model_gateway (auto-wired)")
 
     # Auto-wire LocalMountContributor from local_mounts config
     lm = settings.local_mounts
@@ -394,6 +629,8 @@ def _create_contributors(
             ravn_kwargs["ravn_image"] = settings.ravn_flock_image
         if settings.ravn_flock_init_writer_image:
             ravn_kwargs["init_writer_image"] = settings.ravn_flock_init_writer_image
+        if settings.ravn_flock_llm_config:
+            ravn_kwargs["default_llm_config"] = settings.ravn_flock_llm_config
         contributors.append(RavnFlockContributor(**ravn_kwargs))
         logger.info("Session contributor: ravn_flock (auto-wired)")
 

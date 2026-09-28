@@ -73,6 +73,10 @@ DATA_DIR_MAPPINGS = [
     (REPO_ROOT / "web-next" / "apps" / "niuu" / "dist", "cli/web/dist"),
     # PostgreSQL binaries built from source
     (REPO_ROOT / "build" / "pginstall", "niuu/pginstall"),
+    # Versioned built-in personas and the read-only workflow catalog
+    (REPO_ROOT / "src" / "ravn" / "personas", "ravn/personas"),
+    (REPO_ROOT / "src" / "ting" / "workflows", "ting/workflows"),
+    (REPO_ROOT / "src" / "ting" / "workflow_templates", "ting/workflow_templates"),
 ]
 
 # Data file globs mapped into the binary. Use file globs for migrations so
@@ -89,6 +93,9 @@ NOFOLLOW_IMPORTS = [
     "ruff",
     "respx",
 ]
+
+POSTGRES_PACKAGE_CONFIG = REPO_ROOT / "src/cli/postgres.nuitka-package.config.yml"
+POSTGRES_LAYOUT_PLUGIN = REPO_ROOT / "scripts/postgres_nuitka_plugin.py"
 
 DEFAULT_BINARY_NAME = "niuu"
 DEFAULT_ENTRY_POINT = str(REPO_ROOT / "src" / "cli" / "__main__.py")
@@ -137,6 +144,9 @@ def build_command(
         f"--output-dir={output_dir}",
         f"--output-filename={binary_name}-{platform_suffix()}",
         "--enable-plugin=no-qt",
+        f"--user-package-configuration-file={POSTGRES_PACKAGE_CONFIG}",
+        f"--user-plugin={POSTGRES_LAYOUT_PLUGIN}",
+        "--noinclude-data-files=niuu/pginstall/bin/*",
     ]
     cmd.extend(nuitka_toolchain_flags())
 

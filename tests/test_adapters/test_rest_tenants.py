@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from volundr.adapters.inbound.rest_tenants import create_identity_router
 from volundr.domain.models import (
     Principal,
@@ -38,6 +39,7 @@ def _mock_identity(principal=None):
 
 def _make_app(tenant_service, identity=None):
     app = FastAPI()
+    app.state.authorization = AllowAllAuthorizationAdapter()
     app.state.identity = identity or _mock_identity()
     app.include_router(create_identity_router(tenant_service))
     return app
@@ -91,6 +93,55 @@ class TestGetMe:
         assert any(field["key"] == "email" for field in data["sections"][0]["fields"])
         assert data["sections"][1]["id"] == "tokens"
         assert data["sections"][1]["resources"][0]["type"] == "tokens"
+
+
+class TestGetAuthConfig:
+    """Tests for GET /auth/config — the flag the web UI reads for a banner."""
+
+    def test_none_mode_returns_explicit_flag_not_404(self):
+        svc = AsyncMock(spec=TenantService)
+        app = _make_app(svc)
+        app.state.settings = SimpleNamespace(auth_mode="none")
+        client = TestClient(app)
+
+        resp = client.get("/api/v1/identity/auth/config", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "none"
+        assert data["device_authorization_supported"] is False
+
+    def test_oidc_mode_reports_issuer_and_mode(self):
+        svc = AsyncMock(spec=TenantService)
+        app = _make_app(svc)
+        app.state.settings = SimpleNamespace(
+            auth_mode="oidc",
+            auth_discovery=SimpleNamespace(
+                issuer="https://kc.example/realms/volundr",
+                cli_client_id="volundr-cli",
+                scopes="openid profile email",
+            ),
+        )
+        client = TestClient(app)
+
+        resp = client.get("/api/v1/identity/auth/config", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "oidc"
+        assert data["issuer"] == "https://kc.example/realms/volundr"
+        assert data["device_authorization_supported"] is True
+
+    def test_envoy_mode_without_issuer_still_404s(self):
+        svc = AsyncMock(spec=TenantService)
+        app = _make_app(svc)
+        app.state.settings = SimpleNamespace(
+            auth_mode="envoy",
+            auth_discovery=SimpleNamespace(issuer="", cli_client_id="", scopes=""),
+            gateway=SimpleNamespace(kwargs={}),
+        )
+        client = TestClient(app)
+
+        resp = client.get("/api/v1/identity/auth/config", headers=AUTH)
+        assert resp.status_code == 404
 
 
 class TestListTenants:
@@ -470,3 +521,58 @@ class TestMembers:
 
         resp = client.delete("/api/v1/identity/tenants/t1/members/u1", headers=AUTH)
         assert resp.status_code == 404
+
+
+class TestTenantIsolation:
+    def test_admin_cannot_access_another_tenant(self):
+        from identity.adapters.cedar import CedarAuthorizationAdapter
+
+        service = AsyncMock(spec=TenantService)
+        app = _make_app(service)
+        app.state.authorization = CedarAuthorizationAdapter()
+        client = TestClient(app)
+        for method, path, body in [
+            ("GET", "/tenants/other", None),
+            ("GET", "/tenants/other/members", None),
+            ("PATCH", "/tenants/other", {"max_sessions": 20}),
+            ("DELETE", "/tenants/other", None),
+            ("POST", "/tenants/other/members", {"user_id": "u2", "role": "admin"}),
+            ("DELETE", "/tenants/other/members/u2", None),
+            ("POST", "/tenants/other/reprovision", None),
+            ("POST", "/tenants", {"name": "New tenant"}),
+        ]:
+            response = client.request(method, "/api/v1/identity" + path, json=body, headers=AUTH)
+            assert response.status_code == 403, response.text
+        assert not service.mock_calls
+
+    def test_lists_only_own_tenant_and_users(self):
+        from identity.adapters.cedar import CedarAuthorizationAdapter
+        from identity.models import User
+
+        service = AsyncMock(spec=TenantService)
+        service.list_tenants.return_value = [_sample_tenant(), _sample_tenant(id="other")]
+        service.get_members.return_value = [TenantMembership(user_id="u1", tenant_id="t1")]
+        service.list_users.return_value = [
+            User(id="u1", email="me@test"),
+            User(id="u2", email="x@test"),
+        ]
+        app = _make_app(service)
+        app.state.authorization = CedarAuthorizationAdapter()
+        client = TestClient(app)
+        tenants = client.get("/api/v1/identity/tenants", headers=AUTH)
+        assert tenants.status_code == 200
+        assert [tenant["id"] for tenant in tenants.json()] == ["t1"]
+        users = client.get("/api/v1/identity/users", headers=AUTH)
+        assert users.status_code == 200
+        assert [user["id"] for user in users.json()] == ["u1"]
+        response = client.post("/api/v1/identity/users/u2/reprovision", headers=AUTH)
+        assert response.status_code == 403
+        service.reprovision_user.assert_not_awaited()
+
+    def test_authorization_unavailable_fails_closed(self):
+        service = AsyncMock(spec=TenantService)
+        app = _make_app(service)
+        del app.state.authorization
+        response = TestClient(app).delete("/api/v1/identity/tenants/t1", headers=AUTH)
+        assert response.status_code == 503
+        service.delete_tenant.assert_not_awaited()

@@ -31,13 +31,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
-import skuld.tool_result_preview as trp_mod
+from skuld import tool_result_preview as trp_mod
 from skuld.tool_result_preview import (
     PreviewCache,
     extract_image_bytes,
     generate_preview_jpeg,
 )
-from tests.conftest import InMemorySessionRepository, MockPodManager
+from tests.conftest import (
+    InMemorySessionRepository,
+    MockPodManager,
+    make_session_participant_service,
+)
 from tests.test_domain.test_session_archive_service import InMemorySessionEventLog
 from volundr.adapters.inbound.rest import create_router
 from volundr.adapters.outbound.archive_store import FileSystemArchiveStore
@@ -198,6 +202,7 @@ def _build(
             session_service,
             archive_service=archive_service,
             preview_cache=cache,
+            session_participant_service=make_session_participant_service(session_service),
         )
     )
 
@@ -616,6 +621,17 @@ def test_generate_preview_undecodable_bytes_raise_value_error() -> None:
         generate_preview_jpeg(b"definitely not an image")
 
 
+@pytest.mark.parametrize("session_id", ["../outside", "/tmp/outside", "a/../../outside"])
+@pytest.mark.parametrize("tool_use_id", ["../image", "/tmp/image", "a/../../image"])
+def test_preview_cache_contains_untrusted_identifiers(tmp_path, session_id, tool_use_id):
+    cache = PreviewCache(tmp_path / "cache")
+    cache.put(session_id, tool_use_id, b"preview")
+    assert cache.get(session_id, tool_use_id) == b"preview"
+    assert cache.has(session_id, tool_use_id)
+    assert cache._path(session_id, tool_use_id).resolve().is_relative_to(cache.root.resolve())
+    assert list(tmp_path.iterdir()) == [cache.root]
+
+
 @pytest.mark.asyncio
 async def test_multiple_images_use_separate_preview_cache_entries(tmp_path) -> None:
     event_log = _CountingEventLog()
@@ -637,3 +653,53 @@ async def test_multiple_images_use_separate_preview_cache_entries(tmp_path) -> N
             assert image.size == size
     assert client.get(path, params={"image_index": 2}).status_code == 404
     assert client.get(path, params={"image_index": -1}).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_router_builds_cache_from_preview_cache_dir_when_not_injected(
+    tmp_path,
+) -> None:
+    """create_router must build its PreviewCache from the passed `preview_cache_dir`
+    when the caller does not inject a PreviewCache directly — this is the wiring
+    volundr.main relies on to point production at the configured
+    Settings.preview_cache_dir instead of DEFAULT_PREVIEW_CACHE_DIR (a Kubernetes
+    pod's read-only root filesystem makes that default unwritable)."""
+    event_log = _CountingEventLog()
+    repository = InMemorySessionRepository()
+    session_service = SessionService(
+        repository=repository,
+        pod_manager=_RUNNING_POD_MANAGER,
+        validate_repos=False,
+    )
+    archive_service = SessionArchiveService(
+        session_service,
+        _NoWorkspaceStorage(),
+        FileSystemArchiveStore(),
+        event_log_repository=event_log,
+    )
+    cache_dir = tmp_path / "configured-preview-cache"
+
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            session_service,
+            archive_service=archive_service,
+            preview_cache_dir=cache_dir,
+            session_participant_service=make_session_participant_service(session_service),
+        )
+    )
+
+    class _SettingsStub:
+        local_mounts = LocalMountsConfig()
+
+    app.state.settings = _SettingsStub()
+    app.state.admin_settings = {}
+    client = TestClient(app)
+
+    session = await _stopped_session(repository)
+    await event_log.append(_frames(session.id, {"tu-img": _image_envelope(320, 320)}))
+
+    resp = client.get(_PREVIEW_PATH.format(sid=session.id, tuid="tu-img"))
+
+    assert resp.status_code == 200
+    assert list(cache_dir.rglob("*.jpg")), "preview was not written under preview_cache_dir"

@@ -23,11 +23,13 @@ class StorageContributor(SessionContributor):
         *,
         storage: StoragePort | None = None,
         home_enabled: bool = True,
+        persistent_tmp: bool = True,
         admin_settings: dict | None = None,
         **_extra: object,
     ):
         self._storage = storage
         self._default_home_enabled = home_enabled
+        self._persistent_tmp = persistent_tmp
         self._admin_settings = admin_settings
 
     @property
@@ -48,10 +50,22 @@ class StorageContributor(SessionContributor):
         session: Session,
         context: SessionContext,
     ) -> SessionContribution:
-        if context.runtime_backend == "openshell":
+        # VM runtimes own their guest-local workspace and archive lifecycle.
+        # Emitting PVC-backed Helm values would make that local disk look like
+        # Kubernetes storage and must not provision an unused workspace claim.
+        if context.storage_backend == "vm" or context.runtime_backend == "vm":
             return SessionContribution()
 
         if self._storage is None:
+            return SessionContribution()
+
+        # Pre-existing OpenShell sessions keep their gateway-owned volume and
+        # use native stop/start; do not provision replacement empty storage.
+        if (
+            context.runtime_backend == "openshell"
+            and session.pod_name
+            and await self._storage.get_workspace_by_session(str(session.id)) is None
+        ):
             return SessionContribution()
 
         home_pvc, workspace_pvc = await self._provision(session)
@@ -62,6 +76,7 @@ class StorageContributor(SessionContributor):
                 "enabled": True,
                 "existingClaim": home_pvc,
                 "mountPath": self._storage.home_mount_path,
+                "persistentTmp": self._persistent_tmp,
             }
         if workspace_pvc:
             values["persistence"] = {
@@ -76,6 +91,8 @@ class StorageContributor(SessionContributor):
         session: Session,
         context: SessionContext,
     ) -> None:
+        if context.storage_backend == "vm" or context.runtime_backend == "vm":
+            return
         if self._storage is None:
             return
         await self._storage.archive_session_workspace(str(session.id))

@@ -21,7 +21,50 @@ from websockets.sync.client import connect
 
 from volundr.domain.models import LocalMountSource, Session, SessionStatus
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity proof")
+_linux_only = pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity proof")
+
+
+def _terminate_if_alive(process):
+    """Send SIGTERM to a still-live subprocess, tolerating an exit/signal race.
+
+    ``process.poll() is None`` only proves liveness at that instant. The real
+    process (uvicorn, here) can exit on its own — graceful shutdown, CI
+    resource pressure — in the gap before the signal lands. ``Popen.terminate``
+    re-checks liveness internally but still calls ``os.kill()`` on a pid that
+    can vanish in that same window, raising ``ProcessLookupError`` for a
+    process that is already exactly what we wanted: gone. This is the CI
+    failure this helper fixes (ProcessLookupError from this exact teardown
+    call), not a broadened catch — it guards only the terminate/wait pair.
+    """
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=15)
+    except ProcessLookupError:
+        # The process exited between poll() and terminate().
+        pass
+
+
+def test_terminate_if_alive_tolerates_process_exiting_between_check_and_signal():
+    """Deterministic reproduction of the teardown race that raised
+    ``ProcessLookupError: [Errno 3] No such process`` in the Forge Stability
+    gate: the liveness check (``poll() is None``) passes, then the process
+    exits before the signal reaches it. Faked instead of raced against a real
+    process so the interleaving is exact and platform-independent.
+    """
+
+    class ExitsBetweenCheckAndSignal:
+        def poll(self):
+            return None  # still alive at the liveness check
+
+        def terminate(self):
+            raise ProcessLookupError(3, "No such process")  # ...gone by the signal
+
+        def wait(self, timeout=None):
+            raise AssertionError("wait() must not run after terminate() raised")
+
+    _terminate_if_alive(ExitsBetweenCheckAndSignal())  # must not raise
 
 
 def _port():
@@ -36,15 +79,16 @@ def _identity(pid):
     return {"pid": pid, "start_ticks": fields[19]}
 
 
-def _wait_http(url, process):
+def _wait_http(url, process, log_path):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        assert process.poll() is None, "API exited before ready; inspect fixture api.log"
+        assert process.poll() is None, log_path.read_text()
         try:
             response = httpx.get(url, timeout=0.5, trust_env=False)
             if response.status_code == 200:
                 return response.json()
         except httpx.TransportError:
+            # The API may not be listening yet; the readiness deadline remains enforced.
             pass
         time.sleep(0.05)
     raise AssertionError(f"Readiness deadline exceeded: {url}")
@@ -60,6 +104,7 @@ def _receive_until(ws, needle):
     raise AssertionError(f"No {needle} in {frames}")
 
 
+@_linux_only
 @pytest.mark.parametrize(
     "status",
     [SessionStatus.RUNNING, SessionStatus.STOPPED, SessionStatus.ARCHIVED, SessionStatus.FAILED],
@@ -132,10 +177,10 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
 
         try:
             api = launch()
-            initial = _wait_http(rest + "/fixture/status", api)
+            initial = _wait_http(rest + "/fixture/status", api, tmp_path / "api.log")
             assert initial["backend"] == "process"
             assert initial["session"] == session.model_dump(mode="json")
-            _wait_http(f"http://127.0.0.1:{gateway_port}/health", api)
+            _wait_http(f"http://127.0.0.1:{gateway_port}/health", api, tmp_path / "api.log")
             gateway_pid = json.loads(Path(config["state_file"]).read_text())[str(session.id)]["pid"]
             gateway_identity = _identity(gateway_pid)
             with connect(ws_url, proxy=None) as first:
@@ -151,7 +196,7 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
             assert _identity(gateway_pid) == gateway_identity
             assert _identity(native_pid) == native_identity
             api = launch()
-            assert _wait_http(rest + "/fixture/status", api) == initial
+            assert _wait_http(rest + "/fixture/status", api, tmp_path / "api.log") == initial
             with connect(ws_url, proxy=None) as second:
                 _receive_until(second, "BEFORE_RESTART")
                 # Also exercise abrupt API death: both restarts must rebuild
@@ -164,7 +209,7 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
                 assert time.monotonic() < deadline, "Owned turn did not progress during API outage"
                 time.sleep(0.05)
             api = launch()
-            assert _wait_http(rest + "/fixture/status", api) == initial
+            assert _wait_http(rest + "/fixture/status", api, tmp_path / "api.log") == initial
             with connect(ws_url, proxy=None) as third:
                 _receive_until(third, "DURING_API_OUTAGE")
                 # Allow the real periodic startup-reconciliation loop to run
@@ -205,9 +250,7 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
                 )
             )
         finally:
-            if api is not None and api.poll() is None:
-                api.terminate()
-                api.wait(timeout=15)
+            _terminate_if_alive(api)
             # Clean up only test-owned identities, even on assertion failure.
             owned = {}
             for kind in ("gateway", "native"):
@@ -222,6 +265,7 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
                     if _identity(gateway_pid) == owned[gateway_pid]:
                         os.kill(gateway_pid, signal.SIGTERM)
                 except (FileNotFoundError, ProcessLookupError, AssertionError):
+                    # The owned process already exited or its PID was reused.
                     pass
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
@@ -235,4 +279,5 @@ def test_full_api_restart_preserves_processes_turn_and_proxy_reconnect(tmp_path,
                     if _identity(pid) == original:
                         os.kill(pid, signal.SIGKILL)
                 except (FileNotFoundError, ProcessLookupError, AssertionError):
+                    # The owned process already exited or its PID was reused.
                     pass

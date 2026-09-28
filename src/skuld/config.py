@@ -16,7 +16,7 @@ import json
 import os
 from contextlib import suppress
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -27,9 +27,11 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from identity.authz_config import AuthorizationAdapterConfig
+from niuu.config import DynamicAdapterConfig
 from niuu.domain.observability import ObservabilityConfig
 from niuu.forge_mcp.models import ForgeMcpGrant
-from niuu.mesh.config import MeshNatsConfig
+from niuu.mesh.config import DEFAULT_RPC_REPLY_CACHE_SIZE, MeshNatsConfig
 from skuld.claude_permission import DEFAULT_CLAUDE_PERMISSION_MODE
 
 
@@ -106,8 +108,8 @@ class MeshConfig(BaseModel):
     adapters: list[dict[str, Any]] = Field(default_factory=list)
     discovery_adapters: list[dict[str, Any]] = Field(default_factory=list)
     nats: MeshNatsConfig = Field(default_factory=MeshNatsConfig)
-    redis_url_env: str = Field(default="REDIS_URL")
     rpc_timeout_s: float = Field(default=10.0)
+    rpc_reply_cache_size: int = Field(default=DEFAULT_RPC_REPLY_CACHE_SIZE, ge=1)
     default_work_timeout_s: float = Field(default=120.0)
     default_response_urgency: float = Field(default=0.3)
     diff_max_bytes: int = Field(default=8192)
@@ -152,6 +154,17 @@ class WorkflowRuntimeConfig(BaseModel):
     initial_context: str = Field(default="")
     graph: dict[str, Any] = Field(default_factory=dict)
     trace_context: dict[str, str] = Field(default_factory=dict)
+    evidence_verifier: DynamicAdapterConfig | None = Field(
+        default=None,
+        description=(
+            "Deployment-owned evidence verifier adapter and trust configuration. Required "
+            "for evidence gate nodes; never populated from imported workflow graph content."
+        ),
+    )
+    evidence_artifacts: DynamicAdapterConfig | None = Field(
+        default=None,
+        description="Deployment-owned resolver for the current digest of evidence gate artifacts.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -305,11 +318,11 @@ class SkuldSessionConfig(BaseModel):
             "declare a tenant."
         ),
     )
-    model: str = Field(default="claude-opus-5")
+    model: str = Field(default="claude-opus-5-5")
     reasoning_effort: str = Field(
         default="",
         description=(
-            "Reasoning effort to launch the CLI at (e.g. 'ultra' for GPT-5.6 Sol). "
+            "Reasoning effort to launch the CLI at (e.g. 'ultra' for GPT-6 Sol). "
             "Empty lets the transport pick a model-appropriate default."
         ),
     )
@@ -359,38 +372,145 @@ class ObservationRelayConfig(BaseModel):
 
 
 class WsAuthConfig(BaseModel):
-    """Ownership enforcement for inbound WebSocket connections.
+    """Optional ownership enforcement behind a trusted authentication proxy.
 
-    The broker does not validate token signatures — that is Envoy's / the API
-    gateway's job (see ``.claude/rules/architecture.md``: delegate to standard
-    OIDC flows). What the broker enforces is AUTHORIZATION: the connecting
-    identity must own this session. Identity is resolved the same way
-    Volundr's ``extract_principal`` does — Envoy ``x-auth-*`` headers first,
-    developer query parameters second, decoded bearer claims last — and the
-    verdict mirrors ``SimpleRoleAuthorizationAdapter``: tenant scoping, admin
-    bypass, then owner match. Sessions with no ``session.owner_id`` (legacy
-    and unauthenticated dev sessions) are not restricted.
+    Disabled mode supports local mini-mode without authentication. Enabled mode
+    requires verified identity headers and explicit session owner/tenant metadata.
+    The application listener must only be reachable through the trusted proxy.
     """
 
     enforce_ownership: bool = Field(
-        default=True,
+        default=False,
+        description="Require authenticated session ownership for WebSocket connections.",
+    )
+    authorization: AuthorizationAdapterConfig = Field(default_factory=AuthorizationAdapterConfig)
+    identity: AuthorizationAdapterConfig | None = None
+    websocket_check_interval: float = Field(
+        default=5.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Maximum interval between active WebSocket credential lifetime checks.",
+    )
+    user_id_header: str = "x-auth-user-id"
+    tenant_header: str = "x-auth-tenant"
+    roles_header: str = "x-auth-roles"
+    room_role_header: str = Field(
+        default="x-niuu-room-role",
         description=(
-            "Reject WebSocket connections whose identity does not match the "
-            "session owner. Only applies when session.owner_id is set."
+            "Header the session proxy (niuu.session_proxy) stamps with the "
+            "caller's verified room role (owner/approver/viewer), used to gate "
+            "per-message-type WebSocket authorization. Must match the proxy's "
+            "own header name."
         ),
     )
+    role_mapping: dict[str, str] = Field(default_factory=dict)
     admin_roles: list[str] = Field(
         default_factory=lambda: ["volundr:admin"],
-        description="Roles that may attach to any session within the tenant.",
+        description="Verified roles mapped to the Cedar administrator role.",
     )
     allow_loopback: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "Accept unauthenticated connections from loopback addresses. "
-            "In-pod peers (the CLI attaching via --sdk-url, flock ravn "
-            "daemons) share the pod trust boundary and carry no user token."
+            "Trust unauthenticated loopback CLI/Ravn peers. Enable only when "
+            "those endpoints cannot be reached through a reverse proxy."
         ),
     )
+    room_role_source: Literal["proxy", "deployment", "remote"] = Field(
+        default="deployment",
+        description=(
+            "How to resolve the room role when room_role_header is absent. "
+            "'deployment' (the default, and what every non-process backend "
+            "gets — Kubernetes, OpenShell, VM, and docker unless routed "
+            "through the session proxy): this pod's own auth boundary "
+            "(ext_authz / enforce_ownership / the deployment's Gateway or "
+            "ingress) already gates every caller who reaches this pod, "
+            "participants are not supported on these backends (invites are "
+            "refused with 409 before this ever matters), so a missing "
+            "header simply means owner — identical to this pod's behavior "
+            "before session_participants existed. 'proxy' (rendered only "
+            "for the process backend, by the local process launcher): the "
+            "session proxy (niuu.session_proxy) resolves and stamps the "
+            "header itself from session_participants grants, so trust it — "
+            "a missing header means viewer, except a loopback caller "
+            "carrying no x-forwarded-for (same-pod tooling a reverse proxy "
+            "could never present as). 'remote' (Kubernetes pods deliberately "
+            "opted into session_participants support — "
+            "see PodManagerConfig.room_role_source in volundr/config.py): "
+            "room_role_remote's dynamic adapter asks Forge for the caller's "
+            "grant on every request, so a missing header genuinely means "
+            "'ask Forge', not an implicit default — see "
+            "skuld.room_role_port.RoomRoleResolverPort. Requires "
+            "room_role_remote to be set; unreachable Forge or a resolution "
+            "error is a hard deny, never owner or viewer."
+        ),
+    )
+    room_role_remote: DynamicAdapterConfig | None = Field(
+        default=None,
+        description=(
+            "Dynamic adapter (skuld.room_role_port.RoomRoleResolverPort) used "
+            "when room_role_source is 'remote'. Required in that case — "
+            "config that asks for remote resolution and supplies no adapter "
+            "to do it is a configuration error, not an implicit fallback to "
+            "'deployment'."
+        ),
+    )
+    room_role_revalidate_interval_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "How often an open 'remote'-mode browser WebSocket re-checks its "
+            "room role against Forge and closes on revoke/demotion (mirrors "
+            "niuu.session_proxy._revalidate_loop). Only used when "
+            "room_role_source is 'remote'."
+        ),
+    )
+    room_role_revalidate_max_consecutive_failures: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "A transient RoomRoleResolutionError during revalidation (a "
+            "momentary Forge blip) keeps the connection open rather than "
+            "closing it — but that grace is bounded: after this many "
+            "consecutive failures, or room_role_revalidate_max_staleness_"
+            "seconds since the first one (whichever comes first), the "
+            "socket closes (1011) rather than staying open indefinitely on "
+            "an authority that never recovers."
+        ),
+    )
+    room_role_revalidate_max_staleness_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "See room_role_revalidate_max_consecutive_failures — the time"
+            "-based half of the same bound."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _remote_room_role_requires_adapter(self) -> "WsAuthConfig":
+        if self.room_role_source != "remote":
+            return self
+        if self.room_role_remote is None:
+            raise ValueError(
+                "ws_auth.room_role_source is 'remote' but ws_auth.room_role_remote is not "
+                "set — configure its adapter (e.g. "
+                "skuld.room_role_remote.RemoteAuthorizationAdapter) and kwargs, or set "
+                "room_role_source back to 'deployment'."
+            )
+        if self.enforce_ownership:
+            raise ValueError(
+                "ws_auth.room_role_source is 'remote' but ws_auth.enforce_ownership is "
+                "true — this pod's own ext_authz sidecar (identity.adapters.envoy_authz) "
+                "gates every connection to Cedar's 'start' action (owner/admin only) "
+                "before a remote room-role lookup ever runs, so a participant could "
+                "never attach regardless of their grant. Disable enforce_ownership for "
+                "this backend, or set room_role_source back to 'deployment' and keep "
+                "session_participants invites refused (see "
+                "rest_session_participants.REMOTE_CAPABLE_RUNTIME_BACKENDS)."
+            )
+        return self
 
 
 class ActivityHeartbeatConfig(BaseModel):
@@ -607,6 +727,33 @@ class CodexAuthConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
 
 
+class ModelGatewayConfig(BaseModel):
+    """Route the Claude Code and Codex CLIs through the platform's model gateway.
+
+    Set by the platform (``SKULD__MODEL_GATEWAY__URL``) when a session is
+    launched with the Model server provider: the CLIs then talk to Bifrost,
+    which speaks both the Anthropic and the OpenAI dialect and forwards to the
+    self-hosted server. Empty means the CLIs use their vendors' own APIs.
+    """
+
+    url: str = Field(
+        default="",
+        description="Bifrost base URL as reachable from the session, e.g. http://niuu:8080/api/v1/bifrost.",
+    )
+    token: str = Field(
+        default="",
+        description=(
+            "Bearer token the CLIs present to the gateway. Empty (the default) sends "
+            "no meaningful credential — fine for a gateway running auth_mode: open "
+            "(it ignores whatever is sent), a hard 401 from any other gateway auth "
+            "mode. A 'pat'/'mesh'/'oidc' gateway needs a real PAT configured here; "
+            "there is no platform-computed default yet (see "
+            "cli.config.CLISettings._OIDC_UNCOVERED_PLUGINS['bifrost'] for the "
+            "current state of automatically minting one)."
+        ),
+    )
+
+
 class PiRuntimeConfig(BaseModel):
     """Native PI RPC process settings; credentials remain owned by PI on the host."""
 
@@ -632,7 +779,7 @@ class DshRuntimeConfig(BaseModel):
         default="",
         description=(
             "Path to a Cordis composition file for the runtime. Empty uses the "
-            "default composition bundled with deepseek-harness-runtime-bin."
+            "SDK profile bundled with deepseek-harness-runtime-bin."
         ),
     )
     base_url: str = Field(
@@ -734,6 +881,34 @@ class ReflexConfig(BaseModel):
     )
 
 
+class TraceContextConfig(BaseSettings):
+    """The W3C trace context this broker process inherited at spawn time.
+
+    Not operator configuration — a per-process runtime carrier. Völundr's
+    ``CoreSessionContributor`` sets bare ``TRACEPARENT``/``TRACESTATE`` (no
+    ``SKULD__`` prefix, since these are the standard W3C env var names other
+    tools — including Claude Code itself — read the same way) in the env of
+    the pod/process it spawns for a session; this is Skuld reading that back
+    as typed settings instead of a bare ``os.environ.get`` (config-first.md).
+    A separate ``BaseSettings`` subclass, not a nested field on
+    ``SkuldSettings``, because pydantic-settings only resolves a field's own
+    ``validation_alias`` against nested env vars for a ``BaseSettings``
+    instance — a plain nested ``BaseModel`` field ignores it and only ever
+    sees ``SKULD__TRACE_CONTEXT__TRACEPARENT``, not the real env var.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    traceparent: str = Field(
+        default="",
+        validation_alias=AliasChoices("traceparent", "TRACEPARENT"),
+    )
+    tracestate: str = Field(
+        default="",
+        validation_alias=AliasChoices("tracestate", "TRACESTATE"),
+    )
+
+
 class SkuldSettings(BaseSettings):
     """Skuld broker settings.
 
@@ -804,6 +979,7 @@ class SkuldSettings(BaseSettings):
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     ws_auth: WsAuthConfig = Field(default_factory=WsAuthConfig)
     observation_relay: ObservationRelayConfig = Field(default_factory=ObservationRelayConfig)
+    trace_context: TraceContextConfig = Field(default_factory=TraceContextConfig)
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8081)
     volundr_api_url: str = Field(default="")
@@ -829,6 +1005,8 @@ class SkuldSettings(BaseSettings):
     workload_identity: WorkloadIdentityConfig = Field(default_factory=WorkloadIdentityConfig)
     codex_auth: CodexAuthConfig = Field(default_factory=CodexAuthConfig)
     dsh: DshRuntimeConfig = Field(default_factory=DshRuntimeConfig)
+    model_gateway: ModelGatewayConfig = Field(default_factory=ModelGatewayConfig)
+
     pi: PiRuntimeConfig = Field(default_factory=PiRuntimeConfig)
     service_user_id: str = Field(default="skuld-broker")
     service_tenant_id: str = Field(default="default")
@@ -930,6 +1108,19 @@ class SkuldSettings(BaseSettings):
         ge=1,
         description="Maximum navigation keys and, separately, confirmations for workspace trust.",
     )
+    tmux_native_text_wait_s: float = Field(
+        default=0.1,
+        gt=0,
+        description=(
+            "Longest a PreToolUse hook waits for Claude's native transcript to show the "
+            "text preceding that tool before falling back to captured hook order."
+        ),
+    )
+    tmux_native_text_poll_s: float = Field(
+        default=0.005,
+        gt=0,
+        description="Interval between native transcript reads while that wait is open.",
+    )
     codex_receive_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     # Unified internal-visibility default for a freshly-connected live channel
     # (SRD FR-7 / INV-10). The read paths thread the SAME configured default
@@ -1011,11 +1202,18 @@ class SkuldSettings(BaseSettings):
             return self.session.workspace_dir
         return f"{self.persistence_mount_path}/{self.session.id}/workspace"
 
+    persistent_home_path: str = Field(
+        default="",
+        description="Mounted user home for file management; empty uses the session-local home.",
+    )
+
     @property
     def home_path(self) -> str:
         """Resolved home directory path for the session."""
         if self.home_dir:
             return self.home_dir
+        if self.persistent_home_path:
+            return self.persistent_home_path
         return f"{self.persistence_mount_path}/{self.session.id}/home"
 
     @property

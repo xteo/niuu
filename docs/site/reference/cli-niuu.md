@@ -12,15 +12,25 @@ For the agent runtime CLI see [ravn](cli-ravn.md).
 
 ### Run the local stack
 
-The scripts are the short path for day-to-day work. Use the CLI directly when you are debugging the platform host itself.
+The scripts are the short path for day-to-day work. Use the CLI directly for a foreground run; stop that run with Ctrl+C. The status/down commands only see services in their own process, so they do not control another terminal's foreground platform.
 
 ```bash
 ./start-dev                 # full local stack on :8080, mini mode
 ./stop-dev
 
-niuu platform up            # same thing, driven directly
-niuu platform status        # health of every registered service
-niuu platform down
+niuu platform up            # foreground; Ctrl+C to stop
+```
+
+### Lifecycle shortcuts
+
+`niuu up`, `niuu down`, and `niuu status` forward to the `platform` commands with default flags; use the `platform` group when you need per-service flags. In docker mode `niuu up` starts the Docker compose bundle instead of host processes. `niuu doctor` runs the host checks for the configured mode without starting anything.
+
+```bash
+niuu up                     # same as `niuu platform up` with default flags
+niuu down                   # same as `niuu platform down`
+niuu status                 # same as `niuu platform status`
+niuu doctor                 # host checks only; exit 1 on failure
+niuu up --mode docker       # whole stack as containers on this host
 ```
 
 ### Choose what starts
@@ -51,7 +61,9 @@ niuu login
 niuu whoami
 
 niuu context list
-niuu context add staging https://niuu.example.com
+printf 'Server URL: '
+read -r NIUU_CONTEXT_URL
+niuu context add staging "$NIUU_CONTEXT_URL"
 niuu context use staging
 ```
 
@@ -60,7 +72,9 @@ niuu context use staging
 ```bash
 niuu sessions list
 niuu sessions create my-feature
-niuu sessions stop <session-id>
+printf 'ID of the session to stop: '
+read -r NIUU_SESSION_ID
+niuu sessions stop "$NIUU_SESSION_ID"
 niuu sessions list --json          # machine-readable
 ```
 
@@ -70,12 +84,15 @@ Runs are individual executions; sagas are the longer campaigns that dispatch the
 
 ```bash
 niuu runs active
-niuu runs approve <run-id>
-niuu runs reject <run-id>
+# Inspect the pending review before choosing approve or reject.
+niuu runs approve --help
+niuu runs reject --help
 
 niuu sagas list
 niuu sagas create nightly-cleanup
-niuu sagas dispatch <saga-id>
+printf 'ID of the saga to dispatch: '
+read -r NIUU_SAGA_ID
+niuu sagas dispatch "$NIUU_SAGA_ID"
 ```
 
 ### Watch it all
@@ -99,8 +116,8 @@ niuu [OPTIONS] COMMAND [ARGS]...
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--version`, `-V` | flag |  | Print version and exit. |
-| `--home` | TEXT |  | Config directory (default: ~/.niuu, env NIUU_HOME). Env: `NIUU_HOME` |
-| `--config` | TEXT |  | Config file path (default: ~/.niuu/config.yaml). |
+| `--home` | STR |  | Config directory (default: ~/.niuu, env NIUU_HOME). Env: `NIUU_HOME` |
+| `--config` | STR |  | Config file path (default: ~/.niuu/config.yaml). |
 | `--install-completion` | flag |  | Install completion for the current shell. |
 | `--show-completion` | flag |  | Show completion for the current shell, to copy it or customize the installation. |
 
@@ -108,14 +125,18 @@ niuu [OPTIONS] COMMAND [ARGS]...
 | --- | --- |
 | [`config`](#niuu-config) | Show or update configuration. |
 | [`context`](#niuu-context) | Manage server contexts. |
+| [`doctor`](#niuu-doctor) | Check this host can run the platform in the configured mode. |
+| [`down`](#niuu-down) | Stop the platform. Same as `niuu platform down`. |
 | [`login`](#niuu-login) | Authenticate with the Niuu platform. |
 | [`logout`](#niuu-logout) | Clear stored credentials. |
-| [`platform`](#niuu-platform) | Manage the platform (up, down, status, init). |
+| [`platform`](#niuu-platform) | Manage the platform (up, down, status, init). `niuu up\|down\|status` are shortcuts for these with default flags. |
 | [`ravn`](#niuu-ravn) | Manage Ravn AI agent sessions. |
 | [`runs`](#niuu-runs) | Manage runs. |
 | [`sagas`](#niuu-sagas) | Manage sagas. |
 | [`sessions`](#niuu-sessions) | Manage coding sessions. |
+| [`status`](#niuu-status) | Show platform status. Same as `niuu platform status`. |
 | [`tui`](#niuu-tui) | Launch the interactive TUI. |
+| [`up`](#niuu-up) | Start the platform. |
 | [`version`](#niuu-version) | Print the niuu CLI version. |
 | [`whoami`](#niuu-whoami) | Show the currently authenticated user. |
 
@@ -137,7 +158,7 @@ niuu config [OPTIONS] COMMAND [ARGS]...
 Set a configuration value.
 
 ```bash
-niuu config set [OPTIONS] KEY VALUE
+niuu config set [OPTIONS] {key} {value}
 ```
 
 | Argument | Required | Description |
@@ -173,7 +194,7 @@ niuu context [OPTIONS] COMMAND [ARGS]...
 Add a new server context.
 
 ```bash
-niuu context add [OPTIONS] NAME URL
+niuu context add [OPTIONS] {name} {url}
 ```
 
 | Argument | Required | Description |
@@ -186,7 +207,7 @@ niuu context add [OPTIONS] NAME URL
 Remove a context.
 
 ```bash
-niuu context delete [OPTIONS] NAME
+niuu context delete [OPTIONS] {name}
 ```
 
 | Argument | Required | Description |
@@ -206,12 +227,34 @@ niuu context list [OPTIONS]
 Switch to a context.
 
 ```bash
-niuu context use [OPTIONS] NAME
+niuu context use [OPTIONS] {name}
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
 | `NAME` | yes | Context name to activate |
+
+#### `niuu doctor`
+
+Check this host can run the platform in the configured mode.
+
+```bash
+niuu doctor [OPTIONS]
+```
+
+Prints the same preflight `niuu up` runs (Docker, GPU, disk, ports, ... in docker mode; claude binary, embedded database, ... in mini mode) without starting anything. Exit code 1 when a check fails.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--mode` | STR |  | Check the host for this mode instead of the configured one. |
+
+#### `niuu down`
+
+Stop the platform. Same as `niuu platform down`.
+
+```bash
+niuu down [OPTIONS]
+```
 
 #### `niuu login`
 
@@ -223,8 +266,8 @@ niuu login [OPTIONS]
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--issuer`, `-i` | TEXT |  | OIDC issuer URL. Env: `NIUU_OIDC_ISSUER` |
-| `--client-id` | TEXT | `niuu-cli` | OIDC client ID. Env: `NIUU_OIDC_CLIENT_ID` |
+| `--issuer`, `-i` | STR |  | OIDC issuer URL. Env: `NIUU_OIDC_ISSUER` |
+| `--client-id` | STR | `niuu-cli` | OIDC client ID. Env: `NIUU_OIDC_CLIENT_ID` |
 
 #### `niuu logout`
 
@@ -236,7 +279,7 @@ niuu logout [OPTIONS]
 
 #### `niuu platform`
 
-Manage the platform (up, down, status, init).
+Manage the platform (up, down, status, init). `niuu up\|down\|status` are shortcuts for these with default flags.
 
 ```bash
 niuu platform [OPTIONS] COMMAND [ARGS]...
@@ -276,10 +319,10 @@ niuu platform inventory [OPTIONS]
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--host-profile` | TEXT | `full` | Host profile used to resolve mounted route domains. |
-| `--mounts` | TEXT |  | Comma-separated route domains to inventory instead of the profile default. |
+| `--host-profile` | STR | `full` | Host profile used to resolve mounted route domains. |
+| `--mounts` | STR |  | Comma-separated route domains to inventory instead of the profile default. |
 | `--json` | flag |  | Print route inventory as JSON. |
-| `--out` | TEXT |  | Optional file path to write the JSON route inventory report. |
+| `--out` | STR |  | Optional file path to write the JSON route inventory report. |
 
 ##### `niuu platform status`
 
@@ -302,9 +345,9 @@ niuu platform up [OPTIONS]
 | `--skip-preflight`, `--no-skip-preflight` | flag |  | Start without running the host preflight checks. |
 | `--all`, `--no-all` | flag |  | Start every registered service, ignoring per-service defaults. |
 | `--no-web`, `--no-no-web` | flag |  | Start the backend services without serving the web UI. |
-| `--host-profile` | TEXT | `full` | Host profile that decides which route domains are mounted. |
-| `--mounts` | TEXT |  | Comma-separated route domains to mount instead of the profile default. |
-| `--workspaces-dir` | TEXT |  | Directory for session workspaces. Mini mode only. |
+| `--host-profile` | STR | `full` | Host profile that decides which route domains are mounted. |
+| `--mounts` | STR |  | Comma-separated route domains to mount instead of the profile default. |
+| `--workspaces-dir` | STR |  | Directory for session workspaces. Mini mode only. |
 | `--audit`, `--no-audit` | flag |  | Force the audit service on or off — Audit log query service. |
 | `--bifrost`, `--no-bifrost` | flag |  | Force the bifrost service on or off — Anthropic-compatible LLM proxy. |
 | `--credentials`, `--no-credentials` | flag |  | Force the credentials service on or off — Credential, secret, and MCP metadata service. |
@@ -364,7 +407,7 @@ niuu ravn status [OPTIONS]
 Stop a running agent session.
 
 ```bash
-niuu ravn stop [OPTIONS] SESSION_ID
+niuu ravn stop [OPTIONS] {session_id}
 ```
 
 | Argument | Required | Description |
@@ -407,7 +450,7 @@ niuu runs active [OPTIONS]
 Approve a pending run.
 
 ```bash
-niuu runs approve [OPTIONS] RUN_ID
+niuu runs approve [OPTIONS] {run_id}
 ```
 
 | Argument | Required | Description |
@@ -423,7 +466,7 @@ niuu runs approve [OPTIONS] RUN_ID
 Reject a pending run.
 
 ```bash
-niuu runs reject [OPTIONS] RUN_ID
+niuu runs reject [OPTIONS] {run_id}
 ```
 
 | Argument | Required | Description |
@@ -439,7 +482,7 @@ niuu runs reject [OPTIONS] RUN_ID
 Retry a failed run.
 
 ```bash
-niuu runs retry [OPTIONS] RUN_ID
+niuu runs retry [OPTIONS] {run_id}
 ```
 
 | Argument | Required | Description |
@@ -469,7 +512,7 @@ niuu sagas [OPTIONS] COMMAND [ARGS]...
 Create a new saga.
 
 ```bash
-niuu sagas create [OPTIONS] NAME
+niuu sagas create [OPTIONS] {name}
 ```
 
 | Argument | Required | Description |
@@ -485,7 +528,7 @@ niuu sagas create [OPTIONS] NAME
 Dispatch a saga for execution.
 
 ```bash
-niuu sagas dispatch [OPTIONS] SAGA_ID
+niuu sagas dispatch [OPTIONS] {saga_id}
 ```
 
 | Argument | Required | Description |
@@ -528,7 +571,7 @@ niuu sessions [OPTIONS] COMMAND [ARGS]...
 Create a new session.
 
 ```bash
-niuu sessions create [OPTIONS] NAME
+niuu sessions create [OPTIONS] {name}
 ```
 
 | Argument | Required | Description |
@@ -544,7 +587,7 @@ niuu sessions create [OPTIONS] NAME
 Delete a session.
 
 ```bash
-niuu sessions delete [OPTIONS] SESSION_ID
+niuu sessions delete [OPTIONS] {session_id}
 ```
 
 | Argument | Required | Description |
@@ -572,7 +615,7 @@ niuu sessions list [OPTIONS]
 Stop a running session.
 
 ```bash
-niuu sessions stop [OPTIONS] SESSION_ID
+niuu sessions stop [OPTIONS] {session_id}
 ```
 
 | Argument | Required | Description |
@@ -583,6 +626,14 @@ niuu sessions stop [OPTIONS] SESSION_ID
 | --- | --- | --- | --- |
 | `--json` | flag |  | Output raw JSON. |
 
+#### `niuu status`
+
+Show platform status. Same as `niuu platform status`.
+
+```bash
+niuu status [OPTIONS]
+```
+
 #### `niuu tui`
 
 Launch the interactive TUI.
@@ -590,6 +641,21 @@ Launch the interactive TUI.
 ```bash
 niuu tui [OPTIONS]
 ```
+
+#### `niuu up`
+
+Start the platform.
+
+```bash
+niuu up [OPTIONS]
+```
+
+Shortcut for `niuu platform up` with default service flags. In docker mode it renders the compose bundle under ~/.niuu/docker, runs `docker compose up -d` and waits for the health endpoint; use `niuu platform up --<service>` flags when you need per-service control.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--mode` | STR |  | Override the configured mode for this run (mini, openshell, cluster, docker). |
+| `--skip-preflight`, `--no-skip-preflight` | flag |  | Skip the host preflight checks. |
 
 #### `niuu version`
 

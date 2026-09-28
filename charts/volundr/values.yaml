@@ -181,6 +181,16 @@ storage:
     # -- Mount path inside session pods
     mountPath: /volundr/home
 
+# Tool-result image preview cache (config.preview_cache_dir). The root
+# filesystem is read-only, so this needs a writable mount; previews are
+# regenerable, so an emptyDir suffices.
+previewCache:
+  # -- Mount path for the tool-result image preview cache, rendered into
+  # config.yaml's preview_cache_dir
+  mountPath: /volundr/preview-cache
+  # -- Size limit for the preview cache emptyDir volume (leave empty/"" for no limit)
+  sizeLimit: 1Gi
+
 # Database configuration
 database:
   # -- Database name
@@ -307,9 +317,19 @@ bifrost:
     # -- Secret-backed kwargs forwarded through env indirection
     secretKwargs: []
 
+compute: null
+
 podManager:
+  # -- Explicit contributor backend identity; set vm for VmPodManager
+  runtimeBackend: ""
   # -- Fully-qualified class path for the PodManager adapter
   adapter: "volundr.adapters.outbound.flux.FluxPodManager"
+  # -- "deployment" (default, unchanged) or "remote" (Kubernetes-only —
+  # session_participants invites honoured; requires session pods deployed
+  # with wsAuth.enforce_ownership: false). See PodManagerConfig.room_role_source.
+  roomRoleSource: "deployment"
+  # -- RemoteAuthorizationAdapter's cache TTL when roomRoleSource is "remote"
+  roomRoleCacheTtlSeconds: 5.0
   # -- Existing secret containing the backend API token (mounted as POD_MANAGER_TOKEN)
   existingSecret: ""
   # -- Key in secret containing the token
@@ -326,22 +346,43 @@ podManager:
     code_scheme: "https"
     chat_path: "/session"
     code_path: "/"
+    # -- Base URL residents call for platform reachability (their own
+    # triggers/budget reporting). Empty (the default) means residents get no
+    # platform block at all — resident_triggers_enabled/resident_budget_enabled
+    # below then do nothing (rejected loudly by FluxPodManager.__init__, not
+    # silently — see .claude/rules/no-fallbacks.md) until this is set, e.g.
+    # http://niuu-volundr.volundr.svc.cluster.local.
+    resident_platform_base_url: ""
+    # -- Have deployed residents poll and execute triggers created via
+    # POST /api/v1/ravn/triggers (ravn.adapters.triggers.api_source
+    # .ApiTriggerSource). Requires resident_platform_base_url. Also set the
+    # skuld chart's resident.triggers.enabled (that is what actually runs the
+    # resident's poll loop) and this Ravn API deployment's
+    # trigger_execution.enabled (ravn.config.TriggerExecutionConfig) so
+    # /api/v1/ravn/settings and trigger-create responses stop reporting
+    # execution as off — none of these three is derived from another.
+    resident_triggers_enabled: false
+    # -- Have deployed residents durably report their own spend via
+    # PlatformBudgetReporter. Requires resident_platform_base_url, and the
+    # resident's own resident_budget.adapter (ravn config) must be set to
+    # ravn.adapters.resident_budget.PlatformBudgetReporter for this to do
+    # anything — this flag alone only reaches into the rendered resident
+    # config, it is not itself the adapter selection.
+    resident_budget_enabled: false
   # -- Secret kwargs from K8s Secrets, merged into kwargs at runtime
   # Each entry: { kwarg: "name", secretName: "k8s-secret", secretKey: "key" }
   secretKwargs: []
 
-# Codex subscription credentials are centrally refreshed by Völundr. Session
-# workloads receive only the access token and account metadata.
+# OpenBao oauthapp owns Codex subscription renewal. The broker delivers only
+# access tokens and account metadata from the configured OAuth credential store.
 codexCredentialBroker:
   adapter: "volundr.adapters.outbound.codex_credential_broker.OpenBaoCodexCredentialBroker"
-  kwargs:
-    oauth_token_url: "https://auth.openai.com/oauth/token"
-    oauth_client_id: "app_EMoamEEZ73f0CkXaXp7hrann"
-    refresh_skew_seconds: 300
+  kwargs: {}
   secretKwargs: []
 
 # Trusted login runner is independent of the selected session pod manager.
-# Clusters with OpenShell configure OpenShellCredentialEnrollmentRunner here.
+# Configure KubernetesLoginRunner with kwargs.image (a pinned Skuld image) and
+# kwargs.namespace (a dedicated login namespace) for Codex and Claude sign-in.
 credentialEnrollmentRunner:
   adapter: "volundr.adapters.outbound.credential_enrollment_runner.UnsupportedCredentialEnrollmentRunner"
   kwargs: {}
@@ -472,13 +513,34 @@ launchSpecs:
     description: "Default Codex session for OpenAI-backed coding work."
     sessionDefinition: skuldCodex
     workloadType: session
-    model: "gpt-5.4"
+    model: "gpt-5.6-terra"
     cliTool: codex
     resourceConfig:
       cpu: "1"
       memory: "2Gi"
 
 # Git provider configuration
+# Provider-neutral delivery uses deployment-pinned adapters, identities and policy.
+# Configure signing material through secret_kwargs_env, never inline Helm values.
+delivery:
+  enabled: false
+  authenticator:
+    adapter: ""
+    kwargs: {}
+    secret_kwargs_env: {}
+  workstreams:
+    adapter: ""
+    kwargs: {}
+  authorizer:
+    adapter: ""
+    kwargs: {}
+  forge:
+    adapter: volundr.adapters.outbound.user_delivery_forge.UserDeliveryForgeProvider
+    kwargs: {}
+  producer_id: forge-service
+  trusted_producers: []
+  policies: {}
+
 git:
   # -- Validate repositories on session creation
   validateOnCreate: true
@@ -569,6 +631,10 @@ envoy:
     email: x-auth-email
     tenant: x-auth-tenant
     roles: x-auth-roles
+    # A client-supplied copy must never reach the pod: only the session
+    # proxy (niuu.session_proxy) is trusted to stamp this, from a verified
+    # session_participants grant (see the room-scoped Cedar actions).
+    roomRole: x-niuu-room-role
   # JWT authentication (via Keycloak)
   # Uncomment and configure to enable JWT validation
   jwt:
@@ -599,6 +665,8 @@ envoy:
     keycloakPort: 8080
     # -- Enable TLS for Keycloak upstream
     keycloakTls: false
+    # -- CA bundle used to verify the JWKS server when TLS is enabled
+    keycloakCaFile: "/etc/ssl/certs/ca-certificates.crt"
     # -- Additional JWT claim-to-header mappings
     # extraClaimHeaders:
     #   - headerName: x-auth-display-name
@@ -607,10 +675,14 @@ envoy:
     # -- Path prefixes that bypass JWT validation (no auth required)
     # Rules are evaluated in order; matching prefixes skip the JWT check.
     bypassPrefixes:
+      - /api/v1/integrations/oauth/callback
+      - /api/v1/integrations/oauth/mcp/callback
+      - /api/v1/integrations/oauth/mcp/client-metadata
       - /api/v1/identity/auth/config
       - /api/v1/tokens/workload/exchange
       - /api/v1/tokens/workload/jwks
       - /health
+      - /api/v1/forge/health
     # -- Additional JWT provider for short-lived Niuu workload tokens.
     # When enabled, Envoy accepts either Keycloak user tokens or workload tokens.
     workload:
@@ -619,6 +691,11 @@ envoy:
       audiences: []
       # Defaults to the app-local workload JWKS endpoint when empty.
       jwksUri: ""
+      # Empty host uses the pod-local exchange; remote JWKS require verified TLS.
+      jwksHost: ""
+      jwksPort: 443
+      jwksTls: true
+      jwksCaFile: /etc/ssl/certs/ca-certificates.crt
       jwksTimeout: "5s"
       jwksCacheDurationSeconds: 300
       tenantClaim: "tenant_id"
@@ -628,6 +705,52 @@ envoy:
   extraHttpFilters: []
   # -- Extra upstream clusters
   extraClusters: []
+  # -- Additional volumes mounted into Envoy, for example a private JWKS CA
+  extraVolumeMounts: []
+  # Cedar admission runs after JWT verification, on a pod-local gRPC listener.
+  # Also configure authorization.adapter and identity.adapter for production.
+  authorization:
+    # Optional central identity/PAT revocation check before gateway admission.
+    # Use identity.adapters.remote.RemoteHeaderAuthenticationAdapter with HTTPS authority_url.
+    identity: null
+    enabled: false
+    port: 9002
+    # -- Envoy's budget for the authorization decision. When identityAuthority is
+    # enabled, identityAuthority.timeout is added so the identity lookup fits.
+    timeout: "1s"
+    shutdownGraceSeconds: 5
+    # -- Mount deployment-managed custom policy/schema volumes, when configured
+    extraVolumeMounts: []
+    readinessProbe:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    # First matching route wins. Scoped credentials cannot use routes without
+    # a required_scope, even when their owner would otherwise have access.
+    routes:
+      - path: /api/v1/identity/me
+        methods: [GET]
+        required_scope: identity:self
+      - path: /api/v1/forge/sessions
+        methods: [POST]
+        required_scope: "forge:session:create"
+      - path: /api/v1/forge/sessions/{session_id}/participants/role
+        path_template: true
+        methods: [GET]
+        required_scope: "forge:session:room-role"
+      - path: /api/v1/forge
+        prefix: true
+        methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+      - path: /s
+        prefix: true
+        methods: [GET]
 
 workloadIdentity:
   enabled: false
@@ -639,8 +762,97 @@ workloadIdentity:
   signingKey:
     existingSecret: ""
     key: private-key.pem
+  # -- Raw niuu WorkloadIdentityVerifierConfig entries (name/adapter/kwargs).
+  # Any mapping naming a `verifier:` that has no matching entry here never
+  # matches — the exchange fails loud with "Verifier not configured: <name>"
+  # rather than silently admitting nobody (niuu.domain.services.workload_identity
+  # .WorkloadIdentityService.exchange). In particular, `residentMapping` below
+  # sets `verifier: "kubernetes"` and needs a corresponding entry, e.g.:
+  #   verifiers:
+  #     - name: kubernetes
+  #       adapter: "niuu.adapters.workload_identity.jwt.JwtWorkloadIdentityVerifier"
+  #       kwargs:
+  #         issuer: "https://kubernetes.default.svc"       # cluster-specific
+  #         jwks_uri: "https://kubernetes.default.svc/openid/v1/jwks"
+  #         audiences: []  # must match the aud claim residents' SA tokens actually carry
+  # An operator must supply the cluster's real issuer/jwks_uri/audiences —
+  # this chart cannot guess them, and getting `audiences` wrong (e.g. it must
+  # include the CUSTOM audience the resident's projected serviceAccountToken
+  # volume actually carries — charts/skuld's resident.workloadIdentity.audience,
+  # mounted at /var/run/secrets/niuu-workload in deployment.yaml, not the
+  # cluster's default audience; automountServiceAccountToken is disabled on
+  # that ServiceAccount, so no default-audience token is ever mounted) fails
+  # verification the same loud way, not silently.
   verifiers: []
+  # -- Dynamic adapter resolving a per-caller tenant_id for residentMapping
+  # below from resident_runtimes.tenant_id, keyed by the same resident id
+  # owner_id_claim_pattern extracts — WITHOUT this, every resident matched by
+  # residentMapping gets the SAME tenantId (below), which is only correct for
+  # a single-tenant deployment: any other tenant's resident would poll an
+  # empty trigger list and write spend where GET /budget/{id} never sees it.
+  # Point it at the same Postgres this release's own database.existingSecret
+  # already names — resident_runtimes lives in this same database.
+  tenantResolver:
+    adapter: ""
+    # adapter: "volundr.adapters.outbound.resident_tenant_resolver.LazyPostgresResidentTenantResolver"
+    kwargs: {}
+    # kwargs:
+    #   dsn: ""  # prefer secretKwargs below over a plaintext DSN here
+    secretKwargs: []
+    # secretKwargs:
+    #   - kwarg: "dsn"
+    #     secretName: "volundr-postgres-app"
+    #     secretKey: "dsn"
+  # -- Extra mappings appended verbatim (raw niuu WorkloadIdentityMappingConfig
+  # objects — see residentMapping below for the one this chart synthesizes).
   mappings: []
+  # -- Admits the projected ServiceAccount token every resident pod carries
+  # (see charts/skuld's serviceaccount.yaml + resident's serviceAccountName,
+  # set by volundr.adapters.outbound.flux.FluxPodManager's
+  # resident_platform_base_url/*_enabled kwargs) and derives ravn_id from the
+  # verified subject per-caller — WITHOUT this, every resident matching a
+  # bare "system:serviceaccount:<namespace>:" mapping would share one
+  # owner_id/ravn_id, and GET/POST /api/v1/ravn/budget/* would key rows by
+  # that shared id instead of the resident_runtimes id the web passes.
+  #
+  # Enable residentMapping BEFORE setting podManager.kwargs
+  # .resident_platform_base_url (which starts every managed resident calling
+  # this platform for real). Flip the order and a resident's projected token
+  # only matches whatever's already in workloadIdentity.mappings — a bare
+  # "system:serviceaccount:<ns>:" catch-all, if one exists, admits it with a
+  # SHARED owner_id instead of its own, and budget/trigger rows land under
+  # that shared id until residentMapping is turned on and every resident
+  # cycles onto its own identity.
+  residentMapping:
+    enabled: false
+    name: "ravn-resident"
+    verifier: "kubernetes"
+    # -- Namespace resident pods run in — must match whatever namespace the
+    # ResidentRuntimeController (flux.py) deploys resident HelmReleases into.
+    namespace: ""
+    # -- Used ONLY when tenantResolver.adapter above is unset (the default) —
+    # every resident this mapping admits then gets this ONE tenantId, an
+    # explicit single-tenant-only choice, not a silent multi-tenant guess.
+    # Configure tenantResolver instead for a deployment with more than one
+    # tenant's residents.
+    tenantId: "default"
+    roles:
+      - "volundr:developer"
+
+workflowExecutionCredentials:
+  enabled: false
+  projectionAdapter: "volundr.adapters.outbound.execution_credential_k8s.KubernetesExecutionCredentialProjection"
+  # Merged over the default `namespace: <release namespace>`. The chart's RBAC
+  # only grants Secret create/patch/delete in the release namespace. If you set
+  # `projectionKwargs.namespace` to another namespace you must create a Role
+  # (secrets: get, create, patch, delete) and RoleBinding for the Volundr
+  # ServiceAccount in that namespace yourself; the chart never grants this
+  # cluster-wide.
+  projectionKwargs: {}
+  projectionSecretKwargsEnv: {}
+  refreshIntervalSeconds: 300
+  admissionRoles:
+    - volundr:developer
 
 # Identity adapter (dynamic adapter pattern)
 # Switch between identity/authentication backends by changing the adapter class.
@@ -666,7 +878,8 @@ workloadIdentity:
 #       namespace: "skuld"
 #       home_storage_class: "longhorn"
 #       workspace_storage_class: "longhorn"
-#       workspace_size_gb: 2
+#       home_size_gb: 64
+#       workspace_size_gb: 20
 #
 storageAdapter:
   # -- Fully-qualified class path for the StoragePort adapter
@@ -716,12 +929,8 @@ identity:
 #     adapter: "volundr.adapters.outbound.authorization.SimpleRoleAuthorizationAdapter"
 #     kwargs: {}
 #
-# ── Cerbos PDP ─────────────────────────────────────────────────
-#   authorization:
-#     adapter: "volundr.adapters.outbound.cerbos.CerbosAuthorizationAdapter"
-#     kwargs:
-#       url: "http://cerbos:3592"
-#       timeout: 5
+# Production deployments enforce authorization via Cedar at the Envoy layer,
+# not through this per-request adapter.
 #
 authorization:
   # -- Fully-qualified class path for the AuthorizationPort adapter
@@ -742,6 +951,10 @@ authorization:
 #       mount_path: "volundr"
 #       auth_method: "token"
 #       token: ""
+#
+# OAuth renewal: see docs/operations/openbao-oauth.md. Use
+# niuu.adapters.openbao_oauth_credential_store.OpenBaoOAuthCredentialStore
+# with oauth_mount_path/oauth_servers, plus oauth_mount_path on secretInjection.
 #
 # ── Infisical ──────────────────────────────────────────────────
 #   credentialStore:
@@ -830,6 +1043,24 @@ gateway:
 #   kwargs   – forwarded to the constructor as **kwargs (ports are
 #              injected automatically by the factory)
 #
+# Image for the regular per-persona Ravn containers; pin alongside the runtime image.
+ravnFlockImage: ""
+
+# -- Default LLM for the Ravn nodes of flock sessions, in Ravn's `llm:` shape.
+# workload_config.llm_config and per-persona llm overrides are merged over it.
+# When empty, a flock session that names no model fails to launch. Keep
+# credentials out of this block: point the provider at them with
+# `secret_kwargs_env`.
+#   ravnFlockLlmConfig:
+#     model: Qwen/Qwen3.8-27B
+#     max_tokens: 8192
+#     timeout: 300
+#     provider:
+#       adapter: ravn.adapters.llm.openai.OpenAICompatibleAdapter
+#       kwargs:
+#         base_url: https://vllm.example.internal
+ravnFlockLlmConfig: {}
+
 sessionContributors:
   - adapter: "volundr.adapters.outbound.contributors.core.CoreSessionContributor"
     kwargs:
@@ -916,8 +1147,16 @@ auth:
 
 # OAuth integration configuration
 oauth:
+  # -- Legacy refresh loop; ignored outside mini-mode. OpenBao owns production renewal.
+  miniModeRefreshEnabled: true
   # -- Base URL for OAuth redirect callbacks (e.g. https://volundr.example.com)
   redirectBaseUrl: ""
+  mcpRequestTimeoutSeconds: 15
+  mcpStateTtlSeconds: 600
+  # -- Hostnames of your own MCP servers and their OAuth issuers allowed to resolve
+  # to private addresses (exact names or "*.domain" suffixes, e.g. "*.asgard.niuu.world").
+  # Every other MCP host must resolve to public addresses.
+  mcpInternalHosts: []
   # -- Per-integration OAuth client credentials
   # clients:
   #   linear:
@@ -927,12 +1166,32 @@ oauth:
 
 # Application configuration
 config:
+  # Project checkout roots are paths mounted in the Forge API container.
+  projects:
+    enabled: true
+    instance_id: ""
+    workspace_adapter: volundr.adapters.outbound.project_workspace.GitProjectWorkspace
+    workspace_kwargs: {}
+    context_bytes: 8192
+    git_timeout_seconds: 15
+    dispatch_wait_seconds: 30
+    dispatch_poll_seconds: 0.05
   conversationRecentMaxTurns: 15
   conversationRecentMaxBytes: 262144
+  # -- Timeout (seconds) for the runtime-version health probe against a session's runtime
+  runtimeHealthTimeoutSeconds: 3.0
   # -- Log level (debug, info, warning, error)
   logLevel: info
   # -- Log format (json, text)
   logFormat: json
+  # -- OpenTelemetry trace/metric export. Empty (the default) means
+  # unconfigured — observability.enabled defaults to false, which is a
+  # decision, not a degraded fallback. Set fields to match
+  # niuu.domain.observability.ObservabilityConfig, e.g.:
+  #   enabled: true
+  #   trace_endpoint: "http://otel-collector.observability:4317"
+  #   metric_endpoint: "http://otel-collector.observability:4318/v1/metrics"
+  observability: {}
   # -- Host to bind to
   host: "0.0.0.0"
   # -- Internal shared-host address injected into local Skuld brokers
@@ -941,8 +1200,8 @@ config:
   serverPublicHost: "127.0.0.1"
   # -- Internal OpenShell gateway used for server-side session proxying
   openshellInternalGatewayUrl: "http://openshell.openshell.svc.cluster.local:8080"
-  # -- Number of uvicorn workers
-  workers: 4
+  # -- Number of uvicorn workers. Keep at 1 with the development in-memory credential store.
+  workers: 1
   # -- Session timeout in seconds
   sessionTimeout: "3600"
   # -- Maximum sessions per user
@@ -976,7 +1235,7 @@ sessionDefinitions:
     # -- Human-readable name shown in the UI
     displayName: "Claude Code"
     # -- Short description for the session picker
-    description: "Anthropic Claude — full IDE with terminal, tools, and MCP"
+    description: "Claude Code in the full session workspace: chat, terminal, diffs, files and MCP tools. The usual choice for Claude."
     # -- Default model for this definition (empty = use server default)
     defaultModel: "claude-sonnet-4-6"
     # -- Labels for agent routing - only agents with matching labels will load this
@@ -985,6 +1244,8 @@ sessionDefinitions:
     # -- Model providers this runtime accepts (empty = provider-neutral)
     compatibleProviders:
       - anthropic
+      # a model server you run yourself, through the model gateway
+      - local
     # -- Whether this session definition is active
     active: true
 
@@ -1105,7 +1366,7 @@ sessionDefinitions:
     # -- Human-readable name shown in the UI
     displayName: "Claude Code Interactive"
     # -- Short description for the session picker
-    description: "Anthropic Claude Code through a tmux-backed interactive terminal"
+    description: "Claude Code as the plain interactive terminal you know from your own machine: slash commands, permission prompts and agent teams. Pick this when you want the CLI itself rather than the chat workspace."
     # -- Default model for this definition (empty = use server default)
     defaultModel: "claude-sonnet-4-6"
     # -- Labels for agent routing
@@ -1115,6 +1376,8 @@ sessionDefinitions:
     # -- Model providers this runtime accepts
     compatibleProviders:
       - anthropic
+      # a model server you run yourself, through the model gateway
+      - local
     # -- Whether this session definition is active
     active: true
 
@@ -1228,7 +1491,7 @@ sessionDefinitions:
     # -- Human-readable name shown in the UI
     displayName: "OpenAI Codex"
     # -- Short description for the session picker
-    description: "OpenAI Codex — WebSocket protocol with streaming and tools"
+    description: "OpenAI's Codex coding agent with streaming chat and tools. The usual choice for OpenAI."
     # -- Default model for this definition (empty = use Codex default based on subscription)
     defaultModel: ""
     # -- Labels for agent routing
@@ -1237,6 +1500,8 @@ sessionDefinitions:
     # -- Model providers this runtime accepts (empty = provider-neutral)
     compatibleProviders:
       - openai
+      # a model server you run yourself, through the model gateway
+      - local
     # -- Whether this session definition is active
     active: true
 
@@ -1328,7 +1593,7 @@ sessionDefinitions:
     # -- Human-readable name shown in the UI
     displayName: "OpenCode"
     # -- Short description for the session picker
-    description: "Model-neutral AI coding agent — supports Claude, OpenAI, Gemini, local models"
+    description: "OpenCode, an open-source coding agent that works with any connected provider or a local model."
     # -- Default model for this definition (empty = use OpenCode default)
     defaultModel: ""
     # -- Labels for agent routing
@@ -1405,7 +1670,7 @@ sessionDefinitions:
     # -- Human-readable name shown in the UI
     displayName: "DeepSeek Harness"
     # -- Short description for the session picker
-    description: "DeepSeek Harness (dsh) — streaming, tools, durable session events"
+    description: "DeepSeek's Harness coding agent (dsh) with streaming chat and tools."
     # -- Default model for this definition
     defaultModel: "deepseek-v4-flash"
     # -- Labels for agent routing
@@ -1531,7 +1796,7 @@ web:
     # -- Web UI image registry
     registry: ghcr.io
     # -- Web UI image repository
-    repository: niuulabs/volundr-web
+    repository: niuulabs/niuu-web
     # -- Web UI image tag (defaults to Chart.appVersion)
     tag: ""
     # -- Web UI image pull policy
@@ -1871,6 +2136,10 @@ sidecars: []
 # _default_integration_definitions() is used (GitHub, GitLab, Linear,
 # Anthropic, OpenAI). Override here only to customise the catalog.
 integrations: {}
+  # databaseName: niuu_shared  # Same records used by the shared Connections API.
+  # definitionFiles: []  # Absolute paths supplied through extraVolumes/extraVolumeMounts.
+  # moduleManifestFiles: []  # Trusted external component manifests supplied through mounts.
+  # allowDefinitionOverrides: false
   # definitions:
     # - slug: linear
     #   name: Linear
@@ -1967,3 +2236,22 @@ personaSource:
   mountPath: /etc/ravn/personas
   # -- Volundr base URL that sidecars call to fetch personas (http mode)
   httpBaseUrl: http://volundr:8080
+
+pat:
+  token_issuer_adapter: niuu.adapters.memory_token_issuer.MemoryTokenIssuer
+  token_issuer_kwargs: {}
+  ttl_days: 365
+  issuerSecretName: ""
+  issuerSecretKey: client-secret
+  service_adapter: niuu.domain.services.pat.PATService
+  service_kwargs: {}
+  validator_adapter: niuu.domain.services.pat_validator.PATValidator
+  validator_kwargs: {}
+
+# Shared identity service: fresh membership, role and credential checks.
+# Point at the canonical identity service, never back at this client service.
+identityAuthority:
+  enabled: false
+  url: ""
+  timeout: 5
+  caFile: ""

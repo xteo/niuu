@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from credentials.ports import (  # noqa: F401
@@ -24,7 +24,7 @@ from credentials.ports import (  # noqa: F401
 from identity.models import Resource  # noqa: F401
 from identity.ports import AuthorizationPort, TenantRepository, UserRepository  # noqa: F401
 from niuu.domain.outcome import OutcomeField
-from niuu.ports.credentials import CredentialRefreshLockPort, CredentialStorePort  # noqa: F401
+from niuu.ports.credentials import CredentialStorePort  # noqa: F401
 from niuu.ports.git import (
     GitAuthError,  # noqa: F401
     GitProvider,  # noqa: F401
@@ -96,12 +96,12 @@ from volundr.domain.models import (  # noqa: F401
     WorkspaceStatus,
 )
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.session_participants import ParticipantRole, SessionParticipant
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 __all__ = [
     "AuthorizationPort",
     "CredentialStorePort",
-    "CredentialRefreshLockPort",
     "GitAuthError",
     "GitProvider",
     "GitRepoNotFoundError",
@@ -211,13 +211,14 @@ class CodexAuthTokens:
 
 
 class CodexCredentialBrokerPort(ABC):
-    """Resolve and rotate a user's Codex credential without exposing its refresh token."""
+    """Resolve a user's managed Codex credential without exposing its refresh token."""
 
     @abstractmethod
     async def get_tokens(
         self,
         *,
         owner_id: str,
+        tenant_id: str,
         credential_name: str,
         credential_field: str,
         force_refresh: bool = False,
@@ -269,6 +270,11 @@ class CredentialEnrollmentRunnerPort(ABC):
     def supports_enrollment(self, method: str) -> bool:
         """Return whether this runner implements the configured enrollment method."""
 
+    def available_for(self, slug: str, method: str) -> bool:
+        """Whether *slug* can be enrolled here right now (e.g. a client id is configured)."""
+        del slug
+        return self.supports_enrollment(method)
+
     @abstractmethod
     async def start_enrollment(
         self,
@@ -286,6 +292,10 @@ class CredentialEnrollmentRunnerPort(ABC):
     @abstractmethod
     async def cancel_enrollment(self, enrollment: CredentialEnrollment) -> None:
         """Destroy any runtime resources belonging to the enrollment."""
+
+    async def submit_code(self, enrollment: CredentialEnrollment, code: str) -> None:
+        """Pass a browser authorization code to a login that requires one."""
+        raise ValueError("This login does not accept a browser authorization code")
 
 
 class ExternalSessionProvider(ABC):
@@ -365,6 +375,58 @@ class CommunicationCursorRepository(ABC):
         """Persist the latest consumer cursor."""
 
 
+class SessionParticipantRepository(ABC):
+    """Port for durable per-session collaboration grants (shared agent rooms).
+
+    ``list_active_for_session`` filters on the stored ``status`` only; expiry
+    is judged uniformly by ``SessionParticipant.is_active`` (see
+    ``compute_room_grants``), never re-derived here, so a clock read in SQL
+    can never disagree with the one Cedar attribution uses.
+    """
+
+    @abstractmethod
+    async def invite(
+        self,
+        session_id: UUID,
+        user_id: str,
+        tenant_id: str,
+        role: ParticipantRole,
+        invited_by: str,
+        expires_at: datetime | None,
+    ) -> SessionParticipant:
+        """Create, or re-invite, a grant. Always resets status to INVITED."""
+
+    @abstractmethod
+    async def accept(self, session_id: UUID, user_id: str) -> SessionParticipant | None:
+        """Transition an INVITED grant to ACTIVE. Returns None if none is invited."""
+
+    @abstractmethod
+    async def revoke(self, session_id: UUID, user_id: str) -> SessionParticipant | None:
+        """Transition a grant to REVOKED. Returns None if no grant exists."""
+
+    @abstractmethod
+    async def get(self, session_id: UUID, user_id: str) -> SessionParticipant | None:
+        """Return the grant for one (session, user) pair, if any."""
+
+    @abstractmethod
+    async def list_for_session(self, session_id: UUID) -> list[SessionParticipant]:
+        """Return every grant (any status) for a session."""
+
+    @abstractmethod
+    async def list_active_for_session(self, session_id: UUID) -> list[SessionParticipant]:
+        """Return grants with status=ACTIVE. Callers still filter expiry."""
+
+    @abstractmethod
+    async def list_active_for_user(self, user_id: str) -> list[SessionParticipant]:
+        """Return every status=ACTIVE grant for a user, across sessions.
+
+        Used to widen session *listing* to sessions the user actively
+        participates in but does not own (see ``SessionParticipantService.
+        list_participant_sessions``) — a visibility grant, not a Cedar
+        read/list grant.
+        """
+
+
 class ChronicleRepository(ABC):
     """Port for chronicle persistence operations."""
 
@@ -383,6 +445,9 @@ class ChronicleRepository(ABC):
     @abstractmethod
     async def list(
         self,
+        *,
+        tenant_id: str | None,
+        owner_id: str | None,
         project: str | None = None,
         repo: str | None = None,
         model: str | None = None,
@@ -390,7 +455,14 @@ class ChronicleRepository(ABC):
         limit: int = 50,
         offset: int = 0,
     ) -> list[Chronicle]:
-        """Retrieve chronicles with optional filters."""
+        """Retrieve chronicles with optional filters, newest first.
+
+        Args:
+            tenant_id: Return only chronicles attributed to this tenant. ``None``
+                is unbounded; a bound never matches an untenanted chronicle.
+            owner_id: Return only chronicles attributed to this owner. ``None``
+                is unbounded; a bound never matches an unowned chronicle.
+        """
 
     @abstractmethod
     async def update(self, chronicle: Chronicle) -> Chronicle:
@@ -429,8 +501,30 @@ class TimelineRepository(ABC):
         """Delete all timeline events for a chronicle. Returns count deleted."""
 
 
+@dataclass(frozen=True)
+class SessionCapacity:
+    """How many sessions a runtime can hold and how many it holds right now.
+
+    ``remedy`` says, in the runtime's own terms, where the limit is raised
+    (a config key, a wizard step); it is shown to the person whose launch
+    was refused.
+    """
+
+    limit: int
+    active: int
+    remedy: str
+
+    @property
+    def available(self) -> int:
+        return max(self.limit - self.active, 0)
+
+
 class PodManager(ABC):
     """Port for managing session pods (Skuld, code-server, terminal)."""
+
+    async def capacity(self) -> SessionCapacity | None:
+        """The runtime's session capacity, or None when it has no fixed cap."""
+        return None
 
     @property
     def runtime_backend(self) -> str | None:
@@ -441,6 +535,14 @@ class PodManager(ABC):
         never interprets an ordinary local gateway as a disposable cluster pod.
         """
         return None
+
+    async def capacity_for(self, session: Session) -> SessionCapacity | None:
+        """Capacity available when starting ``session``.
+
+        Runtimes that retain a capacity reservation for stopped or failed
+        sessions may exclude that reservation here so a restart can reuse it.
+        """
+        return await self.capacity()
 
     @property
     def delivers_forge_session_token(self) -> bool:
@@ -488,6 +590,10 @@ class PodManager(ABC):
     async def status(self, session: Session) -> SessionStatus:
         """Get the current status of session pods."""
 
+    async def status_detail(self, session: Session) -> str | None:
+        """Return a safe, non-terminal detail for the current runtime status."""
+        return None
+
     @abstractmethod
     async def wait_for_ready(self, session: Session, timeout: float) -> SessionStatus:
         """Block until infrastructure is ready or failed.
@@ -501,8 +607,14 @@ class StatsRepository(ABC):
     """Port for retrieving aggregate statistics."""
 
     @abstractmethod
-    async def get_stats(self) -> Stats:
+    async def get_stats(self, *, tenant_id: str | None, owner_id: str | None) -> Stats:
         """Retrieve aggregate statistics for the dashboard.
+
+        Args:
+            tenant_id: Count only sessions and history of this tenant. ``None``
+                is unbounded; a bound never matches untenanted rows.
+            owner_id: Count only sessions and history of this owner. ``None``
+                is unbounded; a bound never matches unowned rows.
 
         Returns:
             Stats containing session counts, token usage, and cost for today.
@@ -1123,6 +1235,23 @@ class SessionSpanRepository(ABC):
         """Delete all spans for a session. Returns count deleted."""
 
 
+class AdminSettingsRepository(ABC):
+    """Persists the admin settings edited on the Settings page, one row per section.
+
+    The in-process ``app.state.admin_settings`` dict is loaded from here at
+    startup and written back through ``save`` on every change, so a restart
+    keeps what an admin set.
+    """
+
+    @abstractmethod
+    async def load(self) -> dict[str, dict[str, Any]]:
+        """Return every stored section: ``{section: {key: value}}``."""
+
+    @abstractmethod
+    async def save(self, section: str, values: dict[str, Any]) -> None:
+        """Replace one section's stored values."""
+
+
 class SavedPromptRepository(ABC):
     """Port for saved prompt persistence operations."""
 
@@ -1219,6 +1348,10 @@ class SecretRepository(ABC):
         """Delete ephemeral session secrets."""
 
 
+class HomeStorageBusyError(RuntimeError):
+    """A running session prevents destructive home-storage operations."""
+
+
 class StoragePort(ABC):
     """Port for persistent volume claim management."""
 
@@ -1229,6 +1362,15 @@ class StoragePort(ABC):
     @property
     def workspace_mount_path(self) -> str:
         return "/volundr/sessions"
+
+    @property
+    def supports_home_volumes(self) -> bool:
+        """Whether this backend can give each user a persistent home volume.
+
+        Gates the Home Volumes admin setting and the ``home_volumes_supported``
+        feature flag; backends that only simulate storage report ``False``.
+        """
+        return False
 
     @abstractmethod
     async def provision_user_storage(
@@ -1278,6 +1420,10 @@ class StoragePort(ABC):
         user_id: str,
     ) -> None:
         """Delete a user's home PVC."""
+
+    async def manage_user_home(self, user_id: str, operation: str, path: str = "") -> dict:
+        """Browse or delete entries in this user's home without a coder session."""
+        raise NotImplementedError("Home file management is not supported on this cluster")
 
     async def list_workspaces(
         self,
@@ -1408,6 +1554,11 @@ class SecretInjectionPort(ABC):
     configure how secrets are injected into session pods.  Volundr never
     sees secret values in production.
     """
+
+    @property
+    def supports_managed_oauth(self) -> bool:
+        """Whether this adapter continuously projects OAuth engine access tokens."""
+        return False
 
     @abstractmethod
     async def pod_spec_additions(
@@ -1553,6 +1704,22 @@ class GitWorkspacePort(ABC):
         """
 
 
+if TYPE_CHECKING:
+    from volundr.domain.execution_catalog import ResolvedExecutionPlan
+
+
+class SessionExecutionResolver(Protocol):
+    """Resolve and verify an operator-approved execution choice before contribution."""
+
+    async def has_legacy_allocation(self, session: Session) -> bool: ...
+
+    async def resolve_execution(self, session: Session) -> ResolvedExecutionPlan | None: ...
+
+    async def execution_for(self, session: Session) -> ResolvedExecutionPlan: ...
+
+    def execution_reference(self, plan: ResolvedExecutionPlan) -> dict[str, str]: ...
+
+
 # PATRepository — re-exported from shared niuu module
 from niuu.ports.pat_repository import PATRepository  # noqa: F401, E402
 
@@ -1565,6 +1732,8 @@ class SessionContext:
     definition: str | None = None
     launch_spec: str | None = None
     runtime_backend: str = "kubernetes"
+    storage_backend: str = ""
+    runtime_capabilities: tuple[str, ...] = ()
     terminal_restricted: bool = False
     credential_names: tuple[str, ...] = ()
     integration_ids: tuple[str, ...] = ()

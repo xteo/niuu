@@ -1,5 +1,7 @@
 """Tests for Skuld Helm chart templates."""
 
+import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,6 +10,80 @@ import pytest
 import yaml
 
 CHART_DIR = Path(__file__).parent.parent.parent / "charts" / "skuld"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+@pytest.mark.parametrize("chart", ["skuld", "skuld-planner"])
+def test_evidence_gate_adapters_reach_runtime_configuration(chart):
+    from skuld.config import SkuldSettings
+
+    verifier = {
+        "adapter": "niuu.adapters.evidence_gate.ConfiguredEvidenceGateVerifier",
+        "kwargs": {"trusted_producers": ["document-checker"]},
+    }
+    artifacts = {
+        "adapter": "niuu.adapters.artifact_digest.FilesystemArtifactDigestResolver",
+        "kwargs": {"root": "/workspace"},
+    }
+    command = [
+        "helm",
+        "template",
+        "evidence-test",
+        str(CHART_DIR.parent / chart),
+        "--set-json",
+        "workflow.evidenceVerifier=" + json.dumps(verifier),
+        "--set-json",
+        "workflow.evidenceArtifacts=" + json.dumps(artifacts),
+    ]
+    config = next(
+        yaml.safe_load(doc["data"]["config.yaml"])
+        for doc in yaml.safe_load_all(subprocess.check_output(command))
+        if doc and doc.get("kind") == "ConfigMap" and "config.yaml" in doc.get("data", {})
+    )
+    settings = SkuldSettings(**config)
+    assert settings.workflow.evidence_verifier.model_dump(exclude_defaults=True) == verifier
+    assert settings.workflow.evidence_artifacts.model_dump(exclude_defaults=True) == artifacts
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+@pytest.mark.parametrize("chart", ["skuld", "skuld-planner"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_mcp_connections_reach_runtime_configuration(chart, configured):
+    from skuld.config import SkuldSettings
+    from skuld.transports.mcp_config import build_claude_mcp_config, build_codex_mcp_overrides
+
+    servers = (
+        [
+            {
+                "name": "linear",
+                "type": "http",
+                "url": "https://mcp.linear.app/mcp/readonly",
+                "credential_file": "/run/secrets/mcp/test/token",
+                "credential_format": "oauth",
+                "auth_header": "Authorization",
+                "auth_prefix": "Bearer ",
+            },
+            {"name": "local", "type": "stdio", "command": "tools", "args": ["serve"]},
+        ]
+        if configured
+        else []
+    )
+    command = ["helm", "template", "mcp-test", str(CHART_DIR.parent / chart)]
+    if configured:
+        command.extend(["--set-json", "mcpServers=" + json.dumps(servers)])
+    documents = yaml.safe_load_all(subprocess.check_output(command))
+    config = next(
+        yaml.safe_load(doc["data"]["config.yaml"])
+        for doc in documents
+        if doc and doc.get("kind") == "ConfigMap" and "config.yaml" in doc.get("data", {})
+    )
+    settings = SkuldSettings(**config)
+    assert settings.mcp_servers == servers
+    if configured:
+        claude = json.loads(build_claude_mcp_config(settings.mcp_servers))
+        assert "--oauth" in claude["mcpServers"]["linear"]["headersHelper"]
+        codex = dict(build_codex_mcp_overrides(settings.mcp_servers))
+        assert "--oauth" in codex["mcp_servers.linear.http_headers_helper"]
 
 
 class TestChartMetadata:
@@ -84,6 +160,11 @@ class TestValuesDefaults:
         the injected ANTHROPIC_API_KEY rather than the subscription default."""
         env_vars = values_yaml["envVars"]
         assert env_vars == [{"name": "SKULD__CLAUDE_AUTH", "value": "api_key"}]
+
+    def test_claude_auto_update_disabled_by_default(self, values_yaml):
+        """Cluster sessions run the CLI pinned in the image; a self-update at
+        start-up restarts it inside the session and breaks transport checks."""
+        assert values_yaml["claude"]["disableAutoUpdate"] is True
 
     def test_service_exposes_single_entry_port(self, values_yaml):
         """Test service configuration has single nginx entry port."""
@@ -216,10 +297,35 @@ class TestDeploymentTemplate:
         """Test sessions volume is mounted by multiple containers."""
         assert deployment_yaml.count("name: sessions") >= 2
 
-    def test_git_clone_ensures_dynamic_nginx_include_exists(self, deployment_yaml):
-        """Test session bootstrap always pre-creates .services/nginx.conf."""
-        assert 'mkdir -p "$WORKSPACE/.services"' in deployment_yaml
-        assert 'touch "$WORKSPACE/.services/nginx.conf"' in deployment_yaml
+    @pytest.mark.parametrize("repo_url", ["", "https://github.com/org/repo"])
+    def test_services_setup_precreates_dynamic_nginx_include(self, tmp_path, repo_url):
+        """nginx must not wait on devrunner for the include it loads at startup."""
+        rendered = _render_skuld_chart(
+            tmp_path, {"session": {"id": "abc"}, "git": {"repoUrl": repo_url}}
+        )
+        pod_spec = _deployment_from_rendered(rendered)["spec"]["template"]["spec"]
+        init_containers = pod_spec["initContainers"]
+
+        assert init_containers[-1]["name"] == "services-setup"
+        script = init_containers[-1]["args"][0]
+        assert 'WORKSPACE="/volundr/sessions/abc/workspace"' in script
+        assert 'mkdir -p "$WORKSPACE/.services"' in script
+        assert 'touch "$WORKSPACE/.services/nginx.conf"' in script
+        assert init_containers[-1]["securityContext"] == {
+            "runAsUser": 1000,
+            "allowPrivilegeEscalation": False,
+        }
+        assert init_containers[-1]["volumeMounts"] == [
+            {"name": "sessions", "mountPath": "/volundr/sessions"}
+        ]
+        assert not any(".services" in " ".join(c.get("args", [])) for c in init_containers[:-1])
+
+    def test_services_setup_omitted_without_local_services(self, tmp_path):
+        """No nginx include is rendered, so there is nothing to pre-create."""
+        rendered = _render_skuld_chart(tmp_path, {"localServices": {"enabled": False}})
+        pod_spec = _deployment_from_rendered(rendered)["spec"]["template"]["spec"]
+
+        assert "services-setup" not in [c["name"] for c in pod_spec.get("initContainers", [])]
 
     def test_has_no_reh_container(self, deployment_yaml):
         """Test deployment no longer contains the retired REH container."""
@@ -241,6 +347,11 @@ class TestDeploymentTemplate:
         """Test deployment injects plain env vars via generic range loop."""
         assert "range .Values.envVars" in deployment_yaml
 
+    def test_deployment_disables_claude_auto_update(self, deployment_yaml):
+        """DISABLE_AUTOUPDATER is set outside envVars, so overriding envVars keeps it."""
+        assert "if .Values.claude.disableAutoUpdate" in deployment_yaml
+        assert "name: DISABLE_AUTOUPDATER" in deployment_yaml
+
     def test_external_api_token_is_loaded_from_secret(self, deployment_yaml):
         """The control-plane token is never rendered into a ConfigMap or plain env value."""
         assert "SKULD__EXTERNAL_API_TOKEN" in deployment_yaml
@@ -253,6 +364,7 @@ class TestDeploymentTemplate:
         rendered = _render_skuld_chart(
             tmp_path,
             {
+                "git": {"credentials": {"secretName": "github-token"}},
                 "envVars": [{"name": "SKULD__MESH__ENABLED", "value": "true"}],
                 "mesh": {
                     "enabled": True,
@@ -292,9 +404,10 @@ class TestDeploymentTemplate:
         pod_spec = deployment["spec"]["template"]["spec"]
 
         assert [container["name"] for container in pod_spec["initContainers"]] == [
-            "write-ravn-cfg-coder"
+            "services-setup",
+            "write-ravn-cfg-coder",
         ]
-        assert pod_spec["initContainers"][0]["securityContext"] == {
+        assert pod_spec["initContainers"][1]["securityContext"] == {
             "runAsUser": 1000,
             "runAsGroup": 1000,
             "runAsNonRoot": True,
@@ -303,6 +416,14 @@ class TestDeploymentTemplate:
         containers = {container["name"]: container for container in pod_spec["containers"]}
         assert "skuld" in containers
         assert "ravn-coder" in containers
+        for name in ("skuld", "ravn-coder"):
+            env = {entry["name"]: entry for entry in containers[name]["env"]}
+            for variable in ("GIT_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+                assert env[variable]["valueFrom"]["secretKeyRef"] == {
+                    "name": "github-token",
+                    "key": "token",
+                }
+        assert not any(entry["name"] == "GIT_TOKEN" for entry in containers["nginx"].get("env", []))
         assert {"name": "SKULD__MESH__ENABLED", "value": "true"} in containers["skuld"]["env"]
         assert {"name": "mesh-pub", "containerPort": 7480, "protocol": "TCP"} in containers[
             "skuld"
@@ -414,6 +535,11 @@ class TestHelpersTemplate:
     def test_has_labels_helper(self, helpers_tpl):
         """Test helpers has labels function."""
         assert 'define "skuld.labels"' in helpers_tpl
+
+
+def test_session_restart_never_overlaps_workers(tmp_path):
+    rendered = _render_skuld_chart(tmp_path, {"session": {"id": "research"}})
+    assert _deployment_from_rendered(rendered)["spec"]["strategy"] == {"type": "Recreate"}
 
 
 class TestResidentWorkloadIdentityConfigFirst:
@@ -676,6 +802,121 @@ class TestResidentWorkloadIdentityConfigFirst:
         assert "NIUU_WORKLOAD_IDENTITY" not in rendered
 
 
+class TestResidentTriggersAndBudget:
+    """resident.triggers / resident.budget — render resident_triggers /
+    resident_budget into the ravn config, gated on resident.platform."""
+
+    BASE_VALUES = {
+        "resident": {
+            "enabled": True,
+            "environmentId": "environment-a",
+            "persona": "product-steward",
+            "platform": {
+                "enabled": True,
+                "baseUrl": "http://niuu-volundr.volundr.svc.cluster.local:80",
+            },
+        },
+    }
+
+    def test_triggers_disabled_by_default(self, tmp_path):
+        rendered = _render_skuld_chart(tmp_path, self.BASE_VALUES)
+        config = _ravn_config_from_rendered(rendered)
+        assert "resident_triggers" not in config
+
+    def test_budget_disabled_by_default(self, tmp_path):
+        rendered = _render_skuld_chart(tmp_path, self.BASE_VALUES)
+        config = _ravn_config_from_rendered(rendered)
+        assert "resident_budget" not in config
+
+    def test_triggers_enabled_renders_poll_config(self, tmp_path):
+        values = dict(self.BASE_VALUES)
+        values["resident"] = {
+            **values["resident"],
+            "triggers": {
+                "enabled": True,
+                "pollIntervalSeconds": 45,
+                "maxConsecutivePollFailures": 7,
+            },
+        }
+        rendered = _render_skuld_chart(tmp_path, values)
+        config = _ravn_config_from_rendered(rendered)
+        assert config["resident_triggers"] == {
+            "enabled": True,
+            "poll_interval_seconds": 45,
+            "max_consecutive_poll_failures": 7,
+        }
+
+    def test_triggers_enabled_without_platform_fails_the_render(self, tmp_path):
+        values = {
+            "resident": {
+                "enabled": True,
+                "environmentId": "environment-a",
+                "persona": "product-steward",
+                "triggers": {"enabled": True},
+            }
+        }
+        helm = shutil.which("helm")
+        if not helm:
+            pytest.skip("helm is not installed")
+        values_file = tmp_path / "values.yaml"
+        values_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+        result = subprocess.run(
+            [helm, "template", "skuld-test", str(CHART_DIR), "-f", str(values_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "resident.triggers.enabled requires resident.platform.enabled" in result.stderr
+
+    def test_budget_enabled_renders_platform_reporter_adapter(self, tmp_path):
+        values = dict(self.BASE_VALUES)
+        values["resident"] = {**values["resident"], "budget": {"enabled": True}}
+        rendered = _render_skuld_chart(tmp_path, values)
+        config = _ravn_config_from_rendered(rendered)
+        assert config["resident_budget"]["adapter"] == (
+            "ravn.adapters.resident_budget.PlatformBudgetReporter"
+        )
+        assert config["resident_budget"]["kwargs"]["base_url"] == (
+            "http://niuu-volundr.volundr.svc.cluster.local:80"
+        )
+
+    def test_budget_enabled_without_platform_fails_the_render(self, tmp_path):
+        values = {
+            "resident": {
+                "enabled": True,
+                "environmentId": "environment-a",
+                "persona": "product-steward",
+                "budget": {"enabled": True},
+            }
+        }
+        helm = shutil.which("helm")
+        if not helm:
+            pytest.skip("helm is not installed")
+        values_file = tmp_path / "values.yaml"
+        values_file.write_text(yaml.safe_dump(values), encoding="utf-8")
+        result = subprocess.run(
+            [helm, "template", "skuld-test", str(CHART_DIR), "-f", str(values_file)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "resident.budget.enabled requires resident.platform.enabled" in result.stderr
+
+    def test_triggers_and_budget_can_both_be_enabled_together(self, tmp_path):
+        values = dict(self.BASE_VALUES)
+        values["resident"] = {
+            **values["resident"],
+            "triggers": {"enabled": True},
+            "budget": {"enabled": True},
+        }
+        rendered = _render_skuld_chart(tmp_path, values)
+        config = _ravn_config_from_rendered(rendered)
+        assert config["resident_triggers"]["enabled"] is True
+        assert config["resident_budget"]["adapter"] == (
+            "ravn.adapters.resident_budget.PlatformBudgetReporter"
+        )
+
+
 class TestVolundrReportingConfig:
     """Volundr reporting stays enabled for normal workflow sessions."""
 
@@ -834,6 +1075,46 @@ class TestResidentMemoryPersistence:
         assert config["memory"]["backend"] == "sqlite"
 
 
+class TestResidentRealmBinding:
+    """A realm-deployed resident must carry its realm_slug/charter/HUD/stewardship.
+
+    Before this, the chart's resident mode rendered only environment id/name;
+    a resident deployed for a realm had no way to know which realm's charter
+    to resolve, no HUD, and no configurable stewardship cadence.
+    """
+
+    def test_realm_fields_absent_by_default(self, tmp_path: Path) -> None:
+        rendered = _render_skuld_chart(
+            tmp_path, {"resident": {"enabled": True, "persona": "product-steward"}}
+        )
+        config = _ravn_config_from_rendered(rendered)
+        assert "charter_mimir_page" not in config["environment"]
+        assert "resident_state" not in config
+        assert "resident_evolution" not in config
+        assert config["gateway"]["channels"]["http"]["resident_hud_enabled"] is False
+
+    def test_realm_slug_renders_charter_page_and_hud_and_stewardship(self, tmp_path: Path) -> None:
+        rendered = _render_skuld_chart(
+            tmp_path,
+            {
+                "resident": {
+                    "enabled": True,
+                    "persona": "product-steward",
+                    "realm": {"slug": "workshop"},
+                    "hudEnabled": True,
+                    "stewardshipIntervalSeconds": 30,
+                    "platform": {"enabled": True, "baseUrl": "https://volundr.example.test"},
+                }
+            },
+        )
+        config = _ravn_config_from_rendered(rendered)
+        assert config["environment"]["charter_mimir_page"] == "realms/workshop/charter.md"
+        assert config["resident_evolution"]["realm_slug"] == "workshop"
+        assert config["resident_evolution"]["realm_api_base_url"] == "https://volundr.example.test"
+        assert config["gateway"]["channels"]["http"]["resident_hud_enabled"] is True
+        assert config["resident_state"]["stewardship_interval_seconds"] == 30
+
+
 class TestRavnHomeVolume:
     """Ravn must see the persistent home claim, not only the emptyDir workspace.
 
@@ -910,3 +1191,336 @@ def _deployment_from_rendered(rendered_yaml: str) -> dict:
             return document
     pytest.fail("Deployment was not rendered")
     raise AssertionError("Deployment was not rendered")
+
+
+def test_user_git_integration_authenticates_nested_checkout(tmp_path):
+    token = tmp_path / "integration-token"
+    token.write_text("test-user-integration-token")
+    rendered = _render_skuld_chart(
+        tmp_path,
+        {
+            "git": {
+                "repoUrl": "https://github.com/niuulabs/niuu.git",
+                "credentials": {
+                    "tokenFile": str(token),
+                    "secretName": "unused-cluster-secret",
+                    "username": "x-access-token",
+                },
+            },
+            "extraContainers": [
+                {"name": "ravn-coder", "image": "test", "command": ["python", "-m", "ravn"]}
+            ],
+        },
+    )
+    containers = _deployment_from_rendered(rendered)["spec"]["template"]["spec"]["containers"]
+    coder = next(c for c in containers if c["name"] == "ravn-coder")
+    assert coder["command"][:2] == ["/bin/sh", "-c"]
+    assert ". /run/secrets/env.sh" in coder["command"][2]
+    assert coder["command"][4:] == ["python", "-m", "ravn"]
+    for name in ("skuld", "ravn-coder"):
+        env = next(c["env"] for c in containers if c["name"] == name)
+        assert not any(
+            e.get("valueFrom", {}).get("secretKeyRef", {}).get("name") == "unused-cluster-secret"
+            for e in env
+        )
+        process_env = {**os.environ, **{e["name"]: e["value"] for e in env if "value" in e}}
+        process_env.update(
+            GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull
+        )
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="url=https://github.com/niuulabs/niuu.git\n\n",
+            text=True,
+            capture_output=True,
+            env=process_env,
+            cwd=tmp_path,
+            check=True,
+        )
+        assert "password=test-user-integration-token" in result.stdout
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_websocket_auth_configuration_reaches_broker(enabled):
+    command = [
+        "helm",
+        "template",
+        "test",
+        str(CHART_DIR),
+        "--set",
+        f"wsAuth.enforce_ownership={str(enabled).lower()}",
+        "--set",
+        "session.ownerId=alice",
+        "--set",
+        "session.tenantId=acme",
+        "--set",
+        "gateway.enabled=true",
+        "--set",
+        "gateway.jwt.enabled=true",
+        "--set",
+        "gateway.jwt.issuer=https://issuer.test",
+        "--set",
+        "gateway.jwt.audiences[0]=skuld",
+        "--set",
+        "gateway.jwt.jwksUri=https://issuer.test/jwks",
+    ]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    config = next(
+        yaml.safe_load(d["data"]["config.yaml"])
+        for d in docs
+        if d and d["kind"] == "ConfigMap" and "config.yaml" in d.get("data", {})
+    )
+    assert config["ws_auth"]["enforce_ownership"] is enabled
+    assert config["ws_auth"]["allow_loopback"] is False
+    # "deployment" regardless of enforce_ownership: chart-deployed pods
+    # (Kubernetes) always rely on this pod's own auth boundary, never the
+    # session proxy's stamped header. Only the process backend's local
+    # launcher (volundr.adapters.outbound.local_process) renders "proxy",
+    # outside this chart entirely.
+    assert config["ws_auth"]["room_role_source"] == "deployment"
+    policy = next(d for d in docs if d and d["kind"] == "SecurityPolicy")
+    headers = {c["header"] for c in policy["spec"]["jwt"]["providers"][0]["claimToHeaders"]}
+    assert {"x-auth-user-id", "x-auth-tenant", "x-auth-roles"} <= headers
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_room_role_source_defaults_to_deployment_with_no_remote_adapter():
+    """Existing clusters must render byte-identical wsAuth until they opt in."""
+    from skuld.config import SkuldSettings
+
+    command = ["helm", "template", "test", str(CHART_DIR)]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    config = next(
+        yaml.safe_load(d["data"]["config.yaml"])
+        for d in docs
+        if d and d["kind"] == "ConfigMap" and "config.yaml" in d.get("data", {})
+    )
+    assert config["ws_auth"]["room_role_source"] == "deployment"
+    # No placeholder block: room_role_remote must be entirely absent, not
+    # merely inert, until an operator opts in.
+    assert "room_role_remote" not in config["ws_auth"]
+    settings = SkuldSettings(**config)
+    assert settings.ws_auth.room_role_source == "deployment"
+    assert settings.ws_auth.room_role_remote is None
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_room_role_source_remote_with_enforce_ownership_fails_the_render():
+    """The two together would 403 every participant at the ext_authz sidecar
+    before a remote room-role lookup ever ran — reject the config outright."""
+    command = [
+        "helm",
+        "template",
+        "test",
+        str(CHART_DIR),
+        "--set",
+        "wsAuth.room_role_source=remote",
+        "--set",
+        "wsAuth.enforce_ownership=true",
+        "--set",
+        "session.ownerId=alice",
+        "--set",
+        "session.tenantId=acme",
+        "--set",
+        "gateway.enabled=true",
+        "--set",
+        "gateway.jwt.enabled=true",
+        "--set",
+        "gateway.jwt.issuer=https://issuer.test",
+        "--set",
+        "gateway.jwt.audiences[0]=skuld",
+        "--set",
+        "gateway.jwt.jwksUri=https://issuer.test/jwks",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "enforce_ownership: false" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_room_role_source_remote_renders_the_dynamic_adapter():
+    from skuld.config import SkuldSettings
+
+    command = [
+        "helm",
+        "template",
+        "test",
+        str(CHART_DIR),
+        "--set",
+        "wsAuth.room_role_source=remote",
+        "--set",
+        "wsAuth.room_role_remote.kwargs.volundr_api_url=http://volundr.volundr.svc:8080",
+    ]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    config = next(
+        yaml.safe_load(d["data"]["config.yaml"])
+        for d in docs
+        if d and d["kind"] == "ConfigMap" and "config.yaml" in d.get("data", {})
+    )
+    assert config["ws_auth"]["room_role_source"] == "remote"
+    remote = config["ws_auth"]["room_role_remote"]
+    assert remote["adapter"] == "skuld.room_role_remote.RemoteAuthorizationAdapter"
+    assert remote["kwargs"]["volundr_api_url"] == "http://volundr.volundr.svc:8080"
+    settings = SkuldSettings(**config)
+    assert settings.ws_auth.room_role_source == "remote"
+    assert settings.ws_auth.room_role_remote is not None
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_room_role_remote_defaults_volundr_api_url_and_token_file():
+    """A remote pod must be able to start without repeating volundr.apiUrl or
+    the workload-identity token path a second time under room_role_remote."""
+    command = [
+        "helm",
+        "template",
+        "test",
+        str(CHART_DIR),
+        "--set",
+        "wsAuth.room_role_source=remote",
+        "--set",
+        "volundr.apiUrl=http://volundr.volundr.svc:8080",
+    ]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    config = next(
+        yaml.safe_load(d["data"]["config.yaml"])
+        for d in docs
+        if d and d["kind"] == "ConfigMap" and "config.yaml" in d.get("data", {})
+    )
+    kwargs = config["ws_auth"]["room_role_remote"]["kwargs"]
+    assert kwargs["volundr_api_url"] == "http://volundr.volundr.svc:8080"
+    assert kwargs["token_file"] == "/var/run/secrets/niuu-workload/token"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_forge_controls_render_into_valid_skuld_configuration():
+    from skuld.config import SkuldSettings
+
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "forge-controls",
+            str(CHART_DIR),
+            "--set",
+            "session.reasoningEffort=high",
+            "--set",
+            "broker.historyHydrationEnabled=false",
+            "--set",
+            "broker.codexReceiveMaxBytes=123456",
+            "--set",
+            "broker.pi.binary=/opt/pi",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    configs = [
+        yaml.safe_load(doc["data"]["config.yaml"])
+        for doc in yaml.safe_load_all(result.stdout)
+        if doc and doc.get("kind") == "ConfigMap" and "config.yaml" in doc.get("data", {})
+    ]
+    config = next(item for item in configs if "session" in item)
+    settings = SkuldSettings(**config)
+    assert settings.session.reasoning_effort == "high"
+    assert settings.history_hydration_enabled is False
+    assert settings.codex_receive_max_bytes == 123456
+    assert settings.pi.binary == "/opt/pi"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+class TestResidentServiceAccount:
+    """The resident release's own ServiceAccount — gives its projected
+    workload-identity token a subject unique to it (system:serviceaccount:
+    <ns>:resident-<uuid>), so the volundr chart's residentMapping can derive
+    a per-resident owner_id instead of every resident sharing one identity."""
+
+    @staticmethod
+    def _render(*extra_args: str) -> list[dict]:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "resident.enabled=true",
+                "--set",
+                "resident.persona=product-resident",
+                "--set",
+                "serviceAccountName=resident-abc123",
+                # Content-focused tests below need the SA to actually render;
+                # the opt-in gate itself (default false) has its own tests.
+                "--set",
+                "resident.serviceAccount.create=true",
+                *extra_args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+    def _service_account(self, docs: list[dict]) -> dict:
+        return next(doc for doc in docs if doc.get("kind") == "ServiceAccount")
+
+    def test_automount_service_account_token_is_disabled(self):
+        sa = self._service_account(self._render())
+        assert sa["automountServiceAccountToken"] is False
+
+    def test_name_matches_the_configured_service_account_name(self):
+        sa = self._service_account(self._render())
+        assert sa["metadata"]["name"] == "resident-abc123"
+
+    def test_no_service_account_rendered_without_a_name(self):
+        docs = self._render("--set", "serviceAccountName=")
+        assert not any(doc.get("kind") == "ServiceAccount" for doc in docs)
+
+    def test_no_service_account_rendered_for_a_non_resident_release(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "serviceAccountName=resident-abc123",
+                "--set",
+                "resident.serviceAccount.create=true",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        assert not any(doc.get("kind") == "ServiceAccount" for doc in docs)
+
+    def test_no_service_account_rendered_when_create_is_left_at_its_default(self):
+        """resident.serviceAccount.create defaults to false: a resident release
+        that names a ServiceAccount it does not own (e.g. one a Fleet bundle
+        or another release already created, such as valhalla's shared
+        resident-muninn / resident-ravn) must not attempt to create it too —
+        that would fail on Helm ownership, and uninstalling this release
+        would delete an SA other residents still use."""
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "resident.enabled=true",
+                "--set",
+                "resident.persona=product-resident",
+                "--set",
+                "serviceAccountName=resident-abc123",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        assert not any(doc.get("kind") == "ServiceAccount" for doc in docs)
+
+    def test_service_account_rendered_when_create_is_explicitly_true(self):
+        docs = self._render("--set", "resident.serviceAccount.create=true")
+        sa = self._service_account(docs)
+        assert sa["metadata"]["name"] == "resident-abc123"

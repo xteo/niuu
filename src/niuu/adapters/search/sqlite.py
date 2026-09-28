@@ -219,25 +219,10 @@ class SqliteSearchAdapter(SearchPort):
         If *embedding* is supplied it is stored directly, bypassing
         ``embed_fn``.  This allows callers with pre-computed embeddings to
         avoid redundant model inference.
-
-        A failure to embed does **not** fail the write. Indexing happens on the turn path, so an
-        embedding backend that is down, mid-pull, or refusing an input took the whole conversation
-        turn with it — an agent that cannot answer at all is far worse than one whose newest memory
-        is briefly findable by keyword only. The row is written unembedded and logged loudly;
-        ``unembedded()`` already exists to find these, and ``backfill_embeddings`` to fill them.
         """
         resolved_embedding = embedding
         if resolved_embedding is None and self._embed_fn is not None:
-            try:
-                resolved_embedding = await self._embed_fn(content)
-            except Exception as exc:  # noqa: BLE001 — any backend failure, never fatal to the turn
-                logger.warning(
-                    "index %s: embedding failed (%s: %s) — storing unembedded, "
-                    "recoverable with backfill_embeddings",
-                    id,
-                    type(exc).__name__,
-                    exc,
-                )
+            resolved_embedding = await self._embed_fn(content)
 
         await asyncio.to_thread(self._index_sync, id, content, metadata, resolved_embedding)
 
@@ -710,19 +695,7 @@ class SqliteSearchAdapter(SearchPort):
         assert self._embed_fn is not None
 
         fts_pairs = await asyncio.to_thread(self._load_fts_candidates_sync, query, limit * 3)
-        try:
-            query_vec = await self._embed_fn(query)
-        except Exception as exc:  # noqa: BLE001 — a recall must never cost the caller its turn
-            # This runs on the turn path: an agent recalls before it answers. An embedding backend
-            # that is down or refuses the query used to raise straight through recall and kill the
-            # turn, so the agent said nothing at all. Keyword results are a worse answer than
-            # hybrid ones and a far better one than silence.
-            logger.warning(
-                "search: query embedding failed (%s: %s) — falling back to keyword-only results",
-                type(exc).__name__,
-                exc,
-            )
-            return await asyncio.to_thread(self._search_fts_sync, query, limit)
+        query_vec = await self._embed_fn(query)
 
         if self._use_vec_for_query(query_vec):
             sem_ranking = await asyncio.to_thread(self._knn_sync, query_vec, limit * 3)

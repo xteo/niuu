@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from niuu.domain.models import Principal
 from ting.api.tracker import (
     create_canonical_tracker_router,
@@ -78,7 +79,6 @@ class MockTracker(TrackerPort):
             repos=[],
             feature_branch="feat/test",
             status=SagaStatus.ACTIVE,
-            confidence=0.0,
             created_at=now,
             base_branch="dev",
         )
@@ -91,7 +91,6 @@ class MockTracker(TrackerPort):
             number=1,
             name="P1",
             status=PhaseStatus.PENDING,
-            confidence=0.0,
         )
 
     async def get_run(self, tracker_id: str) -> Run:
@@ -106,7 +105,6 @@ class MockTracker(TrackerPort):
             declared_files=[],
             estimate_hours=None,
             status=RunStatus.PENDING,
-            confidence=0.0,
             session_id=None,
             branch=None,
             chronicle_summary=None,
@@ -168,7 +166,6 @@ class MockTracker(TrackerPort):
             declared_files=[],
             estimate_hours=None,
             status=RunStatus.PENDING,
-            confidence=0.0,
             session_id=None,
             branch=None,
             chronicle_summary=None,
@@ -187,12 +184,6 @@ class MockTracker(TrackerPort):
 
     async def get_run_by_id(self, run_id: UUID) -> Run | None:
         return None
-
-    async def add_confidence_event(self, tracker_id: str, event: object) -> None:  # noqa: ANN001
-        pass
-
-    async def get_confidence_events(self, tracker_id: str) -> list:
-        return []
 
     async def all_runs_merged(self, phase_tracker_id: str) -> bool:
         return False
@@ -388,7 +379,6 @@ class MockSagaRepo(SagaRepository):
                     repos=saga.repos,
                     feature_branch=saga.feature_branch,
                     status=saga.status,
-                    confidence=saga.confidence,
                     created_at=saga.created_at,
                     base_branch=saga.base_branch,
                     repo_branches=saga.repo_branches,
@@ -430,7 +420,6 @@ class MockSagaRepo(SagaRepository):
                     repos=saga.repos,
                     feature_branch=saga.feature_branch,
                     status=saga.status,
-                    confidence=saga.confidence,
                     created_at=saga.created_at,
                     base_branch=saga.base_branch,
                     repo_branches=saga.repo_branches,
@@ -474,8 +463,27 @@ class InMemoryWorkflowRepository(WorkflowRepository):
         self._workflows[workflow.id] = workflow
         return workflow
 
+    async def list_workflow_versions(self, workflow_id):
+        return []
+
+    async def get_workflow_version(self, workflow_id, *, version=None, document_revision=None):
+        workflow = await self.get_workflow(workflow_id)
+        return workflow if workflow is not None and workflow.version == version else None
+
+    async def save_workflow_version(self, workflow, **kwargs):
+        raise NotImplementedError
+
     async def delete_workflow(self, workflow_id) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
+
+    async def has_recorded_version_history(self, workflow_id) -> bool:
+        return True
+
+    async def adopt_legacy_bundled(self, seed):
+        return await self.save_workflow(seed)
+
+    async def reclassify_orphaned_bundled_as_authored(self, workflow_id):
+        return await self.get_workflow(workflow_id)
 
 
 class _DispatchRecorder:
@@ -511,6 +519,7 @@ def _build_test_client(
     dispatch_service: object | None = None,
 ) -> TestClient:
     app = FastAPI()
+    app.state.authorization = AllowAllAuthorizationAdapter()
     app.state.legacy_route_hits = {}
     app.include_router(create_canonical_tracker_router())
     app.include_router(create_tracker_router())
@@ -523,6 +532,18 @@ def _build_test_client(
         app.state.workflow_repo = workflow_repo
     if dispatch_service is not None:
         app.state.dispatch_service = dispatch_service
+    return TestClient(app)
+
+
+def _build_multi_tracker_client(trackers: list[MockTracker]) -> TestClient:
+    app = FastAPI()
+    app.state.authorization = AllowAllAuthorizationAdapter()
+    app.state.legacy_route_hits = {}
+    app.include_router(create_canonical_tracker_router())
+    app.include_router(create_tracker_router())
+    app.dependency_overrides[resolve_trackers] = lambda: trackers
+    app.state.saga_repo = MockSagaRepo()
+    app.state.settings = MagicMock(auth=AuthConfig(allow_anonymous_dev=True))
     return TestClient(app)
 
 
@@ -573,6 +594,7 @@ class TestListProjects:
 
     def test_ignores_tracker_failures(self, mock_tracker: MockTracker):
         app = FastAPI()
+        app.state.authorization = AllowAllAuthorizationAdapter()
         app.include_router(create_tracker_router())
         app.dependency_overrides[resolve_trackers] = lambda: [_FailingTracker(), mock_tracker]
         app.state.saga_repo = MockSagaRepo()
@@ -596,6 +618,23 @@ class TestGetProject:
     def test_not_found(self, client: TestClient):
         resp = client.get("/api/v1/ting/tracker/projects/nonexistent")
         assert resp.status_code == 404
+
+    def test_same_project_id_requires_connection_when_multiple_trackers_match(self):
+        first = MockTracker()
+        second = MockTracker()
+        first.bind_connection(connection_id="jira-a", provider="jira", name="Acme Jira")
+        second.bind_connection(connection_id="jira-b", provider="jira", name="Beta Jira")
+        first.projects = [TrackerProject("SHARED", "Acme", "", "started", "https://a", 0, 1)]
+        second.projects = [TrackerProject("SHARED", "Beta", "", "started", "https://b", 0, 2)]
+        multi_client = _build_multi_tracker_client([first, second])
+
+        ambiguous = multi_client.get("/api/v1/tracker/projects/SHARED")
+        selected = multi_client.get("/api/v1/tracker/projects/SHARED?tracker_connection_id=jira-b")
+
+        assert ambiguous.status_code == 409
+        assert selected.status_code == 200
+        assert selected.json()["name"] == "Beta"
+        assert selected.json()["tracker_connection_id"] == "jira-b"
 
 
 class TestListMilestones:
@@ -677,6 +716,31 @@ class TestImportProject:
         )
         assert resp.status_code == 404
 
+    def test_import_persists_selected_tracker_connection(self):
+        first = MockTracker()
+        second = MockTracker()
+        first.bind_connection(connection_id="jira-a", provider="jira", name="Acme Jira")
+        second.bind_connection(connection_id="jira-b", provider="jira", name="Beta Jira")
+        first.projects = [TrackerProject("P1", "Acme", "", "started", "", 0, 0)]
+        second.projects = [TrackerProject("P1", "Beta", "", "started", "", 0, 0)]
+        multi_client = _build_multi_tracker_client([first, second])
+
+        response = multi_client.post(
+            "/api/v1/tracker/import",
+            json={
+                "project_id": "P1",
+                "tracker_connection_id": "jira-b",
+                "repos": ["org/repo"],
+                "base_branch": "main",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["tracker_connection_id"] == "jira-b"
+        assert response.json()["tracker_type"] == "jira"
+        saved = multi_client.app.state.saga_repo.sagas[0]
+        assert saved.tracker_connection_id == "jira-b"
+
     def test_duplicate_slug_returns_409(self, client: TestClient):
         client.app.state.saga_repo.sagas.append(
             Saga(
@@ -688,7 +752,6 @@ class TestImportProject:
                 repos=["org/repo"],
                 feature_branch="feat/alpha",
                 status=SagaStatus.ACTIVE,
-                confidence=0.0,
                 created_at=datetime.now(UTC),
                 base_branch="dev",
                 owner_id="dev-user",
@@ -719,7 +782,6 @@ class TestImportProject:
                 repos=["org/old-repo"],
                 feature_branch="feat/alpha",
                 status=SagaStatus.ACTIVE,
-                confidence=0.42,
                 created_at=original_created_at,
                 base_branch="main",
                 owner_id="dev-user",
@@ -742,7 +804,6 @@ class TestImportProject:
         assert saved.created_at == original_created_at
         assert saved.repos == ["org/new-repo"]
         assert saved.base_branch == "dev"
-        assert saved.confidence == 0.42
 
     def test_import_persists_repo_refs_and_tag_target(self, client: TestClient):
         response = client.post(

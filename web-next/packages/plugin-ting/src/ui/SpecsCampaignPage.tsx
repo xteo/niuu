@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate, useParams } from '@tanstack/react-router';
 import { useQueryClient } from '@tanstack/react-query';
-import { usePluginCtx } from '@niuulabs/plugin-sdk';
 import { openEventStream } from '@niuulabs/query';
 import type { CampaignArtifactDetail, SpecCampaignDetail } from '../ports';
+import { actionableSpecGates } from '../domain/campaignProgress';
 import {
   useDeleteSpecCampaign,
   useReviewSpecCampaign,
@@ -22,27 +22,6 @@ const DOC_TABS = [
   { kind: 'breakdown', label: 'Breakdown', gateNodeId: 'spec-breakdown-gate' },
   { kind: 'manifest', label: 'Manifest' },
 ] as const;
-
-interface PendingSpecGate {
-  id: string;
-  nodeId: string;
-  summary: string;
-  instructions: string;
-}
-
-function pendingSpecGates(campaign: SpecCampaignDetail | null | undefined): PendingSpecGate[] {
-  const raw = campaign?.metadata.pending_workflow_gates;
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((gate): gate is Record<string, unknown> => typeof gate === 'object' && gate !== null)
-    .map((gate) => ({
-      id: String(gate.id ?? gate.gate_id ?? gate.gateId ?? ''),
-      nodeId: String(gate.node_id ?? gate.nodeId ?? ''),
-      summary: String(gate.summary ?? gate.label ?? 'Review required'),
-      instructions: String(gate.instructions ?? ''),
-    }))
-    .filter((gate) => gate.id && gate.nodeId.startsWith('spec-') && gate.nodeId.endsWith('-gate'));
-}
 
 function docKindForGate(nodeId: string): string | null {
   if (nodeId === 'spec-prd-gate') return 'prd';
@@ -223,12 +202,11 @@ function artifactTitle(artifact: CampaignArtifactDetail | null | undefined, path
 export function SpecsCampaignPage() {
   const { slug } = useParams({ from: '/ting/specs/$slug' });
   const navigate = useNavigate();
-  const ctx = usePluginCtx();
   const queryClient = useQueryClient();
   const { data: campaign, isLoading, isError, error } = useSpecCampaign(slug);
   const deleteCampaign = useDeleteSpecCampaign();
   const reviewCampaign = useReviewSpecCampaign(slug);
-  const gates = pendingSpecGates(campaign);
+  const gates = actionableSpecGates(campaign);
   const primaryGate = gates[0] ?? null;
   const preferredKind = primaryGate ? docKindForGate(primaryGate.nodeId) : null;
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
@@ -274,8 +252,7 @@ export function SpecsCampaignPage() {
 
   function openMimirPage() {
     if (!effectivePath) return;
-    ctx.setTweak('mimir.selectedPagePath', effectivePath);
-    void navigate({ to: '/mimir/pages' });
+    void navigate({ to: '/mimir' });
   }
 
   if (isLoading) return <div className="research-empty-state">Loading spec…</div>;

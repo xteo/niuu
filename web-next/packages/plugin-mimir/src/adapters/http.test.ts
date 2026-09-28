@@ -160,6 +160,9 @@ describe('buildMimirHttpAdapter', () => {
       const mount = await buildMimirHttpAdapter(client).mounts.createRegistryMount(registryMount);
 
       expect(client.post).toHaveBeenCalledWith('/registry/mounts', {
+        adapter: '',
+        kwargs: {},
+        secret_kwargs_env: {},
         name: 'shared',
         kind: 'remote',
         lifecycle: 'registered',
@@ -209,6 +212,9 @@ describe('buildMimirHttpAdapter', () => {
       );
 
       expect(client.put).toHaveBeenCalledWith('/registry/mounts/registry-shared', {
+        adapter: '',
+        kwargs: {},
+        secret_kwargs_env: {},
         name: 'shared',
         kind: 'remote',
         lifecycle: 'registered',
@@ -355,6 +361,18 @@ describe('buildMimirHttpAdapter', () => {
       await buildMimirHttpAdapter(client).pages.search('k8s', 'fts');
       const call = (client.get as ReturnType<typeof vi.fn>).mock.calls[0]![0] as string;
       expect(call).toContain('mode=fts');
+    });
+
+    it('carries the mount each result was read from', async () => {
+      const client = makeClient({
+        get: vi
+          .fn()
+          .mockResolvedValue([
+            { path: '/a', title: 'A', summary: 'S', category: 'arch', mount: 'shared' },
+          ]),
+      });
+      const [result] = await buildMimirHttpAdapter(client).pages.search('a');
+      expect(result?.mounts).toEqual(['shared']);
     });
 
     it('passes the active mount through to the backend when provided', async () => {
@@ -678,6 +696,128 @@ describe('buildMimirHttpAdapter', () => {
         inboundCount: 2,
       });
       expect(graph.edges[0]).toMatchObject({ source: '/infra/k8s', target: '/arch/overview' });
+    });
+
+    it('maps kind, updatedAt, firstSeen, confidence, and edge type', async () => {
+      const rawGraph = {
+        nodes: [
+          {
+            id: 'local:/entities/person-karpathy',
+            title: 'Andrej Karpathy',
+            category: 'person',
+            kind: 'person',
+            updated_at: '2026-04-17T14:22:00Z',
+            first_seen: '2026-03-01T00:00:00Z',
+            confidence: 'high',
+          },
+          {
+            id: 'local:/arch/overview',
+            title: 'Architecture Overview',
+            category: 'arch',
+            kind: 'topic',
+            updated_at: '2026-04-18T10:00:00Z',
+            first_seen: '2026-02-01T00:00:00Z',
+            confidence: null,
+          },
+        ],
+        edges: [
+          {
+            source: 'local:/entities/person-karpathy',
+            target: 'local:/arch/overview',
+            type: 'contradicts',
+          },
+        ],
+      };
+      const client = makeClient({ get: vi.fn().mockResolvedValue(rawGraph) });
+      const graph = await buildMimirHttpAdapter(client).pages.getGraph();
+      expect(graph.nodes[0]).toMatchObject({
+        kind: 'person',
+        updatedAt: '2026-04-17T14:22:00Z',
+        firstSeen: '2026-03-01T00:00:00Z',
+        confidence: 'high',
+      });
+      expect(graph.nodes[1]).toMatchObject({ kind: 'topic', confidence: null });
+      expect(graph.edges[0]).toMatchObject({ type: 'contradicts' });
+    });
+
+    it('passes a null confidence through as null', async () => {
+      const rawGraph = {
+        nodes: [
+          {
+            id: 'local:%2Fx',
+            title: 'X',
+            category: 'x',
+            path: '/x',
+            mount: 'local',
+            updated_at: '2026-04-02T10:00:00+00:00',
+            first_seen: '2026-04-02T10:00:00+00:00',
+            confidence: null,
+          },
+        ],
+        edges: [],
+      };
+      const client = makeClient({ get: vi.fn().mockResolvedValue(rawGraph) });
+      const graph = await buildMimirHttpAdapter(client).pages.getGraph();
+      expect(graph.nodes[0]?.confidence).toBeNull();
+    });
+  });
+
+  describe('pages.getLiveActivity', () => {
+    it('calls GET /activity/live without query string when no options', async () => {
+      const client = makeClient({ get: vi.fn().mockResolvedValue([]) });
+      await buildMimirHttpAdapter(client).pages.getLiveActivity();
+      expect(client.get).toHaveBeenCalledWith('/activity/live');
+    });
+
+    it('url-encodes the since param when provided', async () => {
+      const client = makeClient({ get: vi.fn().mockResolvedValue([]) });
+      await buildMimirHttpAdapter(client).pages.getLiveActivity({
+        since: '2026-04-19T09:00:00Z',
+      });
+      expect(client.get).toHaveBeenCalledWith(
+        `/activity/live?since=${encodeURIComponent('2026-04-19T09:00:00Z')}`,
+      );
+    });
+
+    it('maps snake_case raw activity to LiveActivity', async () => {
+      const raw = [
+        {
+          id: 'act-1',
+          timestamp: '2026-04-19T09:00:00Z',
+          kind: 'write',
+          mount: 'local',
+          path: '/arch/overview',
+          actor: 'ravn-fjolnir',
+        },
+        {
+          id: 'act-2',
+          timestamp: '2026-04-19T08:55:00Z',
+          kind: 'read',
+          mount: 'shared',
+          path: '/api/overview',
+          actor: null,
+        },
+      ];
+      const client = makeClient({ get: vi.fn().mockResolvedValue(raw) });
+      const activity = await buildMimirHttpAdapter(client).pages.getLiveActivity();
+      expect(activity).toEqual([
+        {
+          id: 'act-1',
+          timestamp: '2026-04-19T09:00:00Z',
+          kind: 'write',
+          mount: 'local',
+          path: '/arch/overview',
+          actor: 'ravn-fjolnir',
+        },
+        {
+          id: 'act-2',
+          timestamp: '2026-04-19T08:55:00Z',
+          kind: 'read',
+          mount: 'shared',
+          path: '/api/overview',
+          actor: null,
+        },
+      ]);
     });
   });
 
@@ -1390,4 +1530,29 @@ describe('buildMimirHttpAdapter', () => {
       });
     });
   });
+});
+
+it('routes deployments through Guild while keeping knowledge queries on Mimir', async () => {
+  const knowledge = makeClient();
+  const guild = makeClient();
+  const service = buildMimirHttpAdapter(knowledge, guild);
+  await service.mounts.listMounts();
+  await service.mounts.getDeployments!();
+  await service.mounts.deployInstance!({
+    name: 'brain',
+    backend: 'gbrain',
+    target: 'ymir:cluster',
+  });
+  await service.mounts.inspectDeployment!('brain', 'ymir:cluster');
+  await service.mounts.controlDeployment!('brain', 'update', 'ymir:cluster');
+  expect(knowledge.get).toHaveBeenCalledWith('/mounts');
+  expect(knowledge.post).not.toHaveBeenCalled();
+  expect(guild.get).toHaveBeenCalledWith('/deployments');
+  expect(guild.get).toHaveBeenCalledWith('/deployments/brain?target=ymir%3Acluster');
+  expect(guild.post).toHaveBeenCalledWith('/deployments', {
+    name: 'brain',
+    backend: 'gbrain',
+    target: 'ymir:cluster',
+  });
+  expect(guild.post).toHaveBeenCalledWith('/deployments/brain/update?target=ymir%3Acluster', {});
 });

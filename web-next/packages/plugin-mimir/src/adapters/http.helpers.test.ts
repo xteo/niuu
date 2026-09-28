@@ -42,6 +42,7 @@ describe('mimir http helpers', () => {
       toMount({
         name: 'local',
         role: 'local',
+        access_scope: 'tenant',
         host: 'localhost',
         url: 'http://localhost',
         priority: 1,
@@ -55,7 +56,7 @@ describe('mimir http helpers', () => {
         size_kb: 12,
         desc: 'Local',
       }),
-    ).toMatchObject({ lintIssues: 3, sizeKb: 12 });
+    ).toMatchObject({ lintIssues: 3, sizeKb: 12, accessScope: 'tenant' });
 
     expect(
       toRegistryMount({
@@ -64,6 +65,7 @@ describe('mimir http helpers', () => {
         kind: 'remote',
         lifecycle: 'registered',
         role: 'shared',
+        access_scope: 'global',
         url: 'https://mimir.example',
         path: '/mnt',
         categories: ['entity'],
@@ -74,7 +76,7 @@ describe('mimir http helpers', () => {
         health_message: 'ok',
         desc: 'Shared',
       }),
-    ).toMatchObject({ authRef: 'secret', defaultReadPriority: 5 });
+    ).toMatchObject({ authRef: 'secret', defaultReadPriority: 5, accessScope: 'global' });
 
     const rawPage = {
       path: '/entities/alice',
@@ -94,16 +96,34 @@ describe('mimir http helpers', () => {
       zones: [{ kind: 'assessment', text: 'Solid' }],
     });
 
-    expect(toGraphNode({ id: 'n1', title: 'Node', category: 'arch', inbound_count: 2 })).toEqual({
-      id: 'n1',
+    const rawNode = {
+      id: 'local:%2Farch',
+      title: 'Node',
+      category: 'arch',
+      path: '/arch',
+      mount: 'local',
+      inbound_count: 2,
+      updated_at: '2026-04-02T10:00:00+00:00',
+      first_seen: '2026-01-05T00:00:00+00:00',
+      confidence: 'high',
+    };
+    expect(toGraphNode(rawNode)).toEqual({
+      id: 'local:%2Farch',
       title: 'Node',
       category: 'arch',
       inboundCount: 2,
+      path: '/arch',
+      kind: undefined,
+      summary: undefined,
+      mount: 'local',
+      updatedAt: '2026-04-02T10:00:00+00:00',
+      firstSeen: '2026-01-05T00:00:00+00:00',
+      confidence: 'high',
     });
     expect(toGraphEdge({ source: 'a', target: 'b' })).toEqual({ source: 'a', target: 'b' });
     expect(
       toGraph({
-        nodes: [{ id: 'n1', title: 'Node', category: 'arch', inbound_count: 2 }],
+        nodes: [rawNode],
         edges: [{ source: 'a', target: 'b' }],
       }),
     ).toMatchObject({ nodes: [{ inboundCount: 2 }], edges: [{ source: 'a', target: 'b' }] });

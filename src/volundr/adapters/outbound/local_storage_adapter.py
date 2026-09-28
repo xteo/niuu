@@ -64,6 +64,10 @@ class LocalStorageAdapter(StoragePort):
     # StoragePort implementation
     # ------------------------------------------------------------------
 
+    @property
+    def supports_home_volumes(self) -> bool:
+        return True
+
     async def provision_user_storage(
         self,
         user_id: str,
@@ -143,6 +147,13 @@ class LocalStorageAdapter(StoragePort):
             "Cannot delete a locally mounted workspace. "
             "Please manage storage on your machine directly."
         )
+
+    async def manage_user_home(self, user_id: str, operation: str, path: str = "") -> dict:
+        from volundr.adapters.outbound.user_home_files import home_operation
+
+        if Path(user_id).name != user_id or user_id in {"", ".", ".."}:
+            raise ValueError("Invalid user storage identity")
+        return {"status": "ready", **home_operation(str(self._home_dir / user_id), operation, path)}
 
     async def get_user_storage_usage(
         self,

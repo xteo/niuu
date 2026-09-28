@@ -15,7 +15,8 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from niuu.adapters.outbound.http_auth import WorkloadIdentityBearerTokenAuthAdapter
-from ravn.config import Settings, ToolGroupConfig
+from ravn.config import PermissionConfig, Settings, ToolGroupConfig
+from ravn.domain.permission_mode import PermissionMode, parse_permission_mode
 from ravn.ports.executor import ExecutorPort
 
 logger = logging.getLogger(__name__)
@@ -404,6 +405,12 @@ def _build_executor(
                     **runtime_kwargs,
                     **(configured_kwargs or {}),
                 }
+            if kwargs.get("model_gateway"):
+                # The persona asked for the gateway; the session supplies where
+                # it is. The executor refuses to build if it has none.
+                runtime = loaded_settings.runtime_executor
+                kwargs["model_gateway_url"] = runtime.model_gateway_url
+                kwargs["model_gateway_token"] = runtime.model_gateway_token
     else:
         runtime_transport_adapter = loaded_settings.runtime_executor.transport_adapter.strip()
         if runtime_transport_adapter:
@@ -486,20 +493,19 @@ def _codex_auth_provider(settings: Settings) -> Any | None:
     # it would turn a missing-config error into a confusing connection failure
     # at the first model call.
     if "base_url" not in platform.model_fields_set or not base_url:
-        # A flock persona carries no platform block, but the runtime does inject
-        # the workload exchange URL, which is by construction on the Völundr
-        # that brokers this credential. Same host, same trust, already present.
-        base_url = _platform_origin_from_exchange_url()
-    if not base_url:
-        logger.warning(
-            "runtime_executor: codex_auth_adapter %s is configured but no "
-            "Völundr base URL is available from gateway.platform.base_url or "
-            "%s, so there is no broker to call; leaving the transport "
-            "unauthenticated",
-            adapter,
-            _WORKLOAD_EXCHANGE_URL_ENV,
+        # Flock personas share Skuld's platform origin. OpenShell authenticates
+        # that HTTP path through its provider proxy and has no projected
+        # workload-token exchange URL. Native Kubernetes still supplies one.
+        base_url = (
+            settings.runtime_executor.volundr_api_url.strip()
+            or _platform_origin_from_exchange_url()
         )
-        return None
+    if not base_url:
+        raise RuntimeError(
+            "Configured Codex auth requires gateway.platform.base_url, "
+            "runtime_executor.volundr_api_url (SKULD__VOLUNDR_API_URL), or "
+            "NIUU_WORKLOAD_IDENTITY_EXCHANGE_URL"
+        )
 
     # Pass token_file/exchange_url only when they were actually configured.
     # Both fall back to NIUU_WORKLOAD_IDENTITY_* inside the adapter, and in a
@@ -703,6 +709,19 @@ def _with_mimir_fact_capture(memory: Any | None, mimir: Any | None) -> Any | Non
 # ---------------------------------------------------------------------------
 
 
+def _effective_permission_mode(settings: Settings, persona_config: Any | None) -> PermissionMode:
+    """Return the permission mode a run enforces: the persona's, else Settings'.
+
+    The permission adapter and the executor both take their mode from here so
+    they can never disagree about which boundary applies.  Both sources are
+    re-parsed: a value that is not a known mode raises instead of reaching an
+    enforcer that would read it as its permissive default.
+    """
+    if persona_config is not None and persona_config.parsed_permission_mode is not None:
+        return parse_permission_mode(persona_config.parsed_permission_mode)
+    return parse_permission_mode(settings.permission.mode)
+
+
 def _build_permission(
     settings: Settings,
     workspace: Path,
@@ -716,23 +735,23 @@ def _build_permission(
     if no_tools:
         return DenyAllPermission()
 
-    # Determine effective permission mode: persona override takes precedence
-    mode = settings.permission.mode
-    if persona_config is not None and persona_config.permission_mode:
-        mode = persona_config.permission_mode
+    mode = _effective_permission_mode(settings, persona_config)
 
-    if mode in ("allow_all", "full_access"):
+    if mode in (PermissionMode.ALLOW_ALL, PermissionMode.FULL_ACCESS):
         return AllowAllPermission()
 
-    if mode == "deny_all":
+    if mode == PermissionMode.DENY_ALL:
         return DenyAllPermission()
 
     # Rich permission enforcer for workspace_write, read_only, prompt modes
     from ravn.adapters.memory.approval import ApprovalMemory
     from ravn.adapters.permission.enforcer import PermissionEnforcer
 
-    # Override config mode with the effective mode (persona takes precedence)
-    effective_config = settings.permission.model_copy(update={"mode": mode})
+    # Re-validate rather than model_copy(update=...), which skips validation
+    # and let an unrecognised persona mode reach the enforcer unchecked.
+    effective_config = PermissionConfig.model_validate(
+        {**settings.permission.model_dump(), "mode": mode}
+    )
     return PermissionEnforcer(
         config=effective_config,
         workspace_root=workspace,
@@ -860,6 +879,7 @@ def _build_mimir_auth(settings: Settings, auth_config: Any) -> Any:
         exchange_url=exchange_url,
         audiences=tuple(auth_config.audiences),
         trust_domain=auth_config.trust_domain,
+        token_refresh_margin_seconds=auth_config.token_refresh_margin_seconds,
     )
 
 
@@ -869,32 +889,21 @@ def _build_mimir(settings: Settings) -> Any:
         return None
 
     if settings.mimir.instances:
-        from mimir.adapters.markdown import MarkdownMimirAdapter
+        from mimir.connections import resolve_mimir_connection
         from ravn.adapters.mimir.composite import CompositeMimirAdapter
-        from ravn.adapters.mimir.http import HttpMimirAdapter
         from ravn.domain.mimir import MimirMount, WriteRouting
 
         mounts: list[Any] = []
         for inst in settings.mimir.instances:
-            if inst.adapter:
-                cls = _import_class(inst.adapter)
-                port: Any = cls(**_inject_secrets(dict(inst.kwargs), inst.secret_kwargs_env))
-            elif inst.path:
-                port = MarkdownMimirAdapter(root=inst.path)
-            elif inst.url:
-                auth = None
-                if inst.auth is not None:
-                    auth = _build_mimir_auth(settings, inst.auth)
-                port = HttpMimirAdapter(
-                    base_url=inst.url, auth=auth, environment_id=settings.environment.id
-                )
-            else:
-                # Skipping left the mount silently absent: reads returned fewer
-                # results and nothing said a configured instance was missing.
-                raise ValueError(
-                    f"Mímir instance {inst.name!r} has no adapter, path or url. "
-                    f"Give it one, or remove it from mimir.instances."
-                )
+            port = resolve_mimir_connection(
+                adapter=inst.adapter,
+                kwargs=inst.kwargs,
+                secret_kwargs_env=inst.secret_kwargs_env,
+                path=inst.path,
+                url=inst.url,
+                environment_id=settings.environment.id,
+                auth=_build_mimir_auth(settings, inst.auth) if inst.auth is not None else None,
+            )
             mounts.append(
                 MimirMount(
                     name=inst.name,

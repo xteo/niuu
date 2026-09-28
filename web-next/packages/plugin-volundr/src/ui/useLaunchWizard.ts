@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import type { BifrostModel, IBifrostService } from '@niuulabs/plugin-bifrost';
 import type { IPersonaCatalog, PersonaSummary } from '@niuulabs/domain';
@@ -7,6 +7,7 @@ import { useOptionalService, useService } from '@niuulabs/plugin-sdk';
 import type { RepoRecord } from '@niuulabs/ui';
 import type { IVolundrService } from '../ports/IVolundrService';
 import type {
+  CatalogEntry,
   ClusterResourceInfo,
   McpServerConfig,
   SessionDefinition,
@@ -18,6 +19,8 @@ import type {
   VolundrWorkspace,
 } from '../models/volundr.model';
 
+import { availableEngines, withEngineProvider } from './launchEngines';
+import { errorText } from './errorText';
 import {
   buildPresetComparisonPayload,
   buildPresetPayload,
@@ -37,6 +40,7 @@ import {
   normalizeDefinitionKey,
   pickDefaultModelForDefinition,
   validateSessionName,
+  withDefaultSourceControlIntegrations,
   type RuntimeModelDescriptor,
   type WizardForm,
   type WizardStep,
@@ -54,7 +58,7 @@ type RepoCatalogService = {
 // ---------------------------------------------------------------------------
 
 /** 4-step modal wizard for launching new Volundr sessions. */
-export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProps) {
+export function useLaunchWizard({ open, initialLaunchSpecRef, initialForm }: LaunchWizardProps) {
   const volundr = useService<IVolundrService>('volundr');
   const bifrost = useService<IBifrostService>('bifrost');
   const repoCatalog = useService<RepoCatalogService>('niuu.repos');
@@ -62,11 +66,17 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [repos, setRepos] = useState<RepoRecord[]>([]);
-  const [manualBranches, setManualBranches] = useState<string[]>([]);
+  const [optionsLoading, setOptionsLoading] = useState(true);
+  const [reposLoading, setReposLoading] = useState(true);
+  const [reposError, setReposError] = useState<Error | null>(null);
   const [models, setModels] = useState<Record<string, RuntimeModelDescriptor>>({});
   const [workspaces, setWorkspaces] = useState<VolundrWorkspace[]>([]);
   const [credentials, setCredentials] = useState<StoredCredential[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
+  const [integrationCatalog, setIntegrationCatalog] = useState<CatalogEntry[]>([]);
+  // The engine picker needs both the connections and the catalog; when either
+  // cannot be fetched it says so rather than silently offering no engine.
+  const [providerError, setProviderError] = useState<Error | null>(null);
   const [clusterResources, setClusterResources] = useState<ClusterResourceInfo | null>(null);
   const [presets, setPresets] = useState<VolundrLaunchSpec[]>([]);
   const [targets, setTargets] = useState<VolundrTarget[]>([]);
@@ -108,6 +118,7 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
     targetMatch: 'all',
     yamlMode: false,
     yamlContent: '',
+    ...initialForm,
   }));
   const [bootStep, setBootStep] = useState(0);
   const [bootProgress, setBootProgress] = useState(0);
@@ -119,22 +130,51 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
     if (!open) return;
 
     let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) {
+        setOptionsLoading(true);
+        setReposLoading(true);
+        setReposError(null);
+      }
+    });
+    let providerFailure: Error | null = null;
+    const recordProviderFailure = (error: unknown): [] => {
+      providerFailure = error instanceof Error ? error : new Error(String(error));
+      return [];
+    };
 
     void Promise.all([
-      repoCatalog.getRepos().catch(() => []),
+      repoCatalog
+        .getRepos()
+        .then((result) => {
+          if (!cancelled) {
+            setRepos(result);
+            setReposLoading(false);
+            setReposError(null);
+          }
+          return result;
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            setReposLoading(false);
+            setReposError(error instanceof Error ? error : new Error(String(error)));
+          }
+          return [];
+        }),
       bifrost.getModelCatalog().catch((): Record<string, BifrostModel> => ({})),
       Promise.all([
         volundr.listWorkspaces('archived').catch(() => []),
         volundr.listWorkspaces('active').catch(() => []),
       ]).then(([archived, active]) => [...archived, ...active]),
       volundr.getCredentials().catch(() => []),
-      volundr.getIntegrations().catch(() => []),
+      volundr.getIntegrations().catch(recordProviderFailure),
       volundr.getClusterResources().catch(() => null),
       volundr.getLaunchSpecs().catch(() => []),
       volundr.getTargets().catch(() => []),
       volundr.getAvailableMcpServers().catch(() => []),
       volundr.getSessionDefinitions().catch(() => FALLBACK_SESSION_DEFINITIONS),
       personaCatalog?.listPersonas().catch(() => []) ?? Promise.resolve([]),
+      volundr.getIntegrationCatalog().catch(recordProviderFailure),
     ]).then(
       ([
         nextRepos,
@@ -148,6 +188,7 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
         nextMcpServers,
         nextSessionDefinitions,
         nextPersonas,
+        nextIntegrationCatalog,
       ]) => {
         if (cancelled) return;
         setRepos(nextRepos);
@@ -155,6 +196,28 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
         setWorkspaces(nextWorkspaces);
         setCredentials(nextCredentials);
         setIntegrations(nextIntegrations);
+        setIntegrationCatalog(nextIntegrationCatalog);
+        setProviderError(providerFailure);
+        setForm((current) => {
+          // Attach the Git account that listed the repository and exactly one
+          // AI account for the engine, so a plain "next, next, launch" works.
+          const withSources =
+            current.sourcetype === 'git'
+              ? withDefaultSourceControlIntegrations(
+                  current.selectedIntegrations,
+                  nextIntegrations,
+                  nextRepos,
+                  current.repo,
+                )
+              : current.selectedIntegrations;
+          const engine = availableEngines(
+            nextSessionDefinitions.length ? nextSessionDefinitions : FALLBACK_SESSION_DEFINITIONS,
+            nextIntegrations,
+            nextIntegrationCatalog,
+          ).find((candidate) => candidate.definition.key === current.definition);
+          return { ...current, selectedIntegrations: withEngineProvider(withSources, engine) };
+        });
+        setOptionsLoading(false);
         setClusterResources(nextClusterResources);
         setPresets(nextPresets);
         setTargets(nextTargets);
@@ -171,36 +234,14 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
     };
   }, [bifrost, open, personaCatalog, repoCatalog, volundr]);
 
-  useEffect(() => {
-    if (!open || form.sourcetype !== 'git' || !form.repo.trim()) {
-      queueMicrotask(() => {
-        setManualBranches([]);
-      });
-      return;
-    }
-
-    const matchingRepo = repos.find((repo) => repo.cloneUrl === form.repo);
-    if (matchingRepo?.branches.length) {
-      queueMicrotask(() => {
-        setManualBranches([]);
-      });
-      return;
-    }
-
-    let cancelled = false;
-    void repoCatalog
-      .getBranches(form.repo)
-      .then((branches) => {
-        if (!cancelled) setManualBranches(branches);
-      })
-      .catch(() => {
-        if (!cancelled) setManualBranches([]);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [form.repo, form.sourcetype, open, repoCatalog, repos]);
+  const branchesQuery = useQuery({
+    queryKey: ['volundr', 'repo-branches', form.repo],
+    queryFn: () => repoCatalog.getBranches(form.repo),
+    enabled: open && form.sourcetype === 'git' && Boolean(form.repo.trim()),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const manualBranches = branchesQuery.data ?? [];
 
   useEffect(() => {
     queueMicrotask(() => {
@@ -210,12 +251,12 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
 
         if (repos.length > 0 && current.sourcetype === 'git') {
           const matchingRepo = repos.find((repo) => repo.cloneUrl === current.repo);
-          if (!matchingRepo) {
+          if (!current.repo.trim()) {
             next.repo = repos[0]!.cloneUrl;
             next.branch = repos[0]!.defaultBranch;
             next.workspaceId = '';
             changed = true;
-          } else if (!current.branch.trim()) {
+          } else if (matchingRepo && !current.branch.trim()) {
             next.branch = matchingRepo.defaultBranch;
             changed = true;
           }
@@ -296,17 +337,34 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
       const preset = presets.find((item) => launchSpecRef(item) === ref);
       if (!preset) return;
 
+      const presetDefinition = normalizeDefinitionKey(
+        preset.workloadType || `skuld-${preset.cliTool}`,
+      );
       setForm((current) => ({
         ...current,
         presetId: ref,
-        definition: normalizeDefinitionKey(preset.workloadType || `skuld-${preset.cliTool}`),
+        definition: presetDefinition,
         model: preset.model ?? current.model,
         systemPrompt: preset.systemPrompt ?? '',
         personaName:
           typeof preset.workloadConfig.persona === 'string' ? preset.workloadConfig.persona : '',
         workloadConfig: { ...preset.workloadConfig },
         selectedCredentials: [...preset.envSecretRefs],
-        selectedIntegrations: [...preset.integrationIds],
+        selectedIntegrations: withEngineProvider(
+          preset.source?.type === 'git' || (!preset.source && current.sourcetype === 'git')
+            ? withDefaultSourceControlIntegrations(
+                preset.integrationIds,
+                integrations,
+                repos,
+                preset.source?.type === 'git' ? preset.source.repo : current.repo,
+              )
+            : [...preset.integrationIds],
+          availableEngines(
+            sessionDefinitions.length ? sessionDefinitions : FALLBACK_SESSION_DEFINITIONS,
+            integrations,
+            integrationCatalog,
+          ).find((candidate) => candidate.definition.key === presetDefinition),
+        ),
         mcpServers: [...preset.mcpServers],
         envVars: Object.entries(preset.envVars).map(([key, value]) => ({ key, value })),
         setupScripts: [...preset.setupScripts],
@@ -329,7 +387,7 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
         yamlContent: '',
       }));
     },
-    [presets],
+    [presets, integrations, integrationCatalog, repos, sessionDefinitions],
   );
 
   useEffect(() => {
@@ -497,7 +555,7 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
         queryClient.invalidateQueries({ queryKey: ['volundr', 'domain-sessions'] }),
       ]);
     } catch (error) {
-      setLaunchError(error instanceof Error ? error.message : 'Failed to launch session');
+      setLaunchError(errorText(error, 'Failed to launch session'));
       setStep('confirm');
     } finally {
       setLaunching(false);
@@ -548,15 +606,22 @@ export function useLaunchWizard({ open, initialLaunchSpecRef }: LaunchWizardProp
     handleBack,
     handleNext,
     handleSavePreset,
+    integrationCatalog,
     integrations,
     isLastStep,
     launchError,
     launching,
     manualBranches,
+    branchesLoading: branchesQuery.isFetching,
+    branchesError: branchesQuery.error,
+    optionsLoading,
+    reposLoading,
+    reposError,
     models,
     navigate,
     personas,
     presets,
+    providerError,
     repos,
     sessionDefinitions,
     step,

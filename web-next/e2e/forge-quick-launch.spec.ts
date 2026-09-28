@@ -48,6 +48,10 @@ async function fixture(page: Page, failLaunch = false) {
       tags: [],
     },
   ];
+  // An already configured installation: the first-run wizard stays out of the way.
+  await page.route('**/api/v1/niuu/setup', (route) =>
+    route.fulfill({ json: { enabled: false, completed: true, steps: [], completedSteps: [] } }),
+  );
   await page.route(/\/config(?:\.live)?\.json$/, (route) =>
     route.fulfill({
       json: {
@@ -55,6 +59,7 @@ async function fixture(page: Page, failLaunch = false) {
         theme: 'xteo',
         services: {
           ...baseConfig.services,
+          setup: { mode: 'http', baseUrl: '/api/v1/niuu/setup' },
           forge: { mode: 'http', baseUrl: `${origin}/api/v1/forge` },
           volundr: { mode: 'http', baseUrl: `${origin}/api/v1/volundr` },
           niuu: { mode: 'http', baseUrl: `${origin}/api/v1/niuu` },
@@ -88,9 +93,14 @@ async function fixture(page: Page, failLaunch = false) {
       return route.fulfill({ status: 400, json: { detail: 'Unexpected fixture mutation' } });
     }
     if (path.endsWith('/instances')) return route.fulfill({ json: hosts });
+    // Every fixture host is a mini-mode Forge that mounts local folders.
+    if (path.endsWith('/feature-flags'))
+      return route.fulfill({
+        json: { local_mounts_enabled: true, file_manager_enabled: true, mini_mode: true },
+      });
     if (path.endsWith('/models'))
       return route.fulfill({
-        json: ['claude-fable-5-1', 'gpt-6-astra', 'gpt-5.6-sol'].map((id) => ({
+        json: ['claude-fable-5-1', 'gpt-6-astra', 'gpt-6-sol'].map((id) => ({
           id,
           name: id,
           enabled: true,
@@ -156,7 +166,7 @@ test('Claude and Codex quick launch submits the native contract with optional re
   await expect(page.getByLabel('Model', { exact: true })).toHaveValue('claude-fable-5-1');
   await expect(page.getByLabel('Effort', { exact: true })).toHaveValue('xhigh');
   await expect(
-    page.getByLabel('Model', { exact: true }).locator('option[value="claude-opus-5"]'),
+    page.getByLabel('Model', { exact: true }).locator('option[value="claude-opus-5-5"]'),
   ).toHaveAttribute('disabled', '');
   await page.screenshot({ path: '/tmp/forge-quick-launch-desktop.png', fullPage: true });
   await page.getByRole('button', { name: /^Codex/ }).click();

@@ -27,6 +27,49 @@ LOCAL_SERVICE_DATABASES: dict[str, str] = {
 
 NIUU_SHARED_BOOTSTRAP_SQL: tuple[str, ...] = (
     """
+    CREATE TABLE IF NOT EXISTS realms (
+        id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        slug             TEXT        NOT NULL UNIQUE,
+        name             TEXT        NOT NULL,
+        sleipnir_domain  TEXT,
+        owner_id         TEXT,
+        instance_id      TEXT,
+        autonomy_profile TEXT        NOT NULL DEFAULT 'balanced',
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS trust_grants (
+        id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        realm_id     UUID        NOT NULL REFERENCES realms(id) ON DELETE CASCADE,
+        action_class TEXT        NOT NULL,
+        target       TEXT        NOT NULL DEFAULT '*',
+        level        INTEGER     NOT NULL DEFAULT 0,
+        limits       JSONB       NOT NULL DEFAULT '{}',
+        granted_by   TEXT,
+        granted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_trust_grants_realm_action
+        ON trust_grants(realm_id, action_class);
+
+    CREATE TABLE IF NOT EXISTS capabilities (
+        id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        realm_id        UUID        NOT NULL REFERENCES realms(id) ON DELETE CASCADE,
+        name            TEXT        NOT NULL,
+        kind            TEXT        NOT NULL,
+        status          TEXT        NOT NULL DEFAULT 'gap',
+        trust_level     INTEGER     NOT NULL DEFAULT 0,
+        mimir_page_path TEXT,
+        notes           TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (realm_id, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_capabilities_realm ON capabilities(realm_id);
+    """,
+    """
     CREATE TABLE IF NOT EXISTS tenants (
         id              TEXT PRIMARY KEY,
         path            TEXT NOT NULL UNIQUE,
@@ -92,6 +135,9 @@ NIUU_SHARED_BOOTSTRAP_SQL: tuple[str, ...] = (
         last_used_at TIMESTAMPTZ
     );
     """,
+    "ALTER TABLE personal_access_tokens "
+    "ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';",
+    "ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS scopes TEXT[];",
     "CREATE INDEX IF NOT EXISTS idx_pats_owner_id ON personal_access_tokens(owner_id);",
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_pats_owner_name
@@ -147,6 +193,40 @@ NIUU_SHARED_BOOTSTRAP_SQL: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_credential_metadata_owner
         ON credential_metadata(owner_type, owner_id);
     """,
+    # Mirrors migrations/000060_credential_enrollments.up.sql for the shared
+    # database the credential-enrollment reconciler runs against.
+    """
+    CREATE TABLE IF NOT EXISTS credential_enrollments (
+        id                  UUID         PRIMARY KEY,
+        connection_id       UUID         NOT NULL
+            REFERENCES integration_connections(id) ON DELETE CASCADE,
+        owner_id            TEXT         NOT NULL,
+        tenant_id           TEXT         NOT NULL,
+        provider_slug       VARCHAR(100) NOT NULL,
+        credential_name     VARCHAR(253) NOT NULL,
+        method              VARCHAR(64)  NOT NULL,
+        state               VARCHAR(32)  NOT NULL,
+        runner_ref          JSONB        NOT NULL DEFAULT '{}'::jsonb,
+        verification_uri    TEXT         NOT NULL DEFAULT '',
+        user_code           VARCHAR(128) NOT NULL DEFAULT '',
+        expires_at          TIMESTAMPTZ  NOT NULL,
+        error_code          VARCHAR(100) NOT NULL DEFAULT '',
+        created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        CONSTRAINT credential_enrollments_state_check CHECK (
+            state IN ('pending', 'awaiting_user', 'complete', 'failed', 'expired', 'cancelled')
+        )
+    );
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_credential_enrollments_owner
+        ON credential_enrollments (owner_id, created_at DESC);
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_enrollments_active_connection
+        ON credential_enrollments (connection_id)
+        WHERE state IN ('pending', 'awaiting_user');
+    """,
     """
     CREATE TABLE IF NOT EXISTS ravn_personas (
         owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -176,6 +256,9 @@ GUILD_BOOTSTRAP_SQL: tuple[str, ...] = (
         last_used_at TIMESTAMPTZ
     );
     """,
+    "ALTER TABLE personal_access_tokens "
+    "ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';",
+    "ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS scopes TEXT[];",
     "CREATE INDEX IF NOT EXISTS idx_pats_owner_id ON personal_access_tokens(owner_id);",
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_pats_owner_name
@@ -204,7 +287,7 @@ GUILD_BOOTSTRAP_SQL: tuple[str, ...] = (
         CONSTRAINT niuu_instances_scope_check CHECK (
             (visibility = 'system' AND owner_id IS NULL)
             OR (visibility = 'tenant' AND owner_id IS NULL AND tenant_id IS NOT NULL)
-            OR (visibility = 'user' AND owner_id IS NOT NULL AND tenant_id IS NULL)
+            OR (visibility = 'user' AND owner_id IS NOT NULL)
         )
     );
     """,
@@ -228,6 +311,135 @@ GUILD_BOOTSTRAP_SQL: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_niuu_instances_tags
         ON niuu_instances USING GIN(tags);
+    """,
+    # Server-side reachability tracking (health checker) — an offline instance
+    # must be recorded as such, never left indistinguishable from an idle one.
+    """
+    ALTER TABLE niuu_instances
+        ADD COLUMN IF NOT EXISTS health TEXT NOT NULL DEFAULT 'unknown';
+    """,
+    # last_seen_at: last time a probe SUCCEEDED. last_checked_at: last time a
+    # probe was ATTEMPTED, success or not. Conflating them would let the UI
+    # invent a "just now" last-seen time for a node that has never answered.
+    """
+    ALTER TABLE niuu_instances
+        ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+    """,
+    """
+    ALTER TABLE niuu_instances
+        ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+    """,
+    """
+    ALTER TABLE niuu_instances
+        ADD COLUMN IF NOT EXISTS last_error TEXT;
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'niuu_instances_health_check'
+        ) THEN
+            ALTER TABLE niuu_instances
+                ADD CONSTRAINT niuu_instances_health_check
+                CHECK (health IN ('unknown', 'ok', 'unreachable'));
+        END IF;
+    END $$;
+    """,
+    """
+    -- Push inbox for topology fragments.
+    --
+    -- A source that cannot be reached — a resident on a bare-metal Spark, a Docker
+    -- container behind NAT — publishes its own partial view here on a heartbeat.
+    -- Keyed on the source, so a heartbeat is an idempotent "this is my current
+    -- state" and aggregation never needs dedupe logic.
+    CREATE TABLE IF NOT EXISTS observatory_fragments (
+        source_id TEXT PRIMARY KEY,
+        source_kind TEXT NOT NULL DEFAULT '',
+        source_name TEXT NOT NULL DEFAULT '',
+        realm_id TEXT NOT NULL DEFAULT '',
+        cluster_id TEXT NOT NULL DEFAULT '',
+        host_id TEXT NOT NULL DEFAULT '',
+        revision TEXT NOT NULL DEFAULT '',
+        payload JSONB NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Staleness is read on every aggregation: a source past its TTL is reported
+    -- as stale with a last-seen time rather than vanishing from the graph.
+    CREATE INDEX IF NOT EXISTS observatory_fragments_received_at_idx
+        ON observatory_fragments (received_at DESC);
+    """,
+    """
+    -- Legacy fragments remain quarantined until ownership is audited.
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_observatory_fragments_tenant ON observatory_fragments(tenant_id);
+    """,
+    """
+    ALTER TABLE niuu_instances DROP CONSTRAINT IF EXISTS niuu_instances_scope_check;
+    ALTER TABLE niuu_instances ADD CONSTRAINT niuu_instances_scope_check CHECK (
+        (visibility = 'system' AND owner_id IS NULL)
+        OR (visibility = 'tenant' AND owner_id IS NULL AND tenant_id IS NOT NULL)
+        OR (visibility = 'user' AND owner_id IS NOT NULL)
+    );
+    """,
+    # `niuu join` — single-use pairing codes and the nodes they admit. See
+    # migrations/000083_guild_node_join.up.sql and
+    # docs/operator/joining-machines.md.
+    """
+    CREATE TABLE IF NOT EXISTS niuu_pairing_codes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code_hash TEXT NOT NULL UNIQUE,
+        created_by TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        allow_untrusted_node_auth BOOLEAN NOT NULL DEFAULT false,
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        consumed_by_node_id UUID,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_niuu_pairing_codes_expires
+        ON niuu_pairing_codes(expires_at);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS niuu_nodes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL,
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ,
+        last_request_at BIGINT
+    );
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_public_key
+        ON niuu_nodes(public_key);
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_niuu_nodes_tenant
+        ON niuu_nodes(tenant_id);
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_tenant_name
+        ON niuu_nodes(tenant_id, name);
+    """,
+    """
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS node_id UUID
+        REFERENCES niuu_nodes(id) ON DELETE CASCADE;
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_niuu_instances_node_id
+        ON niuu_instances(node_id);
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_instances_node_kind
+        ON niuu_instances(node_id, kind) WHERE node_id IS NOT NULL;
     """,
 )
 
@@ -325,6 +537,43 @@ async def database_pool(config: DatabaseConfig):
         yield pool
     finally:
         await pool.close()
+
+
+async def ensure_databases(
+    *,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    names: Iterable[str],
+    maintenance_database: str = "postgres",
+) -> tuple[str, ...]:
+    """Create every database in *names* on an external server if it is missing.
+
+    Connects to the maintenance database with a role allowed to CREATE
+    DATABASE and returns the names that were created. Raises when the server
+    is unreachable or the role lacks the privilege; a platform configured for
+    an external database must not start against a half-provisioned server.
+    """
+    conn = await asyncpg.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=maintenance_database,
+    )
+    created: list[str] = []
+    try:
+        for raw_name in names:
+            name = validate_database_name(raw_name)
+            exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", name)
+            if exists:
+                continue
+            await conn.execute(f'CREATE DATABASE "{name}"')
+            created.append(name)
+    finally:
+        await conn.close()
+    return tuple(created)
 
 
 async def bootstrap_database(

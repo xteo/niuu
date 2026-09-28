@@ -1,4 +1,6 @@
 import type { BifrostModel } from '@niuulabs/plugin-bifrost';
+import type { RepoRecord } from '@niuulabs/ui';
+import { sourceControlIdsForRepo } from './launchEngines';
 import type {
   ClusterResourceInfo,
   IntegrationConnection,
@@ -335,7 +337,22 @@ export function formatModelOption(id: string, model?: RuntimeModelDescriptor): s
   return parts.join(' · ');
 }
 
+export function withDefaultSourceControlIntegrations(
+  selected: string[],
+  integrations: IntegrationConnection[],
+  repos: readonly RepoRecord[] = [],
+  repoUrl = '',
+): string[] {
+  const sources = integrations.filter((item) => item.integrationType === 'source_control');
+  if (sources.some((item) => selected.includes(item.id))) return selected;
+  // The account that listed the repository clones it; a pasted URL gets every account.
+  return [...selected, ...sourceControlIdsForRepo(integrations, repos, repoUrl)];
+}
+
 export function formatIntegrationLabel(integration: IntegrationConnection): string {
+  if (integration.slug === 'mcp') {
+    return String(integration.config?.name || integration.config?.mcp_url || 'MCP server');
+  }
   const base = integration.slug
     ? integration.slug.replace(/[-_]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
     : integration.id;
@@ -344,6 +361,7 @@ export function formatIntegrationLabel(integration: IntegrationConnection): stri
 }
 
 export function formatIntegrationMeta(integration: IntegrationConnection): string | null {
+  if (integration.slug === 'mcp') return String(integration.config?.mcp_url || 'MCP server');
   if (integration.integrationType && integration.credentialName) {
     return `${integration.integrationType.replace(/_/g, ' ')} · ${integration.credentialName}`;
   }
@@ -443,14 +461,21 @@ export function getResourceErrors(form: WizardForm, clusterResources: ClusterRes
   return errors;
 }
 
+function trimHyphens(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === '-') start += 1;
+  while (end > start && value[end - 1] === '-') end -= 1;
+  return value.slice(start, end);
+}
+
 export function slugifySessionName(value: string): string {
-  return value
+  const collapsed = value
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-{2,}/g, '-')
-    .slice(0, 63);
+    .replace(/-{2,}/g, '-');
+  return trimHyphens(collapsed).slice(0, 63);
 }
 
 export function validateSessionName(name: string): string | null {

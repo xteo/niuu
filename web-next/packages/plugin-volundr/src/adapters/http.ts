@@ -21,7 +21,6 @@ import type { ForgeEventStreamSource, ForgeStreamListener } from '../ports/IForg
 import type {
   VolundrSession,
   VolundrStats,
-  VolundrFeatures,
   VolundrRepo,
   VolundrMessage,
   VolundrLog,
@@ -42,7 +41,6 @@ import type {
   VolundrTenant,
   IntegrationConnection,
   IntegrationTestResult,
-  CatalogEntry,
   StoredCredential,
   CredentialCreateRequest,
   SecretType,
@@ -495,6 +493,7 @@ function buildStartSessionBody(
     resource_config: config.resourceConfig,
     system_prompt: config.systemPrompt,
     initial_prompt: config.initialPrompt,
+    workload_type: config.workloadType,
     workload_config: config.workloadConfig ?? {},
     issue_id: config.trackerIssue?.id,
     issue_url: config.trackerIssue?.url,
@@ -951,7 +950,12 @@ function normalizeRepoList(
     );
   }
 
-  return Object.values(payload).flat().map(normalizeRepo);
+  // The platform groups repositories by the account that listed them (the
+  // connection's credential name); keeping it lets a launch clone with that
+  // account's token rather than whichever Git account happens to win.
+  return Object.entries(payload).flatMap(([account, repos]) =>
+    repos.map((repo) => ({ ...normalizeRepo(repo), account })),
+  );
 }
 
 type SubscriberSet<T> = Set<(item: T) => void>;
@@ -1387,16 +1391,39 @@ export function buildVolundrHttpAdapter(
     return sessions;
   }
 
-  async function loadSession(id: string): Promise<VolundrSession | null> {
-    const instanceId = sessionCache.get(id)?.instanceId ?? archivedSessionOwners.get(id);
-    const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
-    const session = await forgeClient.get<SessionPayload | null>(`/sessions/${id}${suffix}`);
+  function sessionPath(sessionId: string, suffix = '', explicitInstanceId?: string): string {
+    const instanceId =
+      explicitInstanceId ??
+      sessionCache.get(sessionId)?.instanceId ??
+      archivedSessionOwners.get(sessionId);
+    const path = `/sessions/${sessionId}${suffix}`;
+    if (!instanceId) return path;
+    return `${path}${path.includes('?') ? '&' : '?'}instance_id=${encodeURIComponent(instanceId)}`;
+  }
+
+  async function loadSession(
+    id: string,
+    options?: { instanceId?: string; signal?: AbortSignal },
+  ): Promise<VolundrSession | null> {
+    const path = sessionPath(id, '', options?.instanceId);
+    const session = await (options?.signal
+      ? forgeClient.get<SessionPayload | null>(path, { signal: options.signal })
+      : forgeClient.get<SessionPayload | null>(path));
     if (!session) {
       sessionCache.delete(id);
       publishSessions();
       return null;
     }
-    const normalized = keepNewerActivity(normalizeSession(session));
+    const fetched = normalizeSession(session);
+    if (options?.instanceId && fetched.instanceId && fetched.instanceId !== options.instanceId) {
+      throw new Error(
+        `Session ${id} was returned by ${fetched.instanceId}, expected ${options.instanceId}`,
+      );
+    }
+    if (options?.instanceId && !fetched.instanceId) {
+      fetched.instanceId = options.instanceId;
+    }
+    const normalized = keepNewerActivity(fetched);
     sessionCache.set(normalized.id, normalized);
     publishSessions();
     return normalized;
@@ -1428,13 +1455,13 @@ export function buildVolundrHttpAdapter(
 
   async function loadMessages(sessionId: string): Promise<VolundrMessage[]> {
     return forgeClient
-      .get<ConversationPayload>(`/sessions/${sessionId}/conversation`)
+      .get<ConversationPayload>(sessionPath(sessionId, '/conversation'))
       .then((payload) => normalizeMessages(sessionId, payload));
   }
 
   async function loadLogs(sessionId: string, limit?: number): Promise<VolundrLog[]> {
     return forgeClient
-      .get<LogPayload>(`/sessions/${sessionId}/logs${limit ? `?lines=${limit}` : ''}`)
+      .get<LogPayload>(sessionPath(sessionId, `/logs${limit ? `?lines=${limit}` : ''}`))
       .then((payload) => normalizeLogs(sessionId, payload));
   }
 
@@ -1449,7 +1476,7 @@ export function buildVolundrHttpAdapter(
   ): Promise<AggregatedLogsResult> {
     return forgeClient
       .get<AggregatedLogPayload>(
-        `/sessions/${sessionId}/logs/aggregate${buildAggregatedLogsQuery(options)}`,
+        sessionPath(sessionId, `/logs/aggregate${buildAggregatedLogsQuery(options)}`),
       )
       .then((payload) => normalizeAggregatedLogs(sessionId, payload));
   }
@@ -1687,13 +1714,24 @@ export function buildVolundrHttpAdapter(
   }
 
   return {
-    getFeatures: () => sharedClient.get<VolundrFeatures>('/features'),
+    getFeatures: async (instanceId) => {
+      const flags = await forgeClient.get<{
+        local_mounts_enabled: boolean;
+        file_manager_enabled: boolean;
+        mini_mode: boolean;
+      }>(`/feature-flags${instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : ''}`);
+      return {
+        localMountsEnabled: flags.local_mounts_enabled,
+        fileManagerEnabled: flags.file_manager_enabled,
+        miniMode: flags.mini_mode,
+      };
+    },
     getSessionDefinitions: async () => {
       const payload = await catalogClient.get<SessionDefinitionPayload[]>('/session-definitions');
       return payload.map(normalizeSessionDefinition);
     },
     getSessions: (options) => loadSessions('/sessions', options),
-    getSession: (id) => loadSession(id),
+    getSession: (id, options) => loadSession(id, options),
     getRuntimeVersion: (id, instanceId) => {
       const owner = instanceId ?? sessionCache.get(id)?.instanceId ?? archivedSessionOwners.get(id);
       const suffix = owner ? `?instance_id=${encodeURIComponent(owner)}` : '';
@@ -1721,6 +1759,13 @@ export function buildVolundrHttpAdapter(
           SharedRepoResponse | SharedRepoPayload[] | VolundrRepo[]
         >('/repos'),
       ),
+    listUserHome: (instanceId, path) =>
+      client.get(`/storage/home?${new URLSearchParams({ instance_id: instanceId, path })}`),
+    deleteUserHomePath: async (instanceId, path) => {
+      await client.delete(
+        `/storage/home?${new URLSearchParams({ instance_id: instanceId, path })}`,
+      );
+    },
     getProjects: (options) =>
       options
         ? forgeClient.get(
@@ -1837,7 +1882,7 @@ export function buildVolundrHttpAdapter(
     evaluatePermissionAutoApproval: async (sessionId, request) =>
       normalizePermissionAutoApproval(
         await forgeClient.post<PermissionAutoApprovalPayload>(
-          `/sessions/${sessionId}/permissions/auto-approval/evaluate`,
+          sessionPath(sessionId, '/permissions/auto-approval/evaluate'),
           {
             request_id: request.requestId,
             tool_name: request.toolName,
@@ -1850,18 +1895,18 @@ export function buildVolundrHttpAdapter(
     connectSession: async (config) =>
       normalizeSession(await forgeClient.post<SessionPayload>('/sessions/connect', config)),
     updateSession: (sessionId, updates) =>
-      forgeClient.put<SessionPayload>(`/sessions/${sessionId}`, updates).then(normalizeSession),
-    stopSession: (sessionId) => forgeClient.post<void>(`/sessions/${sessionId}/stop`),
-    resumeSession: (sessionId) => forgeClient.post<void>(`/sessions/${sessionId}/resume`),
+      forgeClient.put<SessionPayload>(sessionPath(sessionId), updates).then(normalizeSession),
+    stopSession: (sessionId) => forgeClient.post<void>(sessionPath(sessionId, '/stop')),
+    resumeSession: (sessionId) => forgeClient.post<void>(sessionPath(sessionId, '/resume')),
     deleteSession: (sessionId, cleanup) =>
-      forgeClient.delete<void>(`/sessions/${sessionId}`, {
+      forgeClient.delete<void>(sessionPath(sessionId), {
         cleanup: cleanup ?? [],
       }),
     archiveSession: (sessionId) =>
-      forgeClient.patch<void>(`/sessions/${sessionId}/archive`, undefined),
+      forgeClient.patch<void>(sessionPath(sessionId, '/archive'), undefined),
     archiveStoppedSessions: () => forgeClient.post<string[]>('/sessions/archive-stopped'),
     restoreSession: (sessionId) =>
-      forgeClient.patch<void>(`/sessions/${sessionId}/restore`, undefined),
+      forgeClient.patch<void>(sessionPath(sessionId, '/restore'), undefined),
     listArchivedSessions: async (options) => {
       const sessions = (
         await readSessionList(
@@ -1895,17 +1940,17 @@ export function buildVolundrHttpAdapter(
 
     getConversationHistory: (sessionId) =>
       forgeClient
-        .get<ConversationPayload>(`/sessions/${sessionId}/conversation`)
+        .get<ConversationPayload>(sessionPath(sessionId, '/conversation'))
         .then(normalizeConversationHistory),
     getWorkflowGates: async (sessionId) => {
       const payload = await forgeClient.get<WorkflowGateListPayload>(
-        `/sessions/${sessionId}/workflow/gates`,
+        sessionPath(sessionId, '/workflow/gates'),
       );
       return (payload.gates ?? []).map(normalizeWorkflowGate);
     },
     resolveWorkflowGate: async (sessionId, gateId, request) => {
       const response = await fetch(
-        `${forgeClient.basePath}/sessions/${sessionId}/workflow/gates/${gateId}/resolve`,
+        `${forgeClient.basePath}${sessionPath(sessionId, `/workflow/gates/${gateId}/resolve`)}`,
         {
           method: 'POST',
           headers: getAuthHeaders({
@@ -1927,7 +1972,7 @@ export function buildVolundrHttpAdapter(
     },
     getMessages: (sessionId) => loadMessages(sessionId),
     sendMessage: (sessionId, content) =>
-      forgeClient.post<VolundrMessage>(`/sessions/${sessionId}/messages`, { content }),
+      forgeClient.post<VolundrMessage>(sessionPath(sessionId, '/messages'), { content }),
     subscribeMessages: (sessionId, callback) => {
       const connection = ensurePollingConnection(
         messageSubscribers,
@@ -1982,7 +2027,7 @@ export function buildVolundrHttpAdapter(
     },
 
     getCodeServerUrl: (sessionId) =>
-      forgeClient.get<string | null>(`/sessions/${sessionId}/code-server-url`),
+      forgeClient.get<string | null>(sessionPath(sessionId, '/code-server-url')),
 
     getChronicle: (sessionId) => loadChronicle(sessionId),
     subscribeChronicle: (sessionId, callback) => {
@@ -2006,7 +2051,7 @@ export function buildVolundrHttpAdapter(
     },
     getSessionTrace: async (sessionId) => {
       try {
-        const payload = await forgeClient.get<TracePayload>(`/sessions/${sessionId}/trace`);
+        const payload = await forgeClient.get<TracePayload>(sessionPath(sessionId, '/trace'));
         return normalizeTrace(payload);
       } catch (error) {
         if (error instanceof Error && /404/.test(error.message)) return null;
@@ -2016,7 +2061,7 @@ export function buildVolundrHttpAdapter(
     getSessionTraceSummary: async (sessionId) => {
       try {
         const payload = await forgeClient.get<TraceSummaryPayload>(
-          `/sessions/${sessionId}/trace/summary`,
+          sessionPath(sessionId, '/trace/summary'),
         );
         return normalizeTraceSummary(payload);
       } catch (error) {
@@ -2030,7 +2075,7 @@ export function buildVolundrHttpAdapter(
         `/repos/prs?url=${encodeURIComponent(repoUrl)}${status ? `&status=${status}` : ''}`,
       ),
     createPullRequest: (sessionId, title, targetBranch) =>
-      forgeClient.post<PullRequest>(`/sessions/${sessionId}/pr`, { title, targetBranch }),
+      forgeClient.post<PullRequest>(sessionPath(sessionId, '/pr'), { title, targetBranch }),
     mergePullRequest: (prNumber, repoUrl, mergeMethod) =>
       forgeClient.post<MergeResult>(`/repos/prs/${prNumber}/merge`, { repoUrl, mergeMethod }),
     getCIStatus: (prNumber, repoUrl, branch) =>
@@ -2039,7 +2084,7 @@ export function buildVolundrHttpAdapter(
       ),
 
     getSessionMcpServers: (sessionId) =>
-      forgeClient.get<McpServer[]>(`/sessions/${sessionId}/mcp-servers`),
+      forgeClient.get<McpServer[]>(sessionPath(sessionId, '/mcp-servers')),
 
     searchTrackerIssues: (query, projectId) =>
       trackerClient.get<TrackerIssue[]>(
@@ -2082,8 +2127,50 @@ export function buildVolundrHttpAdapter(
     storeTenantCredential: (name, data) => credentialsClient.post<void>('/tenant', { name, data }),
     deleteTenantCredential: (name) => credentialsClient.delete<void>(`/tenant/${name}`),
 
-    getIntegrationCatalog: () => sharedClient.get<CatalogEntry[]>('/integrations/catalog'),
-    getIntegrations: () => sharedClient.get<IntegrationConnection[]>('/integrations'),
+    getIntegrationCatalog: async () => {
+      const entries = await sharedClient.get<
+        {
+          id: string;
+          slug: string;
+          name: string;
+          description: string;
+          integration_type: string;
+          model_vendor?: string;
+        }[]
+      >('/integrations/catalog');
+      return entries.map((entry) => ({
+        id: entry.id,
+        slug: entry.slug,
+        name: entry.name,
+        description: entry.description,
+        integrationType: entry.integration_type,
+        modelVendor: entry.model_vendor ?? '',
+      }));
+    },
+    getIntegrations: async () => {
+      const connections = await sharedClient.get<
+        (Partial<IntegrationConnection> & {
+          id: string;
+          integration_type?: string;
+          credential_name?: string;
+          credential_status?: string;
+          created_at?: string;
+          updated_at?: string;
+        })[]
+      >('/integrations');
+      return connections.map((connection) => ({
+        id: connection.id,
+        slug: connection.slug,
+        adapter: connection.adapter,
+        enabled: connection.enabled,
+        integrationType: connection.integrationType ?? connection.integration_type,
+        credentialName: connection.credentialName ?? connection.credential_name,
+        credentialStatus: connection.credentialStatus ?? connection.credential_status,
+        config: connection.config,
+        createdAt: connection.createdAt ?? connection.created_at ?? '',
+        updatedAt: connection.updatedAt ?? connection.updated_at ?? '',
+      }));
+    },
     createIntegration: (connection) =>
       sharedClient.post<IntegrationConnection>('/integrations', connection),
     deleteIntegration: (id) => sharedClient.delete<void>(`/integrations/${id}`),
@@ -2144,7 +2231,8 @@ export function buildVolundrHttpAdapter(
       sharedClient.put<UserFeaturePreference[]>('/features/preferences', preferences),
 
     listTokens: () => sharedClient.get<PersonalAccessToken[]>('/tokens'),
-    createToken: (name) => sharedClient.post<CreatePATResult>('/tokens', { name }),
+    createToken: (name, scopes) =>
+      sharedClient.post<CreatePATResult>('/tokens', { name, ...(scopes ? { scopes } : {}) }),
     revokeToken: (id) => sharedClient.delete<void>(`/tokens/${id}`),
   };
 }

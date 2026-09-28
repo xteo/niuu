@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { RenameSession } from './RenameSession';
 import { AssignSessionProject } from './AssignSessionProject';
 import { PinSession } from './PinSession';
 import { SessionActivityElapsed } from './SessionActivityElapsed';
 import { useNavigate } from '@tanstack/react-router';
-import { useService } from '@niuulabs/plugin-sdk';
+import { useOptionalService, useService } from '@niuulabs/plugin-sdk';
 import { getAuthHeaders } from '@niuulabs/query';
 import {
   Dialog,
@@ -14,6 +14,9 @@ import {
   ErrorState,
   LoadingState,
   SessionChat,
+  type ISessionHistoryLocator,
+  ChatConnectionsContext,
+  ChatDisplayControls,
   type FileEntry,
   type MeshNotificationEvent,
   cn,
@@ -21,6 +24,7 @@ import {
 import {
   Archive,
   AlertTriangle,
+  ArrowLeft,
   Check,
   ChevronDown,
   ChevronRight,
@@ -31,6 +35,7 @@ import {
   FilePenLine,
   FolderOpen,
   GitCommitHorizontal,
+  KeyRound,
   MessageCircleReply,
   MessageSquareText,
   Play,
@@ -66,6 +71,8 @@ import { PermissionApprovalPanel } from './PermissionApprovalPanel';
 import { buildPermissionAutoApprovalRequest } from './permissionAutoApproval';
 import { SessionTerminalLive } from './SessionTerminalLive';
 import { StructuredLogViewer } from './components/StructuredLogViewer';
+import { LinkedText } from './LinkedText';
+import { errorText } from './errorText';
 import './LiveSessionDetailPage.css';
 import { useSessionTabs } from './ForgeSessionSettings';
 import { useForgePreference } from './useForgePreference';
@@ -89,8 +96,20 @@ const ALL_TABS: Array<{ id: SessionTab; label: string; icon: typeof MessageSquar
   { id: 'logs', label: 'Logs', icon: FileCode2 },
 ];
 
+export function normalizeWorkReturnTo(value?: string): string | null {
+  if (!value?.startsWith('/')) return null;
+  try {
+    const target = new URL(value, 'https://niuu.local');
+    if (target.origin !== 'https://niuu.local') return null;
+    if (target.pathname !== '/ting/work' && !target.pathname.startsWith('/ting/work/')) return null;
+    return `${target.pathname}${target.search}${target.hash}`;
+  } catch {
+    return null;
+  }
+}
+
 export function isSessionBooting(status: string | null | undefined): boolean {
-  return status === 'starting' || status === 'provisioning';
+  return status === 'created' || status === 'starting' || status === 'provisioning';
 }
 
 export function formatCount(value: number): string {
@@ -467,24 +486,22 @@ type TelemetryToolFilter = {
 };
 
 export function buildTelemetrySpanTree(trace: VolundrSessionTrace): {
-  root: TelemetrySpanNode | null;
+  roots: TelemetrySpanNode[];
   nodeById: Map<string, TelemetrySpanNode>;
 } {
   const nodeById = new Map<string, TelemetrySpanNode>();
   for (const span of trace.spans) {
     nodeById.set(span.id, { span, children: [] });
   }
-  let root: TelemetrySpanNode | null = null;
+  const roots: TelemetrySpanNode[] = [];
   for (const span of trace.spans) {
     const node = nodeById.get(span.id);
     if (!node) continue;
-    if (!span.parentSpanId) {
-      if (!root || span.kind === 'session.lifecycle') root = node;
-      continue;
-    }
-    const parentNode = nodeById.get(span.parentSpanId);
+    const parentNode = span.parentSpanId ? nodeById.get(span.parentSpanId) : undefined;
     if (parentNode) {
       parentNode.children.push(node);
+    } else {
+      roots.push(node);
     }
   }
   for (const node of nodeById.values()) {
@@ -493,7 +510,7 @@ export function buildTelemetrySpanTree(trace: VolundrSessionTrace): {
         new Date(left.span.startedAt).getTime() - new Date(right.span.startedAt).getTime(),
     );
   }
-  return { root, nodeById };
+  return { roots, nodeById };
 }
 
 export function spanAttributes(span: VolundrSessionTraceSpan): Record<string, unknown> {
@@ -730,26 +747,23 @@ export function telemetryTaskDurationMs(
 }
 
 export function buildTelemetryTimelineRows(trace: VolundrSessionTrace): TelemetryTimelineRow[] {
-  const rootSpan = trace.spans.find((span) => span.parentSpanId == null);
-  if (!rootSpan) return [];
-  const rootStart = new Date(rootSpan.startedAt).getTime();
-  const totalDuration = trace.durationMs || rootSpan.durationMs || 0;
-  const childrenByParent = new Map<string, VolundrSessionTraceSpan[]>();
-  for (const span of trace.spans) {
-    if (!span.parentSpanId) continue;
-    const siblings = childrenByParent.get(span.parentSpanId) ?? [];
-    siblings.push(span);
-    childrenByParent.set(span.parentSpanId, siblings);
-  }
-  return trace.spans
-    .filter((span) => span.parentSpanId === rootSpan.id)
-    .sort((left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime())
-    .map((span) => {
+  const { roots } = buildTelemetrySpanTree(trace);
+  if (roots.length === 0) return [];
+  const rootStart = trace.startedAt
+    ? new Date(trace.startedAt).getTime()
+    : Math.min(...trace.spans.map(spanStartedAtMs));
+  const totalDuration = trace.durationMs ?? 0;
+  // Lifecycle spans describe individual broker attempts, not the whole session.
+  // Keep their stages together, plus spans whose parent was never persisted.
+  return roots
+    .flatMap((node) => (node.span.kind === 'session.lifecycle' ? node.children : [node]))
+    .sort((left, right) => spanStartedAtMs(left.span) - spanStartedAtMs(right.span))
+    .map(({ span, children }) => {
       const startOffsetMs = Math.max(0, new Date(span.startedAt).getTime() - rootStart);
       const durationMs = span.durationMs ?? 0;
       const percentOfTotal = totalDuration > 0 ? Math.round((durationMs / totalDuration) * 100) : 0;
       const tone = timelineRowTone(span);
-      const childSpans = childrenByParent.get(span.id) ?? [];
+      const childSpans = children.map((child) => child.span);
       const childToneDurations: Record<'active' | 'wait' | 'blocked' | 'system', number> = {
         active: 0,
         wait: 0,
@@ -818,24 +832,15 @@ export function buildTelemetryTimelineRows(trace: VolundrSessionTrace): Telemetr
 }
 
 export function buildTelemetryTurnRows(trace: VolundrSessionTrace): TelemetryTurnRow[] {
-  const { root, nodeById } = buildTelemetrySpanTree(trace);
+  const { nodeById } = buildTelemetrySpanTree(trace);
   const turnNodes = [...nodeById.values()].filter((node) => node.span.kind.startsWith('turn.'));
   if (turnNodes.length === 0) return [];
 
-  const nestedTurnNodes = turnNodes.filter((node) => {
-    const parentId = node.span.parentSpanId;
-    if (!parentId) return false;
-    const parentNode = nodeById.get(parentId);
-    return Boolean(parentNode?.span.kind.startsWith('turn.'));
-  });
-
-  const directTurnNodes = turnNodes.filter((node) => node.span.parentSpanId === root?.span.id);
-  const candidateNodes =
-    nestedTurnNodes.length > 0
-      ? nestedTurnNodes
-      : directTurnNodes.length > 0
-        ? directTurnNodes
-        : turnNodes;
+  // Exclude aggregate turns individually; another attempt can have direct turns
+  // even when this attempt nests its turns under a coordinator.
+  const candidateNodes = turnNodes.filter(
+    (node) => !node.children.some((child) => child.span.kind.startsWith('turn.')),
+  );
 
   return candidateNodes
     .sort(
@@ -3450,17 +3455,23 @@ function LiveDiffsTab({ chatEndpoint }: { chatEndpoint: string | null }) {
 
 export function LiveSessionDetailPage({
   sessionId,
+  instanceId,
+  returnTo,
   readOnly = false,
   initialTab = 'chat',
 }: {
   sessionId: string;
+  instanceId?: string;
+  returnTo?: string;
   readOnly?: boolean;
   initialTab?: SessionTab;
 }) {
   return (
     <LiveSessionDetailPageInner
-      key={sessionId}
+      key={`${instanceId ?? ''}:${sessionId}`}
       sessionId={sessionId}
+      instanceId={instanceId}
+      returnTo={normalizeWorkReturnTo(returnTo)}
       readOnly={readOnly}
       initialTab={initialTab}
     />
@@ -3469,10 +3480,14 @@ export function LiveSessionDetailPage({
 
 function LiveSessionDetailPageInner({
   sessionId,
+  instanceId,
+  returnTo,
   readOnly = false,
   initialTab = 'chat',
 }: {
   sessionId: string;
+  instanceId?: string;
+  returnTo: string | null;
   readOnly?: boolean;
   initialTab?: SessionTab;
 }) {
@@ -3481,6 +3496,8 @@ function LiveSessionDetailPageInner({
   const [actionBusy, setActionBusy] = useState<
     'start' | 'stop' | 'archive' | 'restore' | 'delete' | null
   >(null);
+  // Why the last toolbar action was refused (a restart with no free slot, say).
+  const [actionError, setActionError] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [dismissedHumanGateIds, setDismissedHumanGateIds] = useState<Set<string>>(new Set());
   const [toolVisibility, setToolVisibility] = useForgePreference('tools', '1', ['0', '1']);
@@ -3489,15 +3506,17 @@ function LiveSessionDetailPageInner({
   const showTokenUsage = tokenVisibility === '1';
   const [detailsPreference] = useForgePreference('details', '0', ['0', '1']);
   const showDetails = detailsPreference === '1';
+  // Signing an AI or Git account in again without leaving the session.
+  const openConnections = useContext(ChatConnectionsContext);
   const [visibleMessageCount, setVisibleMessageCount] = useState<number | null>(null);
   const volundr = useService<IVolundrService>('volundr');
   const filesystem = useService<IFileSystemPort>('filesystem');
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const sessionQuery = useSessionDetail(sessionId);
+  const sessionQuery = useSessionDetail(sessionId, instanceId);
   const liveSessionQuery = useQuery({
-    queryKey: ['volundr', 'raw-session', sessionId],
-    queryFn: () => volundr.getSession(sessionId),
+    queryKey: ['volundr', 'raw-session', sessionId, instanceId ?? null],
+    queryFn: ({ signal }) => volundr.getSession(sessionId, { instanceId, signal }),
     refetchInterval: 5_000,
   });
   const liveSession = liveSessionQuery.data;
@@ -3512,15 +3531,20 @@ function LiveSessionDetailPageInner({
     sessionStatus === 'failed' ||
     sessionStatus === 'error';
   const terminalUrl = deriveTerminalWsUrl(chatEndpoint);
-  const chat = useSkuldChat(chatEndpoint);
+  const historyLocator = useOptionalService<ISessionHistoryLocator>('forge.history');
+  const historyEndpoint = useMemo(
+    () => historyLocator?.historyEndpoint(chatEndpoint) ?? null,
+    [chatEndpoint, historyLocator],
+  );
+  const chat = useSkuldChat(chatEndpoint, { historyEndpoint });
   const workflowGatesQuery = useQuery({
-    queryKey: ['volundr', 'workflow-gates', sessionId],
+    queryKey: ['volundr', 'workflow-gates', sessionId, instanceId ?? null],
     queryFn: () => volundr.getWorkflowGates(sessionId),
     enabled: Boolean(sessionId) && isRunning,
     refetchInterval: isRunning ? 5_000 : false,
   });
   const transcriptQuery = useQuery({
-    queryKey: ['volundr', 'conversation-history', sessionId],
+    queryKey: ['volundr', 'conversation-history', sessionId, instanceId ?? null],
     queryFn: () => volundr.getConversationHistory(sessionId),
     enabled: Boolean(sessionId) && canReplayTranscript,
     staleTime: 5_000,
@@ -3760,9 +3784,13 @@ function LiveSessionDetailPageInner({
   async function handleResumeSession() {
     if (!liveSession || actionBusy) return;
     setActionBusy('start');
+    setActionError(null);
     try {
       await volundr.resumeSession(liveSession.id);
       await refreshSessionData();
+    } catch (error) {
+      // The platform's answer says what stopped the start and where to fix it.
+      setActionError(errorText(error, 'The session could not be started'));
     } finally {
       setActionBusy(null);
     }
@@ -3851,6 +3879,17 @@ function LiveSessionDetailPageInner({
         <div className="niuu-live-session__chrome">
           <div className="niuu-live-session__header">
             <div className="niuu-live-session__title-group">
+              {returnTo ? (
+                <button
+                  type="button"
+                  className="niuu-live-session__return-link"
+                  aria-label="Back to Work"
+                  onClick={() => void navigate({ to: returnTo as never })}
+                >
+                  <ArrowLeft aria-hidden="true" />
+                  Work
+                </button>
+              ) : null}
               <span
                 className={cn(
                   'niuu-live-session__status-dot',
@@ -3967,6 +4006,16 @@ function LiveSessionDetailPageInner({
               )}
             </div>
             <div className="niuu-live-session__toolbar">
+              {!readOnly && openConnections && (
+                <SessionToolbarButton
+                  icon={KeyRound}
+                  title="Reconnect account"
+                  onClick={openConnections}
+                />
+              )}
+              {resolvedActiveTab === 'chat' && (
+                <ChatDisplayControls className="niuu-live-session__display-controls" />
+              )}
               <SessionToolbarButton
                 icon={showInternalMessages ? Eye : EyeOff}
                 title={
@@ -4042,6 +4091,32 @@ function LiveSessionDetailPageInner({
           </div>
         </div>
 
+        {actionError ? (
+          <div
+            role="alert"
+            className="niuu:border-b niuu:border-border-subtle niuu:bg-bg-secondary niuu:px-4 niuu:py-2 niuu:text-xs niuu:text-critical"
+            data-testid="session-action-error"
+          >
+            <LinkedText text={actionError} />
+          </div>
+        ) : liveSession?.error && (sessionStatus === 'failed' || sessionStatus === 'error') ? (
+          <div
+            role="alert"
+            className="niuu:border-b niuu:border-border-subtle niuu:bg-bg-secondary niuu:px-4 niuu:py-2 niuu:text-xs niuu:text-critical"
+            data-testid="session-failure-reason"
+          >
+            Session failed: <LinkedText text={liveSession.error} />
+          </div>
+        ) : liveSession?.error && isSessionBooting(sessionStatus) ? (
+          <div
+            role="status"
+            className="niuu:border-b niuu:border-border-subtle niuu:bg-bg-secondary niuu:px-4 niuu:py-2 niuu:text-xs niuu:text-secondary"
+            data-testid="session-provisioning-detail"
+          >
+            Provisioning: <LinkedText text={liveSession.error} />
+          </div>
+        ) : null}
+
         <div className="niuu:min-h-0 niuu:flex-1 niuu:overflow-hidden">
           {resolvedActiveTab === 'chat' && (
             <div role="tabpanel" className="niuu:flex niuu:h-full niuu:min-h-0 niuu:flex-col">
@@ -4079,6 +4154,7 @@ function LiveSessionDetailPageInner({
                   <SessionChat
                     className="niuu:h-full"
                     showToolbar={false}
+                    showDisplayControls={false}
                     showInternalToggle={false}
                     internalVisibility={showInternalMessages}
                     showTokenUsage={showTokenUsage}
@@ -4101,6 +4177,7 @@ function LiveSessionDetailPageInner({
                     availableCommands={chat.availableCommands}
                     capabilities={chat.capabilities}
                     chatEndpoint={chatEndpoint}
+                    historyEndpoint={historyEndpoint}
                     sessionName={sessionName}
                     onSend={chat.sendMessage}
                     onSendDirected={chat.sendDirectedMessages}
@@ -4128,6 +4205,7 @@ function LiveSessionDetailPageInner({
                 <SessionChat
                   className="niuu:h-full"
                   showToolbar={false}
+                  showDisplayControls={false}
                   showInternalToggle={false}
                   internalVisibility={showInternalMessages}
                   showTokenUsage={showTokenUsage}

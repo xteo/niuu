@@ -53,6 +53,8 @@ const models = Object.fromEntries(
     ]),
   ),
 );
+const miniModeFeatures = { localMountsEnabled: true, fileManagerEnabled: true, miniMode: true };
+const clusterFeatures = { localMountsEnabled: false, fileManagerEnabled: true, miniMode: false };
 function setup(
   overrides: Partial<ReturnType<typeof createMockVolundrService>> = {},
   ui?: React.ReactNode,
@@ -60,7 +62,14 @@ function setup(
 ) {
   const base = createMockVolundrService();
   const startSession = vi.fn(base.startSession);
-  const service = { ...base, startSession, getTargets: async () => hosts, ...overrides };
+  const service = {
+    ...base,
+    startSession,
+    getTargets: async () => hosts,
+    // Thor and Spark are mini-mode Forge hosts that mount local folders.
+    getFeatures: async () => miniModeFeatures,
+    ...overrides,
+  };
   const bifrost = { ...createMockBifrostService(), getModelCatalog: async () => catalog };
   const onAdvanced = vi.fn();
   const onCreated = vi.fn();
@@ -96,6 +105,9 @@ describe('QuickLaunch', () => {
       definition: 'skuldClaudeInteractive',
       model: 'claude-fable-5-1',
       instanceId: 'thor',
+      // The connected Claude account and the non-Git integrations; no Git
+      // account for a local folder.
+      integrationIds: ['claude-code-setup', 'linear-main'],
       source: {
         type: 'local_mount',
         local_path: '/home/thor/repos',
@@ -109,19 +121,19 @@ describe('QuickLaunch', () => {
       expect.objectContaining({ to: '/volundr/sessions/$sessionId' }),
     );
   });
-  it('uses Astra for Codex and allows Sol plus independent effort', async () => {
+  it('uses Astra for Codex and allows GPT-6 Sol plus independent effort', async () => {
     const { startSession } = setup();
     await ready();
     fireEvent.click(screen.getByRole('button', { name: /Codex.*OpenAI/ }));
     expect(screen.getByLabelText('Model')).toHaveValue('gpt-6-astra');
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-5.6-sol' } });
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6-sol' } });
     fireEvent.change(screen.getByLabelText('Effort'), { target: { value: 'ultra' } });
     fireEvent.click(screen.getByRole('button', { name: 'Launch Codex' }));
     await waitFor(() =>
       expect(startSession).toHaveBeenCalledWith(
         expect.objectContaining({
           definition: 'skuldCodex',
-          model: 'gpt-5.6-sol',
+          model: 'gpt-6-sol',
           workloadConfig: { reasoningEffort: 'ultra' },
         }),
       ),
@@ -147,7 +159,7 @@ describe('QuickLaunch', () => {
     await screen.findByText(/This standard is unavailable/);
     expect(screen.getByRole('button', { name: 'Launch Claude' })).toBeDisabled();
     expect(screen.getByLabelText('Model')).toHaveValue('claude-fable-5-1');
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'claude-opus-5' } });
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'claude-opus-5-5' } });
     await ready();
   });
   it('honours an explicitly empty effort list without sending a made-up effort', async () => {
@@ -203,6 +215,49 @@ describe('QuickLaunch', () => {
     await ready();
     expect(screen.getByLabelText('Working folder')).toHaveValue('/home/thor/repos');
   });
+  it('offers only Git on a Forge without local mounts and attaches the repository account', async () => {
+    const { startSession } = setup({ getFeatures: async () => clusterFeatures });
+    const source = await screen.findByLabelText('Workspace source');
+    await waitFor(() => expect(source).toHaveValue('git'));
+    expect(within(source).queryByRole('option', { name: 'Local mount' })).toBeNull();
+    const repository = screen.getByLabelText('Repository');
+    await waitFor(() =>
+      expect(within(repository).getByRole('option', { name: /volundr/ })).toBeInTheDocument(),
+    );
+    fireEvent.change(repository, { target: { value: 'github.com/niuulabs/volundr' } });
+    await ready();
+    fireEvent.click(screen.getByRole('button', { name: 'Launch Claude' }));
+    await waitFor(() =>
+      expect(startSession).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: { type: 'git', repo: 'github.com/niuulabs/volundr', branch: 'main' },
+          integrationIds: ['claude-code-setup', 'github-primary', 'linear-main'],
+        }),
+      ),
+    );
+  });
+  it('re-derives a local folder source when switching to a Forge that cannot mount one', async () => {
+    setup({
+      getFeatures: async (instanceId?: string) =>
+        instanceId === 'spark' ? clusterFeatures : miniModeFeatures,
+    });
+    await ready();
+    fireEvent.change(screen.getByLabelText('Workspace source'), {
+      target: { value: 'local_mount' },
+    });
+    fireEvent.change(screen.getByLabelText('Forge'), { target: { value: 'spark' } });
+    await waitFor(() => expect(screen.getByLabelText('Workspace source')).toHaveValue('git'));
+    expect(screen.queryByLabelText('Working folder')).toBeNull();
+  });
+  it('blocks the launch when the connected accounts cannot be read', async () => {
+    setup({
+      getIntegrations: async () => {
+        throw new Error('Integrations unreachable');
+      },
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent('Integrations unreachable');
+    expect(screen.getByRole('button', { name: 'Launch Claude' })).toBeDisabled();
+  });
   it('retains the advanced launch path', async () => {
     const { onAdvanced } = setup();
     await ready();
@@ -215,6 +270,18 @@ describe('QuickLaunch', () => {
     expect(screen.getByRole('dialog')).toHaveAccessibleName('Quick launch');
     fireEvent.click(screen.getByRole('button', { name: 'Advanced launch' }));
     expect(await screen.findByRole('dialog')).toHaveAccessibleName('Launch pod');
+  });
+  it('opens a prefilled launch (Simple mode, Realms) straight in the advanced wizard', async () => {
+    setup(
+      {},
+      <LaunchWizard
+        open
+        onOpenChange={vi.fn()}
+        initialForm={{ sourcetype: 'git', repo: 'github.com/niuulabs/volundr', branch: 'main' }}
+      />,
+    );
+    expect(await screen.findByRole('dialog')).toHaveAccessibleName('Launch pod');
+    expect(screen.queryByTestId('quick-launch-form')).toBeNull();
   });
   it('keeps saved custom catalogues available behind the standards', async () => {
     setup({}, <LaunchCatalogPage />);

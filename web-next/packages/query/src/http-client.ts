@@ -31,7 +31,11 @@ export interface ApiClient {
   get<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<T>;
   /** GET that also exposes response headers (e.g. partial-availability hints). */
   getWithHeaders?<T>(endpoint: string, options?: { signal?: AbortSignal }): Promise<ApiResponse<T>>;
-  post<T>(endpoint: string, body?: unknown): Promise<T>;
+  post<T>(
+    endpoint: string,
+    body?: unknown,
+    options?: { headers?: HeadersInit; signal?: AbortSignal },
+  ): Promise<T>;
   put<T>(endpoint: string, body: unknown): Promise<T>;
   patch<T>(endpoint: string, body: unknown): Promise<T>;
   delete<T>(endpoint: string, body?: unknown): Promise<T>;
@@ -236,10 +240,11 @@ export function createApiClient(basePath: string): ApiClient {
   ): Promise<ApiResponse<T>> {
     const url = `${basePath}${endpoint}`;
 
-    const headers = getAuthHeaders({
-      ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
-      ...(options.headers as Record<string, string>),
-    });
+    const requestHeaders = new Headers(options.headers);
+    if (!(options.body instanceof FormData) && !requestHeaders.has('Content-Type')) {
+      requestHeaders.set('Content-Type', 'application/json');
+    }
+    const headers = getAuthHeaders(requestHeaders);
 
     const config: RequestInit = { ...options, headers };
     const response = await fetch(url, config);
@@ -248,10 +253,14 @@ export function createApiClient(basePath: string): ApiClient {
       return { data: undefined as T, headers: response.headers };
     }
 
-    const data = await response.json();
-
     if (!response.ok) {
-      const errorDetail = (data as ApiError)?.detail ?? 'Unknown error';
+      const body = await response.text();
+      let errorDetail = body.trim() || response.statusText || 'Unknown error';
+      try {
+        errorDetail = (JSON.parse(body) as ApiError)?.detail ?? 'Unknown error';
+      } catch {
+        // Proxies and servers can return plain text or HTML errors instead of JSON.
+      }
       throw new ApiClientError(
         `API request failed: ${response.status}`,
         response.status,
@@ -259,7 +268,13 @@ export function createApiClient(basePath: string): ApiClient {
       );
     }
 
-    return { data: data as T, headers: response.headers };
+    // Documents served as text (a persona's YAML) come back as the string they are;
+    // everything declared JSON, or undeclared, is parsed as JSON.
+    const contentType = response.headers?.get?.('content-type') ?? '';
+    if (contentType && !/json/i.test(contentType)) {
+      return { data: (await response.text()) as T, headers: response.headers };
+    }
+    return { data: (await response.json()) as T, headers: response.headers };
   }
 
   return {
@@ -273,11 +288,16 @@ export function createApiClient(basePath: string): ApiClient {
     ): Promise<ApiResponse<T>> {
       return requestWithResponse<T>(endpoint, { ...options, method: 'GET' });
     },
-    post<T>(endpoint: string, body?: unknown): Promise<T> {
+    post<T>(
+      endpoint: string,
+      body?: unknown,
+      options?: { headers?: HeadersInit; signal?: AbortSignal },
+    ): Promise<T> {
       if (body instanceof FormData) {
-        return request<T>(endpoint, { method: 'POST', body });
+        return request<T>(endpoint, { ...options, method: 'POST', body });
       }
       return request<T>(endpoint, {
+        ...options,
         method: 'POST',
         body: body ? JSON.stringify(body) : undefined,
       });

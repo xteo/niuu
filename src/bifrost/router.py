@@ -9,7 +9,8 @@ from __future__ import annotations
 import importlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Protocol
 
 import httpx
 
@@ -18,9 +19,60 @@ from bifrost.domain.routing import apply_rules
 from bifrost.ports.key_vault import KeyVaultPort
 from bifrost.ports.provider import ProviderError, ProviderPort
 from bifrost.ports.rules import RoutingContext, RuleEnginePort
+from bifrost.ports.selection import SelectionPort
 from bifrost.translation.models import AnthropicRequest, AnthropicResponse
+from niuu.observability import get_observability
 
 logger = logging.getLogger(__name__)
+
+
+class _UsageLike(Protocol):
+    """Structural type for the two usage shapes callers pass in.
+
+    ``bifrost.translation.models.UsageInfo`` (non-streaming) and
+    ``bifrost.domain.models.TokenUsage`` (streaming, accumulated from SSE
+    deltas) both carry these two fields but aren't related types.
+    """
+
+    input_tokens: int
+    output_tokens: int
+
+
+def record_genai_span_attributes(
+    *,
+    requested_model: str,
+    provider: str,
+    failover_attempts: int,
+    cache_hit: bool,
+    response_model: str = "",
+    usage: _UsageLike | None = None,
+) -> None:
+    """Enrich the active server span with GenAI semantic-convention attributes.
+
+    Bifröst does not open its own span per inference: once the composition
+    root instruments the app (``niuu.observability.instrument_fastapi_app``),
+    every inbound completion request already has a FastAPI server span open
+    for its whole duration — opening a second, nested span here would just
+    duplicate it. This attaches the GenAI attributes (requested model,
+    routed model, chosen provider, failover attempts, cache hit, token usage)
+    to that already-active span instead. A no-op when observability is
+    disabled.
+    """
+    attributes: dict[str, object] = {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": requested_model,
+        "bifrost.failover_attempts": failover_attempts,
+        "bifrost.cache_hit": cache_hit,
+    }
+    if provider:
+        attributes["gen_ai.provider.name"] = provider
+    if response_model:
+        attributes["gen_ai.response.model"] = response_model
+    if usage is not None:
+        attributes["gen_ai.usage.input_tokens"] = usage.input_tokens
+        attributes["gen_ai.usage.output_tokens"] = usage.output_tokens
+    get_observability().set_attributes(attributes)
+
 
 # HTTP status codes that trigger failover to an alternative provider.
 _FAILOVER_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -81,10 +133,19 @@ class ModelRouter:
         config: BifrostConfig,
         rule_engine: RuleEnginePort | None = None,
         key_vault: KeyVaultPort | None = None,
+        selection: SelectionPort | None = None,
     ) -> None:
         self._config = config
         self._rule_engine = rule_engine
         self._key_vault = key_vault
+        self._selection = selection
+        if selection is not None:
+            for provider, model in selection.configured_targets():
+                if (
+                    provider not in config.providers
+                    or model not in config.providers[provider].models
+                ):
+                    raise ValueError(f"Routing target {provider}/{model} is not configured")
         self._adapters: dict[str, ProviderPort] = {}
         # Per-model request counter used by the round_robin strategy.
         self._round_robin_counters: dict[str, int] = {}
@@ -212,16 +273,28 @@ class ModelRouter:
                      budget-sensitive rules are skipped silently.
         """
         ctx = context if context is not None else RoutingContext()
-        request = apply_rules(request, ctx, self._rule_engine)
-        candidates = self._build_candidates(request.model)
+        request = self._honour_model_thinking(await self.prepare(request, ctx))
+        candidates = (
+            [(request._routed_provider, request.model)]
+            if request._routed_provider
+            else await self._select_candidates(request.model)
+        )
         last_exc: Exception | None = None
 
-        for pname, pmodel in candidates:
+        for attempt, (pname, pmodel) in enumerate(candidates):
             try:
                 adapter = self._get_adapter(pname)
                 t0 = time.monotonic()
                 result = await adapter.complete(request, pmodel)
                 self._record_latency(pname, time.monotonic() - t0)
+                record_genai_span_attributes(
+                    requested_model=request.model,
+                    provider=pname,
+                    failover_attempts=attempt,
+                    cache_hit=False,
+                    response_model=pmodel,
+                    usage=result.usage,
+                )
                 return result
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in _FAILOVER_STATUS_CODES:
@@ -258,17 +331,31 @@ class ModelRouter:
                      budget-sensitive rules are skipped silently.
         """
         ctx = context if context is not None else RoutingContext()
-        request = apply_rules(request, ctx, self._rule_engine)
-        candidates = self._build_candidates(request.model)
+        request = self._honour_model_thinking(await self.prepare(request, ctx))
+        candidates = (
+            [(request._routed_provider, request.model)]
+            if request._routed_provider
+            else await self._select_candidates(request.model)
+        )
         last_exc: Exception | None = None
 
-        for pname, pmodel in candidates:
+        for attempt, (pname, pmodel) in enumerate(candidates):
             try:
                 adapter = self._get_adapter(pname)
                 t0 = time.monotonic()
                 async for chunk in adapter.stream(request, pmodel):
                     yield chunk
                 self._record_latency(pname, time.monotonic() - t0)
+                # Token usage isn't known at this layer for streaming responses
+                # (it arrives as SSE deltas the inbound layer accumulates), so
+                # only the request/provider/failover attributes are recorded
+                # here; usage is left for the inbound layer to attach.
+                record_genai_span_attributes(
+                    requested_model=request.model,
+                    provider=pname,
+                    failover_attempts=attempt,
+                    cache_hit=False,
+                )
                 return
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in _FAILOVER_STATUS_CODES:
@@ -286,6 +373,91 @@ class ModelRouter:
         raise RouterError(
             f"All providers failed for model '{candidates[0][1]}': {last_exc}"
         ) from last_exc
+
+    async def _select_candidates(self, model: str) -> list[tuple[str, str]]:
+        if self._selection is None or self._selection.configured_targets():
+            return self._build_candidates(model)
+        resolved = self._config.resolve_alias(model)
+        candidates = [
+            (provider, resolved) for provider in self._config.providers_for_model(resolved)
+        ]
+        if not candidates:
+            raise RouterError(f"No provider configured for model '{resolved}'")
+        selected = await self._selection.select(candidates)
+        if selected not in candidates:
+            raise RouterError("Selection adapter returned an unconfigured target")
+        return [selected]
+
+    def _honour_model_thinking(self, request: AnthropicRequest) -> AnthropicRequest:
+        """Drop thinking controls for a model the catalog says has none.
+
+        ``thinking`` and ``reasoning_effort`` are threaded to backends on
+        purpose (DeepSeek honours them, vLLM ignores them), but a server that
+        knows the model cannot think (Ollama with Llama) rejects the whole
+        request over them. The catalog's ``supports_thinking`` is the
+        configured answer; an unknown model keeps the controls.
+        """
+        entry = self._config.model_entry(request.model)
+        if entry is None or entry.supports_thinking:
+            return request
+        if request.thinking is None and request.reasoning_effort is None:
+            return request
+        logger.info(
+            "Model %s has no thinking mode (supports_thinking=false); "
+            "dropping thinking/reasoning_effort",
+            request.model,
+        )
+        stripped = request.model_copy(update={"thinking": None, "reasoning_effort": None})
+        stripped._routed_provider = request._routed_provider
+        stripped._routing_prepared = request._routing_prepared
+        stripped._response_format = request._response_format
+        return stripped
+
+    async def prepare(
+        self,
+        request: AnthropicRequest,
+        context: RoutingContext | None = None,
+        authorize: Callable[[str], None] | None = None,
+        record_call: Callable[[str, str, AnthropicResponse, float], Awaitable[None]] | None = None,
+    ) -> AnthropicRequest:
+        """Resolve explicit routes before caching, accounting, and answer execution."""
+        if request._routing_prepared:
+            return request
+        request = apply_rules(request, context or RoutingContext(), self._rule_engine)
+        if self._selection is None or not self._selection.configured_targets():
+            return request
+        request = request.model_copy()
+        request._routing_prepared = True
+
+        async def call_model(provider: str, model: str, judge: AnthropicRequest):
+            if (provider, model) not in self._selection.configured_targets():
+                raise RouterError("Classifier requested an unconfigured target")
+            if authorize is not None:
+                authorize(model)
+            started = time.monotonic()
+            response = await self._get_adapter(provider).complete(judge, model)
+            if record_call is not None:
+                await record_call(provider, model, response, time.monotonic() - started)
+            return response
+
+        try:
+            selected = await self._selection.route(request, call_model)
+        except (ValueError, RuntimeError, ProviderError, httpx.HTTPError) as exc:
+            raise RouterError(f"Model selection failed: {exc}") from exc
+        if selected is None:
+            return request
+        provider, model = selected
+        if (provider, model) not in self._selection.configured_targets():
+            raise RouterError("Selection adapter returned an unconfigured target")
+        if authorize is not None:
+            authorize(model)
+        prepared = request.model_copy(update={"model": model})
+        prepared._routed_provider = provider
+        return prepared
+
+    @property
+    def has_model_routes(self) -> bool:
+        return self._selection is not None and bool(self._selection.configured_targets())
 
     async def close(self) -> None:
         """Close all open provider adapters."""

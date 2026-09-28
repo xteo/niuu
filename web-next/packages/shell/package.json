@@ -1,7 +1,7 @@
 {
   "name": "@niuulabs/shell",
   "version": "0.0.1",
-  "description": "Plugin shell \u2014 rail, topbar, subnav, content, footer. Host-agnostic.",
+  "description": "Plugin shell — rail, topbar, subnav, content, footer. Host-agnostic.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -27,8 +27,8 @@
     "dev": "tsup --watch"
   },
   "peerDependencies": {
-    "@tanstack/react-router": "^1.170.18",
-    "react": "^19.2.7"
+    "@tanstack/react-router": "^1.170.39",
+    "react": "^19.3.0"
   },
   "dependencies": {
     "@niuulabs/plugin-sdk": "workspace:*",
@@ -37,12 +37,12 @@
     "@niuulabs/design-tokens": "workspace:*"
   },
   "devDependencies": {
-    "@tanstack/react-router": "^1.170.18",
-    "@types/react": "^19.2.17",
-    "autoprefixer": "^10.5.4",
-    "postcss": "^8.5.20",
-    "postcss-import": "^16.1.0",
-    "react": "^19.2.7",
+    "@tanstack/react-router": "^1.170.39",
+    "@types/react": "^19.3.0",
+    "autoprefixer": "^10.6.1",
+    "postcss": "^8.5.28",
+    "postcss-import": "^17.0.0",
+    "react": "^19.3.0",
     "tailwindcss": "^4.3.3",
     "tsup": "^8.3.5",
     "typescript": "^6.0.3"

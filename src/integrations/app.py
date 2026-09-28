@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -12,6 +10,7 @@ from fastapi import FastAPI
 
 from niuu.adapters.inbound.rest_integrations_settings import create_integrations_settings_router
 from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
+from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRefreshLock
 from niuu.adapters.postgres_integrations import PostgresIntegrationRepository
 from niuu.adapters.postgres_pats import PostgresPATRepository
 from niuu.cors import apply_cors_middleware
@@ -35,17 +34,19 @@ from volundr.adapters.outbound.postgres_credential_enrollments import (
     PostgresCredentialEnrollmentRepository,
 )
 from volundr.adapters.outbound.postgres_users import PostgresUserRepository
-from volundr.composition_builders import _create_credential_enrollment_runner
-from volundr.config import Settings
-from volundr.domain.services.credential_enrollment import (
-    CredentialEnrollmentService,
-    reconcile_credential_enrollments_loop,
+from volundr.composition_builders import (
+    _create_credential_enrollment_runner,
+    create_oauth_client_registry,
+    with_oauth_device_runner,
 )
+from volundr.config import Settings
+from volundr.domain.services.credential_enrollment import CredentialEnrollmentService
 from volundr.domain.services.integration_registry import (
     IntegrationRegistry,
     definitions_from_config,
 )
 from volundr.domain.services.tracker_factory import TrackerFactory
+from volundr.integration_definitions import load_integration_definition_configs
 
 logger = logging.getLogger(__name__)
 
@@ -80,13 +81,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             integration_repo = PostgresIntegrationRepository(pool)
             integration_registry = IntegrationRegistry(
                 definitions_from_config(
-                    [definition.model_dump() for definition in settings.integrations.definitions]
+                    [
+                        definition.model_dump()
+                        for definition in load_integration_definition_configs(settings.integrations)
+                    ]
                 )
             )
             tracker_factory = TrackerFactory(credential_store)
+            oauth_clients = create_oauth_client_registry(
+                settings,
+                credential_store=credential_store,
+                integration_registry=integration_registry,
+            )
+            await oauth_clients.load()
             credential_enrollment_service = CredentialEnrollmentService(
                 repository=PostgresCredentialEnrollmentRepository(pool),
-                runner=_create_credential_enrollment_runner(settings),
+                runner=with_oauth_device_runner(
+                    _create_credential_enrollment_runner(settings),
+                    oauth_clients,
+                    integration_registry,
+                ),
                 integration_repository=integration_repo,
                 integration_registry=integration_registry,
                 credential_store=credential_store,
@@ -125,6 +139,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     registry=integration_registry,
                     credential_store=credential_store,
                     credential_enrollment_service=credential_enrollment_service,
+                    oauth_clients=oauth_clients,
+                    mcp_internal_hosts=settings.oauth.mcp_internal_hosts,
                 )
             )
             app.include_router(
@@ -133,23 +149,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     integration_registry=integration_registry,
                     credential_store=credential_store,
                     integration_repo=integration_repo,
+                    oauth_clients=oauth_clients,
+                    credential_lock=PostgresCredentialRefreshLock(pool),
                 )
             )
 
-            enrollment_reconcile_task = asyncio.create_task(
-                reconcile_credential_enrollments_loop(credential_enrollment_service)
-            )
+            # Enrollment reconciliation and token refresh run in the shared host,
+            # the one process present in every deployment; a second loop here
+            # would poll the same rows and race the same refresh tokens.
             try:
                 yield
             finally:
-                enrollment_reconcile_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await enrollment_reconcile_task
                 release_credential_store(settings)
 
     app.router.lifespan_context = lifespan
     apply_cors_middleware(app, settings.cors)
-    app.add_middleware(PATRevocationMiddleware)
+    app.add_middleware(
+        PATRevocationMiddleware, websocket_check_interval=settings.pat.websocket_check_interval
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str]:

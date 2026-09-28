@@ -4,32 +4,33 @@ import json
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CODEX_VERSION = "0.144.1"
 
 
 def _load_json(path: str) -> dict:
     return json.loads((REPO_ROOT / path).read_text())
 
 
-def test_skuld_and_devrunner_pin_same_codex_version() -> None:
+def test_skuld_and_devrunner_pin_same_cli_versions() -> None:
     """Skuld broker and devrunner shell must expose the same Codex CLI."""
     package_paths = [
         "containers/skuld/npm-tools/package.json",
         "containers/devrunner/npm-tools/package.json",
     ]
 
-    for package_path in package_paths:
-        package = _load_json(package_path)
-        assert package["dependencies"]["@openai/codex"] == CODEX_VERSION
+    versions = [_load_json(path)["dependencies"] for path in package_paths]
+    assert versions[0] == versions[1]
 
 
 def test_devrunner_lockfile_resolves_codex_version() -> None:
     """The checked-in npm lockfile must match the devrunner Codex pin."""
+    codex_version = _load_json("containers/devrunner/npm-tools/package.json")["dependencies"][
+        "@openai/codex"
+    ]
     package_lock = _load_json("containers/devrunner/npm-tools/package-lock.json")
     codex_package = package_lock["packages"]["node_modules/@openai/codex"]
 
-    assert codex_package["version"] == CODEX_VERSION
-    assert f"codex-{CODEX_VERSION}.tgz" in codex_package["resolved"]
+    assert codex_package["version"] == codex_version
+    assert f"codex-{codex_version}.tgz" in codex_package["resolved"]
 
 
 def test_cli_runtime_images_install_vim() -> None:
@@ -56,7 +57,15 @@ def test_openshell_image_installs_locked_agent_clis() -> None:
 
     assert "COPY containers/skuld/npm-tools/package.json" in dockerfile
     assert "npm ci --omit=dev" in dockerfile
-    assert "cp -a /opt/skuld-tools/node_modules/@openai /usr/lib/node_modules/@openai" in dockerfile
+    assert "mv /opt/skuld-tools/node_modules/@openai /usr/lib/node_modules/@openai" in dockerfile
     assert "/usr/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex" in dockerfile
-    for cli in ("claude", "opencode"):
+    for cli in ("claude", "opencode", "grok"):
         assert f"node_modules/.bin/{cli} /usr/local/bin/{cli}" in dockerfile
+
+
+def test_cli_runtime_images_install_bubblewrap() -> None:
+    """Codex expects bwrap on PATH; the build must fail if it goes missing."""
+    for dockerfile_path in ("containers/skuld/Dockerfile", "containers/devrunner/Dockerfile"):
+        dockerfile = (REPO_ROOT / dockerfile_path).read_text()
+        assert "    bubblewrap \\\n" in dockerfile
+        assert "&& bwrap --version" in dockerfile

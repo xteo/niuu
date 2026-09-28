@@ -151,11 +151,8 @@ class TestOpenBaoAgentInjectionAdapter:
         with (
             patch.object(adapter, "_ensure_service_account", new=AsyncMock()) as mock_sa,
             patch.object(adapter, "_create_or_update_configmap", new=AsyncMock()) as mock_cm,
-            patch.object(
-                adapter._admin,
-                "ensure_service_account_access",
-                new=AsyncMock(),
-            ) as mock_access,
+            patch.object(adapter._admin, "ensure_policy", new=AsyncMock()) as mock_policy,
+            patch.object(adapter._admin, "ensure_jwt_role", new=AsyncMock()) as mock_role,
         ):
             await adapter.ensure_secret_provider_class(
                 "alice",
@@ -165,18 +162,14 @@ class TestOpenBaoAgentInjectionAdapter:
             )
 
         mock_sa.assert_awaited_once_with("openbao-session-session-123", "session-123", "alice")
-        mock_access.assert_awaited_once_with(
-            mount_path="volundr",
-            user_id="alice",
-            tenant_id="acme",
-            auth_path="jwt-valhalla",
-            audience="https://k8s-issuer.valhalla.asgard.niuu.world",
-            service_account_namespace="skuld",
-            service_account_name="openbao-session-session-123",
-            policy_name="volundr-user-alice",
-            role_name="volundr-session-session-123",
-            ttl="1h",
+        mock_policy.assert_awaited_once_with(
+            "volundr-session-session-123",
+            'path "volundr/data/users/alice/github" {\n  capabilities = ["read"]\n}',
         )
+        role = mock_role.await_args.args[0]
+        assert role.policies == ("volundr-session-session-123",)
+        assert role.bound_subject == "system:serviceaccount:skuld:openbao-session-session-123"
+        assert role.auth_path == "jwt-valhalla"
         mock_cm.assert_awaited_once()
         cm_kwargs = mock_cm.await_args.kwargs
         assert cm_kwargs["name"] == "openbao-agent-session-123"
@@ -204,6 +197,24 @@ class TestOpenBaoAgentInjectionAdapter:
     async def test_provision_and_deprovision_user_are_noops(self, adapter):
         await adapter.provision_user("alice")
         await adapter.deprovision_user("alice")
+
+    def test_session_policy_only_reads_mapped_paths(self, adapter):
+        policy = adapter._session_policy(
+            "alice",
+            [
+                CredentialMapping(credential_name="claude", env_mappings={"TOKEN": "token"}),
+                CredentialMapping(credential_name="claude", file_mappings={"/token": "token"}),
+                CredentialMapping(credential_name="unmapped"),
+            ],
+        )
+        assert policy == 'path "volundr/data/users/alice/claude" {\n  capabilities = ["read"]\n}'
+
+    @pytest.mark.parametrize("name", ["*", "+", "${user}"])
+    def test_session_policy_rejects_nonliteral_paths(self, adapter, name):
+        with pytest.raises(ValueError, match="literal"):
+            adapter._session_policy(
+                "alice", [CredentialMapping(credential_name=name, env_mappings={"TOKEN": "token"})]
+            )
 
     def test_build_configmap_data_uses_jwt_auto_auth_and_templates(self, adapter):
         data = adapter._build_configmap_data(
@@ -277,6 +288,7 @@ class TestOpenBaoAgentInjectionAdapter:
     @pytest.mark.asyncio()
     async def test_cleanup_session_deletes_role_and_kubernetes_resources(self, adapter):
         with (
+            patch.object(adapter._admin, "delete_policy", new=AsyncMock()) as mock_policy,
             patch.object(adapter._admin, "delete_jwt_role", new=AsyncMock()) as mock_role,
             patch.object(adapter, "_delete_configmap", new=AsyncMock()) as mock_cm,
             patch.object(adapter, "_delete_service_account", new=AsyncMock()) as mock_sa,
@@ -284,12 +296,14 @@ class TestOpenBaoAgentInjectionAdapter:
             await adapter.cleanup_session("session-123")
 
         mock_role.assert_awaited_once_with("volundr-session-session-123", auth_path="jwt-valhalla")
+        mock_policy.assert_awaited_once_with("volundr-session-session-123")
         mock_cm.assert_awaited_once_with("openbao-agent-session-123")
         mock_sa.assert_awaited_once_with("openbao-session-session-123")
 
     @pytest.mark.asyncio()
     async def test_cleanup_session_logs_role_delete_error(self, adapter):
         with (
+            patch.object(adapter._admin, "delete_policy", new=AsyncMock()),
             patch.object(
                 adapter._admin,
                 "delete_jwt_role",
@@ -365,3 +379,60 @@ class TestOpenBaoAgentInjectionAdapter:
         config_module.load_kube_config.assert_awaited_once()
         assert isinstance(api_client, client_module.ApiClient)
         assert isinstance(core_api, client_module.CoreV1Api)
+
+
+def test_oauth_projection_uses_exact_engine_policy_and_continuous_agent():
+    from niuu.domain.oauth_credentials import oauth_credential_name
+
+    adapter = OpenBaoAgentInjectionAdapter(oauth_mount_path="oauthapp")
+    mapping = CredentialMapping(
+        credential_name="gitlab",
+        oauth_tenant_id="tenant-a",
+        oauth_token_field="token",
+        file_mappings={"/run/secrets/mcp/token": "token"},
+        oauth_token_documents=("/run/secrets/mcp/token",),
+    )
+    path = "oauthapp/creds/" + oauth_credential_name("tenant-a", "alice", "gitlab")
+    policy = adapter._session_policy("alice", [mapping])
+    assert policy == f'path "{path}" {{\n  capabilities = ["read"]\n}}'
+    config = adapter._build_configmap_data(
+        user_id="alice", credential_mappings=[mapping], role_name="session"
+    )
+    assert "exit_after_auth = true" in config["config-init.hcl"]
+    assert "exit_after_auth = false" in config["config.hcl"]
+    assert 'static_secret_render_interval = "30s"' in config["config.hcl"]
+    assert path in config["config.hcl"]
+    assert '"access_token" | toJSON' in config["config.hcl"]
+    assert '"expire_time"' in config["config.hcl"]
+    assert "refresh_token" not in config["config.hcl"]
+    assert "client_secret" not in config["config.hcl"]
+    assert ".Data.data" not in config["config.hcl"]
+
+
+async def test_oauth_tenant_mismatch_has_no_side_effects():
+    adapter = OpenBaoAgentInjectionAdapter(oauth_mount_path="oauthapp")
+    adapter._ensure_service_account = AsyncMock()
+    with pytest.raises(ValueError, match="tenant"):
+        await adapter.ensure_secret_provider_class(
+            "alice",
+            [CredentialMapping(credential_name="token", oauth_tenant_id="other")],
+            session_id="session",
+            tenant_id="tenant-a",
+        )
+    adapter._ensure_service_account.assert_not_called()
+
+
+def test_oauth_projection_rejects_refresh_token_field():
+    adapter = OpenBaoAgentInjectionAdapter(oauth_mount_path="oauthapp")
+    with pytest.raises(ValueError, match="only access token"):
+        adapter._build_template_blocks(
+            "alice",
+            [
+                CredentialMapping(
+                    credential_name="token",
+                    oauth_tenant_id="tenant-a",
+                    oauth_token_field="token",
+                    file_mappings={"/run/secrets/refresh": "refresh_token"},
+                )
+            ],
+        )

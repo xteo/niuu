@@ -19,7 +19,6 @@ function makeDispatcherState(overrides: Partial<DispatcherState> = {}): Dispatch
   return {
     id: '00000000-0000-0000-0000-000000000999',
     running: true,
-    threshold: 70,
     maxConcurrentRuns: 3,
     autoContinue: false,
     updatedAt: '2026-01-01T00:00:00Z',
@@ -104,7 +103,6 @@ describe('DispatchView', () => {
   it('renders rule summary card after loading', async () => {
     render(<DispatchView />, { wrapper: wrap(makeServices()) });
     await waitFor(() => expect(screen.getByText('Dispatch rules')).toBeInTheDocument());
-    expect(screen.getAllByText('70%').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('3').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('off')).toBeInTheDocument();
   });
@@ -416,11 +414,6 @@ describe('DispatchView', () => {
     });
   });
 
-  it('shows synthesized confidence for dispatcher queue items', async () => {
-    render(<DispatchView />, { wrapper: wrap(makeServices()) });
-    await waitFor(() => expect(screen.getByText('100')).toBeInTheDocument());
-  });
-
   it('shows Pause dispatcher button in header', async () => {
     render(<DispatchView />, { wrapper: wrap(makeServices()) });
     await waitFor(() =>
@@ -460,18 +453,6 @@ describe('DispatchView', () => {
     render(<DispatchView />, { wrapper: wrap(makeServices()) });
     await waitFor(() => screen.getByText('Dispatch rules'));
     expect(screen.getByRole('button', { name: /edit/i })).toBeInTheDocument();
-  });
-
-  it('opens threshold modal when Override threshold is clicked', async () => {
-    const user = userEvent.setup();
-    render(<DispatchView />, { wrapper: wrap(makeServices()) });
-    await waitFor(() => screen.getByText('Test Run'));
-
-    await user.click(screen.getByRole('checkbox', { name: /select row/i }));
-    await user.click(screen.getByRole('button', { name: /override threshold/i }));
-    await waitFor(() =>
-      expect(screen.getByText('Override dispatch threshold')).toBeInTheDocument(),
-    );
   });
 
   it('opens workflow modal when Apply workflow is clicked', async () => {
@@ -517,4 +498,46 @@ describe('DispatchView', () => {
       expect(screen.getByText(/failed to update dispatcher/i)).toBeInTheDocument(),
     );
   });
+});
+
+it('persists auto-continue through a fresh view and query cache', async () => {
+  const user = userEvent.setup();
+  let saved = false;
+  const save = vi.fn(async (value: boolean) => {
+    saved = value;
+  });
+  const services = makeServices({
+    dispatcher: {
+      getState: async () => makeDispatcherState({ autoContinue: saved }),
+      setAutoContinue: save,
+    },
+  });
+  const view = render(<DispatchView />, { wrapper: wrap(services) });
+  await user.click(await screen.findByRole('button', { name: /^edit$/i }));
+  await user.click(screen.getByRole('button', { name: /toggle auto-continue/i }));
+  await user.click(screen.getByRole('button', { name: /^save$/i }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  expect(save).toHaveBeenCalledWith(true);
+  view.unmount();
+  render(<DispatchView />, { wrapper: wrap(services) });
+  expect(await screen.findByText('on')).toBeInTheDocument();
+});
+
+it('keeps the draft open and reports a failed auto-continue save', async () => {
+  const user = userEvent.setup();
+  const services = makeServices({
+    dispatcher: {
+      setAutoContinue: vi.fn().mockRejectedValue(new Error('Save failed')),
+    },
+  });
+  render(<DispatchView />, { wrapper: wrap(services) });
+  await user.click(await screen.findByRole('button', { name: /^edit$/i }));
+  await user.click(screen.getByRole('button', { name: /toggle auto-continue/i }));
+  await user.click(screen.getByRole('button', { name: /^save$/i }));
+  expect(await screen.findByText('Failed to save auto-continue')).toBeInTheDocument();
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /toggle auto-continue/i })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
 });

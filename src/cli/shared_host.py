@@ -10,19 +10,25 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from niuu.adapters.file_setup_state import FileSetupStateStore
 from niuu.adapters.inbound.auth import extract_principal
 from niuu.adapters.inbound.rest_credentials_settings import create_credentials_settings_router
 from niuu.adapters.inbound.rest_integrations_settings import create_integrations_settings_router
 from niuu.adapters.inbound.rest_pats import create_pats_router
+from niuu.adapters.inbound.rest_realms import create_realms_router
 from niuu.adapters.inbound.rest_repos import create_repos_router
+from niuu.adapters.inbound.rest_setup import create_setup_router
 from niuu.adapters.outbound.git_registry import create_git_registry
 from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
+from niuu.adapters.postgres_credential_refresh_lock import PostgresCredentialRefreshLock
 from niuu.adapters.postgres_integrations import PostgresIntegrationRepository
 from niuu.adapters.postgres_pats import PostgresPATRepository
-from niuu.config import GitConfig
+from niuu.adapters.postgres_realms import PostgresRealmRepository
+from niuu.config import GitConfig, NiuuSettings
 from niuu.cors import apply_cors_middleware
-from niuu.domain.services.pat import PATService
+from niuu.domain.services.realm import RealmService
 from niuu.domain.services.repo import RepoService
+from niuu.domain.services.setup import SetupService
 from niuu.service_database import database_pool
 from niuu.service_databases import apply_service_database_settings
 from niuu.service_integrations import (
@@ -31,12 +37,14 @@ from niuu.service_integrations import (
     seed_linear_integration,
 )
 from niuu.service_runtime import (
+    create_authorization_adapter,
     create_credential_store,
     create_identity_adapter,
     create_pat_validator,
     create_storage_adapter,
     create_workload_identity_service,
     release_credential_store,
+    seed_development_identity,
 )
 from niuu.utils import import_class
 from ravn.adapters.personas.postgres_registry import PostgresPersonaRegistry
@@ -58,7 +66,12 @@ from volundr.adapters.outbound.postgres_credential_enrollments import (
 from volundr.adapters.outbound.postgres_mappings import PostgresMappingRepository
 from volundr.adapters.outbound.postgres_tenants import PostgresTenantRepository
 from volundr.adapters.outbound.postgres_users import PostgresUserRepository
-from volundr.composition_builders import _create_credential_enrollment_runner
+from volundr.composition_builders import (
+    _create_credential_enrollment_runner,
+    create_oauth_client_registry,
+    create_oauth_token_refresh_service,
+    with_oauth_device_runner,
+)
 from volundr.config import Settings
 from volundr.domain.services.credential import CredentialService
 from volundr.domain.services.credential_enrollment import (
@@ -71,9 +84,12 @@ from volundr.domain.services.integration_registry import (
     definitions_from_config,
 )
 from volundr.domain.services.mount_strategies import SecretMountStrategyRegistry
+from volundr.domain.services.oauth_token_refresh import refresh_oauth_tokens_loop
 from volundr.domain.services.tenant import TenantService
 from volundr.domain.services.tracker import TrackerService
 from volundr.domain.services.tracker_factory import TrackerFactory
+from volundr.domain.services.user_integration import UserIntegrationService
+from volundr.integration_definitions import load_integration_definition_configs
 
 logger = logging.getLogger(__name__)
 
@@ -107,13 +123,42 @@ def create_app(
     loaded_settings = apply_service_database_settings(settings or _load_settings(), "niuu-shared")
     app.state.settings = loaded_settings
 
+    # Configured and instrumented here, not in lifespan: Starlette builds and
+    # caches its middleware stack on the app's first ASGI __call__ (which is
+    # also how the lifespan startup event arrives), so instrumenting from
+    # inside a lifespan handler has no effect. This host reuses
+    # volundr.config.Settings wholesale, so observability.service_name would
+    # default to "volundr" unless told otherwise — default_service_name gives
+    # it its own identity unless the operator explicitly set
+    # observability.service_name in its own config. In mini mode this app and
+    # volundr/ting/bifrost's own apps all run as sub-apps of one root app in
+    # one process (see niuu/app.py::build_root_app) — configure_observability
+    # joins whichever pipeline was configured first (typically the root app's
+    # own CLISettings.observability) rather than overwriting it; see its
+    # docstring for the join/opt-out/conflict rules.
+    from niuu.observability import (
+        configure_observability,
+        install_uvicorn_log_redaction,
+        instrument_fastapi_app,
+        instrument_httpx_client,
+    )
+
+    telemetry = configure_observability(
+        loaded_settings.observability,
+        resource_attributes={"service.namespace": "niuu-shared"},
+        component="niuu-shared",
+        default_service_name="niuu-shared",
+    )
+    instrument_fastapi_app(app, telemetry, component="niuu-shared")
+    install_uvicorn_log_redaction()
+    instrument_httpx_client(telemetry)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cfg = git_config or loaded_settings.git
         git_registry = create_git_registry(cfg)
 
         async with database_pool(loaded_settings.database) as pool:
-            repo_service = RepoService(git_registry)
             user_repository = PostgresUserRepository(pool)
             tenant_repository = PostgresTenantRepository(pool)
             storage_adapter = create_storage_adapter(loaded_settings)
@@ -125,21 +170,26 @@ def create_app(
                 tenant_service=tenant_service,
             )
             await tenant_service.ensure_default_tenant()
+            await seed_development_identity(identity_adapter, user_repository)
+            app.state.authorization = create_authorization_adapter(loaded_settings)
 
             pat_repository = PostgresPATRepository(pool)
             pat_validator = create_pat_validator(loaded_settings, pat_repository)
             token_issuer_cls = import_class(loaded_settings.pat.token_issuer_adapter)
             token_issuer = token_issuer_cls(**loaded_settings.pat.token_issuer_kwargs)
-            pat_service = PATService(
+            pat_service = import_class(loaded_settings.pat.service_adapter)(
+                **loaded_settings.pat.service_kwargs,
                 repo=pat_repository,
                 token_issuer=token_issuer,
                 ttl_days=loaded_settings.pat.ttl_days,
                 validator=pat_validator,
+                authorization=create_authorization_adapter(loaded_settings),
             )
             credential_store = create_credential_store(loaded_settings)
             credential_service = CredentialService(
                 store=credential_store,
                 strategies=SecretMountStrategyRegistry(),
+                authorization=create_authorization_adapter(loaded_settings),
             )
             mcp_provider = ConfigMCPServerProvider(loaded_settings.mcp_servers)
             secret_manager = InMemorySecretManager()
@@ -148,14 +198,35 @@ def create_app(
                 definitions_from_config(
                     [
                         definition.model_dump()
-                        for definition in loaded_settings.integrations.definitions
+                        for definition in load_integration_definition_configs(
+                            loaded_settings.integrations
+                        )
                     ]
                 )
             )
             tracker_factory = TrackerFactory(credential_store)
+            # Repositories come from the person's own connections (the accounts
+            # added in the wizard), not only from git instances in config.
+            user_integration_service = UserIntegrationService(
+                shared_git_providers=git_registry.providers,
+                integration_repo=integration_repo,
+                integration_registry=integration_registry,
+                credential_store=credential_store,
+            )
+            repo_service = RepoService(git_registry, user_integration=user_integration_service)
+            oauth_clients = create_oauth_client_registry(
+                loaded_settings,
+                credential_store=credential_store,
+                integration_registry=integration_registry,
+            )
+            await oauth_clients.load()
             credential_enrollment_service = CredentialEnrollmentService(
                 repository=PostgresCredentialEnrollmentRepository(pool),
-                runner=_create_credential_enrollment_runner(loaded_settings),
+                runner=with_oauth_device_runner(
+                    _create_credential_enrollment_runner(loaded_settings),
+                    oauth_clients,
+                    integration_registry,
+                ),
                 integration_repository=integration_repo,
                 integration_registry=integration_registry,
                 credential_store=credential_store,
@@ -215,6 +286,8 @@ def create_app(
             )
             app.state.persona_registry = PostgresPersonaRegistry(pool)
 
+            app.state.realm_service = RealmService(PostgresRealmRepository(pool))
+            app.include_router(create_realms_router(extract_principal))
             app.include_router(create_repos_router(repo_service))
             app.include_router(create_identity_router(tenant_service))
             app.include_router(create_pats_router(extract_principal, prefix="/api/v1/tokens"))
@@ -243,6 +316,8 @@ def create_app(
                     registry=integration_registry,
                     credential_store=credential_store,
                     credential_enrollment_service=credential_enrollment_service,
+                    oauth_clients=oauth_clients,
+                    mcp_internal_hosts=loaded_settings.oauth.mcp_internal_hosts,
                 )
             )
             app.include_router(
@@ -253,6 +328,8 @@ def create_app(
                     registry=integration_registry,
                     credential_store=credential_store,
                     credential_enrollment_service=credential_enrollment_service,
+                    oauth_clients=oauth_clients,
+                    mcp_internal_hosts=loaded_settings.oauth.mcp_internal_hosts,
                 )
             )
             app.include_router(
@@ -261,6 +338,8 @@ def create_app(
                     integration_registry=integration_registry,
                     credential_store=credential_store,
                     integration_repo=integration_repo,
+                    oauth_clients=oauth_clients,
+                    credential_lock=PostgresCredentialRefreshLock(pool),
                 )
             )
             app.include_router(create_canonical_tracker_router(tracker_service=tracker_service))
@@ -268,22 +347,67 @@ def create_app(
             app.include_router(create_features_router(feature_service))
             app.include_router(create_ravn_personas_router())
 
+            host_config = NiuuSettings().host
+
+            async def _database_probe() -> bool:
+                return await pool.fetchval("SELECT 1") == 1
+
+            setup_service = SetupService(
+                FileSetupStateStore(path=host_config.setup_state_file),
+                enabled=host_config.setup_enabled,
+                mode=host_config.setup_mode or host_config.platform_mode,
+                host_facts_file=host_config.host_facts_file,
+                database_probe=_database_probe,
+            )
+            app.state.setup_service = setup_service
+            stack_control = None
+            if host_config.stack_dir:
+                from cli.services.stack_control import DockerStackController
+
+                stack_control = DockerStackController(stack_dir=host_config.stack_dir)
+            app.include_router(create_setup_router(setup_service, stack=stack_control))
+
             enrollment_reconcile_task = asyncio.create_task(
                 reconcile_credential_enrollments_loop(credential_enrollment_service)
             )
+            token_refresh_task = None
+            if (
+                loaded_settings.local_mounts.mini_mode
+                and loaded_settings.oauth.mini_mode_refresh_enabled
+            ):
+                token_refresh_task = asyncio.create_task(
+                    refresh_oauth_tokens_loop(
+                        create_oauth_token_refresh_service(
+                            integration_repository=integration_repo,
+                            integration_registry=integration_registry,
+                            credential_store=credential_store,
+                            oauth_clients=oauth_clients,
+                        )
+                    )
+                )
             try:
                 yield
             finally:
+                if token_refresh_task is not None:
+                    token_refresh_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await token_refresh_task
                 enrollment_reconcile_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await enrollment_reconcile_task
                 release_credential_store(loaded_settings)
                 await git_registry.close()
+                # Not shutdown_observability() here: this host runs alongside
+                # volundr/ting/bifrost in mini mode. configure_observability
+                # registers an atexit shutdown hook for process-exit cleanup.
 
     app.router.lifespan_context = lifespan
 
     apply_cors_middleware(app, loaded_settings.cors)
-    app.add_middleware(PATRevocationMiddleware)
+    app.add_middleware(
+        PATRevocationMiddleware,
+        websocket_check_interval=loaded_settings.pat.websocket_check_interval,
+    )
     # Wire compression (2026-07-12) — see niuu.gzip_sse for the numbers + SSE safety.
     from niuu.gzip_sse import SSESafeGZipMiddleware
 

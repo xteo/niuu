@@ -1,6 +1,7 @@
 """Tests for domain services."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -12,6 +13,10 @@ from tests.conftest import (
     MockGitRegistry,
     MockPodManager,
 )
+from volundr.adapters.outbound.contributors.storage import StorageContributor
+from volundr.adapters.outbound.contributors.workload_identity import (
+    WorkloadIdentityContributor,
+)
 from volundr.adapters.outbound.k8s_storage import InMemoryStorageAdapter
 from volundr.domain.models import (
     Chronicle,
@@ -19,9 +24,14 @@ from volundr.domain.models import (
     CleanupTarget,
     GitProviderType,
     GitSource,
+    IntegrationType,
+    LocalMountSource,
+    Principal,
     RepoInfo,
+    Session,
     SessionStatus,
 )
+from volundr.domain.ports import SessionContribution
 from volundr.domain.services import (
     RepoService,
     RepoValidationError,
@@ -111,6 +121,87 @@ class TestSessionServiceGet:
         assert result.status == SessionStatus.STOPPED
         assert result.chat_endpoint is None
         assert result.code_endpoint is None
+
+    async def test_reconcile_session_if_active_preserves_provisioning_detail(
+        self, repository: Repo
+    ):
+        class WaitingPodManager(MockPodManager):
+            async def status(self, session):
+                return SessionStatus.PROVISIONING
+
+            async def status_detail(self, session):
+                return "No CPU hosts available. Your request will be automatically retried."
+
+        service = SessionService(repository, WaitingPodManager())
+        created = await service.create_session(
+            name="waiting",
+            model="claude-3-opus",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        await repository.update(created.with_status(SessionStatus.PROVISIONING))
+
+        result = await service.reconcile_session_if_active(created.id)
+
+        assert result is not None
+        assert result.status == SessionStatus.PROVISIONING
+        assert result.error == (
+            "No CPU hosts available. Your request will be automatically retried."
+        )
+
+    async def test_reconcile_session_if_active_preserves_failure_detail(self, repository: Repo):
+        class FailedPodManager(MockPodManager):
+            async def status(self, session):
+                return SessionStatus.FAILED
+
+            async def status_detail(self, session):
+                return "RuntimeError: workflow kickoff was never acknowledged"
+
+        service = SessionService(repository, FailedPodManager())
+        created = await service.create_session(
+            name="failed-startup",
+            model="claude-3-opus",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        await repository.update(created.with_status(SessionStatus.PROVISIONING))
+
+        result = await service.reconcile_session_if_active(created.id)
+
+        assert result is not None
+        assert result.status == SessionStatus.FAILED
+        assert result.error == "RuntimeError: workflow kickoff was never acknowledged"
+
+    @pytest.mark.parametrize(
+        ("detail", "expected_error"),
+        [
+            ("workflow kickoff failed", "workflow kickoff failed"),
+            (None, "Provisioning failed: infrastructure reported failure"),
+        ],
+    )
+    async def test_readiness_failure_persists_available_runtime_detail(
+        self,
+        repository: Repo,
+        detail: str | None,
+        expected_error: str,
+    ):
+        class FailedPodManager(MockPodManager):
+            async def status_detail(self, session):
+                return detail
+
+        pod_manager = FailedPodManager(wait_for_ready_result=SessionStatus.FAILED)
+        service = SessionService(repository, pod_manager)
+        created = await service.create_session(
+            name="failed-startup",
+            model="claude-3-opus",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        await repository.update(created.with_status(SessionStatus.PROVISIONING))
+
+        await service._poll_readiness(created, skip_initial_delay=True)
+
+        stored = await repository.get(created.id)
+        assert stored is not None
+        assert stored.status == SessionStatus.FAILED
+        assert stored.error == expected_error
 
     async def test_get_nonexistent_session(self, repository: Repo, pod_manager: Pods):
         """Getting a nonexistent session returns None."""
@@ -614,6 +705,32 @@ class TestSessionServiceStart:
         assert result.chat_endpoint.startswith("ws://localhost:")
         assert "session" in result.chat_endpoint
 
+    async def test_vm_pipeline_omits_kubernetes_identity_and_storage(
+        self,
+        repository: Repo,
+        pod_manager: Pods,
+    ):
+        storage = AsyncMock()
+        service = SessionService(
+            repository,
+            pod_manager,
+            contributors=[
+                StorageContributor(storage=storage),
+                WorkloadIdentityContributor(),
+            ],
+            runtime_backend="vm",
+        )
+        session = await service.create_session(name="vm", model="gpt-5.5")
+
+        await service._start_with_pipeline(session, None, None, None, False)
+
+        _, spec = pod_manager.start_calls[-1]
+        assert spec.values == {}
+        assert spec.pod_spec.service_account is None
+        assert spec.pod_spec.volumes == ()
+        assert spec.pod_spec.volume_mounts == ()
+        storage.get_workspace_by_session.assert_not_awaited()
+
     async def test_restart_preserves_workload_identity(self, repository: Repo, pod_manager: Pods):
         """Restart must not demote a special workload to a plain CLI session.
 
@@ -637,6 +754,200 @@ class TestSessionServiceStart:
 
         assert result.workload_type == "ravn_flock"
         assert result.workload_config["personas"] == ["product-steward"]
+
+    @pytest.mark.parametrize("override", ["", "Continue with the revised brief"])
+    async def test_restart_restores_workflow_brief(
+        self, repository: Repo, pod_manager: Pods, monkeypatch, override
+    ):
+        service = SessionService(repository, pod_manager)
+        session = await service.create_session(name="research", model="gpt-5.5")
+        await repository.update(
+            session.model_copy(
+                update={
+                    "status": SessionStatus.STOPPED,
+                    "workload_type": "ravn_flock",
+                    "workload_config": {"initiative_context": "Research PXE boot"},
+                }
+            )
+        )
+        provision = AsyncMock()
+        monkeypatch.setattr(service, "_provision_background", provision)
+
+        await service.start_session(session.id, initial_prompt=override)
+        await asyncio.gather(*service._provisioning_tasks.values())
+
+        assert provision.await_args.kwargs["initial_prompt"] == (override or "Research PXE boot")
+
+    async def test_restart_preserves_selected_connections(
+        self, repository, pod_manager, monkeypatch
+    ):
+        service = SessionService(repository, pod_manager)
+        session = await service.create_session(name="subscription", model="claude-sonnet-5")
+        await repository.update(
+            session.model_copy(
+                update={
+                    "status": SessionStatus.STOPPED,
+                    "workload_config": {"integration_ids": ["claude-connection"]},
+                }
+            )
+        )
+        provision = AsyncMock()
+        monkeypatch.setattr(service, "_provision_background", provision)
+        await service.start_session(session.id)
+        await asyncio.gather(*service._provisioning_tasks.values())
+        assert provision.await_args.kwargs["integration_ids"] == ["claude-connection"]
+
+    @pytest.mark.parametrize("launch_fails", [False, True])
+    async def test_resolved_connections_survive_provisioning(
+        self, repository, pod_manager, monkeypatch, launch_fails
+    ):
+        from types import SimpleNamespace
+
+        integrations = AsyncMock()
+        integrations.list_connections.return_value = [
+            SimpleNamespace(id="subscription", enabled=True)
+        ]
+        service = SessionService(repository, pod_manager, integration_repo=integrations)
+        monkeypatch.setattr(service, "_poll_readiness", AsyncMock())
+        if launch_fails:
+            monkeypatch.setattr(pod_manager, "start", AsyncMock(side_effect=RuntimeError("failed")))
+        session = await service.create_session(name="subscription", model="claude-sonnet-5")
+        await service._provision_background(
+            session, SimpleNamespace(user_id="owner"), None, None, False
+        )
+        stored = await repository.get(session.id)
+        assert stored.workload_config["integration_ids"] == ["subscription"]
+        expected = SessionStatus.FAILED if launch_fails else SessionStatus.PROVISIONING
+        assert stored.status == expected
+        assert len(pod_manager.stop_calls) == (1 if launch_fails else 0)
+        await asyncio.gather(*service._provisioning_tasks.values())
+
+    async def test_provisioning_timeout_reports_error_and_cleans_up(
+        self, repository, pod_manager, monkeypatch
+    ):
+        service = SessionService(repository, pod_manager)
+        monkeypatch.setattr(pod_manager, "start", AsyncMock(side_effect=TimeoutError()))
+        session = await service.create_session(name="timeout", model="claude")
+
+        await service._provision_background(session)
+
+        stored = await repository.get(session.id)
+        assert stored.status == SessionStatus.FAILED
+        assert stored.error == "Provisioning timed out"
+        assert pod_manager.stop_calls == [session]
+
+    @pytest.mark.parametrize("explicit_git", [False, True])
+    async def test_restart_auto_attaches_new_source_control_integration(
+        self,
+        repository,
+        pod_manager,
+        monkeypatch,
+        explicit_git,
+    ):
+        from types import SimpleNamespace
+
+        from volundr.domain.models import IntegrationType, Principal
+
+        ai = SimpleNamespace(
+            id="ai", owner_id="owner", enabled=True, integration_type=IntegrationType.AI_PROVIDER
+        )
+        github = SimpleNamespace(
+            id="github",
+            owner_id="owner",
+            enabled=True,
+            integration_type=IntegrationType.SOURCE_CONTROL,
+        )
+        disabled = SimpleNamespace(id="disabled", enabled=False)
+        integrations = AsyncMock()
+        integrations.get_connection.side_effect = lambda cid: {"ai": ai, "github": github}[cid]
+        integrations.list_connections.return_value = [github, disabled]
+        service = SessionService(repository, pod_manager, integration_repo=integrations)
+        monkeypatch.setattr(service, "_poll_readiness", AsyncMock())
+        selected = ["ai", "github"] if explicit_git else ["ai"]
+        session = await service.create_session(
+            name="git-session",
+            model="claude",
+            source=GitSource(repo="https://github.com/org/repo"),
+        )
+        await repository.update(
+            session.model_copy(
+                update={
+                    "status": SessionStatus.STOPPED,
+                    "workload_config": {"integration_ids": selected},
+                }
+            )
+        )
+        principal = Principal(user_id="owner", email="owner@test.local", tenant_id="t", roles=[])
+        await service.start_session(session.id, principal=principal)
+        await asyncio.gather(*service._provisioning_tasks.values())
+        stored = await repository.get(session.id)
+        assert stored.workload_config["integration_ids"] == ["ai", "github"]
+        if explicit_git:
+            integrations.list_connections.assert_not_called()
+        else:
+            integrations.list_connections.assert_awaited_once_with(
+                "owner",
+                integration_type=IntegrationType.SOURCE_CONTROL,
+            )
+
+    async def test_workflow_child_local_mount_excludes_source_control_credentials(
+        self,
+        repository,
+        pod_manager,
+    ):
+        ai = SimpleNamespace(
+            id="ai",
+            owner_id="owner",
+            enabled=True,
+            integration_type=IntegrationType.AI_PROVIDER,
+        )
+        github = SimpleNamespace(
+            id="github",
+            owner_id="owner",
+            enabled=True,
+            integration_type=IntegrationType.SOURCE_CONTROL,
+        )
+        integrations = AsyncMock()
+        integrations.get_connection.side_effect = lambda connection_id: {
+            "ai": ai,
+            "github": github,
+        }[connection_id]
+        contributor = SimpleNamespace(contribute=AsyncMock(return_value=SessionContribution()))
+        service = SessionService(
+            repository,
+            pod_manager,
+            integration_repo=integrations,
+            contributors=[contributor],
+        )
+        principal = Principal(
+            user_id="owner",
+            email="owner@test.local",
+            tenant_id="tenant",
+            roles=[],
+        )
+        session = await service.create_session(
+            name="developer-child",
+            model="gpt-5.5",
+            source=LocalMountSource(local_path="/tmp/developer-child"),
+            principal=principal,
+        )
+        workload_config = {"provenance": {"workflow_execution": {"execution_id": "execution-1"}}}
+
+        await service._start_with_pipeline(
+            session,
+            principal,
+            None,
+            None,
+            False,
+            integration_ids=["ai", "github"],
+            workload_config=workload_config,
+        )
+
+        context = contributor.contribute.await_args.args[1]
+        assert context.integration_ids == ("ai",)
+        assert context.integration_connections == (ai,)
+        stored = await repository.get(session.id)
+        assert stored.workload_config["integration_ids"] == ["ai"]
 
     async def test_start_session_prefers_public_host_for_browser_endpoints(
         self,
@@ -747,7 +1058,70 @@ class TestSessionServiceStart:
         session = await repository.get(created.id)
         assert session is not None
         assert session.status == SessionStatus.FAILED
-        assert session.error == "Pod start failed"
+        # Both the original provisioning failure and the cleanup failure that
+        # followed it must be recorded — a cleanup failure here left durable
+        # compute (or capacity) bound to this session, and no-fallbacks means
+        # that must never disappear into a warning log alone.
+        assert session.error == (
+            "Pod start failed; cleanup after provisioning failure also failed: Pod stop failed"
+        )
+
+    async def test_start_failure_cleanup_failure_is_swept_by_reconcile_for_durable_compute(
+        self, repository: Repo, failing_pod_manager: Pods
+    ):
+        """A VM-backed session whose provisioning cleanup also fails must not be
+        excluded from the reconcile sweep — otherwise the leaked machine is
+        never retried. Simulate that: after the FAILED status. If the pod
+        manager still reports the underlying infrastructure as failed, the
+        durable-compute reconcile sweep must attempt to stop it again."""
+        service = SessionService(repository, failing_pod_manager, runtime_backend="vm")
+        created = await service.create_session(
+            name="test",
+            model="claude-3-opus",
+            source=GitSource(
+                repo="https://github.com/org/repo",
+                branch="main",
+            ),
+        )
+        await service.start_session(created.id)
+        await asyncio.sleep(0.5)
+        session = await repository.get(created.id)
+        assert session is not None
+        assert session.status == SessionStatus.FAILED
+        failing_pod_manager.stop_calls.clear()
+        # The next reconcile pass is the retry: this time the (still-bound)
+        # infrastructure stop succeeds.
+        failing_pod_manager.stop_success = True
+
+        reconciled = await service.reconcile_active_sessions()
+
+        assert reconciled == 1
+        assert len(failing_pod_manager.stop_calls) == 1
+        assert failing_pod_manager.stop_calls[0].id == session.id
+
+    async def test_failed_vm_session_is_stopped_and_never_resurrected(
+        self, repository: Repo, failing_pod_manager: Pods
+    ):
+        """A VM runtime reports a still-bound lease as provisioning. The sweep
+        must release it without consulting status, or the failed session would
+        be promoted back to an active state."""
+        service = SessionService(repository, failing_pod_manager, runtime_backend="vm")
+        created = await service.create_session(
+            name="test",
+            model="claude-3-opus",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        await service.start_session(created.id)
+        await asyncio.sleep(0.5)
+        failing_pod_manager.stop_success = True
+        failing_pod_manager.status = AsyncMock(return_value=SessionStatus.PROVISIONING)
+
+        await service.reconcile_active_sessions()
+
+        failing_pod_manager.status.assert_not_awaited()
+        session = await repository.get(created.id)
+        assert session is not None
+        assert session.status == SessionStatus.FAILED
 
 
 class TestSessionServiceStop:
@@ -776,6 +1150,36 @@ class TestSessionServiceStop:
         assert result.chat_endpoint is None
         assert result.code_endpoint is None
         assert len(pod_manager.stop_calls) == 1
+
+    async def test_stop_failed_session_retries_cleanup(self, repository: Repo, pod_manager: Pods):
+        service = SessionService(repository, pod_manager)
+        session = Session(
+            id=uuid4(), name="failed", status=SessionStatus.FAILED, error="start failed"
+        )
+        await repository.create(session)
+        stopped = await service.stop_session(session.id)
+        assert pod_manager.stop_calls == [session]
+        assert stopped.status == SessionStatus.STOPPED
+        assert stopped.error is None
+
+    async def test_vm_stop_leaves_storage_cleanup_to_runtime(
+        self,
+        repository: Repo,
+        pod_manager: Pods,
+    ):
+        storage = AsyncMock()
+        service = SessionService(
+            repository,
+            pod_manager,
+            contributors=[StorageContributor(storage=storage)],
+            runtime_backend="vm",
+        )
+        session = await service.create_session(name="vm", model="gpt-5.5")
+        await repository.update(session.with_status(SessionStatus.RUNNING))
+
+        await service.stop_session(session.id)
+
+        storage.archive_session_workspace.assert_not_awaited()
 
     async def test_stop_nonexistent(self, repository: Repo, pod_manager: Pods):
         """Stopping a nonexistent session raises SessionNotFoundError."""
@@ -820,6 +1224,24 @@ class TestSessionServiceStop:
             await service.stop_session(created.id)
 
         assert exc_info.value.current_status == SessionStatus.STOPPED
+
+    async def test_stop_failed_session_cleans_up_infrastructure(
+        self, repository: Repo, pod_manager: Pods
+    ):
+        """A failed provision may still hold provider capacity and can be stopped."""
+        service = SessionService(repository, pod_manager)
+        created = await service.create_session(
+            name="test",
+            model="claude-3-opus",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        failed = created.with_status(SessionStatus.FAILED)
+        await repository.update(failed)
+
+        stopped = await service.stop_session(created.id)
+
+        assert stopped.status == SessionStatus.STOPPED
+        assert pod_manager.stop_calls == [failed]
 
     async def test_stop_failure_marks_failed_with_error(
         self, repository: Repo, failing_pod_manager: Pods
@@ -878,6 +1300,66 @@ class TestSessionServiceRecordActivity:
 
 class TestSessionServiceGitValidation:
     """Tests for SessionService git repository validation."""
+
+    @pytest.mark.parametrize("runtime_backend", ["kubernetes", "openshell"])
+    @pytest.mark.parametrize("valid", [True, False])
+    async def test_deployment_validates_with_owner_integration(
+        self, repository: Repo, pod_manager: Pods, runtime_backend: str, valid: bool
+    ):
+        shared = MockGitProvider(validate_success=not valid)
+        owner = MockGitProvider(validate_success=valid)
+        integrations = AsyncMock()
+        integrations.find_git_provider_for.return_value = owner
+        service = SessionService(
+            repository,
+            pod_manager,
+            git_registry=MockGitRegistry([shared]),
+            user_integration=integrations,
+            runtime_backend=runtime_backend,
+        )
+        principal = Principal(user_id="owner", email="owner@test.local", tenant_id="t", roles=[])
+        repo = "https://github.com/org/private"
+        if valid:
+            session = await service.create_session(
+                name="test",
+                model="test",
+                source=GitSource(repo=repo),
+                principal=principal,
+            )
+            assert session.owner_id == "owner"
+        else:
+            with pytest.raises(RepoValidationError):
+                await service.create_session(
+                    name="test",
+                    model="test",
+                    source=GitSource(repo=repo),
+                    principal=principal,
+                )
+        integrations.find_git_provider_for.assert_awaited_once_with(repo, "owner")
+        assert owner.validate_calls == [repo]
+        assert shared.validate_calls == []
+
+    async def test_local_launch_preserves_shared_validation(
+        self, repository: Repo, pod_manager: Pods
+    ):
+        shared = MockGitProvider(validate_success=True)
+        integrations = AsyncMock()
+        service = SessionService(
+            repository,
+            pod_manager,
+            git_registry=MockGitRegistry([shared]),
+            user_integration=integrations,
+            runtime_backend="local",
+        )
+        repo = "https://github.com/org/repo"
+        await service.create_session(
+            name="test",
+            model="test",
+            source=GitSource(repo=repo),
+            principal=Principal(user_id="owner", email="owner@test.local", tenant_id="t", roles=[]),
+        )
+        integrations.find_git_provider_for.assert_not_awaited()
+        assert shared.validate_calls == [repo]
 
     async def test_create_session_with_git_validation_success(
         self, repository: Repo, pod_manager: Pods
@@ -1268,3 +1750,31 @@ class TestSessionServiceCreateWithTemplate:
         assert session.repo == "https://github.com/other/repo"
         assert session.branch == "main"
         assert session.model == "claude-sonnet-4-20250514"
+
+
+class TestRepoServiceAccountsWithoutOrgs:
+    """A person's account added without organisations still lists its repositories."""
+
+    async def test_user_provider_without_orgs_lists_everything_it_can_reach(self) -> None:
+        from unittest.mock import AsyncMock
+
+        repo = RepoInfo(
+            provider=GitProviderType.GITHUB,
+            org="jve",
+            name="dotfiles",
+            clone_url="https://github.com/jve/dotfiles.git",
+            url="https://github.com/jve/dotfiles",
+        )
+        shared = MockGitProvider(name="Shared", orgs=())  # config provider: orgs stay explicit
+        personal = MockGitProvider(name="github-signin", orgs=(), repos=[repo])
+        registry = MockGitRegistry([shared])
+        user_int = AsyncMock()
+        user_int.get_git_providers = AsyncMock(return_value=[personal, shared])
+        service = RepoService(registry, user_integration=user_int)
+
+        result = await service.list_repos(user_id="user-1")
+
+        assert list(result) == ["github-signin"]
+        assert [r.name for r in result["github-signin"]] == ["dotfiles"]
+        assert personal.list_repos_calls == [""]
+        assert shared.list_repos_calls == []

@@ -155,6 +155,9 @@ class OpenClawGateway:
     async def run(self) -> None:
         import uvicorn
 
+        from niuu.observability import install_uvicorn_log_redaction
+
+        install_uvicorn_log_redaction()
         host = getattr(self._config, "host", "127.0.0.1")
         port = int(getattr(self._config, "port", 18790))
         server = uvicorn.Server(
@@ -205,6 +208,7 @@ class OpenClawGateway:
         try:
             await conn.run()
         except WebSocketDisconnect:
+            # Peer disconnect is the normal end of this connection.
             pass
         except Exception:
             logger.exception("OpenClaw shim connection failed")

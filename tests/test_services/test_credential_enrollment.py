@@ -6,14 +6,21 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+import respx
 
+from niuu.adapters.memory_credential_store import MemoryCredentialStore
 from volundr.adapters.outbound.memory_integrations import InMemoryIntegrationRepository
+from volundr.adapters.outbound.oauth_device_runner import OAuthDeviceFlowRunner
+from volundr.config import _default_integration_definitions
 from volundr.domain.models import (
     CredentialEnrollmentPoll,
     CredentialEnrollmentState,
     Principal,
+    SecretType,
 )
 from volundr.domain.services.credential_enrollment import (
     CredentialEnrollmentError,
@@ -24,6 +31,33 @@ from volundr.domain.services.integration_registry import (
     IntegrationRegistry,
     definitions_from_config,
 )
+from volundr.domain.services.oauth_clients import OAuthClientRegistry
+
+
+@respx.mock
+async def test_oauth_enrollment_saves_the_self_hosted_repository_api_url():
+    registry = IntegrationRegistry(
+        definitions_from_config([d.model_dump() for d in _default_integration_definitions()])
+    )
+    store = MemoryCredentialStore()
+    clients = OAuthClientRegistry(credential_store=store, integration_registry=registry)
+    await clients.register("github", "own-client", base_url="https://git.example.com")
+    repo = InMemoryIntegrationRepository()
+    service = CredentialEnrollmentService(
+        repository=_EnrollmentRepository(),
+        runner=OAuthDeviceFlowRunner(registry=registry, clients=clients),
+        integration_repository=repo,
+        integration_registry=registry,
+        credential_store=store,
+    )
+    respx.post("https://git.example.com/login/device/code").mock(
+        return_value=httpx.Response(
+            200, json={"device_code": "d", "user_code": "U", "verification_uri": "v"}
+        )
+    )
+    started = await service.start(principal=_principal("user"), slug="github")
+    connection = await repo.get_connection(started.connection_id)
+    assert connection.config["base_url"] == "https://git.example.com/api/v3"
 
 
 class _EnrollmentRepository:
@@ -90,6 +124,9 @@ class _Runner:
     def supports_enrollment(self, method: str) -> bool:
         return method == "codex_device"
 
+    def available_for(self, slug: str, method: str) -> bool:
+        return self.supports_enrollment(method)
+
     async def start_enrollment(self, enrollment):
         return replace(
             enrollment,
@@ -147,6 +184,53 @@ def _service():
     return service, enrollment_repository, integration_repository, credential_store, runner
 
 
+async def test_another_credential_name_is_another_account() -> None:
+    service, _, integration_repository, _, _ = _service()
+    principal = _principal("user-1")
+
+    first = await service.start(principal=principal, slug="codex")
+    second = await service.start(principal=principal, slug="codex", credential_name="codex-work")
+    again = await service.start(principal=principal, slug="codex", credential_name="codex-work")
+
+    assert first.credential_name == "codex-credentials"
+    assert second.credential_name == "codex-work"
+    assert first.connection_id != second.connection_id
+    assert again.id == second.id  # the running sign-in of that account, not a third one
+    connections = await integration_repository.list_connections("user-1")
+    assert sorted(c.credential_name for c in connections) == ["codex-credentials", "codex-work"]
+
+
+async def test_an_account_remembers_its_own_oauth_application() -> None:
+    service, _, integration_repository, _, _ = _service()
+    principal = _principal("user-1")
+
+    started = await service.start(
+        principal=principal, slug="codex", credential_name="codex-org", oauth_app="niuu-org"
+    )
+
+    connection = await integration_repository.get_connection(started.connection_id)
+    assert connection.config == {"oauth_app": "niuu-org"}
+    # codex signs in through its CLI, not an OAuth application: nothing to seed
+    assert "oauth_app" not in started.runner_ref
+
+
+async def test_a_retry_switches_the_account_to_the_application_chosen_now() -> None:
+    service, _, integration_repository, _, _ = _service()
+    principal = _principal("user-1")
+    first = await service.start(
+        principal=principal, slug="codex", credential_name="codex-org", oauth_app="default"
+    )
+    await service.cancel(first.id, principal)
+
+    again = await service.start(
+        principal=principal, slug="codex", credential_name="codex-org", oauth_app="niuulabs"
+    )
+
+    assert again.connection_id == first.connection_id
+    connection = await integration_repository.get_connection(again.connection_id)
+    assert connection.config["oauth_app"] == "niuulabs"
+
+
 async def test_same_credential_name_is_isolated_for_each_user() -> None:
     service, _, integration_repository, credential_store, _ = _service()
 
@@ -188,6 +272,41 @@ async def test_completed_login_persists_only_to_enrollment_owner() -> None:
     assert runner.cancelled == [enrollment.id]
 
 
+async def test_a_refused_start_shows_the_providers_answer(caplog) -> None:
+    service, repository, _, credential_store, runner = _service()
+    principal = _principal("user-1")
+
+    async def refused(enrollment):
+        raise ValueError("gitlab refused the device authorization request: invalid_client")
+
+    runner.start_enrollment = refused
+    with caplog.at_level("ERROR"):
+        with pytest.raises(CredentialEnrollmentError, match="invalid_client"):
+            await service.start(principal=principal, slug="codex")
+    assert "could not start: gitlab refused" in caplog.text
+    stored = credential_store.items[("user", "user-1", "codex-credentials")]
+    assert stored["metadata"]["auth_state"] == "auth_required"
+    assert stored["metadata"]["auth_error_code"] == "enrollment_failed"
+    assert all(row.state == CredentialEnrollmentState.FAILED for row in repository.items.values())
+
+
+async def test_fixed_lifetime_sign_ins_record_when_the_token_runs_out() -> None:
+    service, repository, _, credential_store, runner = _service()
+    principal = _principal("user-1")
+    enrollment = await service.start(principal=principal, slug="codex")
+    await repository.save(replace(enrollment, method="grok_device"))
+    runner.poll_result = CredentialEnrollmentPoll(
+        state=CredentialEnrollmentState.COMPLETE,
+        credential_data={"auth.json": "{}", "expires_at": "2026-09-19T10:00:00+00:00"},
+    )
+
+    completed = await service.get(enrollment.id, principal)
+
+    assert completed.state == CredentialEnrollmentState.COMPLETE
+    stored = credential_store.items[("user", "user-1", "codex-credentials")]
+    assert stored["metadata"]["auth_expires_at"] == "2026-09-19T10:00:00+00:00"
+
+
 async def test_other_user_cannot_read_or_complete_enrollment() -> None:
     service, _, _, credential_store, runner = _service()
     enrollment = await service.start(principal=_principal("user-1"), slug="codex")
@@ -210,6 +329,53 @@ async def test_start_is_idempotent_while_login_is_active() -> None:
     second = await service.start(principal=principal, slug="codex")
 
     assert second.id == first.id
+
+
+async def test_pending_worker_publishes_challenge_after_start():
+    service, repository, _, _, runner = _service()
+    principal = _principal("user-1")
+    enrollment = await service.start(principal=principal, slug="codex")
+    await repository.save(
+        replace(
+            enrollment, state=CredentialEnrollmentState.PENDING, verification_uri="", user_code=""
+        )
+    )
+    runner.poll_result = CredentialEnrollmentPoll(
+        state=CredentialEnrollmentState.AWAITING_USER,
+        verification_uri="https://auth.openai.com/codex/device",
+        user_code="NEW-CODE",
+    )
+    result = await service.get(enrollment.id, principal)
+    assert result.state == CredentialEnrollmentState.AWAITING_USER
+    assert result.user_code == "NEW-CODE"
+    assert result.verification_uri == runner.poll_result.verification_uri
+
+
+async def test_browser_code_is_owner_scoped_and_cannot_inject_terminal_controls():
+    service, repository, _, _, runner = _service()
+    principal = _principal("user-1")
+    attempt = await service.start(principal=principal, slug="codex")
+    await repository.save(replace(attempt, method="claude_setup"))
+    runner.submit_code = AsyncMock()
+    with pytest.raises(CredentialEnrollmentError, match="not found"):
+        await service.submit_code(attempt.id, _principal("other-user"), "test-code")
+    with pytest.raises(CredentialEnrollmentError, match="Invalid authorization code"):
+        await service.submit_code(attempt.id, principal, "test-code\ncommand")
+    runner.submit_code.assert_not_called()
+    result = await service.submit_code(attempt.id, principal, "test-code#test-state")
+    runner.submit_code.assert_awaited_once_with(result, "test-code#test-state")
+
+
+async def test_code_after_cancellation_is_rejected():
+    service, repository, _, _, runner = _service()
+    principal = _principal("user-1")
+    attempt = await service.start(principal=principal, slug="codex")
+    await repository.save(replace(attempt, method="claude_setup"))
+    await service.cancel(attempt.id, principal)
+    runner.submit_code = AsyncMock()
+    with pytest.raises(CredentialEnrollmentError, match="not waiting"):
+        await service.submit_code(attempt.id, principal, "test-code")
+    runner.submit_code.assert_not_called()
 
 
 async def test_expired_login_is_reaped_without_a_ui_poll() -> None:
@@ -270,3 +436,30 @@ async def test_reconcile_loop_reaps_stale_logins_and_survives_failures() -> None
 
     # A failing sweep must not end the loop: the next interval still runs.
     assert len(sweeps) == 3
+
+
+async def test_enrollment_cannot_be_resumed_from_another_tenant():
+    service, _, _, _, _ = _service()
+    principal = _principal("user-1")
+    enrollment = await service.start(principal=principal, slug="codex")
+    other = replace(principal, tenant_id="tenant-2")
+    with pytest.raises(CredentialEnrollmentError, match="not found"):
+        await service.start(principal=other, slug="codex")
+    with pytest.raises(CredentialEnrollmentError, match="not found"):
+        await service.get(enrollment.id, other)
+    with pytest.raises(CredentialEnrollmentError, match="not found"):
+        await service.cancel(enrollment.id, other)
+
+
+async def test_enrollment_cannot_replace_another_tenants_credential():
+    service, _, _, store, _ = _service()
+    await store.store(
+        "user",
+        "user-1",
+        "codex-credentials",
+        SecretType.OAUTH_TOKEN,
+        {"token": "private"},
+        {"tenant_id": "other-tenant"},
+    )
+    with pytest.raises(CredentialEnrollmentError, match="not found"):
+        await service.start(principal=_principal("user-1"), slug="codex")

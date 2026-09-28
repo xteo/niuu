@@ -12,10 +12,12 @@ from niuu.domain.outcome import OutcomeField
 from ravn.adapters.personas.loader import PersonaConfig, PersonaProduces
 from ravn.adapters.tools.build_tool import attach_build_tool
 from ravn.agent import RavnAgent, _build_assistant_content
+from ravn.budget import IterationBudget
 from ravn.domain.events import RavnEventType
-from ravn.domain.exceptions import MaxIterationsError
+from ravn.domain.exceptions import MaxIterationsError, PromptBudgetExceededError
 from ravn.domain.models import (
     LLMResponse,
+    Message,
     StopReason,
     StreamEvent,
     StreamEventType,
@@ -66,6 +68,58 @@ def make_agent(
 
 async def _record(events: list[SleipnirEvent], event: SleipnirEvent) -> None:
     events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_outcome_repair_is_tool_free_and_does_not_replay_history() -> None:
+    llm = AsyncMock(spec=LLMPort)
+    usage = TokenUsage(input_tokens=100, output_tokens=50)
+    llm.generate.return_value = LLMResponse(
+        content="working_state:\n  observations: []",
+        tool_calls=[],
+        stop_reason=StopReason.END_TURN,
+        usage=usage,
+    )
+    agent, _ = make_agent(llm, tools=[EchoTool()], max_prompt_tokens=1000)
+    history = Message(role="user", content="old observations " * 20000)
+    agent.session.messages.append(history)
+
+    result = await agent.repair_outcome("Repair working_state as a mapping")
+
+    assert result.response == llm.generate.return_value.content
+    assert result.usage == usage
+    assert agent.session.messages == [history]
+    assert llm.generate.call_args.args[0] == [
+        {"role": "user", "content": "Repair working_state as a mapping"}
+    ]
+    assert llm.generate.call_args.kwargs["tools"] == []
+    assert agent.prompt_budget_status["estimated_prompt_tokens"] < 1000
+
+    llm.generate.reset_mock()
+    with pytest.raises(PromptBudgetExceededError):
+        await agent.repair_outcome("oversized repair " * 20000)
+    llm.generate.assert_not_called()
+
+    llm.generate.return_value = LLMResponse(
+        content="",
+        tool_calls=[ToolCall(id="x", name="echo", input={})],
+        stop_reason=StopReason.TOOL_USE,
+        usage=usage,
+    )
+    with pytest.raises(ValueError, match="not tool calls"):
+        await agent.repair_outcome("Repair working_state")
+
+    budget = IterationBudget(total=1)
+    agent, _ = make_agent(llm, iteration_budget=budget)
+    llm.generate.return_value = LLMResponse(
+        content="repaired", tool_calls=[], stop_reason=StopReason.END_TURN, usage=usage
+    )
+    await agent.repair_outcome("Repair working_state")
+    assert budget.exhausted
+    llm.generate.reset_mock()
+    with pytest.raises(MaxIterationsError):
+        await agent.repair_outcome("Repair working_state")
+    llm.generate.assert_not_called()
 
 
 class _FakeSandboxShell:
@@ -459,6 +513,11 @@ class TestRavnAgentToolUse:
             valkyrie_id="resident-a",
         )
         tool_code = "def run(input):\n    return {'installed': True}\n"
+        test_code = (
+            "import _verify_tool\n\n"
+            "def test_ok():\n"
+            "    assert _verify_tool.run({}) == {'installed': True}\n"
+        )
         installed = await tool.execute(
             {
                 "manifest": {
@@ -468,6 +527,7 @@ class TestRavnAgentToolUse:
                     "required_permission": "probe:read",
                 },
                 "tool_code": tool_code,
+                "test_code": test_code,
                 "canary_input": {},
             }
         )
@@ -528,6 +588,12 @@ class TestRavnAgentToolUse:
                 "tool_code": (
                     "def run(input):\n"
                     "    return {'widget_id': input.get('widget_id'), 'status': 'ok'}\n"
+                ),
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    result = _verify_tool.run({'widget_id': 'x'})\n"
+                    "    assert result == {'widget_id': 'x', 'status': 'ok'}\n"
                 ),
                 "canary_input": {"widget_id": "canary"},
             },
@@ -603,6 +669,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "pure_compute", "access": "none"}],
                 },
                 "tool_code": "def run(input):\n    return {'ok': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'ok': True}\n"
+                ),
                 "canary_input": {},
             }
         )
@@ -617,6 +688,11 @@ class TestRavnAgentToolUse:
         assert payload["tool_code"].startswith("def run")
         # P5a default preserved: without config the proposal travels at 0.74.
         assert payload["confidence"] == pytest.approx(0.74)
+        # NIU capability-propagation-contract: the one publisher carries
+        # test_code + builder_evidence to the peer, which build_tool's
+        # proposal used to omit entirely.
+        assert payload["test_code"].strip().startswith("import _verify_tool")
+        assert payload["builder_evidence"]["verification"]["ok"] is True
 
     async def test_build_tool_keeps_success_when_flock_publication_fails(self, tmp_path) -> None:
         class _UnavailablePublisher:
@@ -642,6 +718,11 @@ class TestRavnAgentToolUse:
                     "required_permission": "probe:read",
                 },
                 "tool_code": "def run(input):\n    return {'ok': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'ok': True}\n"
+                ),
                 "canary_input": {},
             }
         )
@@ -686,6 +767,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "pure_compute", "access": "none"}],
                 },
                 "tool_code": "def run(input):\n    return {'ok': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'ok': True}\n"
+                ),
                 "canary_input": {},
             }
         )
@@ -729,6 +815,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "kubernetes_write", "access": "write"}],
                 },
                 "tool_code": "def run(input):\n    return {'restarted': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'restarted': True}\n"
+                ),
                 "canary_input": {"name": "canary"},
             }
         )
@@ -783,6 +874,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "pure_compute", "access": "none"}],
                 },
                 "tool_code": "def run(input):\n    return {'ok': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'ok': True}\n"
+                ),
                 "canary_input": {},
             }
         )
@@ -829,6 +925,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "credential", "access": "read"}],
                 },
                 "tool_code": "def run(input):\n    return {'ok': True}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'ok': True}\n"
+                ),
                 "canary_input": {},
             }
         )
@@ -863,6 +964,11 @@ class TestRavnAgentToolUse:
                     "declared_reach": [{"kind": "pure_compute", "access": "none"}],
                 },
                 "tool_code": "def run(input):\n    return {'backend': 'local'}\n",
+                "test_code": (
+                    "import _verify_tool\n\n"
+                    "def test_ok():\n"
+                    "    assert _verify_tool.run({}) == {'backend': 'local'}\n"
+                ),
                 "canary_input": {},
             }
         )

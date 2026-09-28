@@ -40,8 +40,27 @@ from niuu.adapters.inbound.forge_notification_feed import (
     merge_newest,
 )
 from niuu.adapters.inbound.forge_session_stream import merge_events, remote_events
-from niuu.adapters.inbound.remote_urls import build_remote_url
+from niuu.adapters.inbound.remote_urls import (
+    build_remote_url,
+)
+from niuu.adapters.inbound.remote_urls import (
+    forward_identity_headers as _forward_headers,
+)
+from niuu.adapters.inbound.remote_urls import (
+    forward_local_identity_headers as _forward_local_headers,
+)
+from niuu.adapters.inbound.remote_urls import (
+    forward_websocket_identity_headers as _forward_websocket_headers,
+)
+from niuu.adapters.inbound.source_health import (
+    instance_source_failures,
+    set_source_health_header,
+)
 from niuu.adapters.inbound.ws_forge_replay import forward_replay
+from niuu.adapters.outbound.guild_transport import (
+    GuildTransportError,
+    build_guild_httpx_client,
+)
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.notifications import notification_visible_to
 from niuu.domain.services.forge_session_policy import policy_refusal
@@ -55,6 +74,24 @@ MCP_PATH = "/mcp"
 NOTIFICATION_EVENT = "session_notification"
 # Gateway-only selectors: never forwarded to a Forge node, whose ids differ.
 _FLEET_SELECTORS = frozenset({"instance_id", "all_instances", "scope"})
+
+_DELIVERY_POST_PATHS = frozenset(
+    {
+        "refs/resolve",
+        "forge/reviews",
+        "forge/branches",
+        "workspaces/allocate",
+        "workspaces/verify",
+        "workspaces/integration/inspect",
+        "workspaces/integration/inspect-chain",
+        "evidence/policy",
+        "evidence/validate",
+        "workspaces/integrate",
+        "forge/inspect",
+        "forge/merge",
+        "forge/reconcile",
+    }
+)
 
 
 class SessionProjectAssignment(BaseModel):
@@ -94,21 +131,6 @@ def _is_session_principal(principal: Principal) -> bool:
 
 def _local_only(instances: list[RegisteredInstance]) -> list[RegisteredInstance]:
     return [instance for instance in instances if _uses_embedded_transport(instance)]
-
-
-def _forward_headers(request: Request) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    for name in (
-        "authorization",
-        "x-auth-user-id",
-        "x-auth-email",
-        "x-auth-tenant",
-        "x-auth-roles",
-    ):
-        value = request.headers.get(name)
-        if value:
-            headers[name] = value
-    return headers
 
 
 async def _visible_instances(
@@ -265,11 +287,26 @@ def _with_resource_type_aliases(item: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
+def _upstream_detail(response: httpx.Response) -> str:
+    """The upstream's own message: the ``detail`` of a FastAPI error body,
+    otherwise the body text, otherwise the reason phrase. Forwarding the raw
+    JSON body used to wrap the message in a second ``{"detail": ...}`` layer,
+    which the clients then showed verbatim."""
+    text = response.text.strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            return payload["detail"]
+    return text or response.reason_phrase
+
+
 def _ensure_remote_success(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
-    detail = response.text.strip() or response.reason_phrase
-    raise HTTPException(status_code=response.status_code, detail=detail[:1000])
+    raise HTTPException(status_code=response.status_code, detail=_upstream_detail(response)[:1000])
 
 
 def _ensure_history_success(response: httpx.Response) -> None:
@@ -406,14 +443,20 @@ async def _request_remote(
     embedded_app: ASGIApp | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
-    if not _uses_embedded_transport(instance) and presented_session_claims(request) is not None:
+    embedded = _uses_embedded_transport(instance)
+    if not embedded and presented_session_claims(request) is not None:
         # Never forward a session credential to another node: it is local, and the
         # remote node could not (and must not) honour it.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=LOCAL_NODE_ONLY_DETAIL.format(instance_id=instance.id),
         )
-    headers = _forward_headers(request)
+    # An embedded target shares this process (ASGITransport, no network hop),
+    # so it is not a separate trust domain and gets the caller's full resolved
+    # identity, same as today. A non-embedded target is a genuinely remote
+    # Guild instance and gets only the bearer token — see
+    # niuu.adapters.inbound.remote_urls.forward_identity_headers.
+    headers = _forward_local_headers(request) if embedded else _forward_headers(request)
     if extra_headers:
         headers.update(extra_headers)
     request_kwargs: dict[str, Any] = {
@@ -424,7 +467,7 @@ async def _request_remote(
         request_kwargs["content"] = content_body
     elif json_body is not None:
         request_kwargs["json"] = json_body
-    if _uses_embedded_transport(instance):
+    if embedded:
         if embedded_app is None:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -442,12 +485,19 @@ async def _request_remote(
                 **request_kwargs,
             )
 
+    dial_url = base_url or instance.base_url
     try:
-        remote_url = build_remote_url(base_url or instance.base_url, remote_prefix, path)
+        remote_url = build_remote_url(dial_url, remote_prefix, path)
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+    try:
+        client = await build_guild_httpx_client(
+            instance, dial_url=dial_url, timeout_seconds=timeout
+        )
+    except GuildTransportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    async with client:
         response = await client.request(
             method,
             remote_url,
@@ -517,6 +567,96 @@ async def _sync_persona_to_instance(
     _ensure_remote_success(synced)
 
 
+async def _sync_realm_to_instance(
+    instance: RegisteredInstance,
+    request: Request,
+    realm_id: object,
+    *,
+    embedded_app: ASGIApp | None,
+) -> None:
+    """Sync a realm from this host's local database onto a remote target.
+
+    Deploying a resident bound to a realm (realm_id in the create body)
+    forwards that id verbatim to the target instance, whose ResidentRuntime
+    FK requires a matching realms row on ITS OWN database. Realms otherwise
+    only exist wherever they were created (e.g. ymir), so without this a
+    resident deployed on a different instance (e.g. noatun, valhalla) fails
+    at create with "Realm not found" and is left half-made. This makes the
+    same realm identity (id + slug) exist on the target first — the same
+    "materialize the source of truth on the remote before launch" pattern
+    _sync_persona_to_instance uses for personas.
+
+    Raises on any failure: a realm_id was explicitly requested, so a resident
+    created without it actually being synced would silently drop the link
+    the caller asked for (see .claude/rules/no-fallbacks.md) — worse than
+    refusing the create.
+
+    This syncs the realm ROW, not its Mímir charter page (realms/<slug>/
+    charter.md, written by the create-realm wizard to whichever Mímir mount
+    it targeted). The deployed resident resolves that page for itself at
+    startup (environment.charter_mimir_page) and fails loudly if it cannot
+    read it — see resident_runtime_wiring.py's _resolve_environment_charter.
+    For that to succeed on a resident deployed on a DIFFERENT instance than
+    the one the realm was created on, the target instance's resident
+    deployment profile (resident.mimir.instances in its deployment.values)
+    must itself be configured with a Mímir mount that can read the SAME
+    underlying pages — either a Mímir shared/reachable across instances, or
+    an operator-configured mount pointing at the realm-owning instance's
+    Mímir. This function cannot discover or provision that network path; if
+    it is not configured, the resident's own charter check raises with a
+    precise "page does not exist" error naming the missing page, which is
+    the intended fail-loud outcome documented here rather than solved here.
+    """
+    raw_id = str(realm_id or "").strip()
+    if not raw_id:
+        return
+    if _uses_embedded_transport(instance):
+        return  # The target IS this host; the realm already lives here.
+
+    try:
+        parsed_id = UUID(raw_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Invalid realm id: {raw_id!r}",
+        ) from exc
+
+    realm_service = getattr(getattr(embedded_app, "state", None), "realm_service", None)
+    if realm_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Cannot deploy a resident bound to realm {parsed_id}: this host has no "
+                "local realm service to read it from before syncing it to the target "
+                "instance."
+            ),
+        )
+    realm = await realm_service.get_realm(parsed_id)
+    if realm is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"Realm not found: {parsed_id}",
+        )
+
+    synced = await _request_remote(
+        instance,
+        request,
+        method="PUT",
+        path=f"/realms/by-id/{parsed_id}",
+        remote_prefix="/api/v1",
+        json_body={
+            "slug": realm.slug,
+            "name": realm.name,
+            "sleipnir_domain": realm.sleipnir_domain,
+            "owner_id": realm.owner_id,
+            "instance_id": realm.instance_id,
+            "autonomy_profile": realm.autonomy_profile,
+        },
+        embedded_app=embedded_app,
+    )
+    _ensure_remote_success(synced)
+
+
 async def _local_session_instance(
     service: InstanceService,
     principal: Principal,
@@ -551,6 +691,71 @@ def _local_session_scope(request: Request) -> bool:
     return scope == "local"
 
 
+async def _find_runtime_owner(
+    service: InstanceService,
+    principal: Principal,
+    request: Request,
+    path: str,
+    not_found_detail: str,
+    *,
+    embedded_app: ASGIApp | None,
+    rebase_chat_endpoint: bool = True,
+    local_scope: bool = False,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[RegisteredInstance, dict[str, Any]]:
+    async def probe(instance: RegisteredInstance) -> tuple[RegisteredInstance, httpx.Response]:
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=path,
+            extra_headers=extra_headers,
+            embedded_app=embedded_app,
+            timeout=5.0,
+        )
+        return instance, response
+
+    selected = request.query_params.get("instance_id")
+    if local_scope:
+        instances = [await _local_session_instance(service, principal, request)]
+    elif selected:
+        instances = [await _resolve_target_instance(service, principal, selected)]
+    else:
+        instances = await _visible_instances(service, principal)
+    tasks = [asyncio.create_task(probe(instance)) for instance in instances]
+    failure: HTTPException | None = None
+    try:
+        # Ownership is unknown until a visible instance returns the resource.
+        # An unrelated offline instance must not delay a healthy owner's reply.
+        for task in asyncio.as_completed(tasks):
+            try:
+                instance, response = await task
+            except httpx.RequestError:
+                failure = HTTPException(502, "An instance was unreachable during owner lookup")
+                continue
+            except HTTPException as exc:
+                failure = exc
+                continue
+            if response.status_code in {status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND}:
+                continue
+            if response.is_error:
+                failure = HTTPException(502, "An instance failed during owner lookup")
+                continue
+            payload = response.json()
+            if isinstance(payload, dict):
+                return instance, _with_instance(
+                    payload, instance, rebase_chat_endpoint=rebase_chat_endpoint
+                )
+        if failure is not None:
+            # A partial search cannot establish that the resource is absent.
+            raise failure
+        raise HTTPException(status_code=404, detail=not_found_detail)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _find_session_owner(
     service: InstanceService,
     principal: Principal,
@@ -558,39 +763,17 @@ async def _find_session_owner(
     session_id: str,
     *,
     embedded_app: ASGIApp | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[RegisteredInstance, dict[str, Any]]:
-    selected = request.query_params.get("instance_id")
-    if _local_session_scope(request):
-        instances = [await _local_session_instance(service, principal, request)]
-    elif selected:
-        instances = [await _resolve_target_instance(service, principal, selected)]
-    else:
-        instances = await _visible_instances(service, principal)
-    for instance in instances:
-        response = await _request_remote(
-            instance,
-            request,
-            method="GET",
-            path=f"/sessions/{session_id}",
-            embedded_app=embedded_app,
-        )
-        if response.status_code == status.HTTP_404_NOT_FOUND:
-            continue
-        if response.status_code == status.HTTP_403_FORBIDDEN:
-            continue
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive transport mapping
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=str(exc),
-            ) from exc
-        payload = response.json()
-        if isinstance(payload, dict):
-            return instance, _with_instance(payload, instance)
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Session not found: {session_id}",
+    return await _find_runtime_owner(
+        service,
+        principal,
+        request,
+        f"/sessions/{session_id}",
+        f"Session not found: {session_id}",
+        embedded_app=embedded_app,
+        local_scope=_local_session_scope(request),
+        extra_headers=extra_headers,
     )
 
 
@@ -602,23 +785,14 @@ async def _find_resident_owner(
     *,
     embedded_app: ASGIApp | None = None,
 ) -> tuple[RegisteredInstance, dict[str, Any]]:
-    for instance in await _visible_instances(service, principal):
-        response = await _request_remote(
-            instance,
-            request,
-            method="GET",
-            path=f"/resident-runtimes/{runtime_id}",
-            embedded_app=embedded_app,
-        )
-        if response.status_code in {status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND}:
-            continue
-        _ensure_remote_success(response)
-        payload = response.json()
-        if isinstance(payload, dict):
-            return instance, _with_instance(payload, instance, rebase_chat_endpoint=False)
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Resident runtime not found: {runtime_id}",
+    return await _find_runtime_owner(
+        service,
+        principal,
+        request,
+        f"/resident-runtimes/{runtime_id}",
+        f"Resident runtime not found: {runtime_id}",
+        embedded_app=embedded_app,
+        rebase_chat_endpoint=False,
     )
 
 
@@ -714,6 +888,11 @@ def create_volundr_router(
     service: InstanceService,
     *,
     embedded_forge_app: ASGIApp | None = None,
+    forge_stream_remote_timeout_seconds: float = 45.0,
+    forge_stream_remote_connect_timeout_seconds: float = 5.0,
+    forge_stream_retry_seconds: float = 5.0,
+    forge_stream_keepalive_seconds: float = 15.0,
+    forge_stream_queue_maxsize: int = 256,
 ) -> APIRouter:
     """Create a registry-aware Forge runtime router."""
     router = APIRouter(
@@ -721,6 +900,75 @@ def create_volundr_router(
         tags=["Forge"],
         dependencies=[Depends(_session_route_guard)],
     )
+
+    @router.post("/delivery/{operation:path}")
+    async def delivery_operation(
+        request: Request,
+        operation: str,
+        instance_id: str | None = Query(default=None),
+        target_tags: list[str] | None = Query(default=None),
+        target_match: str = Query(default="all"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Forward the typed coordinator delivery surface to one visible Forge."""
+        if operation not in _DELIVERY_POST_PATHS:
+            raise HTTPException(status_code=404, detail="Unknown delivery operation")
+        instance = await _resolve_target_instance(
+            service,
+            principal,
+            instance_id,
+            tags=target_tags,
+            match=target_match,
+        )
+        body = await request.body()
+        content_type = request.headers.get("content-type")
+        response = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=f"/delivery/{operation}",
+            content_body=body,
+            params=[
+                (key, value)
+                for key, value in request.query_params.multi_items()
+                if key not in {"instance_id", "target_tags", "target_match"}
+            ],
+            extra_headers={"content-type": content_type} if content_type else None,
+            embedded_app=embedded_forge_app,
+        )
+        forwarded_headers = {
+            name: response.headers[name]
+            for name in ("content-type", "retry-after", "www-authenticate")
+            if name in response.headers
+        }
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=forwarded_headers,
+        )
+
+    @router.get("/storage/home")
+    @router.delete("/storage/home")
+    async def manage_user_home(
+        request: Request,
+        instance_id: str = Query(...),
+        path: str = Query(default=""),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        instance = await _resolve_target_instance(service, principal, instance_id)
+        response = await _request_remote(
+            instance,
+            request,
+            method=request.method,
+            path="/storage/home",
+            params=[("path", path)],
+            embedded_app=embedded_forge_app,
+        )
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type="application/json",
+        )
 
     @router.get("/resident-profiles")
     async def list_resident_profiles(
@@ -1429,6 +1677,8 @@ def create_volundr_router(
             ),
             reverse=True,
         )
+        if not selected:
+            set_source_health_header(response, instance_source_failures(instances, results))
         return sessions
 
     @router.get("/sessions/stream")
@@ -1457,21 +1707,41 @@ def create_volundr_router(
             else [await _resolve_target_instance(service, principal, selected)]
         )
         headers = _forward_headers(request)
-        broadcaster = getattr(getattr(embedded_forge_app, "state", None), "broadcaster", None)
-        if not fleet and _uses_embedded_transport(instances[0]) and broadcaster is None:
+        # The embedded Forge's principal-scoped stream, never its raw broadcaster:
+        # a subscriber only receives events for sessions it may list.
+        local_stream = getattr(
+            getattr(embedded_forge_app, "state", None), "session_event_stream", None
+        )
+        if not fleet and _uses_embedded_transport(instances[0]) and local_stream is None:
             raise HTTPException(status_code=503, detail="Session event stream unavailable")
+        if local_stream is not None and any(map(_uses_embedded_transport, instances)):
+            try:
+                local_stream.authorize(principal)
+            except PermissionError as exc:
+                raise HTTPException(status_code=401, detail=str(exc)) from exc
 
         async def events(instance: RegisteredInstance) -> Any:
             if _uses_embedded_transport(instance):
-                if broadcaster is None:
+                if local_stream is None:
                     raise RuntimeError("Session event stream unavailable")
-                async for event in broadcaster.subscribe():
+                async for event in local_stream.subscribe(principal):
+                    # Notifications are the owner's (or an admin's) only.
                     if not _event_visible(event.type.value, event.data, principal):
                         continue
                     yield event.type.value, _with_instance(event.data, instance)
             else:
                 url = build_remote_url(instance.base_url, "/api/v1/forge", "/sessions/stream")
-                async for name, payload in remote_events(url, headers):
+                # A GuildTransportError here (policy refusal or pin mismatch)
+                # is not caught specially: it propagates to merge_events'
+                # own per-source Exception handler, which already logs and
+                # retries this source exactly like any other stream failure.
+                client = await build_guild_httpx_client(
+                    instance,
+                    dial_url=instance.base_url,
+                    timeout_seconds=forge_stream_remote_timeout_seconds,
+                    connect_timeout_seconds=forge_stream_remote_connect_timeout_seconds,
+                )
+                async for name, payload in remote_events(client, url, headers):
                     # The node filters too; re-check so an older node cannot leak
                     # another owner's notification through the fleet stream.
                     if not _event_visible(name, payload, principal):
@@ -1480,7 +1750,10 @@ def create_volundr_router(
 
         return StreamingResponse(
             merge_events(
-                {instance.id: lambda item=instance: events(item) for instance in instances}
+                {instance.id: lambda item=instance: events(item) for instance in instances},
+                retry_seconds=forge_stream_retry_seconds,
+                keepalive_seconds=forge_stream_keepalive_seconds,
+                queue_maxsize=forge_stream_queue_maxsize,
             ),
             media_type="text/event-stream",
             headers={
@@ -1822,14 +2095,13 @@ def create_volundr_router(
     @router.get("/feature-flags")
     async def get_feature_flags(
         request: Request,
+        instance_id: str | None = Query(default=None),
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
         instance = (
             await _local_session_instance(service, principal, request)
             if _local_session_scope(request)
-            else await _resolve_target_instance(
-                service, principal, request.query_params.get("instance_id")
-            )
+            else await _resolve_target_instance(service, principal, instance_id)
         )
         response = await _request_remote(
             instance,
@@ -2437,6 +2709,27 @@ def create_volundr_router(
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
 
+    @router.get("/sessions/{session_id}/log/page")
+    async def get_log_page(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/log/page",
+            params=_query_params(request),
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
     @router.get("/sessions/{session_id}/log")
     async def get_log(
         request: Request,
@@ -2466,9 +2759,18 @@ def create_volundr_router(
     @router.websocket("/sessions/{session_id}/replay")
     async def replay_session(websocket: WebSocket, session_id: str) -> None:
         principal = await extract_principal(websocket)
+        # Browsers cannot set Authorization on a WebSocket, so the bearer may
+        # have arrived as ?token=/?access_token=. Carry it as a header on the
+        # owner probes and the bridged socket, or every owner answers 401.
+        headers = _forward_websocket_headers(websocket)
         try:
             instance, _ = await _find_session_owner(
-                service, principal, websocket, session_id, embedded_app=embedded_forge_app
+                service,
+                principal,
+                websocket,
+                session_id,
+                embedded_app=embedded_forge_app,
+                extra_headers=headers,
             )
         except HTTPException:
             await websocket.close(code=1008)
@@ -2477,7 +2779,7 @@ def create_volundr_router(
             websocket,
             instance,
             session_id,
-            headers=_forward_headers(websocket),
+            headers=headers,
             embedded_app=embedded_forge_app,
         )
 

@@ -7,32 +7,16 @@ falls back to allow-all with a default identity only when
 
 from __future__ import annotations
 
-from contextvars import ContextVar
-
 from fastapi import HTTPException, Request, status
 
-from niuu.domain.models import Principal
-
-_current_bearer_token: ContextVar[str | None] = ContextVar(
-    "ting_current_bearer_token",
-    default=None,
+from niuu.adapters.identity_headers import parse_roles_header
+from niuu.adapters.inbound.auth_context import (
+    current_bearer_token as current_bearer_token,
 )
-
-
-def current_bearer_token() -> str | None:
-    """Return the bearer token for the current request context, if available."""
-    return _current_bearer_token.get()
-
-
-def extract_bearer_token(request: Request) -> str | None:
-    """Extract Bearer token from the Authorization header, or None."""
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        _current_bearer_token.set(None)
-        return None
-    token = auth[7:]
-    _current_bearer_token.set(token)
-    return token
+from niuu.adapters.inbound.auth_context import (
+    extract_bearer_token as extract_bearer_token,
+)
+from niuu.domain.models import Principal
 
 
 async def extract_principal(request: Request) -> Principal:
@@ -42,6 +26,37 @@ async def extract_principal(request: Request) -> Principal:
     back to a default developer identity. Otherwise returns 401.
     """
     extract_bearer_token(request)
+    if getattr(request.app.state, "identity", None) is not None:
+        from identity.adapters.http_auth import extract_principal as configured_identity
+
+        settings = getattr(request.app.state, "settings", None)
+        if settings is None or not settings.auth.allow_anonymous_dev:
+            principal = await configured_identity(request)
+            from identity.adapters.http_auth import authorization_http_errors
+            from identity.models import Resource
+
+            # Admission before route code can call external trackers or runtimes.
+            authorization = request.app.state.authorization
+            with authorization_http_errors():
+                allowed = await authorization.is_allowed(
+                    principal,
+                    "enter",
+                    Resource(
+                        "gateway",
+                        request.url.path,
+                        {
+                            "owner_id": "",
+                            "tenant_id": principal.tenant_id,
+                            "method": request.method,
+                            "required_scope": "",
+                            "scoped": False,
+                            "scopes": [],
+                        },
+                    ),
+                )
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Operation denied")
+            return principal
     user_id = request.headers.get("x-auth-user-id", "")
     if not user_id:
         settings = getattr(request.app.state, "settings", None)
@@ -55,12 +70,12 @@ async def extract_principal(request: Request) -> Principal:
         return Principal(
             user_id=default_uid,
             email="",
-            tenant_id="",
+            tenant_id=settings.auth.default_tenant_id if settings else "",
             roles=["volundr:developer"],
         )
     return Principal(
         user_id=user_id,
         email=request.headers.get("x-auth-email", ""),
         tenant_id=request.headers.get("x-auth-tenant", ""),
-        roles=request.headers.get("x-auth-roles", "volundr:developer").split(","),
+        roles=parse_roles_header(request.headers.get("x-auth-roles", "")),
     )

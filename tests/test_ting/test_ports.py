@@ -17,6 +17,7 @@ class TestTrackerPort:
 
     def test_methods_exist(self) -> None:
         methods = {
+            "bind_connection",
             "create_saga",
             "create_phase",
             "create_run",
@@ -32,11 +33,11 @@ class TestTrackerPort:
             "list_issues",
             "update_run_progress",
             "get_run_progress_for_saga",
+            "get_authorized_run_progress_for_saga",
+            "has_unscoped_run_progress_for_saga",
             "get_run_by_session",
             "list_runs_by_status",
             "get_run_by_id",
-            "add_confidence_event",
-            "get_confidence_events",
             "all_runs_merged",
             "list_phases_for_saga",
             "update_phase_status",
@@ -66,12 +67,21 @@ class TestVolundrPort:
     def test_methods_exist(self) -> None:
         methods = {
             "spawn_session",
+            "resolve_delivery_ref",
+            "validate_delivery_evidence",
+            "describe_delivery_policy",
+            "inspect_delivery_candidate",
+            "reconcile_delivery_merge",
+            "inspect_delivery_integration",
+            "inspect_delivery_integration_chain",
+            "get_current_portable_persona",
             "get_session",
             "list_sessions",
             "get_pr_status",
             "get_chronicle_summary",
             "send_message",
             "send_directed_room_message",
+            "publish_workflow_event",
             "get_workflow_gates",
             "resolve_workflow_gate",
             "get_help_requests",
@@ -80,6 +90,7 @@ class TestVolundrPort:
             "list_integration_ids",
             "list_repos",
             "get_conversation",
+            "get_public_session_log_page",
             "get_last_assistant_message",
             "subscribe_activity",
         }

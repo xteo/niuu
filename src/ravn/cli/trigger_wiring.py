@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 from ravn.domain.events import RavnEvent, RavnEventType
@@ -191,6 +192,92 @@ def _wire_cron(
     return tools
 
 
+def _wire_api_triggers(drive_loop: Any, settings: Settings, persona_name: str) -> None:
+    """Load this resident's durable triggers from the Ravn API and run them.
+
+    Reuses the workload-authenticated HTTP boundary ``RealmClient`` already
+    uses (``ravn.adapters.realm.client``) rather than a direct database
+    connection — a resident deployed in a container already carries
+    ``gateway.platform``'s base URL and workload identity, so this avoids
+    shipping Postgres credentials to every resident pod. See
+    ``ravn.adapters.triggers.api_source`` for the execution engines this
+    drives (cron reuses ``CronTrigger``; event reuses ``SleipnirEventTrigger``).
+
+    Configured-but-impossible is fatal, not a skip: ``resident_triggers.enabled:
+    true`` with no persona, no platform base URL, or no AMQP transport
+    configured cannot silently run with zero triggers or retry an unusable
+    event transport forever.
+    """
+    if not settings.resident_triggers.enabled:
+        return
+    if not persona_name:
+        raise ValueError(
+            "resident_triggers.enabled is true but this resident has no persona "
+            "configured — triggers are scoped by persona_name, so set a persona "
+            "(initiative.default_persona or a deployed persona_config), or set "
+            "resident_triggers.enabled: false"
+        )
+    platform = settings.gateway.platform
+    if not platform.base_url:
+        raise ValueError(
+            "resident_triggers.enabled is true but gateway.platform.base_url is empty — "
+            "set gateway.platform.base_url (and a PAT or workload identity) so this "
+            "resident can reach its trigger store, or set resident_triggers.enabled: false"
+        )
+
+    import os  # noqa: PLC0415
+
+    from ravn.adapters.tool_build.http import client_from_workload_identity  # noqa: PLC0415
+    from ravn.adapters.triggers.api_source import ApiCronJobStore, ApiTriggerSource  # noqa: PLC0415
+    from ravn.adapters.triggers.cron import CronTrigger  # noqa: PLC0415
+
+    amqp_url = os.environ.get(settings.sleipnir.amqp_url_env, "")
+    if not amqp_url:
+        raise ValueError(
+            f"resident_triggers.enabled is true but ${settings.sleipnir.amqp_url_env} is "
+            "not set — event-kind triggers need Sleipnir's AMQP transport, and templates "
+            "this resident may be assigned (e.g. Simple mode's product/QA residents) "
+            "create event triggers by default. Set that env var, or set "
+            "resident_triggers.enabled: false if this resident will only ever use "
+            "cron-kind triggers"
+        )
+
+    client = client_from_workload_identity(
+        base_url=platform.base_url,
+        external_token=platform.pat_token,
+        workload_token_file=platform.workload_token_file,
+        workload_exchange_url=platform.workload_exchange_url,
+        workload_audiences=platform.workload_audiences,
+        timeout_seconds=platform.timeout,
+    )
+    source = ApiTriggerSource(
+        client=client,
+        base_url=platform.base_url,
+        persona_name=persona_name,
+        poll_interval_seconds=settings.resident_triggers.poll_interval_seconds,
+        amqp_url=amqp_url,
+        sleipnir_exchange=settings.sleipnir.exchange,
+        max_consecutive_poll_failures=settings.resident_triggers.max_consecutive_poll_failures,
+    )
+    drive_loop.register_trigger(source)
+
+    journal_dir = Path(settings.initiative.queue_journal_path).expanduser().parent
+    cron_trigger = CronTrigger(
+        jobs=[],
+        state_path=journal_dir / "cron_api_state.json",
+        lock_path=journal_dir / "cron_api.lock",
+        tick_seconds=settings.initiative.cron_tick_seconds,
+        store=ApiCronJobStore(source),
+    )
+    drive_loop.register_trigger(cron_trigger)
+    logger.info(
+        "api_triggers: polling %s every %.0fs for persona=%s",
+        platform.base_url,
+        settings.resident_triggers.poll_interval_seconds,
+        persona_name,
+    )
+
+
 def _wire_task_dispatch(drive_loop: Any, sleipnir_config: Any) -> None:
     """Register a TaskDispatchChannel as a drive-loop trigger (NIU-505)."""
     from ravn.adapters.channels.event import TaskDispatchChannel
@@ -238,21 +325,17 @@ def _wire_cascade(
     """
     from ravn.adapters.tools.cascade_tools import build_cascade_tools  # noqa: PLC0415
 
-    # Build optional mesh and discovery adapters (discovery first — mesh needs it)
+    # Build optional mesh and discovery adapters (discovery first — mesh needs it).
+    # Enabled-but-unbuildable is fatal: a cascade without its configured mesh
+    # would run as a lone peer while every indicator reads healthy.
     mesh: Any = None
     discovery: Any = None
 
     if settings.discovery.enabled:
-        try:
-            discovery = _build_discovery(settings, persona_config, profile_name)
-        except Exception as exc:
-            logger.warning("cascade: failed to build discovery adapter: %s", exc)
+        discovery = _build_discovery(settings, persona_config, profile_name)
 
     if settings.mesh.enabled:
-        try:
-            mesh = _build_mesh(settings, discovery)
-        except Exception as exc:
-            logger.warning("cascade: failed to build mesh adapter: %s", exc)
+        mesh = _build_mesh(settings, discovery)
 
     # Build cascade tools (Mode 1 always; Mode 2/3 when mesh/discovery available)
     allowed_target_personas = None
@@ -361,7 +444,9 @@ def _wire_cascade(
                 return {"status": "rejected", "error": "empty content"}
             if not isinstance(metadata, dict):
                 metadata = {}
-            accepted = await drive_loop.handle_directed_message(content, metadata)
+            accepted = await drive_loop.handle_directed_message(
+                content, metadata, output_mode=OutputMode.AMBIENT
+            )
             return {"status": "accepted" if accepted else "rejected"}
 
         if msg_type == "task_result":
@@ -442,9 +527,13 @@ def _wire_cascade(
     drive_loop.set_mesh(mesh)
     drive_loop.set_persona_config(persona_config)
     drive_loop.set_workflow_allowed_outcomes_resolver(
-        lambda task, _persona: _workflow_allowed_outcome_topics(
-            settings,
-            node_id=str(getattr(task, "workflow_node_id", "") or "").strip() or None,
+        lambda task, _persona: (
+            set(task.workflow_allowed_outcome_topics)
+            if task.workflow_allowed_outcome_topics
+            else _workflow_allowed_outcome_topics(
+                settings,
+                node_id=str(getattr(task, "workflow_node_id", "") or "").strip() or None,
+            )
         )
     )
 
@@ -470,6 +559,33 @@ def _wire_cascade(
                 persona_config.name,
                 event_types,
             )
+        review_cycle_sources = {
+            (
+                str(policy.get("reviewed_node_id") or ""),
+                str(policy.get("reviewed_event_type") or ""),
+            )
+            for group in workflow_consumer_groups
+            for policy in [group.get("review_verdict_policy") or {}]
+            if policy.get("reviewed_node_id") and policy.get("reviewed_event_type")
+        }
+        review_cycle_authorities = {
+            (
+                str(policy.get("reviewed_node_id") or ""),
+                str(policy.get("reviewed_event_type") or ""),
+            ): {
+                str(persona)
+                for persona in policy.get("reviewed_personas") or []
+                if str(persona).strip()
+            }
+            for group in workflow_consumer_groups
+            for policy in [group.get("review_verdict_policy") or {}]
+            if policy.get("reviewed_node_id") and policy.get("reviewed_event_type")
+        }
+        drive_loop.set_workflow_review_cycle_sources(review_cycle_sources)
+        subscription_event_types = list(event_types)
+        for _node_id, source_event_type in sorted(review_cycle_sources):
+            if source_event_type not in subscription_event_types:
+                subscription_event_types.append(source_event_type)
 
         # Register fan-in contributors from the persona catalog so the
         # buffer knows how many producer outcomes to collect.
@@ -518,26 +634,22 @@ def _wire_cascade(
             if event.type != RavnEventType.OUTCOME:
                 return
 
-            payload = event.payload
+            from ravn.cli.runtime_builders import _resolve_workspace
+
+            payload = dict(event.payload)
+            # Sender paths belong to its container; this task uses our mount.
+            if payload.get("workspace_path"):
+                payload["workspace_path"] = str(_resolve_workspace(settings))
             event_type = payload.get("event_type", "")
             source_persona = payload.get("persona", "")
             source_task_id = event.task_id or event.correlation_id
             root_corr = event.root_correlation_id or event.correlation_id
             source_event_id = event.event_id or source_task_id
-            cycle_corr = str(payload.get("workflow_parent_event_id") or root_corr)
+            cycle_corr = str(payload.get("workflow_parent_event_id") or source_event_id)
+            workflow_scope = event.session_id or root_corr
 
-            logger.info(
-                "mesh: received outcome event_type=%s from=%s task_id=%s root=%s",
-                event_type,
-                source_persona,
-                source_task_id,
-                root_corr,
-            )
-
-            # --- Workflow kickoff handshake ---
-            # Ack the kickoff before any LLM work so Skuld stops redelivering;
-            # a redelivery means our previous ack was lost, so re-ack it but
-            # never enqueue the same kickoff twice.
+            # Ack kickoff redelivery before dedupe so Skuld can retire its
+            # durable notification even when this exact event was consumed.
             if kickoff_acknowledger.is_kickoff(event):
                 first_delivery = await kickoff_acknowledger.acknowledge(event)
                 if not first_delivery:
@@ -547,6 +659,70 @@ def _wire_cascade(
                         root_corr,
                     )
                     return
+
+            if drive_loop.workflow_event_consumed(source_event_id):
+                logger.info(
+                    "mesh: ignoring durably consumed workflow event event_id=%s",
+                    source_event_id,
+                )
+                return
+
+            # Observe authoritative artifacts even when this persona does not
+            # otherwise consume their event type.  Strict review joins later
+            # resolve the exact event ID and declared binding fields against
+            # this durable current-cycle record.
+            payload_node_id = str(payload.get("workflow_node_id") or "")
+            payload_outcome = payload.get("outcome")
+            if not isinstance(payload_outcome, dict):
+                payload_outcome = {}
+            for reviewed_node_id, reviewed_event_type in review_cycle_sources:
+                if event_type != reviewed_event_type:
+                    continue
+                if payload.get("success") is not True or payload.get("valid") is not True:
+                    logger.info(
+                        "mesh: ignoring invalid authoritative-cycle event event_type=%s node=%s",
+                        event_type,
+                        reviewed_node_id,
+                    )
+                    continue
+                if payload_node_id != reviewed_node_id:
+                    logger.info(
+                        "mesh: ignoring unscoped authoritative-cycle event "
+                        "event_type=%s expected_node=%s actual_node=%s",
+                        event_type,
+                        reviewed_node_id,
+                        payload_node_id or "-",
+                    )
+                    continue
+                allowed_source_personas = review_cycle_authorities.get(
+                    (reviewed_node_id, reviewed_event_type), set()
+                )
+                if source_persona not in allowed_source_personas:
+                    logger.info(
+                        "mesh: ignoring unauthorized authoritative-cycle event "
+                        "event_type=%s node=%s persona=%s allowed=%s",
+                        event_type,
+                        reviewed_node_id,
+                        source_persona or "-",
+                        sorted(allowed_source_personas),
+                    )
+                    continue
+                drive_loop.observe_workflow_cycle(
+                    scope_id=workflow_scope,
+                    node_id=reviewed_node_id,
+                    event_type=reviewed_event_type,
+                    event_id=source_event_id,
+                    outcome=payload_outcome,
+                    timestamp=event.timestamp,
+                )
+
+            logger.info(
+                "mesh: received outcome event_type=%s from=%s task_id=%s root=%s",
+                event_type,
+                source_persona,
+                source_task_id,
+                root_corr,
+            )
 
             # --- Producer aggregation ---
             # If the source persona contributes_to a target, check if all
@@ -579,6 +755,7 @@ def _wire_cascade(
             ]
             pending_groups: list[str] = []
             matched = False
+            processing_failed = False
             for group in consumer_groups:
                 group_event_types = list(group.get("event_types") or [])
                 if event_type not in group_event_types:
@@ -605,22 +782,95 @@ def _wire_cascade(
                 matched = True
                 group_id = str(group.get("id") or persona_config.name)
                 group_strategy = str(group.get("fan_in_strategy") or fan_in_strategy)
-                result = drive_loop.fan_in.try_accept_consumer(
-                    event_type=event_type,
-                    event_payload=payload,
-                    root_correlation_id=root_corr,
-                    persona_name=persona_config.name if persona_config else "unknown",
-                    consumes_event_types=group_event_types,
-                    strategy=group_strategy,
-                    consumer_key=group_id,
-                    cycle_correlation_id=cycle_corr,
-                )
+                review_policy = group.get("review_verdict_policy") or {}
+                is_review_join = isinstance(
+                    review_policy, dict
+                ) and event_type == review_policy.get("event_type")
+                authoritative_review_context = ""
+                if is_review_join:
+                    reviewed_node_id = str(review_policy.get("reviewed_node_id") or "")
+                    reviewed_event_type = str(review_policy.get("reviewed_event_type") or "")
+                    binding_fields = list(review_policy.get("binding_fields") or [])
+                    if payload.get("success") is not True or payload.get("valid") is not True:
+                        logger.info(
+                            "mesh: ignoring invalid strict review event cycle=%s group=%s",
+                            cycle_corr,
+                            group_id,
+                        )
+                        continue
+                    if reviewed_node_id and reviewed_event_type:
+                        current, reason = drive_loop.validate_workflow_review_cycle(
+                            scope_id=workflow_scope,
+                            node_id=reviewed_node_id,
+                            event_type=reviewed_event_type,
+                            event_id=cycle_corr,
+                            outcome=payload_outcome,
+                            binding_fields=binding_fields,
+                        )
+                        if not current:
+                            logger.info(
+                                "mesh: ignoring review event for obsolete or invalid "
+                                "cycle=%s group=%s reason=%s",
+                                cycle_corr,
+                                group_id,
+                                reason,
+                            )
+                            continue
+                        authoritative_review_context = drive_loop.workflow_review_artifact_context(
+                            scope_id=workflow_scope,
+                            node_id=reviewed_node_id,
+                            event_type=reviewed_event_type,
+                            event_id=cycle_corr,
+                        )
+                        if not authoritative_review_context:
+                            logger.info(
+                                "mesh: ignoring strict review event without retained "
+                                "artifact cycle=%s group=%s",
+                                cycle_corr,
+                                group_id,
+                            )
+                            continue
+                        discarded_cycles = drive_loop.fan_in.discard_superseded_review_cycles(
+                            aggregation_key=f"workflow:{group_id}:{event_type}",
+                            current_cycle_id=cycle_corr,
+                        )
+                        if discarded_cycles:
+                            logger.info(
+                                "mesh: discarded %d superseded review fan-in cycle(s) for group=%s",
+                                len(discarded_cycles),
+                                group_id,
+                            )
+                    result = drive_loop.fan_in.try_accept_required_personas(
+                        aggregation_key=f"workflow:{group_id}:{event_type}",
+                        consumer_persona=(persona_config.name if persona_config else "unknown"),
+                        required_personas=list(review_policy.get("required_personas") or []),
+                        producer_persona=str(source_persona),
+                        event_type=event_type,
+                        event_payload=payload,
+                        root_correlation_id=root_corr,
+                        cycle_correlation_id=cycle_corr,
+                        binding_fields=binding_fields,
+                    )
+                else:
+                    result = drive_loop.fan_in.try_accept_consumer(
+                        event_type=event_type,
+                        event_payload=payload,
+                        root_correlation_id=root_corr,
+                        persona_name=persona_config.name if persona_config else "unknown",
+                        consumes_event_types=group_event_types,
+                        strategy=group_strategy,
+                        consumer_key=group_id,
+                        cycle_correlation_id=cycle_corr,
+                    )
 
                 if result is None:
                     pending_groups.append(group_id)
                     continue
 
-                task_id_suffix = (root_corr or "unknown")[:8]
+                cycle_identity = result.cycle_correlation_id or source_event_id
+                task_id_suffix = hashlib.sha256(
+                    f"{workflow_scope}\x00{cycle_identity}".encode()
+                ).hexdigest()[:16]
                 safe_group_id = group_id.replace(".", "_").replace("-", "_")
                 stage_context = _workflow_stage_context(settings, node_id=group_id)
                 initiative_context = (
@@ -628,6 +878,8 @@ def _wire_cascade(
                     if stage_context
                     else result.merged_context
                 )
+                if authoritative_review_context:
+                    initiative_context = f"{initiative_context}\n\n{authoritative_review_context}"
                 task = AgentTask(
                     task_id=f"event_{safe_group_id}_{task_id_suffix}",
                     title=f"Handle {result.triggered_by}",
@@ -648,11 +900,25 @@ def _wire_cascade(
                     ),
                     priority=5,
                     root_correlation_id=result.root_correlation_id,
-                    workflow_parent_event_id=source_event_id,
+                    workflow_parent_event_id=(
+                        cycle_identity if is_review_join else source_event_id
+                    ),
                     workflow_node_id=group_id,
                 )
-                task.session_id = event.session_id or task.session_id
+                task.session_id = workflow_scope
                 task.trace_context = dict(event.trace_context)
+                if is_review_join:
+                    task.workflow_review_cycle_id = cycle_identity
+                    task.workflow_review_source_node_id = str(
+                        review_policy.get("reviewed_node_id") or ""
+                    )
+                    task.workflow_review_source_event_type = str(
+                        review_policy.get("reviewed_event_type") or ""
+                    )
+                    outcome_key = "pass_outcomes" if result.passed else "fail_outcomes"
+                    task.workflow_allowed_outcome_topics = list(
+                        review_policy.get(outcome_key) or []
+                    )
 
                 try:
                     accepted = await drive_loop.enqueue(task)
@@ -671,6 +937,7 @@ def _wire_cascade(
                             result.triggered_by,
                         )
                 except Exception as exc:
+                    processing_failed = True
                     logger.error("mesh: failed to enqueue task for event: %s", exc)
 
             if pending_groups:
@@ -685,10 +952,20 @@ def _wire_cascade(
                     event_type,
                     persona_config.name if persona_config else "unknown",
                 )
+            # Only durably record an event this handler actually acted on for a
+            # consumer group (including one still waiting on the rest of a
+            # fan-in). An unmatched event had no side effect here, so a later
+            # redelivery of it is already a safe no-op — recording it would
+            # only spend ledger retention on events nothing here needs to
+            # dedupe.
+            if matched and not processing_failed:
+                await drive_loop.record_workflow_event_consumed(source_event_id)
 
         # Store pending subscriptions - will be activated after mesh.start()
-        mesh._pending_outcome_subscriptions = [(et, _handle_outcome_event) for et in event_types]
-        for event_type in event_types:
+        mesh._pending_outcome_subscriptions = [
+            (et, _handle_outcome_event) for et in subscription_event_types
+        ]
+        for event_type in subscription_event_types:
             logger.info("mesh: will subscribe to event_type=%s after start", event_type)
 
     if mesh is None and discovery is None:

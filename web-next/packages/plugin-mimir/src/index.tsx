@@ -1,101 +1,122 @@
-import { createRoute } from '@tanstack/react-router';
+import { createRoute, redirect } from '@tanstack/react-router';
+import { Brain } from 'lucide-react';
 import { definePlugin } from '@niuulabs/plugin-sdk';
 import type { PluginCtx } from '@niuulabs/plugin-sdk';
-import { MimirPage } from './ui/MimirPage';
-import { SearchPage } from './ui/SearchPage';
-import { GraphPage } from './ui/GraphPage';
-import { RavnsPage } from './ui/RavnsPage';
-import { HealthPage } from './ui/HealthPage';
-import { RegistryPage } from './ui/RegistryPage';
-import { AnalyticsPage } from './ui/AnalyticsPage';
+import { MemoryExploreView } from './ui/memory/MemoryExploreView';
+import { MemoryPagePage } from './ui/memory/MemoryPagePage';
+import { RegistryWorkspace } from './ui/RegistryWorkspace';
 import { MimirSubnav } from './ui/MimirSubnav';
 import { MimirTopbar } from './ui/MimirTopbar';
+import { validateMemoryViewSearch } from './application/memoryViewSearch';
+
+/** A legacy route's `search.mount`, if any — everything else is dropped. */
+function legacySearch(search: unknown): { mount?: string } {
+  const record = search as Record<string, unknown>;
+  return typeof record.mount === 'string' ? { mount: record.mount } : {};
+}
+
+/** Redirect a retired `/mimir/*` route to the Memory scene, keeping `mount`. */
+function redirectToMemory({ location }: { location: { search: unknown } }): never {
+  throw redirect({ to: '/mimir', search: legacySearch(location.search) as never });
+}
 
 export const mimirPlugin = definePlugin({
   id: 'mimir',
   rune: 'M',
   title: 'Mímir',
   subtitle: 'the well of knowledge',
+  // Memory: what the platform and its residents know. The Memory scene
+  // (Explore/Focus/Ask/Replay) is the home for both Simple and Advanced mode.
+  simple: {
+    tabs: ['memory'],
+    title: 'Memory',
+    subtitle: 'what niuu knows, and how sure it is',
+    icon: <Brain size={17} aria-hidden="true" />,
+  },
   tabs: [
-    { id: 'overview', label: 'Overview', rune: '◎', path: '/mimir' },
-    { id: 'pages', label: 'Pages', rune: '▤', path: '/mimir/pages' },
-    { id: 'sources', label: 'Sources', rune: '↧', path: '/mimir/sources' },
-    { id: 'search', label: 'Search', rune: '⌕', path: '/mimir/search' },
-    { id: 'graph', label: 'Graph', rune: '⌖', path: '/mimir/graph' },
+    { id: 'memory', label: 'Memory', rune: '◎', path: '/mimir' },
     { id: 'registry', label: 'Registry', rune: '⛁', path: '/mimir/registry' },
-    { id: 'wardens', label: 'Wardens', rune: 'ᚢ', path: '/mimir/ravns' },
-    { id: 'health', label: 'Health', rune: '✚', path: '/mimir/health' },
-    { id: 'analytics', label: 'Analytics', rune: '∑', path: '/mimir/analytics' },
   ],
   routes: (rootRoute) => [
+    ...['wardens', 'health', 'analytics'].map((section) =>
+      createRoute({
+        getParentRoute: () => rootRoute,
+        path: `/mimir/registry/${section}`,
+        component: RegistryWorkspace,
+      }),
+    ),
+
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir',
-      component: MimirPage,
+      // Explore/Focus/Ask/Replay all deep-link through these, in both modes.
+      validateSearch: validateMemoryViewSearch,
+      component: MemoryExploreView,
     }),
+    // Reading a page works in either mode: a link from a realm, a session, or
+    // the scene's Focus panel lands on the same screen.
     createRoute({
       getParentRoute: () => rootRoute,
-      path: '/mimir/pages',
-      component: () => <MimirPage defaultTab="pages" />,
-    }),
-    createRoute({
-      getParentRoute: () => rootRoute,
-      path: '/mimir/sources',
-      component: () => <MimirPage defaultTab="sources" />,
-    }),
-    createRoute({
-      getParentRoute: () => rootRoute,
-      path: '/mimir/search',
-      component: SearchPage,
-    }),
-    createRoute({
-      getParentRoute: () => rootRoute,
-      path: '/mimir/graph',
-      component: GraphPage,
+      path: '/mimir/read',
+      component: MemoryPagePage,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/registry',
-      component: RegistryPage,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/ravns',
-      component: RavnsPage,
-    }),
-    // Legacy deep links: /ingest -> Sources (which owns the working ingest
-    // form), /lint and /doctor -> the consolidated Health page, /dreams ->
-    // Analytics (dream history lives in its telemetry section).
-    createRoute({
-      getParentRoute: () => rootRoute,
-      path: '/mimir/ingest',
-      component: () => <MimirPage defaultTab="sources" />,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/health',
-      component: HealthPage,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/lint',
-      component: HealthPage,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/doctor',
-      component: HealthPage,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/dreams',
-      component: AnalyticsPage,
+      component: RegistryWorkspace,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/mimir/analytics',
-      component: AnalyticsPage,
+      component: RegistryWorkspace,
     }),
+    // Asking a question is now answered inline in the Memory scene — carry
+    // both q and mount across, everything else the flat page used stays put.
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: '/mimir/ask',
+      beforeLoad: ({ location }) => {
+        const search = location.search as Record<string, unknown>;
+        throw redirect({
+          to: '/mimir',
+          search: { ...legacySearch(search), q: search.q } as never,
+        });
+      },
+    }),
+    // Legacy tabs — Pages/Sources/Search/Graph/Ingest/Entities — are all the
+    // one Memory scene now; only the mount scope still carries over.
+    ...['pages', 'sources', 'search', 'graph', 'ingest', 'entities'].map((legacy) =>
+      createRoute({
+        getParentRoute: () => rootRoute,
+        path: `/mimir/${legacy}`,
+        beforeLoad: redirectToMemory,
+      }),
+    ),
   ],
   subnav: (ctx: PluginCtx) => <MimirSubnav ctx={ctx} />,
   topbarRight: (ctx: PluginCtx) => <MimirTopbar ctx={ctx} />,
@@ -137,26 +158,16 @@ export type { EvalMetrics, EvalReport, QueryLogEntry, QueryStats } from './domai
 export { zeroResultQueries } from './domain/analytics';
 export type { DoctorStatus, DoctorCheck, DoctorReport } from './domain/doctor';
 export { fixableChecks } from './domain/doctor';
-export type {
-  FileTreeDir,
-  FileTreeLeaf,
-  FileTreeItem,
-  WikilinkTarget,
-  ZoneEditState,
-  ZoneEditAction,
-} from './domain';
-export {
-  buildFileTree,
-  mergeFileTrees,
-  resolveWikilink,
-  detectBrokenWikilinks,
-  zoneEditReducer,
-} from './domain';
+export type { WikilinkTarget } from './domain';
+export { resolveWikilink, detectBrokenWikilinks } from './domain';
 
 // UI components (plugin-local; promote to @niuulabs/ui when a second plugin needs them)
+export { RegistryMountEditor, type RegistryMountEditorProps } from './ui/RegistryPage';
+export type { KnowledgeDeployment, DeploymentStatus } from './domain/instances';
 export { WikilinkPill } from './ui/components/WikilinkPill';
 export { PageTypeGlyph } from './ui/components/PageTypeGlyph';
 export { MountChip } from './ui/components/MountChip';
-export { OverviewView } from './ui/OverviewView';
-export { PagesView } from './ui/PagesView';
-export { SourcesView } from './ui/SourcesView';
+export { MemoryExploreView } from './ui/memory/MemoryExploreView';
+export { MemoryPagePage } from './ui/memory/MemoryPagePage';
+export { ProofPill } from './ui/memory/ProofPill';
+export type { FactEvidence, EvidenceTrend, RelatedPage, ReviseRequest } from './domain/evidence';

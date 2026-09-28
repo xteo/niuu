@@ -16,3 +16,24 @@ data:
   {{- if .Values.config.categories }}
   MIMIR_CATEGORIES: {{ .Values.config.categories | join "," | quote }}
   {{- end }}
+
+  {{- if or .Values.knowledgeDeployment .Values.niuu.tenantId .Values.config.observability .Values.config.liveActivity }}
+  config.yaml: |
+    tenant_id: {{ .Values.niuu.tenantId | default "" | quote }}
+    {{- if .Values.knowledgeDeployment }}
+    deployment:
+      {{- if eq .Values.knowledgeDeployment.adapter "mimir.adapters.flux.FluxKnowledgeDeploymentAdapter" }}
+      {{- toYaml (mergeOverwrite (deepCopy .Values.knowledgeDeployment) (dict "envoy" .Values.envoy)) | nindent 6 }}
+      {{- else }}
+      {{- toYaml .Values.knowledgeDeployment | nindent 6 }}
+      {{- end }}
+    {{- end }}
+    {{- with .Values.config.observability }}
+    observability:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.config.liveActivity }}
+    live_activity:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- end }}

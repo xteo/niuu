@@ -1,4 +1,4 @@
-import { BranchSelect, Field, Input, RepoSelect, type RepoRecord } from '@niuulabs/ui';
+import { Field, Input, RepoSelect, type RepoRecord } from '@niuulabs/ui';
 import type {
   IntegrationConnection,
   SessionDefinition,
@@ -18,6 +18,7 @@ import {
   SectionCard,
   WizardSelect,
 } from './LaunchWizardPrimitives';
+import { withRepoSourceControl } from './launchEngines';
 import './LaunchWizard.css';
 
 export * from './LaunchWizardPrimitives';
@@ -28,15 +29,26 @@ export function SourceStep({
   update,
   repos,
   branchOptions,
+  branchesLoading = false,
+  branchesError = null,
+  reposLoading = false,
+  reposError = null,
   trackerResults,
   trackerLoading,
+  integrations = [],
 }: {
   form: WizardForm;
   update: (patch: Partial<WizardForm>) => void;
   repos: RepoRecord[];
   branchOptions: string[];
+  branchesLoading?: boolean;
+  branchesError?: Error | null;
+  reposLoading?: boolean;
+  reposError?: Error | null;
   trackerResults: TrackerIssue[];
   trackerLoading: boolean;
+  /** The person's integrations; picking a repository attaches the account that listed it. */
+  integrations?: IntegrationConnection[];
 }) {
   const currentRepo = repos.find((repo) => repo.cloneUrl === form.repo);
 
@@ -65,7 +77,9 @@ export function SourceStep({
         {form.sourcetype === 'git' ? (
           <div className="niuu:grid niuu:grid-cols-2 niuu:gap-4">
             <Field label="Repository">
-              {repos.length > 0 ? (
+              {reposLoading && <p role="status">Loading repositories…</p>}
+              {reposError && <p role="alert">Could not load repositories: {reposError.message}</p>}
+              {repos.length > 0 && (!form.repo || currentRepo) ? (
                 <RepoSelect
                   repos={repos}
                   value={form.repo}
@@ -75,6 +89,13 @@ export function SourceStep({
                       repo: value,
                       branch: repo?.defaultBranch ?? '',
                       workspaceId: '',
+                      // clone with the account that listed the repository
+                      selectedIntegrations: withRepoSourceControl(
+                        form.selectedIntegrations,
+                        integrations,
+                        repos,
+                        value,
+                      ),
                     });
                   }}
                   placeholder="Select repository"
@@ -82,32 +103,26 @@ export function SourceStep({
                 />
               ) : (
                 <Input
+                  aria-label="Repository"
                   value={form.repo}
                   onChange={(e) => update({ repo: e.target.value, workspaceId: '' })}
-                  placeholder="github.com/niuulabs/volundr"
+                  placeholder="https://git.example.com/group/repository.git"
                 />
               )}
             </Field>
             <Field label="Branch">
-              {branchOptions.length ? (
-                currentRepo?.branches.length ? (
-                  <BranchSelect
-                    repos={repos}
-                    selectedRepos={form.repo}
-                    value={form.branch}
-                    onChange={(value: string) => update({ branch: value })}
-                    placeholder="Select branch"
-                    testId="branch-select"
-                  />
-                ) : (
-                  <WizardSelect
-                    options={branchOptions.map((branch) => ({ value: branch, label: branch }))}
-                    value={form.branch}
-                    onChange={(value) => update({ branch: value })}
-                    placeholder="Select branch"
-                    testId="branch-select"
-                  />
-                )
+              {branchesLoading && <p role="status">Loading branches…</p>}
+              {branchesError && (
+                <p role="alert">Could not load branches: {branchesError.message}</p>
+              )}
+              {branchOptions.length && (!form.branch || branchOptions.includes(form.branch)) ? (
+                <WizardSelect
+                  options={branchOptions.map((branch) => ({ value: branch, label: branch }))}
+                  value={form.branch}
+                  onChange={(value) => update({ branch: value })}
+                  placeholder="Select branch"
+                  testId="branch-select"
+                />
               ) : (
                 <Input
                   value={form.branch}
@@ -270,7 +285,14 @@ export function ConfirmStep({
         >
           <ConfirmChipList
             title="MCP servers"
-            items={form.mcpServers.map((server) => server.name)}
+            items={[
+              ...form.mcpServers.map((server) => server.name),
+              ...integrations
+                .filter(
+                  (item) => item.slug === 'mcp' && form.selectedIntegrations.includes(item.id),
+                )
+                .map(formatIntegrationLabel),
+            ]}
             emptyLabel="No MCP servers attached"
           />
           <ConfirmChipList

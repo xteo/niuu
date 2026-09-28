@@ -8,7 +8,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from tests.conftest import make_session_participant_service
 from volundr.adapters.inbound.rest import SessionCreate, create_router
+from volundr.adapters.outbound.k8s_storage import InMemoryStorageAdapter
 from volundr.domain.models import Session
 from volundr.domain.project_ports import ProjectConflictError
 from volundr.domain.projects import ForgeProject, SessionCoordination, SessionReference
@@ -231,7 +233,14 @@ async def test_rest_contract_v2(rig):
         local_mounts=SimpleNamespace(enabled=False, mini_mode=False, allowed_prefixes=[])
     )
     app.state.admin_settings = {}
-    app.include_router(create_router(service.sessions, project_service=service))
+    app.state.storage = InMemoryStorageAdapter()
+    app.include_router(
+        create_router(
+            service.sessions,
+            project_service=service,
+            session_participant_service=make_session_participant_service(service.sessions),
+        )
+    )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as api:
         created = await api.post("/api/v1/forge/projects", json={"name": "Quick"})
         assert created.status_code == 201

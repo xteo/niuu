@@ -7,7 +7,7 @@ client, and assert the structured ``plan`` / ``agent_update`` frames surface, ar
 tracked, and replay on reconnect. Default-tier tests cover the broker helpers and
 the ``/api/plan`` / ``/api/agents`` read endpoints without tmux.
 
-See docs/forge-plan-and-agents-surfacing.md for the contract + decision log.
+See docs/forge/forge-plan-and-agents-surfacing.md for the contract + decision log.
 """
 
 from __future__ import annotations
@@ -411,7 +411,7 @@ async def test_reap_dead_teammates_noop_without_live_pane_transport() -> None:
 @pytest.mark.asyncio
 async def test_get_plan_and_get_agents_endpoints(monkeypatch) -> None:
     """The /api/plan and /api/agents endpoints answer from live broker state."""
-    import skuld.broker as broker_mod
+    from skuld import broker as broker_mod
 
     fresh = broker_mod.Broker()
     monkeypatch.setattr(broker_mod, "broker", fresh)
@@ -468,7 +468,7 @@ def _usage_line(message_id: str, *, inp: int = 0, out: int = 0, read: int = 0, c
 async def _wire_broker_to_transport(tmp_path, monkeypatch):
     """A fresh Broker + real tmux transport, with agent_update frames forwarded as they
     would be by the live event bus. Returns (broker_mod, broker, transport)."""
-    import skuld.broker as broker_mod
+    from skuld import broker as broker_mod
     from skuld.transports.tmux_interactive import TmuxInteractiveTransport
 
     fresh = broker_mod.Broker()
@@ -643,7 +643,7 @@ def test_agents_endpoint_include_finished_query_flag(monkeypatch) -> None:
     `?include_finished=1` is what appends the retained corpses."""
     from fastapi.testclient import TestClient
 
-    import skuld.broker as broker_mod
+    from skuld import broker as broker_mod
 
     fresh = broker_mod.Broker()
     monkeypatch.setattr(broker_mod, "broker", fresh)
@@ -659,7 +659,7 @@ def test_agents_endpoint_include_finished_query_flag(monkeypatch) -> None:
     fresh._running_agents = {"a1": dict(running)}  # noqa: SLF001
     fresh._finished_agents.append(dict(finished))  # noqa: SLF001
 
-    client = TestClient(broker_mod.app)
+    client = TestClient(broker_mod.app, headers={"x-niuu-room-role": "owner"})
     assert client.get("/api/agents").json() == {"agents": [running]}
     assert client.get("/api/agents?include_finished=1").json() == {"agents": [running, finished]}
     assert client.get("/api/agents?include_finished=true").json() == {"agents": [running, finished]}

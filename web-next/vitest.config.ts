@@ -3,11 +3,22 @@ import react from '@vitejs/plugin-react';
 import { resolve } from 'path';
 
 const isCi = Boolean(process.env.CI);
+const isShard = Boolean(process.env.VITEST_SHARD);
 
 export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
+      // Resolve stylesheet subpaths before package entry aliases. Browser tests
+      // exercise the generated CSS bundles; unit tests use the source stylesheet.
+      ...Object.fromEntries(
+        ['volundr', 'ting', 'ravn', 'realms', 'mimir', 'valkyrie', 'observatory'].flatMap((name) =>
+          ['styles', 'index'].map((entry) => [
+            `@niuulabs/plugin-${name}/${entry}.css`,
+            resolve(__dirname, `packages/plugin-${name}/src/styles.css`),
+          ]),
+        ),
+      ),
       '@niuulabs/auth': resolve(__dirname, 'packages/auth/src/index.ts'),
       '@niuulabs/domain': resolve(__dirname, 'packages/domain/src/index.ts'),
       '@niuulabs/design-tokens': resolve(__dirname, 'packages/design-tokens/src/index.ts'),
@@ -23,18 +34,20 @@ export default defineConfig({
         'packages/plugin-observatory/src/index.tsx',
       ),
       '@niuulabs/plugin-ravn': resolve(__dirname, 'packages/plugin-ravn/src/index.ts'),
+      '@niuulabs/plugin-realms': resolve(__dirname, 'packages/plugin-realms/src/index.tsx'),
       '@niuulabs/plugin-ting': resolve(__dirname, 'packages/plugin-ting/src/index.ts'),
       '@niuulabs/plugin-valkyrie': resolve(__dirname, 'packages/plugin-valkyrie/src/index.tsx'),
       '@niuulabs/plugin-volundr': resolve(__dirname, 'packages/plugin-volundr/src/index.ts'),
       '@niuulabs/plugin-login': resolve(__dirname, 'packages/plugin-login/src/index.ts'),
       '@niuulabs/plugin-sdk': resolve(__dirname, 'packages/plugin-sdk/src/index.ts'),
+      '@niuulabs/plugin-setup': resolve(__dirname, 'packages/plugin-setup/src/index.ts'),
       '@niuulabs/query': resolve(__dirname, 'packages/query/src/index.ts'),
       '@niuulabs/shell': resolve(__dirname, 'packages/shell/src/index.ts'),
       '@niuulabs/ui': resolve(__dirname, 'packages/ui/src/index.ts'),
     },
   },
   test: {
-    maxWorkers: isCi ? 2 : undefined,
+    maxWorkers: isCi ? 4 : undefined,
     minWorkers: isCi ? 1 : undefined,
     environment: 'jsdom',
     globals: true,
@@ -46,12 +59,16 @@ export default defineConfig({
       reporter: isCi ? ['text', 'lcov'] : ['text', 'html', 'lcov'],
       include: ['packages/*/src/**/*.{ts,tsx}'],
       exclude: ['**/*.test.{ts,tsx}', '**/index.{ts,tsx}', '**/ports.ts', '**/*.d.ts'],
-      thresholds: {
-        statements: 85,
-        branches: 85,
-        functions: 85,
-        lines: 85,
-      },
+      // A CI shard sees only its slice of the suite; the 85% gate is enforced
+      // once, on the merged report (`vitest run --merge-reports --coverage`).
+      thresholds: isShard
+        ? undefined
+        : {
+            statements: 85,
+            branches: 85,
+            functions: 85,
+            lines: 85,
+          },
     },
   },
 });

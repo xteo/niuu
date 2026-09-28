@@ -13,16 +13,23 @@ from niuu.adapters.postgres_schema import apply_startup_migrations
 
 logger = logging.getLogger(__name__)
 
-# Versions 49–55 were assigned different identities by the released Forge and
-# upstream streams. These additive prerequisites may have been skipped by the
-# old numeric cursor; migration 56 already depends on resident_runtimes.
+# Versions 49–55 and 62–66 diverged between Forge and upstream. Repair
+# prerequisites skipped by the numeric cursor without rewriting either history.
 _DIVERGED_FIRST = 49
-_DIVERGED_LAST = 55
+_DIVERGED_LAST = 66
 _PREREQUISITES = (
     "000049_valkyrie_history.up.sql",
     "000053_realms_trust_capabilities.up.sql",
     "000054_sessions_workload_config.up.sql",
     "000055_resident_runtimes.up.sql",
+)
+
+_LATER_PREREQUISITES = (
+    "000062_pat_authority.up.sql",
+    "000063_topology_source_authority.up.sql",
+    "000064_instance_tenant_attribution.up.sql",
+    "000065_admin_settings.up.sql",
+    "000066_compute_leases.up.sql",
 )
 
 
@@ -42,7 +49,7 @@ async def prepare_numbered_migrations(conn: asyncpg.Connection, migrations_dir: 
     """Ensure prerequisites without resetting or advancing migrate's version row.
 
     Fresh installations and versions outside the historical overlap need no
-    preparation. Both known lineages may safely apply the four additive files.
+    preparation. Both known lineages may safely apply these idempotent prerequisites.
     A dirty numeric history is an interrupted migration and must be repaired
     explicitly; it is never force-reset by this bridge.
     """
@@ -55,7 +62,11 @@ async def prepare_numbered_migrations(conn: asyncpg.Connection, migrations_dir: 
         raise RuntimeError("Numbered migration history is dirty; repair it before upgrading Forge")
     if not _DIVERGED_FIRST <= row["version"] <= _DIVERGED_LAST:
         return 0
-    files = [migrations_dir / name for name in _PREREQUISITES]
+    names = [
+        *_PREREQUISITES,
+        *(name for name in _LATER_PREREQUISITES if int(name[:6]) <= row["version"]),
+    ]
+    files = [migrations_dir / name for name in names]
     for path in files:
         if not path.is_file():
             raise RuntimeError(f"Required Forge lineage migration is missing: {path.name}")

@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import signal
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -146,13 +147,46 @@ _SLASH_COMMAND_ROW_RE = re.compile(r"^(/\S+)\s{2,}(.+?)\s*$")
 # the tmux test harness (tests/support/forge/tmux_page.py) imports this so it
 # parses menus exactly the way the shipped transport does.
 _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
+# Claude Code fills an empty composer with a dimmed suggestion, e.g.
+# `❯ Try "how does work?"` (v2.1.x). It is not input: the composer is empty.
+_COMPOSER_SUGGESTION_RE = re.compile(r'Try "[^"\n]*"')
 _WORKSPACE_TRUST_ROW_RE = re.compile(
     r"^\s*([❯>])?\s*(?:[1-9][.)]\s+)?(No, exit|Yes, I trust this folder)\s*$"
 )
-# An EMPTY composer that shows Claude Code's placeholder suggestion, e.g.
-# '❯ Try "edit <filepath> to..."' (2.1.281 renders it in fresh workspaces instead
-# of the older "? for shortcuts" footer). Menu rows never look like this.
-_PLACEHOLDER_PROMPT_ROW_RE = re.compile(r'^\s*❯\s+Try "[^"\n]*"\s*$')
+# Claude Code v2.1.282 wraps a long/multi-line pasted message in a
+# `<pasted_content id="...">...</pasted_content id="...">` reference chip before
+# handing it to the model — and echoes that SAME wrapped text back as the
+# `prompt` field of the UserPromptSubmit hook. The wrapper is a CLI-side
+# artifact around content we pasted verbatim, not part of the text itself, so
+# it must be stripped before comparing against the delivered message —
+# otherwise `_match_prompt_correlation` never matches on any paste that
+# triggers it, `_claude_native_session_id` is never captured, and every later
+# AskUserQuestion in the session fails `_question_native_identity` with
+# ControlRecoveryError("This question has no verifiable native tool identity").
+_PASTED_CONTENT_WRAPPER_RE = re.compile(r'</?pasted_content(?:\s+id="[^"]*")?>')
+
+
+def _replace_text_atomically(path: Path, text: str) -> None:
+    """Replace a file so that a concurrent reader sees the old or the new content.
+
+    Writing in place truncates first, and another session reading the same
+    file at that moment parses an empty document. The new content is written
+    beside the file and renamed over it, which is atomic on one filesystem. A
+    symlinked file is replaced at its target so the link survives.
+    """
+    target = path.resolve()
+    descriptor, temporary = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if target.exists():
+            shutil.copymode(target, temporary)
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -211,8 +245,12 @@ class TmuxInteractiveTransport(CLITransport):
         turn_max_seconds: float | None = None,
         pane_poll_interval_s: float | None = None,
         frame_interval_s: float | None = None,
+        model_gateway_url: str = "",
+        model_gateway_token: str = "",
         question_transcript_max_bytes: int = 1048576,
         question_result_history_limit: int = 128,
+        native_text_wait_s: float = 0.1,
+        native_text_poll_s: float = 0.005,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
         session_tools: SessionTools | None = None,
@@ -224,6 +262,8 @@ class TmuxInteractiveTransport(CLITransport):
         self.workspace_dir = workspace_dir
         self._session_tools = session_tools
         self._model = model
+        self._model_gateway_url = model_gateway_url
+        self._model_gateway_token = model_gateway_token
         self._reasoning_effort = (
             validate_effort(reasoning_effort, MODEL_EFFORTS.get(model, ()))
             if reasoning_effort
@@ -312,6 +352,10 @@ class TmuxInteractiveTransport(CLITransport):
         self._workspace_trust_settle_s = workspace_trust_settle_s
         self._workspace_trust_max_attempts = workspace_trust_max_attempts
         self._question_transcript_max_bytes = question_transcript_max_bytes
+        if native_text_wait_s <= 0 or native_text_poll_s <= 0:
+            raise ValueError("Native text wait and poll intervals must be positive")
+        self._native_text_wait_s = native_text_wait_s
+        self._native_text_poll_s = native_text_poll_s
         # Initial-prompt fix: the REPL isn't ready to accept input the instant the
         # CLI is spawned — pasting the seed prompt into a still-booting Claude makes
         # it land mid-startup (it was being parsed as a slash command). Wait for a
@@ -543,10 +587,7 @@ class TmuxInteractiveTransport(CLITransport):
             marker and marker != "❯" and marker in text for marker in self._repl_ready_markers
         ) or (
             "❯" in self._repl_ready_markers
-            and any(
-                self._is_empty_prompt_row(row) or _PLACEHOLDER_PROMPT_ROW_RE.match(row)
-                for row in text.splitlines()
-            )
+            and any(self._is_empty_prompt_row(row) for row in text.splitlines())
         )
 
     @staticmethod
@@ -653,6 +694,14 @@ class TmuxInteractiveTransport(CLITransport):
 
         Called with the input lock held. A timeout leaves the terminal available
         for inspection and never pastes a seed/chat/discovery probe into a menu.
+
+        ``allow_pending_question`` is for ``start()`` only: a CLI that has raised
+        a native control (a resumed question, a permission menu) hides the
+        composer. Waiting for the composer there deadlocks — the browser that
+        would answer the control cannot attach until ``start()`` returns. It
+        returns False without marking startup ready, so nothing is typed into
+        the control. Callers that are about to type leave it False; they must
+        see the composer itself.
         """
         target = self._target_pane()
         self._startup_ready = False
@@ -992,7 +1041,9 @@ class TmuxInteractiveTransport(CLITransport):
     @staticmethod
     def _normalize_prompt(text: str) -> str:
         """Collapse whitespace so a delivered message matches the prompt Claude echoes
-        back via UserPromptSubmit (the REPL may reflow/trim it)."""
+        back via UserPromptSubmit (the REPL may reflow/trim it, and v2.1.282+ wraps a
+        long/multi-line paste in a `<pasted_content id="...">` reference chip)."""
+        text = _PASTED_CONTENT_WRAPPER_RE.sub("", text)
         return " ".join(text.split())
 
     def _match_prompt_correlation(self, prompt: str) -> tuple[str | None, str | None]:
@@ -1392,16 +1443,16 @@ class TmuxInteractiveTransport(CLITransport):
         if not anchor.get("transcript_path"):
             return
         # Claude can POST PreToolUse before its asynchronous JSONL write is
-        # visible. Wait only for the exact native tool proof, bounded to 100 ms;
+        # visible. Wait only for the exact native tool proof, bounded by config;
         # no text (or a writer depending on hook return) falls back to captured
         # hook order without blocking the native tool indefinitely.
         try:
-            async with asyncio.timeout(0.1):
+            async with asyncio.timeout(self._native_text_wait_s):
                 while True:
                     items = await asyncio.to_thread(preceding_tool_text, anchor)
                     if items is not None:
                         break
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(self._native_text_poll_s)
         except TimeoutError:
             return
         for item in items:
@@ -1612,6 +1663,7 @@ class TmuxInteractiveTransport(CLITransport):
             try:
                 self._active_subagent_stack.remove(tool_use_id)
             except ValueError:
+                # The task may have completed before it entered the active stack.
                 pass
         result = payload.get("tool_response")
         if result is None:
@@ -2144,79 +2196,120 @@ class TmuxInteractiveTransport(CLITransport):
             low = chosen.strip().casefold()
             if low not in {"allow", "allow & don't ask again", "deny"}:
                 raise ValueError("The requested answer is not a declared Claude permission option")
-            rows = await self._capture_menu_rows_wait(pane_id=pane_id)
-            digit = self._permission_menu_digit(low, rows)
-            if digit is None:
-                raise ValueError("The requested answer does not match the live Claude menu")
-            pending["answer_uncertain"] = True
-            await self._send_key("Escape" if low == "deny" else str(digit), pane_id=pane_id)
-            await self._resolve_tty_answer(request_id, "deny" if low == "deny" else chosen)
+            # Claimed for the rest of this branch (see the question-path comment below):
+            # `_capture_menu_rows_wait` is a bounded poll with real `await`s, and a
+            # concurrent turn-end signal must not clear this entry while we're waiting
+            # on it — `_clear_pending_tty_prompts` skips any entry with `answer_in_flight`.
+            pending["answer_in_flight"] = True
+            try:
+                rows = await self._capture_menu_rows_wait(pane_id=pane_id)
+                if self._pending_tty_prompts.get(request_id) is not pending:
+                    raise ValueError(
+                        "The native Claude permission prompt ended while its menu was rendering"
+                    )
+                digit = self._permission_menu_digit(low, rows)
+                if digit is None:
+                    raise ValueError("The requested answer does not match the live Claude menu")
+                pending["answer_uncertain"] = True
+                await self._send_key("Escape" if low == "deny" else str(digit), pane_id=pane_id)
+                await self._resolve_tty_answer(request_id, "deny" if low == "deny" else chosen)
+            finally:
+                pending.pop("answer_in_flight", None)
             return
 
         plans = self._question_answer_plans(pending.get("questions"), answers)
         if not pending.get("native_tool_use_id") or not pending.get("native_session_id"):
             raise ControlRecoveryError("This question has no verifiable native tool identity")
-        result = await self._native_question_result(pending)
-        if result is not None:
-            await self._reject_native_question(request_id, result, pane_id=pane_id)
-            raise ValueError("The native Claude question already completed before this answer")
-        # Validate the first page before claiming an attempt. Later transitions
-        # can already have consumed an answer, so any failure then is uncertain.
+        # Claimed for the REST of this call, not just while driving keys: the render wait
+        # below (`_wait_question_screen`) already spans real `await`s where a concurrent
+        # turn-end signal (Stop hook, synthetic-turn watchdog) can land. `_clear_pending_
+        # tty_prompts` skips any entry with `answer_in_flight` set, so setting it only
+        # once we start pressing keys left this validation window unprotected — a pending
+        # question could be silently dropped while we were still confirming its menu was
+        # live, which is the actual bug: the client's answer would be refused for a
+        # question that vanished attribution-free instead of failing loudly and visibly.
+        pending["answer_in_flight"] = True
         try:
-            await self._wait_question_screen(
-                lambda screen: self._question_page_matches(screen, plans[0]), pane_id=pane_id
-            )
-        except ValueError:
             result = await self._native_question_result(pending)
             if result is not None:
                 await self._reject_native_question(request_id, result, pane_id=pane_id)
-            raise
-        if self._pending_tty_prompts.get(request_id) is not pending:
-            raise ValueError("The native Claude question ended while its menu was rendering")
-        result = await self._native_question_result(pending)
-        if result is not None:
-            await self._reject_native_question(request_id, result, pane_id=pane_id)
-            raise ValueError("The native Claude question already completed before this answer")
-        pending["answer_uncertain"] = True
-        pending["answer_in_flight"] = True
-        try:
-            for plan in plans:
-                await self._drive_question_page(plan, pane_id=pane_id)
-            if len(plans) > 1 or any(plan["multi"] for plan in plans):
-                review = await self._wait_question_screen(
-                    lambda screen: self._question_review_matches(screen, plans), pane_id=pane_id
+                raise ValueError("The native Claude question already completed before this answer")
+            # Validate the first page before claiming an attempt. Later transitions
+            # can already have consumed an answer, so any failure then is uncertain.
+            try:
+                await self._wait_question_screen(
+                    lambda screen: self._question_page_matches(screen, plans[0]), pane_id=pane_id
                 )
-                digit = self._match_menu_digit("Submit answers", self._menu_rows(review))
-                await self._send_key(str(digit), pane_id=pane_id)
-            result = await self._wait_native_question_result(pending)
-            actual = result.get("answers")
-            matched = (
-                not result["is_error"]
-                and isinstance(actual, dict)
-                and set(actual) == {plan["text"] for plan in plans}
-                and all(self._question_answer_matches(actual[plan["text"]], plan) for plan in plans)
-            )
-            if not matched:
-                await self._reject_native_question(request_id, result, pane_id=pane_id)
-                raise ValueError("Claude did not consume the requested question answers")
-            decision = (
-                plans[0]["values"][0] if len(plans) == 1 and not plans[0]["multi"] else "answered"
-            )
-            await self._resolve_tty_answer(request_id, decision)
-        except Exception as exc:
-            if request_id in self._pending_tty_prompts:
+            except ValueError as exc:
                 result = await self._native_question_result(pending)
-                if result is not None and not pending.get("resolution_pending"):
+                if result is not None:
+                    # The native question already resolved some other way (e.g. answered
+                    # directly in the terminal) — this answer is stale, not retryable.
                     await self._reject_native_question(request_id, result, pane_id=pane_id)
-                    raise ValueError(
-                        "Claude question completed outside the expected answer state"
-                    ) from exc
-                await self._emit_ask_user_question(request_id, pending["questions"])
-                raise ControlRecoveryError(
-                    "Claude answer consumption is uncertain; inspect the native question "
-                    "before retrying"
+                    raise
+                # No keys were sent yet and the native question is still open: this
+                # mismatch is purely a *read* failure (our parser didn't recognize the
+                # live screen), so nothing about the pending question's state has
+                # changed. Per this module's recovery philosophy, `pending` is only
+                # ever escalated to `ControlRecoveryError` (answer_uncertain) once we
+                # start pressing keys — before that, the safe and correct choice is to
+                # leave the question pending and tell the caller plainly that the exact
+                # same answer can be retried, rather than raising an opaque internal
+                # message or silently dropping the question.
+                raise ValueError(
+                    "The live Claude menu does not match the pending question state; "
+                    "no keys were sent, so the question is still pending and this "
+                    "same answer can be retried"
                 ) from exc
-            raise
+            if self._pending_tty_prompts.get(request_id) is not pending:
+                raise ValueError("The native Claude question ended while its menu was rendering")
+            result = await self._native_question_result(pending)
+            if result is not None:
+                await self._reject_native_question(request_id, result, pane_id=pane_id)
+                raise ValueError("The native Claude question already completed before this answer")
+            pending["answer_uncertain"] = True
+            try:
+                for plan in plans:
+                    await self._drive_question_page(plan, pane_id=pane_id)
+                if len(plans) > 1 or any(plan["multi"] for plan in plans):
+                    review = await self._wait_question_screen(
+                        lambda screen: self._question_review_matches(screen, plans), pane_id=pane_id
+                    )
+                    digit = self._match_menu_digit("Submit answers", self._menu_rows(review))
+                    await self._send_key(str(digit), pane_id=pane_id)
+                result = await self._wait_native_question_result(pending)
+                actual = result.get("answers")
+                matched = (
+                    not result["is_error"]
+                    and isinstance(actual, dict)
+                    and set(actual) == {plan["text"] for plan in plans}
+                    and all(
+                        self._question_answer_matches(actual[plan["text"]], plan) for plan in plans
+                    )
+                )
+                if not matched:
+                    await self._reject_native_question(request_id, result, pane_id=pane_id)
+                    raise ValueError("Claude did not consume the requested question answers")
+                decision = (
+                    plans[0]["values"][0]
+                    if len(plans) == 1 and not plans[0]["multi"]
+                    else "answered"
+                )
+                await self._resolve_tty_answer(request_id, decision)
+            except Exception as exc:
+                if request_id in self._pending_tty_prompts:
+                    result = await self._native_question_result(pending)
+                    if result is not None and not pending.get("resolution_pending"):
+                        await self._reject_native_question(request_id, result, pane_id=pane_id)
+                        raise ValueError(
+                            "Claude question completed outside the expected answer state"
+                        ) from exc
+                    await self._emit_ask_user_question(request_id, pending["questions"])
+                    raise ControlRecoveryError(
+                        "Claude answer consumption is uncertain; inspect the native question "
+                        "before retrying"
+                    ) from exc
+                raise
         finally:
             pending.pop("answer_in_flight", None)
 
@@ -2420,6 +2513,19 @@ class TmuxInteractiveTransport(CLITransport):
             await asyncio.sleep(self._menu_poll_step_s)
 
     @staticmethod
+    def _strip_question_border(line: str) -> str:
+        """Claude Code v2.1.x prefixes the active tab's question text with a dim
+        "│ " gutter — the left border of that question's panel in a multi-question
+        AskUserQuestion (tabs across the top, one per question, plus a Submit tab).
+        It carries no content, but it defeats the exact-text comparison in
+        `_question_page_matches` below unless it's stripped first. A no-op on the
+        older, non-tabbed single-question rendering (and on any other row)."""
+        stripped = line.strip()
+        if stripped.startswith("│"):
+            stripped = stripped[1:].strip()
+        return stripped
+
+    @staticmethod
     def _question_page_matches(screen: str, plan: dict[str, Any]) -> bool:
         if not screen or "Review your answers" in screen:
             return False
@@ -2429,7 +2535,10 @@ class TmuxInteractiveTransport(CLITransport):
         first_row = next(
             (i for i, line in enumerate(lines) if _MENU_ROW_RE.match(line)), len(lines)
         )
-        if " ".join(plan["text"].split()) != " ".join(" ".join(lines[1:first_row]).split()):
+        body = " ".join(
+            TmuxInteractiveTransport._strip_question_border(line) for line in lines[1:first_row]
+        )
+        if " ".join(plan["text"].split()) != " ".join(body.split()):
             return False
         rows = TmuxInteractiveTransport._menu_rows(screen)
         labels = []
@@ -2793,6 +2902,7 @@ class TmuxInteractiveTransport(CLITransport):
 
     async def _create_session(self) -> None:
         env = self._spawn_env()
+        self._prepare_claude_config(env)
         self._write_hook_settings()
         command = self._interactive_argv()
         logger.info("TmuxInteractiveTransport: starting %s", self._session_name)
@@ -2844,7 +2954,7 @@ class TmuxInteractiveTransport(CLITransport):
                 "claude.ai/code + phone in parallel with the Volundr API",
                 rc_name,
             )
-        if self._hook_events_enabled and self._sdk_port:
+        if self._skip_permissions or (self._hook_events_enabled and self._sdk_port):
             cmd.extend(["--settings", str(self._hook_settings_path)])
         appended_system_prompt = self._composed_system_prompt()
         if appended_system_prompt:
@@ -2889,27 +2999,35 @@ class TmuxInteractiveTransport(CLITransport):
         return self._safe_name(raw)[:60]
 
     def _write_hook_settings(self) -> None:
-        if not self._hook_events_enabled or not self._sdk_port:
+        settings: dict[str, Any] = {}
+        if self._skip_permissions:
+            # Session settings belong in the CLI overlay: user settings can be
+            # symlinked to a read-only Kubernetes credential projection.
+            settings["skipDangerousModePermissionPrompt"] = True
+        if self._hook_events_enabled and self._sdk_port:
+            events = list(_CLAUDE_HOOK_EVENTS)
+            if self._message_display_hook_enabled:
+                events.extend(_OPTIONAL_HIGH_VOLUME_HOOK_EVENTS)
+            hook: dict[str, Any] = {
+                "type": "http",
+                "url": f"http://127.0.0.1:{self._sdk_port}/api/claude/hooks",
+                "timeout": 5,
+            }
+            if self._session_tools is not None and self._session_tools.loopback_authorization:
+                # Claude HTTP hooks send literal headers; the broker requires its secret.
+                hook["headers"] = {"Authorization": self._session_tools.loopback_authorization}
+            settings["hooks"] = {event: [{"matcher": "", "hooks": [hook]}] for event in events}
+        if not settings:
             return
-
-        events = list(_CLAUDE_HOOK_EVENTS)
-        if self._message_display_hook_enabled:
-            events.extend(_OPTIONAL_HIGH_VOLUME_HOOK_EVENTS)
-        hook: dict[str, Any] = {
-            "type": "http",
-            "url": f"http://127.0.0.1:{self._sdk_port}/api/claude/hooks",
-            "timeout": 5,
-        }
-        if self._session_tools is not None and self._session_tools.loopback_authorization:
-            # Claude HTTP hooks send literal headers; the broker requires its secret.
-            hook["headers"] = {"Authorization": self._session_tools.loopback_authorization}
-        settings = {"hooks": {event: [{"matcher": "", "hooks": [hook]}] for event in events}}
         content = json.dumps(settings, indent=2, sort_keys=True) + "\n"
         self._hook_settings_path.parent.mkdir(parents=True, exist_ok=True)
         write_private_file(self._hook_settings_path, content)
 
     def _spawn_env(self) -> dict[str, str]:
-        env = claude_spawn_env()
+        env = claude_spawn_env(
+            gateway_url=self._model_gateway_url,
+            gateway_token=self._model_gateway_token,
+        )
         env["TERM"] = env.get("TERM") or "xterm-256color"
         if self._agent_teams:
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
@@ -2920,6 +3038,43 @@ class TmuxInteractiveTransport(CLITransport):
         )
         env.update(shim_env)
         return env
+
+    @staticmethod
+    def _claude_config_path(env: dict[str, str]) -> Path:
+        """The CLI's user config file: ``$CLAUDE_CONFIG_DIR/.claude.json`` when the
+        directory is set (the session image sets it), else ``~/.claude.json``."""
+        config_dir = env.get("CLAUDE_CONFIG_DIR", "").strip()
+        if config_dir:
+            return Path(config_dir) / ".claude.json"
+        home = env.get("HOME", "").strip()
+        return (Path(home) if home else Path.home()) / ".claude.json"
+
+    def _prepare_claude_config(self, env: dict[str, str]) -> None:
+        """Answer the CLI's first-run dialogs ahead of time.
+
+        A session sandbox starts with no CLI state, and the interactive REPL
+        then walks through onboarding (theme, then a login picker that does
+        not count the OAuth token in the environment as a login), the
+        workspace trust question, and the bypass-permissions notice. Nobody
+        is at that keyboard; the broker is. So the answers a sandboxed session
+        implies are written into the config the CLI reads before it starts:
+        onboarding done, this workspace trusted, and the permission mode the
+        session was configured with acknowledged.
+        """
+        config_path = self._claude_config_path(env)
+        config: dict[str, Any] = {}
+        if config_path.exists():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        before = json.dumps(config, sort_keys=True)
+        config["hasCompletedOnboarding"] = True
+        config.setdefault("theme", "dark")
+        projects = config.setdefault("projects", {})
+        project = projects.setdefault(self.workspace_dir, {})
+        project["hasTrustDialogAccepted"] = True
+        if json.dumps(config, sort_keys=True) != before:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            _replace_text_atomically(config_path, json.dumps(config, indent=2))
+            logger.info("tmux: prepared Claude CLI config at %s (onboarding, trust)", config_path)
 
     async def _emit_system_init(self) -> None:
         await self._emit(
@@ -3473,7 +3628,20 @@ class TmuxInteractiveTransport(CLITransport):
     async def _composer_state(self, needle: str, target: str) -> str:
         """One bottom-of-pane observation: 'holds' when our text tail is still visible in
         the input region and no selection menu is open; 'menu' when a menu row is visible
-        (never press Enter into it); 'clear' otherwise (submitted / can't tell)."""
+        (never press Enter into it); 'clear' otherwise (submitted / can't tell).
+
+        Claude Code v2.1.x echoes the just-submitted turn back into the transcript with
+        the same "❯ " prefix the live composer uses (see `_is_prompt_row`), so our own
+        text tail can stay *visible* a few rows up long after the composer itself is
+        empty. A plain substring search over the whole snapshot can't tell "still typed"
+        from "already submitted and echoed back" apart — that used to spin Enter retries
+        against a message Claude had already consumed (composer-still-holds false
+        positive). The two are told apart by what renders *after* the row(s) our text
+        tail lives in: nothing but blank lines / dividers / the status footer means it's
+        still the live composer; anything that looks like new turn activity (an
+        assistant row, a tool-call summary, the thinking spinner) means Claude has moved
+        on and this occurrence is history, not the input box.
+        """
         snapshot = await self._run_tmux(
             "capture-pane", "-p", "-S", "-12", "-t", target, check=False
         )
@@ -3482,8 +3650,25 @@ class TmuxInteractiveTransport(CLITransport):
         rows = self._normalize_terminal_rows(snapshot.stdout)
         if any(_MENU_ROW_RE.match(row) for row in rows):
             return "menu"
-        joined = self._normalize_prompt(" ".join(rows))
-        return "holds" if needle in joined else "clear"
+        non_blank = [row for row in (self._normalize_prompt(r) for r in rows) if row]
+        if not non_blank:
+            return "clear"
+        joined = " ".join(non_blank)
+        pos = joined.rfind(needle)  # most recent (bottom-most) occurrence wins
+        if pos == -1:
+            return "clear"
+        end_offset = pos + len(needle)
+        cumulative = 0
+        end_row = len(non_blank) - 1
+        for idx, row in enumerate(non_blank):
+            cumulative += len(row)
+            if cumulative + idx >= end_offset:
+                end_row = idx
+                break
+        trailing = non_blank[end_row + 1 :]
+        if any(not self._is_terminal_chrome_row(row) for row in trailing):
+            return "clear"
+        return "holds"
 
     async def _send_key(self, key: str, *, pane_id: str | None = None) -> None:
         target = self._target_pane(pane_id)
@@ -3554,6 +3739,9 @@ class TmuxInteractiveTransport(CLITransport):
         finally:
             with suppress(Exception):
                 await self._send_key_raw("Escape", pane_id=target)
+                # Claude handles menu dismissal asynchronously. Without a render
+                # tick, the menu consumes C-u and leaves '/' in the next prompt.
+                await asyncio.sleep(self._menu_poll_step_s)
                 await self._send_key_raw("C-u", pane_id=target)
 
         commands: list[dict] = []
@@ -3825,7 +4013,8 @@ class TmuxInteractiveTransport(CLITransport):
         stripped = row.strip().replace("\u00a0", " ")
         if not stripped.startswith("❯"):
             return False
-        return not stripped[1:].strip()
+        rest = stripped[1:].strip()
+        return not rest or _COMPOSER_SUGGESTION_RE.fullmatch(rest) is not None
 
     @classmethod
     def _clean_response_row(cls, row: str) -> str | None:
@@ -3848,9 +4037,18 @@ class TmuxInteractiveTransport(CLITransport):
     def _is_terminal_chrome_row(stripped: str) -> bool:
         if stripped in {"?", "│", "╭", "╰"}:
             return True
-        if set(stripped) <= {"─"}:
+        # A row made up solely of box-drawing / rule characters (dividers, and the
+        # borders a boxed prompt or panel draws around itself) can never carry content
+        # on its own — see `_composer_state`, which relies on this to tell "nothing new
+        # rendered below our text" from "Claude answered", and would otherwise trip over
+        # a plain decorative border.
+        if stripped and set(stripped) <= set("─│╭╮╰╯"):
             return True
         if "for shortcuts" in stripped:
+            return True
+        # v2.1.x's idle status footer, e.g. "bypass permissions on (shift+tab to
+        # cycle) . for agents" — replaces "? for shortcuts" in some permission modes.
+        if "shift+tab to cycle" in stripped:
             return True
         if "esc to interrupt" in stripped:
             return True

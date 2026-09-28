@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import (
     BaseSettings,
     NoDecode,
@@ -205,7 +205,7 @@ def _default_instance_catalog() -> list[InstanceCatalogEntryConfig]:
         ),
         InstanceCatalogEntryConfig(
             kind=InstanceKind.TING,
-            label="Tyr",
+            label="Ting",
             rune="✦",
             summary="saga coordinator",
             detail="dispatch ravens",
@@ -227,11 +227,87 @@ def _default_instance_catalog() -> list[InstanceCatalogEntryConfig]:
     ]
 
 
+class InstanceProbeConfig(BaseModel):
+    """Dynamic adapter config for the instance-reachability prober.
+
+    Follows ``.claude/rules/dynamic-adapters.md``: ``adapter`` names a
+    fully-qualified ``InstanceProbePort`` implementation, and every other
+    key is passed through as a constructor kwarg — adding a new probe
+    strategy is "write the class + point this at it", zero code changes
+    elsewhere. ``embedded_app`` is deliberately not a field here: it is a
+    live ASGI object, injected by the composition root (``guild/app.py``),
+    never something that belongs in a config file.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    adapter: str = Field(
+        default="niuu.adapters.outbound.http_instance_probe.HttpInstanceProbeAdapter",
+        description="Fully-qualified InstanceProbePort implementation class.",
+    )
+    timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Per-probe HTTP timeout, for both the periodic loop and register-time checks.",
+    )
+    health_paths: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-kind health path overrides (InstanceKind value -> path), merged on top of "
+            "HttpInstanceProbeAdapter.DEFAULT_HEALTH_PATHS — only the kinds being changed need "
+            "an entry here. An individual instance can also override its own path via "
+            "config.health_path on the registered instance, which wins over both."
+        ),
+    )
+
+
+class InstanceHealthConfig(BaseModel):
+    """Server-side reachability checking for registered runtime instances.
+
+    A configured instance that cannot be reached must be reported as
+    unreachable, never left looking merely idle — see
+    ``.claude/rules/no-fallbacks.md``.
+    """
+
+    interval_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="How often the periodic health loop re-probes every registered instance.",
+    )
+    probe: InstanceProbeConfig = Field(default_factory=InstanceProbeConfig)
+
+
+class NodeJoinConfig(BaseModel):
+    """`niuu join` — pairing and node-signed request policy."""
+
+    clock_skew_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Maximum allowed difference between a node's clock and Guild's for a "
+            "signed node request (heartbeat/leave) to be accepted."
+        ),
+    )
+    pairing_code_ttl_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "How long a minted pairing code remains valid before it must be re-minted. "
+            "Deliberately its own, shorter knob — a pairing code is shown to an operator "
+            "once and used immediately, unlike the longer-lived workload_identity."
+            "token_ttl_seconds shared by other scoped credentials. The stored code is "
+            "never valid for longer than min(this, that JWT's own expiry)."
+        ),
+    )
+
+
 class InstanceRegistryConfig(BaseModel):
     """Shared registry config for runtime instances."""
 
     instances: list[InstanceSeedConfig] = Field(default_factory=list)
     catalog: list[InstanceCatalogEntryConfig] = Field(default_factory=_default_instance_catalog)
+    health: InstanceHealthConfig = Field(default_factory=InstanceHealthConfig)
+    node_join: NodeJoinConfig = Field(default_factory=NodeJoinConfig)
 
 
 def has_enabled_instance_kind(settings: Any, kind: InstanceKind) -> bool:
@@ -357,6 +433,66 @@ class NiuuHostConfig(BaseSettings):
         default="",
         validation_alias=AliasChoices("external_database_host", "DATABASE__HOST"),
     )
+    external_database_port: int = Field(
+        default=5432,
+        validation_alias=AliasChoices("external_database_port", "DATABASE__PORT"),
+    )
+    session_proxy_role_check_interval_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "session_proxy_role_check_interval_seconds",
+            "NIUU_SESSION_PROXY_ROLE_CHECK_INTERVAL_SECONDS",
+        ),
+        description=(
+            "How often a proxied session WebSocket re-validates attach and room "
+            "role while connected, so a revoked or demoted session_participants "
+            "grant closes the live socket instead of only blocking new "
+            "connections. Mirrors skuld.config.WsAuthConfig.websocket_check_interval."
+        ),
+    )
+    external_database_user: str = Field(
+        default="postgres",
+        validation_alias=AliasChoices("external_database_user", "DATABASE__USER"),
+    )
+    external_database_password: str = Field(
+        default="",
+        validation_alias=AliasChoices("external_database_password", "DATABASE__PASSWORD"),
+    )
+    platform_mode: str = Field(
+        default="",
+        description="Operating mode of the host process (mini, openshell, cluster, docker).",
+        validation_alias=AliasChoices("platform_mode", "NIUU_MODE"),
+    )
+    setup_enabled: bool = Field(
+        default=False,
+        description="Serve the first-launch setup wizard (single-host installs).",
+        validation_alias=AliasChoices("setup_enabled", "NIUU_SETUP_ENABLED"),
+    )
+    setup_mode: str = Field(
+        default="",
+        description="Mode name the wizard reports (e.g. docker) when it differs from the "
+        "mode the host process runs in; empty = platform_mode.",
+        validation_alias=AliasChoices("setup_mode", "NIUU_SETUP_MODE"),
+    )
+    setup_state_file: str = Field(
+        default="~/.niuu/setup-state.json",
+        description="Where wizard progress is recorded.",
+        validation_alias=AliasChoices("setup_state_file", "NIUU_SETUP_STATE_FILE"),
+    )
+    host_facts_file: str = Field(
+        default="",
+        description="Host facts JSON written by `niuu up`; empty when not started that way.",
+        validation_alias=AliasChoices("host_facts_file", "NIUU_HOST_FACTS_FILE"),
+    )
+    stack_dir: str = Field(
+        default="",
+        description=(
+            "Directory with the bundle settings `niuu up` recorded (stack.yaml); enables the "
+            "wizard's runtime, access and local-model changes. Empty = not available."
+        ),
+        validation_alias=AliasChoices("stack_dir", "NIUU_STACK_DIR"),
+    )
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -373,6 +509,24 @@ class NiuuHostConfig(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return "auto"
         return value
+
+
+class HostIdentityConfig(BaseModel):
+    """Identity adapter for the root niuu app's own inbound requests.
+
+    Used by the session proxy (``niuu.session_proxy``) to resolve a verified
+    caller identity for WS/HTTP attach — a header-only slot (no user
+    provisioning), the same shape as Ravn's own ``RAVN_API_AUTH``. Set from
+    ``host_auth.mode`` (``cli.config.AuthConfig``) via the ``HOST_IDENTITY__*``
+    env vars — a distinct name from ``IDENTITY__*`` deliberately, so this
+    slot can never collide with Völundr/Identity's own ``IDENTITY__ADAPTER``
+    env var when both processes share the same environment.
+    """
+
+    adapter: str = Field(
+        default="identity.adapters.identity.AllowAllHeaderAuthenticationAdapter",
+    )
+    kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
 class NiuuSettings(BaseSettings):
@@ -393,6 +547,15 @@ class NiuuSettings(BaseSettings):
     cors: CorsConfig = Field(default_factory=CorsConfig)
     host: Annotated[NiuuHostConfig, NoDecode] = Field(
         default_factory=NiuuHostConfig,
+    )
+    host_identity: HostIdentityConfig = Field(default_factory=HostIdentityConfig)
+    auth_mode: str = Field(
+        default="envoy",
+        description=(
+            "Mirrors volundr.config.Settings.auth_mode / ting.config.Settings."
+            "auth_mode — see either for the full description. Set from "
+            "host_auth.mode via the AUTH_MODE env var."
+        ),
     )
 
     @field_validator("host", mode="before")

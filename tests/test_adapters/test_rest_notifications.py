@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
 from niuu.domain.notifications import NotificationDraft, build_notification_turn
 from tests.conftest import InMemorySessionRepository, MockPodManager
 from tests.support.notifications import InMemoryNotificationStore
@@ -55,7 +56,7 @@ def env():
         sinks=[NotificationSinkInfo(name="ops", label="Ops webhook")],
     )
     app = FastAPI()
-    app.state.identity = object()  # forwarded x-auth-* headers identify the caller
+    app.state.identity = EnvoyHeaderAuthenticationAdapter()  # trusts forwarded x-auth-*
     app.include_router(
         create_notifications_router(
             service, session_service, prefix=PREFIX, default_page_size=2, max_page_size=5

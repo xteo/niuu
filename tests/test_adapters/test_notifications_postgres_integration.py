@@ -44,7 +44,7 @@ from volundr.domain.notifications import (
 
 pytestmark = pytest.mark.integration
 MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION = "000069_forge_notifications"
+MIGRATION = "000084_forge_notifications"
 
 
 @pytest_asyncio.fixture
@@ -126,8 +126,8 @@ async def test_migration_is_idempotent_and_reversible(pool):
     up = (MIGRATIONS / f"{MIGRATION}.up.sql").read_text()
     down = (MIGRATIONS / f"{MIGRATION}.down.sql").read_text()
     await pool.execute(up)  # re-applying is a no-op
-    item_up = (MIGRATIONS / "000071_forge_notification_reads.up.sql").read_text()
-    item_down = (MIGRATIONS / "000071_forge_notification_reads.down.sql").read_text()
+    item_up = (MIGRATIONS / "000086_forge_notification_reads.up.sql").read_text()
+    item_down = (MIGRATIONS / "000086_forge_notification_reads.down.sql").read_text()
     await pool.execute(item_up)  # both migrations are idempotent
     await pool.execute(item_down)  # children before the parent migration
     await pool.execute(item_down)

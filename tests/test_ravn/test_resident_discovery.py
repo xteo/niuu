@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import httpx
+import pytest
 import respx
 from fastapi.testclient import TestClient
 
@@ -191,7 +192,7 @@ class TestKubernetesListingPlumbing:
     """Shared deployment-listing behavior (no client library installed)."""
 
     async def test_no_token_mounted_returns_empty(self, tmp_path, monkeypatch) -> None:
-        import ravn.adapters.kubernetes_deployments as kd
+        from ravn.adapters import kubernetes_deployments as kd
 
         monkeypatch.setattr(kd, "_SERVICE_ACCOUNT_ROOT", tmp_path)
         adapter = KubernetesResidentDiscoveryAdapter(namespace="volundr")
@@ -200,7 +201,7 @@ class TestKubernetesListingPlumbing:
 
     @respx.mock
     async def test_incluster_rest_listing_maps_residents(self, tmp_path, monkeypatch) -> None:
-        import ravn.adapters.kubernetes_deployments as kd
+        from ravn.adapters import kubernetes_deployments as kd
 
         (tmp_path / "token").write_text("sa-token", encoding="utf-8")
         monkeypatch.setattr(kd, "_SERVICE_ACCOUNT_ROOT", tmp_path)
@@ -254,7 +255,7 @@ class TestKubernetesListingPlumbing:
     async def test_incluster_rest_all_namespaces_error_returns_empty(
         self, tmp_path, monkeypatch
     ) -> None:
-        import ravn.adapters.kubernetes_deployments as kd
+        from ravn.adapters import kubernetes_deployments as kd
 
         (tmp_path / "token").write_text("sa-token", encoding="utf-8")
         monkeypatch.setattr(kd, "_SERVICE_ACCOUNT_ROOT", tmp_path)
@@ -382,14 +383,18 @@ class TestCompositeResidentDiscoveryAdapter:
             ("resident-muninn", "Observed")
         ]
 
-    async def test_tolerates_failing_adapter(self) -> None:
+    async def test_a_failing_adapter_raises_instead_of_silently_dropping_its_residents(
+        self,
+    ) -> None:
+        """A configured discovery adapter that cannot answer is a fault, not
+        an empty contribution — the old behavior made its residents vanish
+        from the fleet with no signal (see .claude/rules/no-fallbacks.md)."""
         composite = CompositeResidentDiscoveryAdapter(
             [_FailingResidentDiscovery(), _StaticResidentDiscovery([_resident()])]
         )
 
-        residents = await composite.list_residents()
-
-        assert [item.id for item in residents] == ["resident-muninn"]
+        with pytest.raises(RuntimeError, match="_FailingResidentDiscovery"):
+            await composite.list_residents()
 
 
 class TestResidentDiscoveryConfig:
@@ -461,11 +466,16 @@ def test_ravn_api_lists_discovered_standalone_residents(tmp_path) -> None:
         return_value=httpx.Response(200, json=[])
     )
     client = TestClient(
-        create_app(
+        headers={
+            "x-auth-user-id": "dev-user",
+            "x-auth-tenant": "default",
+            "x-auth-roles": "volundr:developer",
+        },
+        app=create_app(
             warden_store=WardenStore(tmp_path),
             settings=settings,
             resident_discovery=_StaticResidentDiscovery([_resident()]),
-        )
+        ),
     )
 
     ravens = client.get("/api/v1/ravn/ravens")

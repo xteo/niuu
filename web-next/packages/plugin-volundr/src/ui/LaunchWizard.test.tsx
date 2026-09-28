@@ -15,7 +15,8 @@ vi.mock('@tanstack/react-router', () => ({
 function wrap(open = true, onOpenChange = vi.fn(), service = createMockVolundrService()) {
   return wrapWithServices(open, onOpenChange, service, {
     getRepos: service.getRepos.bind(service),
-    getBranches: async () => [],
+    getBranches: async (url: string) =>
+      (await service.getRepos()).find((repo) => repo.cloneUrl === url)?.branches ?? [],
   });
 }
 
@@ -84,6 +85,32 @@ async function advanceToConfirm() {
 }
 
 describe('LaunchWizard', () => {
+  it('automatically checks the enabled GitHub integration for a Git session', async () => {
+    const service = createMockVolundrService();
+    service.getIntegrations = vi.fn().mockResolvedValue([
+      {
+        id: 'github',
+        slug: 'github',
+        integrationType: 'source_control',
+        enabled: true,
+        createdAt: '',
+        updatedAt: '',
+      },
+      {
+        id: 'disabled',
+        slug: 'gitlab',
+        integrationType: 'source_control',
+        enabled: false,
+        createdAt: '',
+        updatedAt: '',
+      },
+    ]);
+    wrap(true, vi.fn(), service);
+    await advanceToRuntime();
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: /^github$/i })).toBeChecked());
+    expect(screen.getByRole('checkbox', { name: /^gitlab$/i })).not.toBeChecked();
+  });
+
   it('renders when open', async () => {
     wrap();
     await waitFor(() => expect(screen.getByText('Launch pod')).toBeInTheDocument());
@@ -125,12 +152,47 @@ describe('LaunchWizard', () => {
     expect(screen.getByTestId('source-tab-blank')).toBeInTheDocument();
   });
 
-  it('shows runtime step with CLI options', async () => {
+  it('shows runtime step with the engines a connected provider powers', async () => {
     wrap();
     await advanceToRuntime();
-    expect(screen.getByTestId('runtime-option-skuldClaude')).toBeInTheDocument();
-    expect(screen.getByTestId('runtime-option-skuldClaudeInteractive')).toBeInTheDocument();
-    expect(screen.getByTestId('runtime-option-skuldCodex')).toBeInTheDocument();
+    const engine = screen.getByTestId('runtime-engine');
+    // the mock has a Claude subscription and a ChatGPT login connected
+    expect(within(engine).getByRole('option', { name: 'Claude Code' })).toBeInTheDocument();
+    expect(
+      within(engine).getByRole('option', { name: 'Claude Code Interactive' }),
+    ).toBeInTheDocument();
+    expect(within(engine).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
+    expect(within(engine).getByRole('option', { name: 'OpenCode' })).toBeInTheDocument();
+    expect(screen.getByTestId('runtime-engine-hint')).toHaveTextContent(
+      'Uses Claude Code (subscription) · claude-code-setup',
+    );
+    expect(screen.getByRole('link', { name: 'Manage providers' })).toHaveAttribute(
+      'href',
+      '/settings/integrations',
+    );
+  });
+
+  it('offers only the engines whose provider is connected', async () => {
+    const service = createMockVolundrService();
+    const connections = await service.getIntegrations();
+    service.getIntegrations = async () =>
+      connections.filter((connection) => connection.slug !== 'codex');
+    wrap(true, vi.fn(), service);
+    await advanceToRuntime();
+    const engine = screen.getByTestId('runtime-engine');
+    expect(within(engine).getByRole('option', { name: 'Claude Code' })).toBeInTheDocument();
+    expect(within(engine).queryByRole('option', { name: 'Codex' })).not.toBeInTheDocument();
+  });
+
+  it('says when the providers cannot be loaded instead of hiding every engine', async () => {
+    const service = createMockVolundrService();
+    service.getIntegrationCatalog = async () => {
+      throw new Error('catalog offline');
+    };
+    wrap(true, vi.fn(), service);
+    await advanceToRuntime();
+    expect(screen.getByTestId('runtime-engine-error')).toHaveTextContent('catalog offline');
+    expect(screen.queryByTestId('runtime-engine')).not.toBeInTheDocument();
   });
 
   it('shows confirm step with review rows', async () => {
@@ -170,7 +232,7 @@ describe('LaunchWizard', () => {
     });
   });
 
-  it('uses embedded branch lists, links tracker issues, clears them, and supports blank sources', async () => {
+  it('loads selected repository branches, links tracker issues, clears them, and supports blank sources', async () => {
     wrap();
     await waitForSourceStep();
 
@@ -407,7 +469,7 @@ source:
     expect(screen.getByText('skuld-codex')).toBeInTheDocument();
     expect(screen.getByText('~/code/niuu/custom')).toBeInTheDocument();
     expect(screen.getByText('openai-key')).toBeInTheDocument();
-    expect(screen.getByText('github-primary')).toBeInTheDocument();
+    expect(screen.getByText(/github-primary/)).toBeInTheDocument();
     expect(screen.getByText('review-http')).toBeInTheDocument();
     expect(screen.getByText('LOG_LEVEL=debug')).toBeInTheDocument();
     expect(screen.getByText('pnpm lint')).toBeInTheDocument();

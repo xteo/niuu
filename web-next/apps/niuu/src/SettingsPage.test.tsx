@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import '@testing-library/jest-dom/vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ConfigProvider } from '@niuulabs/plugin-sdk';
+import { ConfigProvider, ServicesProvider } from '@niuulabs/plugin-sdk';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SettingsPage } from './SettingsPage';
@@ -150,7 +151,7 @@ vi.mock('@niuulabs/query', () => ({
   })),
 }));
 
-function wrap(children: ReactNode, enableSessions = false) {
+function wrap(children: ReactNode, enableSessions = false, enableInterface = false) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -169,12 +170,15 @@ function wrap(children: ReactNode, enableSessions = false) {
           credentials: { enabled: true, order: 1 },
           integrations: { enabled: true, order: 2 },
           ting: { enabled: true, order: 3 },
+          setup: { enabled: true, order: 4 },
+          settings: { enabled: enableInterface, order: 5 },
         },
         services: {
           identity: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/identity' },
           credentials: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/credentials' },
           integrations: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/integrations' },
           ting: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/ting' },
+          runtime: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/niuu/setup' },
         },
       }}
     >
@@ -187,6 +191,20 @@ describe('SettingsPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installDefaultGetMock();
+  });
+
+  it('renders interface mode as a local settings section', () => {
+    routerMocks.params = { providerId: 'interface', sectionId: 'mode' };
+    wrap(<SettingsPage />, false, true);
+
+    expect(screen.getByRole('heading', { name: 'Interface mode' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Interface mode' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Simple' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'Advanced' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    expect(apiMocks.get).not.toHaveBeenCalled();
   });
 
   it('renders local session checkboxes without fetching or saving a remote schema', () => {
@@ -269,6 +287,20 @@ describe('SettingsPage', () => {
     );
     expect(screen.getByText('Create token')).toBeTruthy();
     expect(await screen.findByText('local-tools')).toBeTruthy();
+    const createButton = screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement;
+    fireEvent.change(screen.getByLabelText('Token name'), { target: { value: 'ci-runner' } });
+    expect(createButton.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Permission'), {
+      target: { value: 'forge:session:create' },
+    });
+    fireEvent.click(createButton);
+    await waitFor(() =>
+      expect(apiMocks.post).toHaveBeenCalledWith('/api/v1/tokens', {
+        name: 'ci-runner',
+        scopes: ['forge:session:create'],
+      }),
+    );
+
     expect(screen.getByText('Editable')).toBeTruthy();
   });
 
@@ -280,6 +312,38 @@ describe('SettingsPage', () => {
     expect(screen.getByText('Editable')).toBeTruthy();
     expect(screen.getByRole('checkbox', { name: 'Enabled' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Save notification settings' })).toBeTruthy();
+  });
+
+  it('saves a section as flat field values to the section path', async () => {
+    routerMocks.params = { providerId: 'ting', sectionId: 'notifications' };
+    apiMocks.patch.mockResolvedValueOnce(null);
+    wrap(<SettingsPage />);
+
+    const checkbox = await screen.findByRole('checkbox', { name: 'Enabled' });
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole('button', { name: 'Save notification settings' }));
+
+    await waitFor(() => {
+      expect(apiMocks.patch).toHaveBeenCalledWith('/settings/notifications', { enabled: false });
+    });
+    expect(await screen.findByText('Saved.')).toBeTruthy();
+  });
+
+  it('shows the server reason when a section save fails', async () => {
+    routerMocks.params = { providerId: 'ting', sectionId: 'notifications' };
+    apiMocks.patch.mockRejectedValueOnce(
+      Object.assign(new Error('API request failed: 422'), {
+        detail: 'send homeEnabled and/or fileManagerEnabled; nothing to update',
+      }),
+    );
+    wrap(<SettingsPage />);
+
+    await screen.findByRole('checkbox', { name: 'Enabled' });
+    fireEvent.click(screen.getByRole('button', { name: 'Save notification settings' }));
+
+    expect((await screen.findByTestId('settings-save-error')).textContent).toBe(
+      'Failed to save this section: send homeEnabled and/or fileManagerEnabled; nothing to update',
+    );
   });
 
   it('renders the credentials resource composer inside the unified shell', async () => {
@@ -431,6 +495,55 @@ describe('SettingsPage', () => {
     expect(await screen.findByRole('button', { name: 'Connect integration' })).toBeTruthy();
     expect(await screen.findAllByText('Telegram')).toHaveLength(2);
     expect(screen.getByDisplayValue('telegram-credential')).toBeTruthy();
+  });
+
+  it.each(['Linear-mcp', ''])('shows the MCP connection name or endpoint: %s', async (name) => {
+    routerMocks.params = { providerId: 'integrations', sectionId: 'connections' };
+    const defaultGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === '/settings') {
+        return {
+          title: 'Integrations',
+          scope: 'user',
+          sections: [
+            {
+              id: 'connections',
+              label: 'Connections',
+              fields: [],
+              resources: [
+                {
+                  id: 'integration_connections',
+                  type: 'integrations',
+                  label: 'Integration connections',
+                  listPath: '/api/v1/integrations',
+                  catalogPath: '/api/v1/integrations/catalog',
+                  credentialListPath: '/api/v1/credentials/user',
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (path === '/api/v1/integrations') {
+        return [
+          {
+            id: 'linear-mcp',
+            slug: 'mcp',
+            integration_type: 'mcp',
+            credential_name: 'mcp-internal-credential-id',
+            enabled: true,
+            config: { name, mcp_url: 'https://mcp.linear.app/mcp/readonly' },
+          },
+        ];
+      }
+      return defaultGet(path);
+    });
+    wrap(<SettingsPage />);
+    expect(
+      await screen.findByText(name || 'https://mcp.linear.app/mcp/readonly', { exact: true }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/mcp · https:\/\/mcp.linear.app\/mcp\/readonly/)).toBeInTheDocument();
+    expect(screen.queryByText(/mcp-internal-credential-id/)).not.toBeInTheDocument();
   });
 
   it('supports reusing an existing stored credential for non-oauth integrations', async () => {
@@ -590,18 +703,133 @@ describe('SettingsPage', () => {
     expect(screen.queryByText('Create a new credential')).toBeNull();
   });
 
-  it('starts a user-scoped Codex device login from shared Integrations', async () => {
+  it('offers Jira sign-in or API token setup with project and label scope', async () => {
+    routerMocks.params = { providerId: 'integrations', sectionId: 'connections' };
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === '/settings') {
+        return {
+          title: 'Integrations',
+          scope: 'user',
+          sections: [
+            {
+              id: 'connections',
+              label: 'Connections',
+              fields: [],
+              resources: [
+                {
+                  id: 'integration_connections',
+                  type: 'integrations',
+                  label: 'Integration connections',
+                  listPath: '/api/v1/integrations',
+                  catalogPath: '/api/v1/integrations/catalog',
+                  createPath: '/api/v1/integrations',
+                  deletePath: '/api/v1/integrations/{id}',
+                  credentialListPath: '/api/v1/credentials/user',
+                  testPath: '/api/v1/integrations/{id}/test',
+                  oauthAuthorizePath: '/api/v1/integrations/oauth/{slug}/authorize',
+                  oauthDisconnectPath: '/api/v1/integrations/oauth/{slug}/disconnect',
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (path === '/api/v1/credentials/user') return { credentials: [] };
+      if (path === '/api/v1/integrations') return [];
+      if (path === '/api/v1/integrations/catalog') {
+        return [
+          {
+            id: 'jira',
+            slug: 'jira',
+            name: 'Jira Cloud',
+            description: 'Jira Cloud issue tracking',
+            integration_type: 'issue_tracker',
+            auth_type: 'api_key',
+            credential_schema: {
+              required: ['email', 'api_token'],
+              properties: {
+                email: { label: 'Atlassian account email', type: 'string' },
+                api_token: { label: 'API token', type: 'password' },
+              },
+            },
+            config_schema: {
+              required: ['site_url'],
+              properties: {
+                site_url: { label: 'Jira site URL', type: 'url' },
+                project_keys: { label: 'Allowed project keys', type: 'string[]' },
+                labels: { label: 'Allowed issue labels', type: 'string[]' },
+              },
+            },
+            credential_enrollment: {
+              method: 'oauth_authorization_code',
+              credential_field: 'access_token',
+              default_credential_name: 'jira-signin',
+            },
+            sign_in_available: true,
+            oauth_client_secret_required: true,
+          },
+        ];
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+
+    wrap(<SettingsPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up Jira Cloud' }));
+    expect(screen.getByRole('button', { name: /Sign in with Atlassian/ })).toBeTruthy();
+    const tokenMode = screen.getByRole('button', { name: /Use an API token/ });
+    expect(tokenMode).toBeTruthy();
+    fireEvent.click(tokenMode);
+
+    fireEvent.change(await screen.findByTestId('setup-input-jira-email'), {
+      target: { value: 'ada@example.com' },
+    });
+    fireEvent.change(screen.getByTestId('setup-input-jira-api_token'), {
+      target: { value: 'secret' },
+    });
+    fireEvent.change(screen.getByTestId('setup-config-jira-site_url'), {
+      target: { value: 'https://example.atlassian.net' },
+    });
+    fireEvent.change(screen.getByTestId('setup-config-jira-project_keys'), {
+      target: { value: 'PROJ, OPS' },
+    });
+    fireEvent.change(screen.getByTestId('setup-config-jira-labels'), {
+      target: { value: 'auth, security' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect Jira Cloud' }));
+
+    await waitFor(() =>
+      expect(apiMocks.post).toHaveBeenCalledWith('/api/v1/integrations', {
+        slug: 'jira',
+        enabled: true,
+        credential: {
+          name: 'jira-setup',
+          data: { email: 'ada@example.com', api_token: 'secret' },
+        },
+        config: {
+          site_url: 'https://example.atlassian.net',
+          project_keys: ['PROJ', 'OPS'],
+          labels: ['auth', 'security'],
+        },
+      }),
+    );
+  });
+
+  it.each(['codex', 'claude-code'])('connects %s through shared Integrations', async (slug) => {
+    const isClaude = slug === 'claude-code';
+    const label = isClaude ? 'Claude Code' : 'Codex';
     routerMocks.params = { providerId: 'integrations', sectionId: 'connections' };
     const challenge = {
       id: 'enrollment-1',
       connectionId: 'codex-connection-1',
-      providerSlug: 'codex',
+      providerSlug: slug,
       credentialName: 'codex-credentials',
       state: 'awaiting_user',
       verificationUri: 'https://auth.openai.com/codex/device',
       userCode: 'ABCD-EFGH',
       expiresAt: '2026-08-01T12:15:00Z',
       errorCode: '',
+      inputRequired: isClaude,
     };
     apiMocks.post.mockImplementation(async (path: string) => {
       if (path === '/api/v1/integrations/enrollments') return challenge;
@@ -633,6 +861,7 @@ describe('SettingsPage', () => {
                   enrollmentStartPath: '/api/v1/integrations/enrollments',
                   enrollmentStatusPath: '/api/v1/integrations/enrollments/{id}',
                   enrollmentCancelPath: '/api/v1/integrations/enrollments/{id}',
+                  enrollmentCodePath: '/api/v1/integrations/enrollments/{id}/code',
                 },
               ],
             },
@@ -644,7 +873,7 @@ describe('SettingsPage', () => {
         return [
           {
             id: 'codex-connection-1',
-            slug: 'codex',
+            slug,
             integrationType: 'ai_provider',
             credentialName: 'codex-credentials',
             credentialStatus: 'auth_required',
@@ -655,15 +884,15 @@ describe('SettingsPage', () => {
       if (path === '/api/v1/integrations/catalog') {
         return [
           {
-            id: 'codex',
-            slug: 'codex',
-            name: 'OpenAI Codex (ChatGPT)',
+            id: slug,
+            slug,
+            name: isClaude ? 'Claude Code (subscription)' : 'OpenAI Codex (ChatGPT)',
             integration_type: 'ai_provider',
-            auth_type: 'device_code',
+            auth_type: isClaude ? 'browser_login' : 'device_code',
             credential_schema: {},
             config_schema: {},
             credential_enrollment: {
-              method: 'codex_device',
+              method: isClaude ? 'claude_setup' : 'codex_device',
               credential_field: 'auth.json',
               default_credential_name: 'codex-credentials',
             },
@@ -676,16 +905,30 @@ describe('SettingsPage', () => {
 
     wrap(<SettingsPage />);
 
-    const reconnect = await screen.findByRole('button', { name: 'Reconnect Codex' });
+    const reconnect = await screen.findByRole('button', { name: `Reconnect ${label}` });
     expect(screen.getByText('Reconnect required')).toBeTruthy();
     fireEvent.click(reconnect);
 
-    expect(await screen.findByText('ABCD-EFGH')).toBeTruthy();
+    if (isClaude) {
+      fireEvent.change(await screen.findByLabelText('Authorization code'), {
+        target: { value: 'test-browser-code' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Complete sign-in' }));
+      await waitFor(() =>
+        expect(apiMocks.post).toHaveBeenCalledWith(
+          '/api/v1/integrations/enrollments/enrollment-1/code',
+          { code: 'test-browser-code' },
+        ),
+      );
+      expect(await screen.findByText('Completing sign-in…')).toBeTruthy();
+    } else {
+      expect(await screen.findByText('ABCD-EFGH')).toBeTruthy();
+    }
     expect(screen.getByRole('link', { name: 'the provider login page' }).getAttribute('href')).toBe(
       challenge.verificationUri,
     );
     expect(apiMocks.post).toHaveBeenCalledWith('/api/v1/integrations/enrollments', {
-      slug: 'codex',
+      slug,
       credential_name: 'codex-credentials',
       connection_id: 'codex-connection-1',
     });
@@ -731,6 +974,202 @@ describe('SettingsPage', () => {
         'No service base URL is configured for this provider in the active app profile.',
       ),
     ).toBeTruthy();
+  });
+
+  it('validates and registers deployment-owned integration packages', async () => {
+    routerMocks.params = { providerId: 'runtime', sectionId: 'external-integrations' };
+    const packageRecord = {
+      id: '0',
+      ok: true,
+      sourceDir: '/var/lib/niuu/private-integrations/acme-bugs',
+      definitionFiles: ['integration.yaml'],
+      definitions: [
+        {
+          slug: 'acme-bugs',
+          name: 'Acme Bugs',
+          integrationType: 'issue_tracker',
+          adapter: 'acme_bugs.adapter.AcmeBugsAdapter',
+        },
+      ],
+      errors: [],
+    };
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === '/settings') {
+        return {
+          title: 'Runtime',
+          scope: 'admin',
+          sections: [
+            {
+              id: 'external-integrations',
+              label: 'External integrations',
+              fields: [],
+              resources: [
+                {
+                  id: 'external-integration-packages',
+                  type: 'external_integrations',
+                  label: 'Integration packages',
+                  description: 'Private packages remain on this machine.',
+                  listPath: '/api/v1/niuu/setup/settings/external-integrations',
+                  createPath: '/api/v1/niuu/setup/settings/external-integrations',
+                  deletePath: '/api/v1/niuu/setup/settings/external-integrations/{id}',
+                  validatePath: '/api/v1/niuu/setup/settings/external-integrations/validate',
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (path === '/api/v1/niuu/setup/settings/external-integrations') {
+        return {
+          managedRoot: '/var/lib/niuu/private-integrations',
+          items: [],
+        };
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+    apiMocks.post.mockImplementation(async (path: string) => {
+      if (path.endsWith('/validate')) return packageRecord;
+      if (path === '/api/v1/niuu/setup/settings/external-integrations') {
+        return { ...packageRecord, applyState: 'applying' };
+      }
+      throw new Error(`Unexpected POST ${path}`);
+    });
+
+    wrap(<SettingsPage />);
+
+    const source = (await screen.findByLabelText('Package directory')) as HTMLInputElement;
+    await waitFor(() => expect(source.value).toBe('/var/lib/niuu/private-integrations/'));
+    fireEvent.change(source, {
+      target: { value: '/var/lib/niuu/private-integrations/acme-bugs' },
+    });
+    fireEvent.change(screen.getByLabelText('Definition files'), {
+      target: { value: 'integration.yaml' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Validate package' }));
+
+    expect(await screen.findByText('Package is valid')).toBeTruthy();
+    expect(screen.getByText('Acme Bugs (acme-bugs)')).toBeTruthy();
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/v1/niuu/setup/settings/external-integrations/validate',
+      {
+        sourceDir: '/var/lib/niuu/private-integrations/acme-bugs',
+        definitionFiles: ['integration.yaml'],
+      },
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add and restart platform' }));
+    await waitFor(() =>
+      expect(apiMocks.post).toHaveBeenCalledWith(
+        '/api/v1/niuu/setup/settings/external-integrations',
+        {
+          sourceDir: '/var/lib/niuu/private-integrations/acme-bugs',
+          definitionFiles: ['integration.yaml'],
+        },
+      ),
+    );
+    expect(
+      await screen.findByText(
+        'Stack update started. The platform may be unavailable briefly while it restarts.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('validates and registers compute-only module packages', async () => {
+    routerMocks.params = { providerId: 'runtime', sectionId: 'external-integrations' };
+    const packageRecord = {
+      id: '0',
+      ok: true,
+      sourceDir: '/var/lib/niuu/private-integrations/acme-machines',
+      definitionFiles: [],
+      manifestFile: 'niuu-module.yaml',
+      moduleId: 'acme-machines',
+      definitions: [],
+      components: [
+        {
+          kind: 'machine_provider',
+          name: 'acme',
+          adapter: 'acme_machines.provider.AcmeMachineProvider',
+        },
+      ],
+      errors: [],
+    };
+    apiMocks.get.mockImplementation(async (path: string) => {
+      if (path === '/settings') {
+        return {
+          title: 'Runtime',
+          scope: 'admin',
+          sections: [
+            {
+              id: 'external-integrations',
+              label: 'External integrations',
+              fields: [],
+              resources: [
+                {
+                  id: 'external-integration-packages',
+                  type: 'external_integrations',
+                  label: 'Integration packages',
+                  listPath: '/api/v1/niuu/setup/settings/external-integrations',
+                  createPath: '/api/v1/niuu/setup/settings/external-integrations',
+                  deletePath: '/api/v1/niuu/setup/settings/external-integrations/{id}',
+                  validatePath: '/api/v1/niuu/setup/settings/external-integrations/validate',
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (path === '/api/v1/niuu/setup/settings/external-integrations') {
+        return {
+          managedRoot: '/var/lib/niuu/private-integrations',
+          items: [packageRecord],
+        };
+      }
+      throw new Error(`Unexpected GET ${path}`);
+    });
+    apiMocks.post.mockImplementation(async (path: string) => {
+      if (path.endsWith('/validate')) return packageRecord;
+      if (path === '/api/v1/niuu/setup/settings/external-integrations') {
+        return { ...packageRecord, applyState: 'applying' };
+      }
+      throw new Error(`Unexpected POST ${path}`);
+    });
+
+    wrap(<SettingsPage />);
+
+    expect(await screen.findByText('acme-machines')).toBeTruthy();
+    expect(screen.getByText(/machine provider: acme/)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText('Package directory'), {
+      target: { value: '/var/lib/niuu/private-integrations/acme-machines' },
+    });
+    fireEvent.change(screen.getByLabelText('Definition files'), { target: { value: '' } });
+    fireEvent.change(screen.getByLabelText('Module manifest'), {
+      target: { value: 'niuu-module.yaml' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Validate package' }));
+
+    expect(await screen.findByText('Package is valid')).toBeTruthy();
+    expect(screen.getByText('acme (machine provider)')).toBeTruthy();
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/v1/niuu/setup/settings/external-integrations/validate',
+      {
+        sourceDir: '/var/lib/niuu/private-integrations/acme-machines',
+        definitionFiles: [],
+        manifestFile: 'niuu-module.yaml',
+      },
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add and restart platform' }));
+    await waitFor(() =>
+      expect(apiMocks.post).toHaveBeenCalledWith(
+        '/api/v1/niuu/setup/settings/external-integrations',
+        {
+          sourceDir: '/var/lib/niuu/private-integrations/acme-machines',
+          definitionFiles: [],
+          manifestFile: 'niuu-module.yaml',
+        },
+      ),
+    );
   });
 
   it('renders the schema error state when a mounted provider fails to load', async () => {
@@ -830,4 +1269,27 @@ describe('SettingsPage', () => {
     expect(await screen.findByText(expectedCopy)).toBeTruthy();
     expect(await screen.findByText('Response detail:')).toBeTruthy();
   });
+});
+
+it('renders locally mounted storage management inside the settings shell', async () => {
+  routerMocks.params = { providerId: 'storage', sectionId: 'home' };
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <ConfigProvider
+      value={{
+        demoMode: false,
+        theme: 'ice',
+        plugins: { volundr: { enabled: true, order: 1 } },
+        services: {},
+      }}
+    >
+      <QueryClientProvider client={queryClient}>
+        <ServicesProvider services={{ volundr: { getTargets: async () => [] } }}>
+          <SettingsPage />
+        </ServicesProvider>
+      </QueryClientProvider>
+    </ConfigProvider>,
+  );
+  expect(await screen.findByRole('combobox', { name: 'Storage cluster' })).toBeTruthy();
+  expect(await screen.findByText('No clusters are available to your account.')).toBeTruthy();
 });

@@ -14,7 +14,9 @@ export function LaunchWizard(props: LaunchWizardProps & { initialStandard?: Forg
     if (!open) setAdvanced(false);
     props.onOpenChange(open);
   };
-  if (advanced || props.initialLaunchSpecRef)
+  // A preset or a prefilled form (Simple mode, Realms) is already an advanced
+  // launch; only a bare open offers the quick standards.
+  if (advanced || props.initialLaunchSpecRef || props.initialForm)
     return <AdvancedLaunchWizard {...props} onOpenChange={close} />;
   return (
     <Dialog open={props.open} onOpenChange={close}>

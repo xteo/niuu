@@ -177,6 +177,15 @@ Shared PersistentVolumeClaims mounted by the Volundr API deployment. These are s
 | `storage.home.size` | string | `"1Gi"` | Size of the home PVC (user config is small) |
 | `storage.home.mountPath` | string | `"/volundr/home"` | Mount path inside session pods |
 
+### Preview Cache
+
+Tool-result image preview JPEGs (`config.preview_cache_dir`), backed by an `emptyDir` volume rather than a PVC — previews are regenerable, not durable state. The volundr container's root filesystem is read-only, so this mount is required, not optional.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `previewCache.mountPath` | string | `"/volundr/preview-cache"` | Mount path for the tool-result image preview cache, rendered into `config.yaml`'s `preview_cache_dir` |
+| `previewCache.sizeLimit` | string | `"1Gi"` | Size limit for the preview cache emptyDir volume (leave empty/`""` for no limit) |
+
 ### Database
 
 | Key | Type | Default | Description |
@@ -404,25 +413,14 @@ Controls access control decisions. Uses the [dynamic adapter pattern](#architect
 |---------|-------|-------------|
 | AllowAll (default) | `volundr.adapters.outbound.authorization.AllowAllAuthorizationAdapter` | Development mode -- all actions are permitted |
 | SimpleRole | `volundr.adapters.outbound.authorization.SimpleRoleAuthorizationAdapter` | Role-based access control using the identity role mapping |
-| Cerbos | `volundr.adapters.outbound.cerbos.CerbosAuthorizationAdapter` | Delegates authorization to a [Cerbos PDP](https://cerbos.dev/) via HTTP. Scalable, policy-as-code authorization |
+
+Production deployments enforce authorization via Cedar at the Envoy layer
+(`src/identity/adapters/cedar.py`), not through this per-request port.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `authorization.adapter` | string | `"volundr.adapters.outbound.authorization.AllowAllAuthorizationAdapter"` | Fully-qualified class path for the AuthorizationPort adapter |
 | `authorization.kwargs` | object | `{}` | All kwargs forwarded to the adapter constructor |
-
-<details>
-<summary>CerbosAuthorizationAdapter kwargs</summary>
-
-```yaml
-authorization:
-  adapter: "volundr.adapters.outbound.cerbos.CerbosAuthorizationAdapter"
-  kwargs:
-    url: "http://cerbos:3592"
-    timeout: 5
-```
-
-</details>
 
 ### Credential Store Adapter
 
@@ -575,7 +573,7 @@ The shared `Gateway` resource that all session `HTTPRoute`s attach to. Requires 
 | `config.logLevel` | string | `"info"` | Log level (`debug`, `info`, `warning`, `error`) |
 | `config.logFormat` | string | `"json"` | Log format (`json`, `text`) |
 | `config.host` | string | `"0.0.0.0"` | Host to bind to |
-| `config.workers` | int | `4` | Number of uvicorn workers |
+| `config.workers` | int | `1` | Number of uvicorn workers. Keep at 1 with the development in-memory credential store |
 | `config.sessionTimeout` | string | `"3600"` | Session timeout in seconds |
 | `config.maxSessionsPerUser` | string | `"5"` | Maximum sessions per user |
 | `config.corsOrigins` | string | `"*"` | CORS allowed origins |
@@ -706,7 +704,7 @@ Session definitions are Kubernetes custom resources that describe how session po
 | `web.enabled` | bool | `false` | Enable the Volundr web UI component |
 | `web.replicaCount` | int | `1` | Number of web replicas |
 | `web.image.registry` | string | `"ghcr.io"` | Web UI image registry |
-| `web.image.repository` | string | `"niuulabs/volundr-web"` | Web UI image repository |
+| `web.image.repository` | string | `"niuulabs/niuu-web"` | Web UI image repository |
 | `web.image.tag` | string | `""` | Web UI image tag (defaults to Chart.appVersion) |
 | `web.image.pullPolicy` | string | `"Always"` | Web UI image pull policy |
 | `web.service.type` | string | `"ClusterIP"` | Web UI service type |
@@ -902,8 +900,15 @@ stringData:
 
 ### Development (minimal)
 
+The default in-memory credential store requires one worker and one replica.
+Its credentials are lost on restart. Configure a shared OpenBao credential store
+before increasing either count (see [OpenBao setup](../../docs/operations/openbao-ymir-bootstrap.md)).
+
 ```yaml
 replicaCount: 1
+
+config:
+  workers: 1
 
 resources:
   requests:
@@ -1106,3 +1111,25 @@ curl http://localhost:8080/health
 ---
 
 <!-- This README was generated from values.yaml comments using charts/volundr/README-generate.sh -->
+
+### Shared subscription connections
+
+For a Forge in another cluster, resolve the user's saved connections through the
+central Connections API. Credentials still come from the configured credential
+store and secret injector; the HTTP lookup forwards the authenticated caller's
+bearer token and returns connection metadata only.
+
+```yaml
+integrations:
+  repository:
+    adapter: niuu.adapters.http_integrations.HTTPIntegrationRepository
+    kwargs:
+      base_url: https://yggdrasil.niuu.world
+      api_prefix: /api/v1/integrations
+      auth_adapter: niuu.adapters.outbound.http_auth.RequestBearerTokenAuthAdapter
+```
+
+Use the central Connections service's actual URL. A selected connection must
+exist, belong to the launching user, and be enabled. Launches retain their
+resolved connection IDs for restarts. Claude subscription connections select
+subscription authentication; credential injection errors fail provisioning.

@@ -10,7 +10,7 @@ import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -40,7 +40,6 @@ from ting.domain.services.dispatch_service import (
     _format_persona_label,
     build_prompt,
     is_ready,
-    resolve_target_adapter,
     select_adapter_by_tags,
 )
 from ting.domain.templates import TemplatePhase, TemplateRun
@@ -137,7 +136,6 @@ def _make_saga() -> Saga:
         repos=["org/repo-a", "org/repo-b"],
         feature_branch="feat/alpha",
         status=SagaStatus.ACTIVE,
-        confidence=0.0,
         created_at=datetime.now(UTC),
         base_branch="dev",
     )
@@ -254,21 +252,6 @@ class TestBuildPrompt:
         assert "NIU-42" in prompt
         assert "Add auth" in prompt
         assert "niu-42" in prompt
-
-
-class TestResolveTargetAdapter:
-    def test_no_connection_id_returns_fallback(self):
-        fallback = MockVolundr()
-        assert resolve_target_adapter(None, {}, fallback) is fallback
-
-    def test_matching_returns_adapter(self):
-        fallback = MockVolundr()
-        target = MockVolundr()
-        assert resolve_target_adapter("a", {"a": target}, fallback) is target
-
-    def test_unknown_returns_fallback(self):
-        fallback = MockVolundr()
-        assert resolve_target_adapter("b", {"a": MockVolundr()}, fallback) is fallback
 
 
 class TestSelectAdapterByTags:
@@ -435,7 +418,6 @@ class TestFindReadyIssues:
                     number=1,
                     name="Phase 1",
                     status=PhaseStatus.ACTIVE,
-                    confidence=0.0,
                 ),
                 Phase(
                     id=uuid4(),
@@ -444,7 +426,6 @@ class TestFindReadyIssues:
                     number=2,
                     name="Phase 2",
                     status=PhaseStatus.GATED,
-                    confidence=0.0,
                 ),
             ]
         )
@@ -536,7 +517,6 @@ class TestFindReadyIssues:
                 repos=["org/repo-b"],
                 feature_branch="feat/beta",
                 status=SagaStatus.ACTIVE,
-                confidence=0.0,
                 created_at=datetime.now(UTC),
                 base_branch="main",
             )
@@ -775,7 +755,6 @@ class TestDispatchIssues:
             repos=saga.repos,
             feature_branch=saga.feature_branch,
             status=saga.status,
-            confidence=saga.confidence,
             created_at=saga.created_at,
             base_branch=saga.base_branch,
             owner_id=saga.owner_id,
@@ -841,7 +820,6 @@ class TestDispatchIssues:
             repos=saga.repos,
             feature_branch=saga.feature_branch,
             status=saga.status,
-            confidence=saga.confidence,
             created_at=saga.created_at,
             base_branch=saga.base_branch,
             owner_id=saga.owner_id,
@@ -938,6 +916,47 @@ class TestDispatchIssues:
         assert t.progress_calls[0]["session_id"] == "ses-1"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("tenant_aware", [False, True])
+    async def test_progress_supports_unchanged_external_adapters(
+        self,
+        saga_repo: MockSagaRepo,
+        dispatcher_repo: MockDispatcherRepo,
+        tenant_aware: bool,
+    ):
+        tracker = _make_tracker()
+        recorded = []
+
+        async def legacy_progress(
+            tracker_id, *, status, session_id, owner_id, phase_tracker_id, saga_tracker_id
+        ):
+            recorded.append({"tracker_id": tracker_id, "owner_id": owner_id})
+
+        async def scoped_progress(tracker_id, *, tenant_id=None, **kwargs):
+            await legacy_progress(tracker_id, **kwargs)
+            recorded[-1]["tenant_id"] = tenant_id
+
+        tracker.update_run_progress = scoped_progress if tenant_aware else legacy_progress
+        service = DispatchService(
+            tracker_factory=MockTrackerFactory([tracker]),
+            volundr_factory=MockVolundrFactory(adapters=[MockVolundr()]),
+            saga_repo=saga_repo,
+            dispatcher_repo=dispatcher_repo,
+            config=DispatchConfig(default_system_prompt="Be helpful."),
+        )
+        result = await service.dispatch_issues(
+            owner_id="dev-user",
+            principal=Principal(user_id="dev-user", email="", tenant_id="tenant-a", roles=[]),
+            items=[
+                DispatchItem(saga_id=str(saga_repo.sagas[0].id), issue_id="i-1", repo="org/repo-a")
+            ],
+        )
+        assert result[0].status == "spawned"
+        expected = {"tracker_id": "i-1", "owner_id": "dev-user"}
+        if tenant_aware:
+            expected["tenant_id"] = "tenant-a"
+        assert recorded == [expected]
+
+    @pytest.mark.asyncio
     async def test_forwards_auth_token(
         self,
         service: DispatchService,
@@ -978,7 +997,6 @@ class TestActiveSagaFiltering:
                 repos=["org/repo"],
                 feature_branch="feat/done",
                 status=SagaStatus.COMPLETE,
-                confidence=0.0,
                 created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
                 base_branch="dev",
             )
@@ -1033,7 +1051,6 @@ class TestActiveSagaFiltering:
             repos=["org/repo"],
             feature_branch="feat/done",
             status=SagaStatus.ACTIVE,
-            confidence=0.0,
             created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
             base_branch="dev",
         )
@@ -1230,7 +1247,6 @@ class TestBuildSpawnRequestPersonaOverrides:
             feature_branch="feat/alpha",
             base_branch="main",
             status=SagaStatus.ACTIVE,
-            confidence=0.5,
             created_at=datetime.now(UTC),
         )
 
@@ -1384,6 +1400,71 @@ class TestBuildSpawnRequestPersonaOverrides:
                 },
             }
         ]
+
+    @pytest.mark.parametrize("turn_timeout_s", [900.0, 0.0])
+    def test_workflow_snapshot_gives_claude_personas_the_configured_turn_timeout(
+        self, turn_timeout_s: float
+    ):
+        config = DispatchConfig(
+            flock_enabled=False,
+            flock_default_personas=[],
+            workflow_cli_turn_timeout_seconds=turn_timeout_s,
+        )
+        saga = self._make_saga()
+        issue = self._make_issue()
+        workflow_snapshot = {
+            "workflow_id": str(uuid4()),
+            "name": "Mixed Flow",
+            "version": "1.0.0",
+            "graph": {
+                "nodes": [
+                    {
+                        "id": "stage-1",
+                        "kind": "stage",
+                        "label": "Implement",
+                        "stageMembers": [
+                            {"personaId": "coder", "model": "claude-sonnet-4-6", "budget": 40}
+                        ],
+                    },
+                    {
+                        "id": "stage-2",
+                        "kind": "stage",
+                        "label": "Review",
+                        "stageMembers": [
+                            {"personaId": "reviewer", "model": "gpt-5.5", "budget": 25}
+                        ],
+                    },
+                ]
+            },
+        }
+
+        svc = MagicMock()
+        svc._config = config
+        svc._flow_provider = None
+        item = DispatchItem(saga_id=str(saga.id), issue_id="i-1", repo="org/repo")
+        req = DispatchService._build_spawn_request(
+            svc,
+            item=item,
+            saga=saga,
+            issue=issue,
+            effective_model="claude-sonnet-4-6",
+            effective_prompt="",
+            integration_ids=[],
+            workflow_snapshot=workflow_snapshot,
+        )
+
+        executors = {
+            persona["name"]: persona["executor"]["kwargs"]
+            for persona in req.workload_config["personas"]
+        }
+        assert executors["coder"] == {
+            "transport_adapter": "skuld.transports.sdk.SDKTransport",
+            "transport_kwargs": {"turn_timeout_s": turn_timeout_s},
+        }
+        assert executors["reviewer"] == {
+            "transport_adapter": "skuld.transports.codex_ws.CodexWebSocketTransport",
+            "transport_kwargs": {"skip_permissions": True},
+        }
 
     def test_workflow_snapshot_ignores_incompatible_default_session_definition(self):
         config = DispatchConfig(
@@ -1540,8 +1621,27 @@ class _StubWorkflowRepo(WorkflowRepository):
         self._workflows[workflow.id] = workflow
         return workflow
 
+    async def list_workflow_versions(self, workflow_id):
+        return []
+
+    async def get_workflow_version(self, workflow_id, *, version=None, document_revision=None):
+        workflow = await self.get_workflow(workflow_id)
+        return workflow if workflow is not None and workflow.version == version else None
+
+    async def save_workflow_version(self, workflow, **kwargs):
+        raise NotImplementedError
+
     async def delete_workflow(self, workflow_id) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
+
+    async def has_recorded_version_history(self, workflow_id) -> bool:
+        return True
+
+    async def adopt_legacy_bundled(self, seed):
+        return await self.save_workflow(seed)
+
+    async def reclassify_orphaned_bundled_as_authored(self, workflow_id):
+        return await self.get_workflow(workflow_id)
 
 
 class TestResolveWorkflowSnapshot:
@@ -1576,7 +1676,6 @@ class TestResolveWorkflowSnapshot:
             feature_branch="feat/alpha",
             base_branch="main",
             status=SagaStatus.ACTIVE,
-            confidence=0.5,
             created_at=datetime.now(UTC),
             owner_id="owner-1",
         )
@@ -1613,7 +1712,6 @@ class TestResolveWorkflowSnapshot:
             feature_branch="feat/alpha",
             base_branch="main",
             status=SagaStatus.ACTIVE,
-            confidence=0.5,
             created_at=datetime.now(UTC),
             owner_id="owner-1",
         )
@@ -1661,7 +1759,6 @@ def _make_phase(saga_id, number: int = 1) -> Phase:
         number=number,
         name="review",
         status=PhaseStatus.ACTIVE,
-        confidence=0.0,
     )
 
 
@@ -1678,7 +1775,6 @@ def _make_run(phase_id, persona: str = "reviewer") -> Run:
         declared_files=[],
         estimate_hours=1.0,
         status=RunStatus.PENDING,
-        confidence=0.0,
         session_id=None,
         branch=None,
         chronicle_summary=None,
@@ -1831,3 +1927,137 @@ class TestDispatchTemplatePhaseFlockFlow:
         assert final_runs[runs[0].tracker_id].status == RunStatus.RUNNING
         assert final_runs[runs[1].tracker_id].status == RunStatus.RUNNING
         assert final_runs[runs[2].tracker_id].status == RunStatus.QUEUED
+
+
+@pytest.mark.parametrize("tags,match", [((), "all"), (("gpu",), "all"), (("gpu", "cpu"), "any")])
+def test_selection_balances_only_eligible_targets(monkeypatch, tags, match):
+    first = SimpleNamespace(name="one", target_id="one", tags=["gpu"])
+    second = SimpleNamespace(name="two", target_id="two", tags=["gpu"])
+    excluded = SimpleNamespace(name="three", target_id="three", tags=["other"])
+    adapters = [first, second, excluded]
+    eligible = adapters if not tags else [first, second]
+    choice = Mock(side_effect=[first, second])
+    monkeypatch.setattr("ting.domain.services.dispatch_service.random.choice", choice)
+    assert select_adapter_by_tags(adapters, tags, match) is first
+    assert select_adapter_by_tags(adapters, tags, match) is second
+    assert all(call.args == (eligible,) for call in choice.call_args_list)
+    assert select_adapter_by_tags(adapters, tags, match, connection_id="two") is second
+    assert choice.call_count == 2
+    with pytest.raises(TargetSelectionError):
+        select_adapter_by_tags(adapters, tags, match, connection_id="missing")
+    with pytest.raises(TargetSelectionError):
+        select_adapter_by_tags(adapters, ["gpu"], connection_id="three")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_balances_each_issue_and_does_not_retry_failure(
+    service, saga_repo, volundr, monkeypatch
+):
+    second = MockVolundr()
+    service._volundr_factory = MockVolundrFactory([volundr, second])
+    choice = Mock(side_effect=[volundr, second, second])
+    monkeypatch.setattr("ting.domain.services.dispatch_service.random.choice", choice)
+    items = [
+        DispatchItem(saga_id=str(saga_repo.sagas[0].id), issue_id=i, repo="org/repo-a")
+        for i in ("i-1", "i-3")
+    ]
+    results = await service.dispatch_issues("dev-user", items)
+    assert [result.status for result in results] == ["spawned", "spawned"]
+    assert [len(adapter.spawned) for adapter in (volundr, second)] == [1, 1]
+    second.fail_spawn = True
+    results = await service.dispatch_issues("dev-user", items[:1])
+    assert results[0].status == "failed"
+    assert len(volundr.spawned) == 1
+    assert choice.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_queue_and_capacity_include_all_targets(service, volundr):
+    from ting.ports.volundr import VolundrSession
+
+    second = MockVolundr()
+    second.sessions = [
+        VolundrSession(
+            id="secondary-session", name="run", status="running", tracker_issue_id="ALPHA-1"
+        )
+    ]
+    service._volundr_factory = MockVolundrFactory([volundr, second])
+    queue = await service.find_ready_issues("dev-user")
+    assert {item.identifier for item in queue} == {"ALPHA-3"}
+    _, active, _, available = await service._dispatch_capacity_snapshot(
+        "dev-user", volundrs=[volundr, second]
+    )
+    assert (active, available) == (1, 2)
+    second.list_sessions = AsyncMock(side_effect=RuntimeError("unreachable"))
+    with pytest.raises(RuntimeError, match="unreachable"):
+        await service._dispatch_capacity_snapshot("dev-user", volundrs=[volundr, second])
+
+
+@pytest.mark.asyncio
+async def test_template_phase_balances_each_run(service, volundr, monkeypatch):
+    second = MockVolundr()
+    volundr.integration_ids = ["first-integration"]
+    second.integration_ids = ["second-integration"]
+    service._volundr_factory = MockVolundrFactory([volundr, second])
+    choice = Mock(side_effect=[volundr, second])
+    monkeypatch.setattr("ting.domain.services.dispatch_service.random.choice", choice)
+    saga = _make_saga()
+    phase = _make_phase(saga.id)
+    runs = [_make_run(phase.id), _make_run(phase.id)]
+    template = _make_template_phase([_make_template_run(), _make_template_run()])
+    await service._dispatch_template_phase(saga, phase, runs, template, "dev-user")
+    assert len(volundr.spawned) == len(second.spawned) == 1
+    assert volundr.spawned[0].integration_ids == ["first-integration"]
+    assert second.spawned[0].integration_ids == ["second-integration"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin_source", ["item", "request", "saga"])
+async def test_dispatch_honors_pins(service, saga_repo, volundr, monkeypatch, pin_source):
+    class NamedVolundr(MockVolundr):
+        @property
+        def name(self):
+            return "pinned"
+
+    pinned = NamedVolundr()
+    service._volundr_factory = MockVolundrFactory([volundr, pinned])
+    choice = Mock(side_effect=AssertionError("Pinned work must not choose randomly"))
+    monkeypatch.setattr("ting.domain.services.dispatch_service.random.choice", choice)
+    saga = saga_repo.sagas[0]
+    if pin_source == "saga":
+        saga_repo.sagas[0] = replace(saga, instance_id="pinned")
+    item = DispatchItem(
+        saga_id=str(saga.id),
+        issue_id="i-1",
+        repo="org/repo-a",
+        connection_id="pinned" if pin_source == "item" else None,
+    )
+    results = await service.dispatch_issues(
+        "dev-user",
+        [item],
+        connection_id="pinned" if pin_source == "request" else None,
+    )
+    assert results[0].status == "spawned"
+    assert len(pinned.spawned) == 1
+    assert not volundr.spawned
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_principal_visible_targets(service, saga_repo, monkeypatch):
+    visible = MockVolundr()
+    principal = Principal(user_id="dev-user", email="", tenant_id="tenant-a", roles=[])
+    factory = SimpleNamespace(
+        for_principal=AsyncMock(return_value=[visible]),
+        for_owner=AsyncMock(side_effect=AssertionError("Principal scope must be preserved")),
+    )
+    service._volundr_factory = factory
+    choice = Mock(return_value=visible)
+    monkeypatch.setattr("ting.domain.services.dispatch_service.random.choice", choice)
+    results = await service.dispatch_issues(
+        "dev-user",
+        [DispatchItem(saga_id=str(saga_repo.sagas[0].id), issue_id="i-1", repo="org/repo-a")],
+        principal=principal,
+    )
+    assert results[0].status == "spawned"
+    factory.for_principal.assert_awaited_once_with(principal)
+    choice.assert_called_once_with([visible])

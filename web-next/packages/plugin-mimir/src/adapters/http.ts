@@ -1,3 +1,4 @@
+import type { InstanceInspection, DeploymentStatus } from '../domain/instances';
 /**
  * HTTP adapter for the Mímir service.
  *
@@ -19,9 +20,17 @@ import type {
   ActivityEvent,
   ActivityEventKind,
 } from '../domain/lint';
-import type { MimirStats, MimirGraph, GraphNode, GraphEdge } from '../domain/api-types';
+import type {
+  MimirStats,
+  MimirGraph,
+  GraphNode,
+  GraphEdge,
+  LiveActivity,
+  LiveActivityKind,
+} from '../domain/api-types';
 import type { EmbeddingSearchResult } from '../ports/IEmbeddingStore';
 import type { EntityKind, EntityMeta } from '../domain/entity';
+import type { FactEvidence, RelatedPage, ReviseRequest } from '../domain/evidence';
 import type { WriteRoutingRule } from '../domain/routing';
 import type { RavnBinding } from '../domain/ravn-binding';
 import type { RegistryMount } from '../domain/registry';
@@ -36,6 +45,7 @@ import { tallySeverity } from '../domain/lint';
 interface RawMount {
   name: string;
   role: string;
+  access_scope?: Mount['accessScope'];
   host: string;
   url: string;
   priority: number;
@@ -56,9 +66,13 @@ interface RawRegistryMount {
   kind: 'local' | 'remote';
   lifecycle: 'registered' | 'ephemeral';
   role: string;
+  access_scope?: Mount['accessScope'];
   url: string;
   path: string;
   categories: string[] | null;
+  adapter?: string;
+  kwargs?: Record<string, unknown>;
+  secret_kwargs_env?: Record<string, string>;
   auth_ref?: string | null;
   default_read_priority: number;
   enabled: boolean;
@@ -103,6 +117,8 @@ interface RawSearchResult {
   title: string;
   summary: string;
   category: string;
+  /** The mount the result was read from. */
+  mount: string;
   type?: string;
   confidence?: string;
   score?: number;
@@ -184,17 +200,50 @@ interface RawGraphNode {
   id: string;
   title: string;
   category: string;
+  path: string;
+  kind?: string;
+  summary?: string;
+  mount: string;
   inbound_count?: number;
+  updated_at: string;
+  first_seen: string;
+  confidence: string | null;
 }
 
 interface RawGraphEdge {
   source: string;
   target: string;
+  type?: string;
 }
 
 interface RawGraph {
   nodes: RawGraphNode[];
   edges: RawGraphEdge[];
+}
+
+interface RawLiveActivity {
+  id: string;
+  timestamp: string;
+  kind: string;
+  mount: string;
+  path: string;
+  actor: string | null;
+}
+
+interface RawFactEvidence {
+  fact: string;
+  proof_count: number;
+  trend: string;
+  latest_support?: string | null;
+  supporting_dates?: string[];
+  source_proof_count?: number;
+}
+
+interface RawRelatedPage {
+  path: string;
+  hop: number;
+  rel?: string | null;
+  direction: string;
 }
 
 interface RawEntityMeta {
@@ -248,6 +297,7 @@ export function toMount(raw: RawMount): Mount {
   return {
     name: raw.name,
     role: raw.role as Mount['role'],
+    accessScope: raw.access_scope,
     host: raw.host,
     url: raw.url,
     priority: raw.priority,
@@ -270,9 +320,13 @@ export function toRegistryMount(raw: RawRegistryMount): RegistryMount {
     kind: raw.kind,
     lifecycle: raw.lifecycle,
     role: raw.role as RegistryMount['role'],
+    accessScope: raw.access_scope,
     url: raw.url,
     path: raw.path,
     categories: raw.categories,
+    adapter: raw.adapter,
+    kwargs: raw.kwargs,
+    secretKwargsEnv: raw.secret_kwargs_env,
     authRef: raw.auth_ref,
     defaultReadPriority: raw.default_read_priority,
     enabled: raw.enabled,
@@ -556,18 +610,36 @@ export function toGraphNode(raw: RawGraphNode): GraphNode {
     id: raw.id,
     title: raw.title,
     category: raw.category,
+    path: raw.path,
+    kind: raw.kind,
+    summary: raw.summary,
+    mount: raw.mount,
     inboundCount: raw.inbound_count,
+    updatedAt: raw.updated_at,
+    firstSeen: raw.first_seen,
+    confidence: raw.confidence,
   };
 }
 
 export function toGraphEdge(raw: RawGraphEdge): GraphEdge {
-  return { source: raw.source, target: raw.target };
+  return { source: raw.source, target: raw.target, type: raw.type };
 }
 
 export function toGraph(raw: RawGraph): MimirGraph {
   return {
     nodes: raw.nodes.map(toGraphNode),
     edges: raw.edges.map(toGraphEdge),
+  };
+}
+
+export function toLiveActivity(raw: RawLiveActivity): LiveActivity {
+  return {
+    id: raw.id,
+    timestamp: raw.timestamp,
+    kind: raw.kind as LiveActivityKind,
+    mount: raw.mount,
+    path: raw.path,
+    actor: raw.actor,
   };
 }
 
@@ -655,6 +727,26 @@ export function isMissingRouteError(error: unknown): error is { status: number }
   );
 }
 
+export function toFactEvidence(raw: RawFactEvidence): FactEvidence {
+  return {
+    fact: raw.fact,
+    proofCount: raw.proof_count,
+    trend: raw.trend as FactEvidence['trend'],
+    latestSupport: raw.latest_support ?? null,
+    supportingDates: raw.supporting_dates ?? [],
+    sourceProofCount: raw.source_proof_count ?? 0,
+  };
+}
+
+export function toRelatedPage(raw: RawRelatedPage): RelatedPage {
+  return {
+    path: raw.path,
+    hop: raw.hop,
+    rel: raw.rel ?? null,
+    direction: raw.direction === 'in' ? 'in' : 'out',
+  };
+}
+
 export function inferPageType(path: string, category: string): PageMeta['type'] {
   if (path.startsWith('/entities/') || category === 'entity') return 'entity';
   if (path.includes('/decisions/') || category === 'decision') return 'decision';
@@ -711,7 +803,10 @@ export async function listLegacySources(client: ApiClient): Promise<Source[]> {
 // Adapter factory
 // ---------------------------------------------------------------------------
 
-export function buildMimirHttpAdapter(client: ApiClient): IMimirService {
+export function buildMimirHttpAdapter(
+  client: ApiClient,
+  deployments: ApiClient = client,
+): IMimirService {
   return {
     mounts: {
       async listMounts(): Promise<Mount[]> {
@@ -777,6 +872,9 @@ export function buildMimirHttpAdapter(client: ApiClient): IMimirService {
           url: mount.url,
           path: mount.path,
           categories: mount.categories,
+          adapter: mount.adapter ?? '',
+          kwargs: mount.kwargs ?? {},
+          secret_kwargs_env: mount.secretKwargsEnv ?? {},
           auth_ref: mount.authRef ?? null,
           default_read_priority: mount.defaultReadPriority,
           enabled: mount.enabled,
@@ -799,6 +897,9 @@ export function buildMimirHttpAdapter(client: ApiClient): IMimirService {
           url: mount.url,
           path: mount.path,
           categories: mount.categories,
+          adapter: mount.adapter ?? '',
+          kwargs: mount.kwargs ?? {},
+          secret_kwargs_env: mount.secretKwargsEnv ?? {},
           auth_ref: mount.authRef ?? null,
           default_read_priority: mount.defaultReadPriority,
           enabled: mount.enabled,
@@ -874,15 +975,52 @@ export function buildMimirHttpAdapter(client: ApiClient): IMimirService {
         );
       },
 
-      async getDoctor(): Promise<DoctorReport | null> {
+      async inspectInstances(mount?: string): Promise<InstanceInspection[]> {
+        return client.get(
+          '/instances/inspect' + (mount ? '?mount=' + encodeURIComponent(mount) : ''),
+        );
+      },
+      async inspectDeployment(name, target) {
+        return deployments.get(
+          '/deployments/' +
+            encodeURIComponent(name) +
+            (target ? '?target=' + encodeURIComponent(target) : ''),
+        );
+      },
+      async controlDeployment(name, action, target) {
+        return deployments.post(
+          '/deployments/' +
+            encodeURIComponent(name) +
+            '/' +
+            action +
+            (target ? '?target=' + encodeURIComponent(target) : ''),
+          {},
+        );
+      },
+      async getDeployments(): Promise<DeploymentStatus> {
+        return deployments.get('/deployments');
+      },
+      async deployInstance(request) {
+        return deployments.post('/deployments', request);
+      },
+      async getDoctor(mountName?: string): Promise<DoctorReport | null> {
         return nullOnMissingRoute(async () =>
-          toDoctorReport(await client.get<RawDoctorReport>('/doctor')),
+          toDoctorReport(
+            await client.get<RawDoctorReport>(
+              '/doctor' + (mountName ? '?mount=' + encodeURIComponent(mountName) : ''),
+            ),
+          ),
         );
       },
 
-      async runDoctorFixes(): Promise<DoctorReport | null> {
+      async runDoctorFixes(mountName?: string): Promise<DoctorReport | null> {
         return nullOnMissingRoute(async () =>
-          toDoctorReport(await client.post<RawDoctorReport>('/doctor/fix', {})),
+          toDoctorReport(
+            await client.post<RawDoctorReport>(
+              '/doctor/fix' + (mountName ? '?mount=' + encodeURIComponent(mountName) : ''),
+              {},
+            ),
+          ),
         );
       },
     },
@@ -944,15 +1082,63 @@ export function buildMimirHttpAdapter(client: ApiClient): IMimirService {
           confidence: (r.confidence ?? 'medium') as SearchResult['confidence'],
           // The API sends JSON null outside debug mode — normalise to undefined.
           score: r.score ?? undefined,
-          mounts: mountName ? [mountName] : undefined,
+          mounts: [r.mount],
           scoreBreakdown: r.score_breakdown ?? undefined,
         }));
+      },
+
+      /**
+       * GET /evidence?path= — the route takes no mount, so the serving
+       * instance answers 404 for a page it does not itself keep. That, and a
+       * store with no evidence subsystem (501), mean "no proof rows here";
+       * anything else is a real failure and raises.
+       */
+      async getEvidence(path: string): Promise<FactEvidence[]> {
+        try {
+          const raw = await client.get<RawFactEvidence[]>(
+            `/evidence?path=${encodeURIComponent(path)}`,
+          );
+          return raw.map(toFactEvidence);
+        } catch (error) {
+          if (!isMissingRouteError(error)) throw error;
+          return [];
+        }
+      },
+
+      /** GET /related?path=&depth=&rel= — same absence rules as getEvidence. */
+      async getRelated(path: string, depth = 1, rel?: string): Promise<RelatedPage[]> {
+        const params = new URLSearchParams({ path, depth: String(depth) });
+        if (rel) params.set('rel', rel);
+        try {
+          const raw = await client.get<RawRelatedPage[]>(`/related?${params.toString()}`);
+          return raw.map(toRelatedPage);
+        } catch (error) {
+          if (!isMissingRouteError(error)) throw error;
+          return [];
+        }
+      },
+
+      /** POST /page/revise — write-authenticated; a refusal raises. */
+      async revisePage(request: ReviseRequest): Promise<Page> {
+        const raw = await client.post<RawPage>('/page/revise', {
+          path: request.path,
+          old_fact: request.oldFact,
+          new_fact: request.newFact,
+          attribution: request.attribution,
+        });
+        return toPage(raw);
       },
 
       async getGraph(options): Promise<MimirGraph> {
         const qs = options?.mountName ? `?mount=${encodeURIComponent(options.mountName)}` : '';
         const raw = await client.get<RawGraph>(`/graph${qs}`);
         return toGraph(raw);
+      },
+
+      async getLiveActivity(options): Promise<LiveActivity[]> {
+        const qs = options?.since ? `?since=${encodeURIComponent(options.since)}` : '';
+        const raw = await client.get<RawLiveActivity[]>(`/activity/live${qs}`);
+        return raw.map(toLiveActivity);
       },
 
       async listEntities(options): Promise<EntityMeta[]> {

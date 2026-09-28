@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 import respx
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from httpx import Response
 
+from identity.adapters.identity import AllowAllIdentityAdapter
 from niuu.adapters.inbound.auth import extract_principal
 from niuu.adapters.inbound.rest_volundr import create_volundr_router
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
@@ -32,6 +34,8 @@ async def guild():
     )
     remote = _instance("remote", base_url=REMOTE, tenant_id=TENANT)
     app = FastAPI()
+    # Mini-mode identity: forwarded user headers are trusted, a bare caller is dev-user.
+    app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
     app.include_router(
         create_volundr_router(StubInstanceService([local, remote]), embedded_forge_app=forge.app)
     )
@@ -210,6 +214,7 @@ class TestMcpForward:
 class TestNiuuPrincipal:
     def _app(self) -> TestClient:
         app = FastAPI()
+        app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
 
         @app.get("/api/v1/forge/whoami")
         @app.get("/api/v1/niuu/whoami")

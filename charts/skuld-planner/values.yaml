@@ -28,6 +28,9 @@ session:
   # -- Initial user message sent when the CLI starts
   initialPrompt: ""
 
+# -- MCP server configurations supplied by session contributors. Use credential references, not tokens.
+mcpServers: []
+
 # Container image for the Skuld broker
 image:
   # -- Skuld broker image repository
@@ -107,7 +110,11 @@ git:
   repoUrl: ""
   branch: ""
   baseBranch: ""
+  userName: ""
+  userEmail: ""
   credentials:
+    # -- Session-injected integration token file; takes precedence over secretName
+    tokenFile: ""
     secretName: ""
     tokenKey: "token"
     username: "x-access-token"
@@ -117,6 +124,11 @@ git:
     pullPolicy: IfNotPresent
 
 # Broker configuration (Skuld application settings)
+workflow:
+  # -- Deployment-owned verifier adapter and kwargs for deterministic evidence gates.
+  evidenceVerifier: null
+  evidenceArtifacts: null
+
 broker:
   cliType: claude
   transport: sdk

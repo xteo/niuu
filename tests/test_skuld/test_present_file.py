@@ -28,7 +28,13 @@ def client(tmp_path, monkeypatch, module_broker_runtime):
     monkeypatch.setattr(bmod.broker._channels, "broadcast", _fake_broadcast)
     monkeypatch.setattr(bmod.broker, "_conversation_turns", [])
     api_mod._presented_registry.clear()
-    c = TestClient(bmod.app, headers={"authorization": module_broker_runtime.authorization})
+    c = TestClient(
+        bmod.app,
+        headers={
+            "authorization": module_broker_runtime.authorization,
+            "x-niuu-room-role": "owner",
+        },
+    )
     c.logged = logged  # type: ignore[attr-defined]
     c.broadcast = broadcast  # type: ignore[attr-defined]
     return c

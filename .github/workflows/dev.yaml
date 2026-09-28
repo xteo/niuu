@@ -4,6 +4,12 @@
 # 3. Determines next version from conventional commits and creates a v*-dev.N prerelease tag
 # 4. Packages Helm charts with the dev version
 #
+# Steps 2-4 publish, so they are gated on step 1: a failed or cancelled test
+# job means no :dev images, no v*-dev.N tag and no charts. The gates use
+# `!failure() && !cancelled()` rather than the implicit success() so that a
+# test job skipped by a future path filter does not block publishing, and so
+# that a skip does not cascade transitively into build-charts.
+#
 # CLI/ravn binaries are release-only (release.yaml) — too slow for dev.
 #
 # The dev prerelease tags (v*-dev.N) are skipped by release.yaml so they
@@ -55,7 +61,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -93,7 +99,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -114,37 +120,6 @@ jobs:
             --override-ini="addopts="
 
   # ---------------------------------------------------------------------------
-  # End-to-end tests (Playwright against real backend + frontend)
-  # ---------------------------------------------------------------------------
-  e2e-test:
-    name: "E2E: Playwright"
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: volundr_test
-          POSTGRES_PASSWORD: volundr_test
-          POSTGRES_DB: volundr_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U volundr_test -d volundr_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - name: Harden runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
-        with:
-          egress-policy: audit
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Playwright temporarily disabled
-        run: echo "Skipping Playwright until visual baselines are stabilized."
-
-  # ---------------------------------------------------------------------------
   # web-next — lint + unit tests. Delegated to reusable workflow.
   # ---------------------------------------------------------------------------
   web-next:
@@ -161,19 +136,27 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Containers — build multi-arch (amd64 + arm64) for the published containers.
-  # Delegated to reusable workflow.
+  # Delegated to reusable workflow. Pushes :dev, so only after every test job.
   # ---------------------------------------------------------------------------
   containers:
     name: Containers
+    needs:
+      - python
+      - python-integration-test-volundr
+      - python-integration-test-ting
+      - web-next
+      - helm-lint
+    if: ${{ !failure() && !cancelled() }}
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/reusable-container-build.yaml
     with:
-      containers: '["agent","skuld","openshell","devrunner","volundr-web","niuu-web","niuu"]'
+      containers: '["agent","skuld","openshell","devrunner","niuu-web","niuu","gbrain"]'
       platforms: '["amd64","arm64"]'
       tag-prefix: ${{ github.sha }}
       manifest-tags: "dev dev-${{ github.sha }}"
+      cache-write: true
       build-args: |
         APP_VERSION=dev-${{ github.sha }}
       labels: |
@@ -188,20 +171,31 @@ jobs:
   scan:
     name: Scan
     needs: containers
+    if: ${{ !failure() && !cancelled() }}
     permissions:
       contents: read
       packages: read
       security-events: write
     uses: ./.github/workflows/reusable-container-scan.yaml
     with:
-      containers: '["agent","skuld","openshell","devrunner","volundr-web","niuu-web","niuu"]'
+      containers: '["agent","skuld","openshell","devrunner","niuu-web","niuu","gbrain"]'
       tag: dev
 
   # ---------------------------------------------------------------------------
-  # Version tagging — prerelease dev tags
+  # Version tagging — prerelease dev tags. Waits for containers as well as the
+  # tests: the charts published under this tag reference dev-<sha> images, so a
+  # tag must never exist for a commit whose images failed to build.
   # ---------------------------------------------------------------------------
   tag:
     name: Determine Version & Tag
+    needs:
+      - python
+      - python-integration-test-volundr
+      - python-integration-test-ting
+      - web-next
+      - helm-lint
+      - containers
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.new_version }}
@@ -234,7 +228,7 @@ jobs:
           if [ "$LAST_TAG" = "v0.0.0" ]; then
             COMMIT_MSGS=$(git log --pretty=%B HEAD)
           else
-            COMMIT_MSGS=$(git log --pretty=%B ${LAST_TAG}..HEAD)
+            COMMIT_MSGS=$(git log --pretty=%B "${LAST_TAG}..HEAD")
           fi
 
           echo "Last production version: $LAST_VERSION"
@@ -252,7 +246,7 @@ jobs:
           echo "Version bump type: $VERSION_TYPE"
 
           if [ "$VERSION_TYPE" = "none" ]; then
-            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -270,8 +264,8 @@ jobs:
           NEW_VERSION="${NEW_BASE}-dev.${DEV_N}"
 
           echo "New dev version: $NEW_VERSION"
-          echo "should_release=true" >> $GITHUB_OUTPUT
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
         if: steps.version.outputs.should_release == 'true'
@@ -290,7 +284,7 @@ jobs:
   build-charts:
     name: Build Helm Charts
     needs: [tag]
-    if: needs.tag.outputs.should_release == 'true'
+    if: ${{ !failure() && !cancelled() && needs.tag.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -307,13 +301,16 @@ jobs:
         run: |
           VERSION="${{ needs.tag.outputs.version }}"
 
-          for CHART in agent bifrost ravn skuld volundr ting niuu-shared niuu skuld-planner; do
+          for CHART in agent bifrost ravn skuld volundr ting niuu-shared niuu skuld-planner mimir gbrain; do
             sed -i "s/^version:.*/version: $VERSION/" "charts/${CHART}/Chart.yaml"
             sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" "charts/${CHART}/Chart.yaml"
           done
+          sed -i 's/^  tag: ""/  tag: "dev-${{ github.sha }}"/' charts/gbrain/values.yaml
 
       - name: Package Helm charts
         run: |
+          helm package charts/mimir -d .helm-packages/
+          helm package charts/gbrain -d .helm-packages/
           helm package charts/bifrost -d .helm-packages/
           helm package charts/agent -d .helm-packages/
           helm package charts/ravn -d .helm-packages/
@@ -327,7 +324,7 @@ jobs:
           helm package charts/niuu -d .helm-packages/
 
       - name: Log in to Container Registry
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -335,6 +332,8 @@ jobs:
 
       - name: Push Helm charts to OCI registry
         run: |
+          helm push .helm-packages/mimir-*.tgz ${{ env.CHART_REPO }}
+          helm push .helm-packages/gbrain-*.tgz ${{ env.CHART_REPO }}
           helm push .helm-packages/agent-*.tgz ${{ env.CHART_REPO }}
           helm push .helm-packages/bifrost-*.tgz ${{ env.CHART_REPO }}
           helm push .helm-packages/ravn-*.tgz ${{ env.CHART_REPO }}

@@ -21,6 +21,8 @@ export interface RenderWithVolundrOptions {
   notifications?: INotificationFeed;
   /** Supply a client to inspect or pre-seed the query cache. */
   queryClient?: QueryClient;
+  /** Extra services to register, e.g. the optional `ravn.personas` catalog. */
+  extraServices?: Record<string, unknown>;
 }
 
 export function renderWithVolundr(
@@ -33,6 +35,7 @@ export function renderWithVolundr(
     clusterAdapter = createMockClusterAdapter(),
     sessionStore = createMockSessionStore(),
     notifications = createMockNotificationFeed(),
+    extraServices = {},
   } = options;
 
   const client =
@@ -65,6 +68,7 @@ export function renderWithVolundr(
           'volundr.sessions': sessionStore,
           'volundr.notifications': notifications,
           sessionStore,
+          ...extraServices,
         }}
       >
         {ui}

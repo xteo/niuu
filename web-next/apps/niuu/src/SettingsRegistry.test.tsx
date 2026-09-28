@@ -3,6 +3,26 @@ import { describe, expect, it } from 'vitest';
 import { buildMountedSettingsProviders } from './SettingsRegistry';
 
 describe('buildMountedSettingsProviders', () => {
+  it('mounts the interface mode control with the Settings plugin', () => {
+    const providers = buildMountedSettingsProviders({
+      demoMode: false,
+      theme: 'ice',
+      plugins: { settings: { enabled: true, order: 0 } },
+      services: {},
+    });
+
+    expect(providers).toHaveLength(1);
+    expect(providers[0]).toMatchObject({
+      source: 'local',
+      id: 'interface',
+      defaultSectionId: 'mode',
+      scope: 'user',
+    });
+    const provider = providers[0];
+    if (provider?.source !== 'local') throw new Error('Expected local interface settings');
+    expect(provider.sections[0]).toMatchObject({ id: 'mode', label: 'Display mode' });
+  });
+
   it('includes remote providers for enabled plugins', () => {
     const providers = buildMountedSettingsProviders({
       demoMode: false,
@@ -78,4 +98,31 @@ describe('buildMountedSettingsProviders', () => {
 
     expect(providers).toEqual([]);
   });
+});
+
+it('mounts the host runtime settings when the setup plugin is enabled', () => {
+  const providers = buildMountedSettingsProviders({
+    demoMode: false,
+    theme: 'ice',
+    plugins: { setup: { enabled: true, order: 0 }, volundr: { enabled: true, order: 1 } },
+    services: { niuu: { mode: 'http', baseUrl: 'http://localhost:8080/api/v1/niuu' } },
+  } as any);
+  const runtime = providers.find((p) => p.id === 'runtime');
+  expect(runtime).toMatchObject({ source: 'remote', scope: 'admin', pluginId: 'setup' });
+  expect((runtime as { baseUrl?: string | null }).baseUrl).toBe(
+    'http://localhost:8080/api/v1/niuu/setup',
+  );
+});
+
+it('mounts personal storage and session display alongside Volundr service settings', () => {
+  const providers = buildMountedSettingsProviders({
+    demoMode: false,
+    theme: 'ice',
+    plugins: { volundr: { enabled: true, order: 1 } },
+    services: {},
+  });
+  expect(providers.map((p) => p.id)).toEqual(['session-view', 'storage', 'volundr']);
+  expect(providers[0]).toMatchObject({ source: 'local', scope: 'user', defaultSectionId: 'tabs' });
+  expect(providers[1]).toMatchObject({ source: 'local', scope: 'user' });
+  expect(providers[2]).toMatchObject({ source: 'remote', scope: 'service' });
 });

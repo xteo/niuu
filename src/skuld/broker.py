@@ -43,6 +43,7 @@ from niuu.domain.transcript_reducer import (
     steering_state_from_frame,
     steering_target_id,
 )
+from niuu.domain.workflow_evidence import evaluate_workflow_evidence, validate_evidence_gate_nodes
 from niuu.domain.workflow_kickoff import (
     WORKFLOW_KICKOFF_ID_KEY,
     WORKFLOW_KICKOFF_REDELIVERY_KEY,
@@ -53,7 +54,8 @@ from niuu.mesh.discovery_builder import build_discovery_adapters
 from niuu.mesh.identity import MeshIdentity
 from niuu.observability import get_observability
 from niuu.ports.cli import CLITransport
-from niuu.utils import import_class
+from niuu.ports.evidence import ArtifactDigestResolver, EvidenceGateVerifier
+from niuu.utils import import_class, resolve_secret_kwargs
 from skuld.activity_reporting import ActivityReportingMixin
 from skuld.channels import (
     ChannelRegistry,
@@ -116,14 +118,11 @@ from skuld.session_artifacts import (  # noqa: F401
 from skuld.transport_lifecycle import TransportLifecycleMixin
 from skuld.websocket_auth import (  # noqa: F401
     WsPrincipal,
-    _claims_to_ws_principal,
     _decode_jwt_claims,
     _extract_bearer_token,
     _extract_token_from_websocket,
     _is_loopback_ws_client,
     _resolve_ws_principal,
-    _split_roles,
-    _ws_query_param,
 )
 from skuld.websocket_lifecycle import WebSocketLifecycleMixin
 from skuld.workflow_runtime import (
@@ -133,6 +132,7 @@ from skuld.workflow_runtime import (
     _merge_workflow_terminal_outcomes,
     _workflow_gate_nodes,
     _workflow_join_satisfied,
+    _workflow_review_attestation,
     _workflow_terminal_nodes,
 )
 from sleipnir.adapters.in_process import InProcessBus
@@ -187,6 +187,7 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger("skuld.broker")
+
 FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
 FORGE_CHRONICLES_PATH = "/api/v1/forge/chronicles"
 FORGE_EVENTS_PATH = "/api/v1/forge/events"
@@ -436,6 +437,101 @@ def _workflow_terminal_requirements_satisfied(
 # WebSocket auth helpers are imported above for compatibility.
 
 
+# Per-message authorization for browser WebSocket traffic, keyed to the
+# room role WebSocketLifecycleMixin.handle_websocket resolved and stored on
+# the connection's WebSocketChannel (see _room_role_for). This is an
+# ALLOWLIST, not a denylist: any message type not explicitly classified here
+# defaults to OWNER-only in _message_role_requirement below, EXCEPT the
+# "default chat" fallback (case _ in _dispatch_browser_message, which every
+# unrecognized/absent "type" already falls into and which was already
+# viewer-level content before this gate existed).
+#
+# tests/test_skuld/test_room_role_message_gating.py asserts these three sets,
+# plus the default-chat bucket, cover every case label in
+# _dispatch_browser_message's match statement — a new case added there
+# without updating this classification fails that test instead of silently
+# defaulting to owner-only (safe) or silently being reachable by a viewer
+# (unsafe, and the thing this whole gate exists to prevent).
+_VIEWER_MESSAGE_TYPES = frozenset(
+    {
+        "directed_message",
+        "steer_active_turn",
+        "set_internal_visibility",
+        "discover_slash_commands",
+        "get_effort",
+        "get_runtime_options",
+    }
+)
+# Approver additionally resolves the tool-permission / operator-question wait.
+_APPROVER_ONLY_MESSAGE_TYPES = frozenset({"permission_response", "ask_user_answer"})
+# Every other named case: mutating transport/session controls, owner only.
+_OWNER_ONLY_MESSAGE_TYPES = frozenset(
+    {
+        "set_permission_mode",
+        "rewind_files",
+        "mcp_set_servers",
+        "terminal_input",
+        "terminal_key",
+        "terminal_resize",
+        "slash_command",
+        "interrupt",
+        "set_model",
+        "set_effort",
+        "set_runtime_options",
+        "set_max_thinking_tokens",
+        "resend_initial_prompt",
+        "publish_event",
+    }
+)
+_ROOM_ROLE_RANK = {"viewer": 0, "approver": 1, "owner": 2}
+
+
+def _message_role_requirement(msg_type: str | None) -> str:
+    """Minimum room role required to send this browser message type.
+
+    A type this repo recognizes as a *command* (any case label in
+    _dispatch_browser_message) must be classified in one of the three sets
+    above; silence is never "allow". Anything else — no "type" at all, or a
+    genuinely unrecognized string — falls through to the default chat
+    handler, which is viewer-level, same as any other chat content.
+    """
+    if msg_type in _OWNER_ONLY_MESSAGE_TYPES:
+        return "owner"
+    if msg_type in _APPROVER_ONLY_MESSAGE_TYPES:
+        return "approver"
+    return "viewer"
+
+
+# Client-controllable metadata keys that let a sub-owner caller impersonate
+# another participant or forge continuation state on a directed message.
+# ``participant_id`` picks WHICH registered room participant the message is
+# attributed to (handle_directed_room_message reads it from metadata, not a
+# separate argument). ``reply_context`` can override the SERVER's own
+# tracked continuation state: niuu.collaboration.room.route_directed_message
+# starts from its stored pending reply_context and then applies the
+# caller's metadata OVER it, so a client-supplied reply_context silently
+# replaces genuine case-continuation data. ``source`` inside metadata is
+# stripped for the same reason as the (already hardcoded) top-level source
+# argument these dispatch cases pass. Mirrors
+# skuld.broker_api._SUB_OWNER_STRIPPED_METADATA_KEYS for the HTTP path —
+# kept as a separate constant rather than a shared import to avoid coupling
+# this domain module to the inbound HTTP adapter.
+_SUB_OWNER_STRIPPED_METADATA_KEYS = frozenset({"participant_id", "reply_context", "source"})
+
+
+def _sanitize_directed_metadata(
+    role: str, metadata: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Strip client-controllable identity/continuation fields for callers below owner.
+
+    Only the session owner's own client may set ``participant_id``,
+    ``reply_context``, or ``source`` inside a directed message's metadata.
+    """
+    if metadata is None or role == "owner":
+        return metadata
+    return {k: v for k, v in metadata.items() if k not in _SUB_OWNER_STRIPPED_METADATA_KEYS}
+
+
 class Broker(
     EffortControlMixin,
     ForgeSessionMixin,
@@ -455,8 +551,59 @@ class Broker(
         self,
         settings: SkuldSettings | None = None,
         sleipnir_publisher: SleipnirPublisher | None = None,
+        evidence_verifier: EvidenceGateVerifier | None = None,
+        evidence_artifacts: ArtifactDigestResolver | None = None,
     ):
         self._settings = settings or SkuldSettings()
+        validate_evidence_gate_nodes(self._settings.workflow.graph)
+        self._evidence_verifier = evidence_verifier
+        self._evidence_artifacts = evidence_artifacts
+        self._evidence_gate_outputs = {
+            str(node[field])
+            for node in self._settings.workflow.graph.get("nodes", [])
+            if node.get("kind") == "gate" and node.get("mode") == "evidence"
+            for field in ("approvalEvent", "changesRequestedEvent")
+        }
+        if self._evidence_gate_outputs and (
+            evidence_verifier is None or evidence_artifacts is None
+        ):
+            raise ValueError(
+                "Evidence gates require workflow.evidence_verifier and "
+                "workflow.evidence_artifacts deployment configuration"
+            )
+        self._ws_identity = None
+        self._ws_authorization = None
+        if self._settings.ws_auth.enforce_ownership:
+            from identity.ports import AuthorizationPort
+
+            identity = self._settings.ws_auth.identity
+            if identity is not None:
+                from niuu.ports.identity import HeaderAuthenticationPort
+
+                self._ws_identity = import_class(identity.adapter)(**identity.kwargs)
+                if not isinstance(self._ws_identity, HeaderAuthenticationPort):
+                    raise TypeError("WebSocket identity must implement HeaderAuthenticationPort")
+            auth = self._settings.ws_auth.authorization
+            self._ws_authorization = import_class(auth.adapter)(
+                **resolve_secret_kwargs(auth.kwargs, auth.secret_kwargs_env)
+            )
+            if not isinstance(self._ws_authorization, AuthorizationPort):
+                raise TypeError("WebSocket authorization must implement AuthorizationPort")
+
+        self._room_role_resolver = None
+        if self._settings.ws_auth.room_role_source == "remote":
+            from skuld.room_role_port import RoomRoleResolverPort
+
+            # WsAuthConfig's own model_validator already guarantees
+            # room_role_remote is set whenever room_role_source == "remote";
+            # this is defense-in-depth, matching the isinstance checks above.
+            remote = self._settings.ws_auth.room_role_remote
+            self._room_role_resolver = import_class(remote.adapter)(
+                **resolve_secret_kwargs(remote.kwargs, remote.secret_kwargs_env)
+            )
+            if not isinstance(self._room_role_resolver, RoomRoleResolverPort):
+                raise TypeError("room_role_remote adapter must implement RoomRoleResolverPort")
+
         self._effort_lock = asyncio.Lock()
         self.session_id = self._settings.session.id
         self.model = self._settings.session.model
@@ -465,6 +612,7 @@ class Broker(
         self._archive_store = archive_store_cls(**self._settings.archive_store.kwargs)
         self.volundr_api_url = self._settings.volundr_api_url
         self._transport: CLITransport | None = None
+        self._transport_start_lock = asyncio.Lock()
         self.service_manager: ServiceManager | None = None
         self._channels = ChannelRegistry()
         self._http_client: httpx.AsyncClient | None = None
@@ -479,8 +627,15 @@ class Broker(
         )
         self._flock_completion_reported = False
         self._flock_failure_reported = False
+        self._pending_terminal_activity: dict[str, Any] | None = None
+        self._restored_workflow_terminal_completion: tuple[str, dict[str, Any]] | None = None
         self._session_start_reported = False
         self._event_sequence = 0
+        # Authenticated peer outcomes retained for deterministic developer
+        # evidence projection. Persona identity comes from the registered room
+        # participant, never from model-authored fields.
+        self._attested_review_outcomes: dict[str, dict[str, Any]] = {}
+        self._review_attestation = _workflow_review_attestation(self._settings.workflow.graph)
         # Durable full-fidelity event log (session_event_log). Every CLI frame is
         # buffered here and flushed to Volundr by a background worker, independent
         # of any attached channel — so nothing is dropped when no client is
@@ -539,6 +694,9 @@ class Broker(
         self._peer_watchdog_task: asyncio.Task[None] | None = None
         self._workflow_trigger_task: asyncio.Task[None] | None = None
         self._workflow_kickoff_tracker: WorkflowKickoffAckTracker | None = None
+        self._startup_ready = False
+        self._startup_state = "created"
+        self._startup_failure = ""
         self._peer_watches: dict[str, PeerWatchState] = {}
         self._peer_pending_commands: dict[str, list[str]] = {}
         self._git_workspace_checkpoint: GitWorkspaceCheckpoint | None = None
@@ -625,11 +783,17 @@ class Broker(
             self._room_bridge = SkuldCollaborationAdapter(
                 config=self._settings.room,
                 channels=self._channels,
+                emit_frame=self._emit_broker_frame,
                 append_turn=self._append_turn,
                 report_timeline_event=self._report_timeline_event,
                 observe_peer_event=self._observe_room_peer_event,
                 publish_presence_event=self._publish_room_presence_event,
                 report_usage=self._report_usage,
+                attestable_review_event_types=(
+                    frozenset({self._review_attestation.event_type})
+                    if self._review_attestation is not None
+                    else frozenset()
+                ),
             )
 
         # Retrieval reflex (NIU-1059) — lazily built from settings.reflex on
@@ -801,6 +965,7 @@ class Broker(
                 content=prompt,
             )
         )
+        self._enqueue_human_turn_event(prompt, turn_id)
         await self._complete_trace_span(
             kind="turn.user",
             name=prompt[:120] or "workflow prompt",
@@ -849,25 +1014,31 @@ class Broker(
                 transport_name,
                 service_prefix="skuld",
             )
-            if transport_name in ("sleipnir", "rabbitmq") and not kwargs:
-                return None
             return build_transport(transport_name, **kwargs)
 
         # New configs select transport and discovery independently. Legacy
         # configs keep adapters as discovery entries and use local NNG.
-        mesh = None
+        # Every branch raises when the configured mesh cannot be built.
         if mesh_cfg.discovery_adapters and mesh_cfg.adapters:
             mesh = build_mesh_from_adapters_list(
                 adapters=list(mesh_cfg.adapters),
                 own_peer_id=own_peer_id,
                 rpc_timeout_s=mesh_cfg.rpc_timeout_s,
+                rpc_reply_cache_size=mesh_cfg.rpc_reply_cache_size,
                 sleipnir_transport_builder=_sleipnir_transport,
                 environment_id=mesh_cfg.realm_id,
             )
-        elif mesh_cfg.transport != "in_process":
-            try:
-                from ravn.adapters.mesh.sleipnir_mesh import SleipnirMeshAdapter  # noqa: PLC0415
+        elif mesh_cfg.transport == "in_process":
+            mesh = build_in_process_mesh(
+                own_peer_id,
+                mesh_cfg.rpc_timeout_s,
+                rpc_reply_cache_size=mesh_cfg.rpc_reply_cache_size,
+                environment_id=mesh_cfg.realm_id,
+            )
+        else:
+            from ravn.adapters.mesh.sleipnir_mesh import SleipnirMeshAdapter  # noqa: PLC0415
 
+            if mesh_cfg.transport == "nng":
                 nng_cfg = getattr(mesh_cfg, "nng", None)
                 address = (
                     getattr(nng_cfg, "pub_sub_address", "tcp://127.0.0.1:0")
@@ -875,27 +1046,27 @@ class Broker(
                     else "tcp://127.0.0.1:0"
                 )
                 peer_addresses = read_cluster_pub_addresses(mesh_cfg.adapters)
-                nng = build_nng_transport(
+                transport = build_nng_transport(
                     address=address,
                     service_id=f"skuld:{own_peer_id}",
                     peer_addresses=peer_addresses or None,
                 )
-                if nng is not None:
-                    mesh = SleipnirMeshAdapter(
-                        publisher=nng,
-                        subscriber=nng,
-                        own_peer_id=own_peer_id,
-                        rpc_timeout_s=mesh_cfg.rpc_timeout_s,
-                        environment_id=mesh_cfg.realm_id,
-                    )
-            except ImportError:
-                logger.warning("mesh: nng transport not available, falling back to in-process")
-
-        if mesh is None:
-            mesh = build_in_process_mesh(
-                own_peer_id,
-                mesh_cfg.rpc_timeout_s,
+            else:
+                transport = build_transport(
+                    mesh_cfg.transport,
+                    **resolve_transport_kwargs(
+                        self._settings,
+                        mesh_cfg.transport,
+                        service_prefix="skuld",
+                    ),
+                )
+            mesh = SleipnirMeshAdapter(
+                publisher=transport,
+                subscriber=transport,
+                own_peer_id=own_peer_id,
+                rpc_timeout_s=mesh_cfg.rpc_timeout_s,
                 environment_id=mesh_cfg.realm_id,
+                rpc_reply_cache_size=mesh_cfg.rpc_reply_cache_size,
             )
 
         # Build discovery adapter using shared niuu.mesh.discovery_builder
@@ -903,6 +1074,8 @@ class Broker(
             peer_id=mesh_cfg.peer_id or self.session_id or "skuld",
             realm_id=mesh_cfg.realm_id,
             persona=mesh_cfg.persona,
+            display_name="Skuld",
+            participant_type="skuld",
             capabilities=list(mesh_cfg.capabilities),
             permission_mode="full_access",
             version="0.1.0",
@@ -920,7 +1093,8 @@ class Broker(
                 await self._room_bridge.register_mesh_peer(
                     peer_id=peer.peer_id,
                     persona=peer.persona,
-                    display_name=peer.persona,
+                    display_name=getattr(peer, "display_name", "") or peer.persona,
+                    participant_type=getattr(peer, "participant_type", "ravn"),
                     subscribes_to=list(getattr(peer, "consumes_event_types", [])),
                     emits=list(getattr(peer, "emits_event_types", [])),
                     tools=list(getattr(peer, "capabilities", [])),
@@ -1053,6 +1227,7 @@ class Broker(
         except Exception as exc:
             logger.error("Mesh adapter start failed: %r", exc, exc_info=True)
             self._mesh_adapter = None
+            raise
 
     def _has_workflow_trigger(self) -> bool:
         cfg = self._settings.workflow_trigger
@@ -1389,6 +1564,8 @@ class Broker(
         """Publish one task event through Skuld's configured mesh adapter."""
         from ravn.domain.events import RavnEvent, RavnEventType
 
+        if event_type.strip() in self._evidence_gate_outputs:
+            raise ValueError("Only the evidence verifier can publish evidence gate output events")
         if self._mesh_adapter is None:
             raise RuntimeError("Flock mesh is not available")
         event_id = correlation_id or str(uuid.uuid4())
@@ -1402,6 +1579,7 @@ class Broker(
             "trigger_source": source,
         }
         event = RavnEvent(
+            event_id=event_id,
             type=RavnEventType.OUTCOME,
             source=f"skuld:{self._mesh_adapter.peer_id}",
             payload=payload,
@@ -1432,6 +1610,8 @@ class Broker(
         task_description = task_description.strip()
         if not event_type:
             raise ValueError("Event type is required")
+        if event_type in self._evidence_gate_outputs:
+            raise ValueError("Only the evidence verifier can publish evidence gate output events")
         if not task_description:
             raise ValueError("Event task description is required")
         if self._mesh_adapter is None:
@@ -1459,6 +1639,7 @@ class Broker(
             event_type,
             task_description,
             source=source,
+            correlation_id=request_id or "",
             extra_payload=payload,
         )
 
@@ -1479,7 +1660,8 @@ class Broker(
             if json.loads(marker_path.read_text(encoding="utf-8")) == marker:
                 logger.info("Workflow kickoff already acknowledged — skipping restart dispatch")
                 return
-        except (FileNotFoundError, OSError, ValueError):
+        except FileNotFoundError:
+            # No acknowledgment exists before the first successful kickoff.
             pass
         telemetry = get_observability()
         workflow_name = (
@@ -1751,11 +1933,19 @@ class Broker(
         event_type = str(metadata.get("event_type") or data.get("event_type") or "").strip()
         if not event_type:
             return
+        if event_type in self._evidence_gate_outputs:
+            raise ValueError("Agent outcomes cannot impersonate deterministic evidence gate events")
 
         participant = self._room_bridge.participants.get(peer_id)
         persona = (
             participant.persona if participant is not None else str(data.get("persona") or "")
         ).strip()
+        is_attested_review = (
+            participant is not None
+            and self._review_attestation is not None
+            and persona in self._review_attestation.personas
+            and event_type == self._review_attestation.event_type
+        )
 
         fields = data.get("fields")
         if not isinstance(fields, dict):
@@ -1768,7 +1958,9 @@ class Broker(
             "event_type": event_type,
             "canonical_event_type": str(data.get("canonical_event_type") or event_type),
             "fields": fields,
-            "valid": bool(data.get("valid", True)),
+            "valid": (
+                data.get("valid") is True if is_attested_review else bool(data.get("valid", True))
+            ),
         }
         verdict = data.get("verdict") or fields.get("verdict")
         if verdict:
@@ -1782,8 +1974,108 @@ class Broker(
 
         if not data.get("routing_only") and data.get("bubble_up") is not False:
             await self._emit_pipeline_event("outcome", payload)
+        if is_attested_review:
+            review_outcome = self._attested_review_outcome(
+                peer_id=peer_id,
+                persona=persona,
+                event_type=event_type,
+                fields=fields,
+                valid=data.get("valid"),
+                event_id=str(metadata.get("task_id") or frame.get("source_event_id") or "").strip(),
+                verdict=data.get("verdict"),
+                summary=data.get("summary"),
+            )
+            if review_outcome is None:
+                logger.warning(
+                    "Ignoring malformed developer review evidence peer=%s persona=%s event_type=%s",
+                    peer_id,
+                    persona,
+                    event_type,
+                )
+                return
+            if not self._record_attested_review_outcome(review_outcome):
+                return
+            await self._report_activity_state(
+                "active",
+                extra_metadata={
+                    "attested_review": {
+                        "schemaVersion": 1,
+                        **review_outcome,
+                    }
+                },
+            )
         await self._maybe_activate_workflow_gate(frame, payload)
         await self._maybe_emit_workflow_terminal_outcome(peer_id, frame, payload)
+
+    def _attested_review_outcome(
+        self,
+        *,
+        peer_id: str,
+        persona: str,
+        event_type: str,
+        fields: dict[str, Any],
+        valid: object,
+        event_id: str,
+        verdict: object = "",
+        summary: object = "",
+    ) -> dict[str, Any] | None:
+        """Build immutable review evidence from authenticated room metadata."""
+        binding = self._review_attestation
+        role = binding.personas.get(persona) if binding is not None else None
+        if role is None or event_type != binding.event_type:
+            return None
+        if valid is not True:
+            return None
+        findings = fields.get("findings")
+        if not isinstance(findings, list) or any(
+            not isinstance(finding, dict) for finding in findings
+        ):
+            return None
+        attempt_id = str(fields.get("attempt_id") or fields.get("attemptId") or "").strip()
+        candidate_sha = str(fields.get("candidate_sha") or fields.get("candidateSha") or "").strip()
+        candidate_tree = str(
+            fields.get("candidate_tree") or fields.get("candidateTree") or ""
+        ).strip()
+        if not attempt_id or not candidate_sha or not candidate_tree:
+            return None
+        source_identity = (
+            f"event:{event_id}"
+            if event_id
+            else f"binding:{attempt_id}:{candidate_sha}:{candidate_tree}"
+        )
+        stable_event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"niuulabs:attested-review:{self.session_id}:{peer_id}:{source_identity}",
+            )
+        )
+        return {
+            "eventId": stable_event_id,
+            "sessionId": self.session_id,
+            "role": role,
+            "scope": binding.scope,
+            "reviewerId": peer_id,
+            "personaId": persona,
+            "attemptId": attempt_id,
+            "candidateSha": candidate_sha,
+            "candidateTree": candidate_tree,
+            "verdict": str(fields.get("verdict") or verdict or ""),
+            "summary": str(fields.get("summary") or summary or ""),
+            "findings": list(findings),
+            "valid": True,
+        }
+
+    def _record_attested_review_outcome(self, outcome: dict[str, Any]) -> bool:
+        """Record an event once; conflicting reuse cannot replace original proof."""
+        event_id = str(outcome["eventId"])
+        existing = self._attested_review_outcomes.get(event_id)
+        if existing is None:
+            self._attested_review_outcomes[event_id] = outcome
+            return True
+        if existing == outcome:
+            return True
+        logger.warning("Ignoring conflicting developer review event_id=%s", event_id)
+        return False
 
     async def _emit_peer_help_needed_sleipnir_event(
         self,
@@ -2144,6 +2436,8 @@ class Broker(
             raise LookupError(f"Workflow gate not found: {gate_id}")
         if state.status != "pending":
             raise ValueError(f"Workflow gate {gate_id} is already resolved")
+        if state.mode == "evidence":
+            raise ValueError("Evidence gates can only be resolved by the configured verifier")
         normalized = decision.strip().upper()
         if normalized not in {"APPROVE", "CHANGES_REQUESTED"}:
             raise ValueError("decision must be APPROVE or CHANGES_REQUESTED")
@@ -2256,6 +2550,9 @@ class Broker(
         summary = str(payload.get("summary") or "").strip()
 
         for node in matching_nodes:
+            if node.mode == "evidence":
+                await self._evaluate_workflow_evidence_gate(node, activation_id, frame, payload)
+                continue
             key = (node.node_id, activation_id)
             slot = self._workflow_gate_slots.setdefault(key, set())
             slot.add(event_type)
@@ -2268,6 +2565,93 @@ class Broker(
                 event_type,
                 summary=summary,
             )
+
+    async def _evaluate_workflow_evidence_gate(
+        self,
+        node: WorkflowGateNode,
+        activation_id: str,
+        frame: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        """Execute an evidence node without an agent turn or a human override."""
+        if (
+            self._evidence_verifier is None
+            or self._evidence_artifacts is None
+            or self._mesh_adapter is None
+        ):
+            raise RuntimeError("Evidence gate requires its verifier and active workflow mesh")
+        artifact = node.artifact or {}
+        fields = payload.get("fields") or {}
+        evidence = fields.get("evidence") if isinstance(fields, dict) else None
+        try:
+            observed_digest = await asyncio.to_thread(
+                self._evidence_artifacts.digest,
+                artifact_kind=artifact["kind"],
+                artifact_id=artifact["id"],
+            )
+            if payload.get("valid") is not True:
+                raise ValueError("Evidence gate received an invalid upstream outcome")
+            if not isinstance(evidence, dict) or not isinstance(evidence.get("identity"), dict):
+                raise ValueError("Evidence gate requires fields.evidence with an artifact identity")
+            if evidence["identity"].get("attempt_id") != activation_id:
+                raise ValueError("Evidence belongs to a different workflow activation")
+            if evidence["identity"].get("execution_id") != self.session_id:
+                raise ValueError("Evidence belongs to a different workflow execution")
+            if (
+                evidence["identity"].get("artifact_kind") != artifact["kind"]
+                or evidence["identity"].get("artifact_id") != artifact["id"]
+                or evidence["identity"].get("artifact_digest") != observed_digest
+            ):
+                raise ValueError("Evidence does not match the current workflow artifact")
+            report = evaluate_workflow_evidence(
+                self._evidence_verifier, evidence=evidence, policy=node.evidence_policy
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            report = {"accepted": False, "blocking_reasons": [str(exc)]}
+        accepted = report["accepted"]
+        event_type = node.approval_event_type if accepted else node.changes_requested_event_type
+        outcome = {
+            "event_type": event_type,
+            "session_id": self.session_id,
+            "persona": "workflow-evidence",
+            "peer_id": f"workflow-evidence:{node.node_id}",
+            "workflow_node_id": node.node_id,
+            "workflow_activation_id": activation_id,
+            "valid": True,
+            "verdict": "pass" if accepted else "fail",
+            "summary": f"{node.label}: evidence {'accepted' if accepted else 'rejected'}",
+            "fields": {"evidence_report": report},
+        }
+        from ravn.domain.events import RavnEvent, RavnEventType
+
+        event = RavnEvent(
+            type=RavnEventType.OUTCOME,
+            source=outcome["peer_id"],
+            payload=outcome,
+            timestamp=datetime.now(UTC),
+            urgency=0.0,
+            correlation_id=activation_id,
+            session_id=self.session_id,
+            root_correlation_id=activation_id,
+        )
+        # Persist the deterministic decision as a normal public workflow outcome.
+        # Publishing may be retried: receipt verification itself has no side effects.
+        await self._emit_broker_frame(
+            {
+                "type": "room_outcome",
+                "participantId": outcome["peer_id"],
+                "persona": outcome["persona"],
+                "eventType": event_type,
+                "workflowNodeId": node.node_id,
+                "valid": True,
+                "verdict": outcome["verdict"],
+                "summary": outcome["summary"],
+                "fields": outcome["fields"],
+            }
+        )
+        await self._emit_pipeline_event("outcome", outcome)
+        await self._mesh_adapter.publish(event, event_type)
+        await self._maybe_emit_workflow_terminal_outcome(outcome["peer_id"], frame, outcome)
 
     async def _maybe_emit_workflow_terminal_outcome(
         self,
@@ -2312,7 +2696,11 @@ class Broker(
             collected = [slot[required] for required in node.event_types if required in slot]
             self._workflow_terminal_slots.pop(key, None)
 
-            if not _workflow_join_satisfied(node.join_mode, collected):
+            if not _workflow_join_satisfied(
+                node.join_mode,
+                collected,
+                passing_verdicts=node.passing_verdicts,
+            ):
                 logger.info(
                     "workflow runtime: terminal node %s rejected activation=%s outcomes=%s",
                     node.node_id,
@@ -2443,14 +2831,12 @@ class Broker(
         if (
             self._flock_completion_reported
             or self._flock_failure_reported
+            or self._pending_terminal_activity is not None
             or not self._is_room_only_workflow_session()
         ):
             return
         if self._room_bridge is None:
             return
-
-        participant = self._room_bridge.participants.get(peer_id)
-        persona = (participant.persona if participant is not None else "").strip()
 
         metadata = frame.get("metadata", {})
         outcome_event_type = str(metadata.get("event_type") or "")
@@ -2465,6 +2851,22 @@ class Broker(
         fields = data.get("fields", data)
         if not isinstance(fields, dict) or not fields:
             return
+        if is_workflow_terminal:
+            normalized = self._authoritative_workflow_terminal_frame(
+                peer_id=peer_id,
+                event_type=outcome_event_type,
+                fields=fields,
+                valid=data.get("valid"),
+            )
+            if normalized is None:
+                return
+            frame = normalized
+            data = frame["data"]
+            fields = data["fields"]
+            persona = "workflow-runtime"
+        else:
+            participant = self._room_bridge.participants.get(peer_id)
+            persona = (participant.persona if participant is not None else "").strip()
         structured_outcome = (
             fields.get("outcome") if isinstance(fields.get("outcome"), dict) else fields
         )
@@ -2482,9 +2884,94 @@ class Broker(
         files_changed = structured_outcome.get("files_changed") or fields.get("files_changed")
         if isinstance(files_changed, list) and files_changed:
             extra_metadata["files_changed"] = files_changed
+        is_attested_terminal = self._review_attestation is not None and any(
+            node.completion_event_type == outcome_event_type
+            for node in self._workflow_terminal_nodes
+        )
+        if is_attested_terminal:
+            result = structured_outcome.get("result")
+            if isinstance(result, dict):
+                extra_metadata["delivery"] = {
+                    "schemaVersion": 1,
+                    "result": dict(result),
+                    "reviews": self._attested_reviews_for_terminal_result(result),
+                }
 
-        self._flock_completion_reported = True
-        await self._report_activity_state("idle", extra_metadata=extra_metadata)
+        if await self._report_activity_state("idle", extra_metadata=extra_metadata):
+            self._flock_completion_reported = True
+
+    def _authoritative_workflow_terminal_frame(
+        self,
+        *,
+        peer_id: str,
+        event_type: str,
+        fields: dict[str, Any],
+        valid: object,
+    ) -> dict[str, Any] | None:
+        """Normalize only a configured runtime-owned workflow stop outcome."""
+        prefix = "workflow-stop:"
+        if not peer_id.startswith(prefix) or valid is not True or not fields:
+            return None
+        node_id = peer_id[len(prefix) :]
+        if self._workflow_terminal_nodes:
+            if not any(
+                node.node_id == node_id and node.completion_event_type == event_type
+                for node in self._workflow_terminal_nodes
+            ):
+                return None
+        else:
+            participant = self._room_bridge.participants.get(peer_id) if self._room_bridge else None
+            if str(getattr(participant, "persona", "") or "").strip() != "workflow-runtime":
+                return None
+        return {
+            "type": "outcome",
+            "metadata": {"event_type": event_type},
+            "data": {
+                "event_type": event_type,
+                "canonical_event_type": event_type,
+                "fields": dict(fields),
+                "valid": True,
+                "bubble_up": False,
+            },
+        }
+
+    def _attested_reviews_for_terminal_result(
+        self,
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Select the latest exact-candidate review from each workstream role.
+
+        The in-memory ledger intentionally retains prior review cycles for audit
+        reporting.  A repaired candidate must not carry those superseded reviews
+        into Ting's terminal attestation envelope.
+        """
+        attempt_id = str(result.get("attemptId") or "").strip()
+        candidate_sha = str(result.get("candidateSha") or "").strip()
+        candidate_tree = str(result.get("candidateTree") or "").strip()
+        if not attempt_id or not candidate_sha or not candidate_tree:
+            return []
+
+        binding = self._review_attestation
+        if binding is None or binding.scope != "workstream":
+            return []
+        workstream_roles = set(binding.roles)
+        selected: dict[str, dict[str, Any]] = {}
+        for outcome in self._attested_review_outcomes.values():
+            role = str(outcome.get("role") or "")
+            if (
+                role not in workstream_roles
+                or outcome.get("scope") != "workstream"
+                or outcome.get("valid") is not True
+                or str(outcome.get("attemptId") or "") != attempt_id
+                or str(outcome.get("candidateSha") or "") != candidate_sha
+                or str(outcome.get("candidateTree") or "") != candidate_tree
+            ):
+                continue
+            # Dictionary iteration preserves observation order, so a repeated
+            # authenticated role for the same immutable candidate supersedes its
+            # earlier observation without erasing the retained audit history.
+            selected[role] = outcome
+        return [selected[role] for role in sorted(selected)]
 
     async def _maybe_report_flock_failure(
         self,
@@ -2501,6 +2988,7 @@ class Broker(
         if (
             self._flock_failure_reported
             or self._flock_completion_reported
+            or self._pending_terminal_activity is not None
             or not self._is_room_only_workflow_session()
         ):
             return
@@ -2514,11 +3002,24 @@ class Broker(
             "failure_persona": persona,
             "error": error,
         }
+        # The workflow node and task the peer was running when it failed, so
+        # Ting can record which stage failed rather than only which peer.
+        frame_metadata = frame.get("metadata")
+        if isinstance(frame_metadata, dict):
+            node_id = str(frame_metadata.get("workflow_node_id") or "").strip()
+            if node_id:
+                extra_metadata["failure_workflow_node_id"] = node_id
+            if not persona:
+                extra_metadata["failure_persona"] = str(frame_metadata.get("persona") or "").strip()
+            failure_kind = str(frame_metadata.get("failure_kind") or "").strip()
+            if failure_kind:
+                extra_metadata["failure_kind"] = failure_kind
+        task_id = str(frame.get("task_id") or "").strip()
+        if task_id:
+            extra_metadata["failure_task_id"] = task_id
 
-        # Set the terminal guard before awaiting the report so a concurrent
-        # completion event cannot overwrite the failure with ``idle``.
-        self._flock_failure_reported = True
-        await self._report_activity_state("error", extra_metadata=extra_metadata)
+        if await self._report_activity_state("error", extra_metadata=extra_metadata):
+            self._flock_failure_reported = True
         await self._finish_trace_span(
             self._trace_workflow_span_id,
             status="failed",
@@ -3525,6 +4026,77 @@ class Broker(
         "discover_slash_commands": "slash_commands",
     }
 
+    def _room_role_for(self, sender_ws: WebSocket | None) -> str:
+        """Return the verified room role for the channel behind *sender_ws*.
+
+        ``sender_ws is None`` means this dispatch did not originate from a
+        live browser connection (an internally-synthesized call, e.g. replay
+        or resume) — those call sites already established their own
+        authority before reaching here, so they are trusted as "owner".  A
+        live connection whose channel cannot be found (torn down mid-dispatch,
+        or never registered — protocol2 registers it only after synchronous
+        history capture) gets the least-privilege default, "viewer": a
+        missing channel must never read as elevated privilege.
+        """
+        if sender_ws is None:
+            return "owner"
+        for ch in self._channels.channels:
+            if isinstance(ch, WebSocketChannel) and ch.ws is sender_ws:
+                return ch.room_role
+        return "viewer"
+
+    def _reply_context_consumption_allowed(self, target_peer_id: str, actual_role: str) -> bool:
+        """Return whether *actual_role* may deliver into *target_peer_id*'s reply wait.
+
+        A directed message (explicit ``directed_message``, default chat routed
+        to the room's default target, or the equivalent HTTP room/direct call)
+        to a peer with a pending ``reply_context``
+        (niuu.collaboration.room.set_reply_context, set when a Ravn case
+        suspends waiting for an operator) DELIVERS that reply and consumes the
+        context — functionally the same act as answering
+        ``ask_user_answer``/``permission_response``, which is already
+        approver-only. Ordinary chat to a peer with NO pending reply is
+        unaffected; this only blocks the specific peer/moment a case is
+        actually waiting. Shared by both the WS dispatch and the
+        ``/api/room/direct`` HTTP route so a viewer cannot reach the same
+        privileged act by calling the HTTP surface directly.
+        """
+        if self._room_bridge is None:
+            return True
+        if target_peer_id not in self._room_bridge.pending_reply_peer_ids():
+            return True
+        return _ROOM_ROLE_RANK[actual_role] >= _ROOM_ROLE_RANK["approver"]
+
+    async def _guard_reply_context_consumption(
+        self,
+        target_peer_id: str,
+        actual_role: str,
+        data: dict,
+        sender_ws: WebSocket | None,
+    ) -> bool:
+        """WS wrapper: deny and notify the sender when the predicate above fails.
+
+        Returns True when the send may proceed.
+        """
+        if self._reply_context_consumption_allowed(target_peer_id, actual_role):
+            return True
+        logger.warning(
+            "_dispatch_browser_message: denied reply-context consumption for peer=%s role=%s",
+            _sanitize_log(target_peer_id),
+            actual_role,
+        )
+        if sender_ws:
+            await self._send_broker_frame_to(
+                sender_ws,
+                control_error_frame(
+                    "This participant is awaiting an operator reply; only the "
+                    "session owner or an approver may answer it",
+                    data,
+                    code="forbidden",
+                ),
+            )
+        return False
+
     @history_write
     async def _dispatch_browser_message(
         self,
@@ -3545,6 +4117,22 @@ class Broker(
             _sanitize_log(msg_type),
             self._transport.is_alive,
         )
+
+        required_role = _message_role_requirement(msg_type)
+        actual_role = self._room_role_for(sender_ws)
+        if _ROOM_ROLE_RANK[actual_role] < _ROOM_ROLE_RANK[required_role]:
+            error_msg = f"{msg_type or 'this message'} requires the {required_role} room role"
+            logger.warning(
+                "_dispatch_browser_message: denied type=%s role=%s requires=%s",
+                _sanitize_log(msg_type),
+                actual_role,
+                required_role,
+            )
+            if sender_ws:
+                await self._send_broker_frame_to(
+                    sender_ws, control_error_frame(error_msg, data, code="forbidden")
+                )
+            return
 
         # Guard: reject control messages the transport does not support.
         cap_field = self._CONTROL_CAPABILITY_MAP.get(msg_type or "")
@@ -3569,11 +4157,16 @@ class Broker(
                 if request_id in self._unrestored_permissions:
                     raise ControlRecoveryError("This approval belongs to a previous native process")
                 behavior = data.get("behavior", "deny")
+                # An approver (below owner) may allow/deny the pending tool
+                # call, but must not also rewrite it: updated_input can
+                # change WHAT command runs, and updated_permissions can grant
+                # a broader mode (e.g. bypassPermissions) than this one
+                # decision implies. Only the owner may set either.
                 response = {
                     "behavior": behavior,
-                    "updatedInput": data.get("updated_input", {}),
+                    "updatedInput": data.get("updated_input", {}) if actual_role == "owner" else {},
                 }
-                if data.get("updated_permissions"):
+                if actual_role == "owner" and data.get("updated_permissions"):
                     response["updatedPermissions"] = data["updated_permissions"]
                 if "content" in data:
                     # Opaque structured content for native form elicitations.
@@ -3752,14 +4345,21 @@ class Broker(
                 content = data.get("content", "")
                 if not target or not content:
                     return
+                if not await self._guard_reply_context_consumption(
+                    str(target), actual_role, data, sender_ws
+                ):
+                    return
                 try:
                     await self.handle_directed_room_message(
                         str(target),
                         str(content),
                         source="browser",
                         request_id=self._extract_request_id(data),
-                        metadata=(
-                            data.get("metadata") if isinstance(data.get("metadata"), dict) else None
+                        metadata=_sanitize_directed_metadata(
+                            actual_role,
+                            data.get("metadata")
+                            if isinstance(data.get("metadata"), dict)
+                            else None,
                         ),
                     )
                 except LookupError as exc:
@@ -3824,10 +4424,16 @@ class Broker(
                 # trace context outside the browser's nested metadata object.
                 # Give the channel adapter first refusal before the resident's
                 # default browser route so that context is not discarded.
-                if await self._try_route_pending_help_reply(data, content_str):
-                    return
-                if await self._try_route_single_room_peer_message(data, content_str):
-                    return
+                # sender_ws is None ONLY for the real Telegram channel's own
+                # on_message callback (see chronicle.py's TelegramChannel
+                # wiring) — a live browser connection claiming
+                # {"source": "telegram"} must never reach this "answer a
+                # pending operator wait" shortcut just by asserting it.
+                if sender_ws is None:
+                    if await self._try_route_pending_help_reply(data, content_str):
+                        return
+                    if await self._try_route_single_room_peer_message(data, content_str):
+                        return
 
                 # Resident sessions: untargeted messages route to the
                 # configured default participant as directed messages. Normalize
@@ -3853,15 +4459,26 @@ class Broker(
                             )
                         return
                 if default_target:
+                    if not await self._guard_reply_context_consumption(
+                        default_target, actual_role, data, sender_ws
+                    ):
+                        return
                     request_id = data.get("request_id")
                     request_id = request_id if isinstance(request_id, str) and request_id else None
+                    # A live browser connection can never claim "telegram" —
+                    # only the real Telegram channel dispatches with no
+                    # sender_ws (see the sender_ws is None guard above).
                     incoming_source = str(data.get("source") or "").strip().lower()
-                    source = "telegram" if incoming_source == "telegram" else "browser"
+                    is_telegram = sender_ws is None and incoming_source == "telegram"
+                    source = "telegram" if is_telegram else "browser"
                     if source == "telegram":
                         metadata = _telegram_directed_metadata(data)
                     else:
-                        metadata = (
-                            data.get("metadata") if isinstance(data.get("metadata"), dict) else None
+                        metadata = _sanitize_directed_metadata(
+                            actual_role,
+                            data.get("metadata")
+                            if isinstance(data.get("metadata"), dict)
+                            else None,
                         )
                     try:
                         await self.handle_directed_room_message(
@@ -4888,9 +5505,7 @@ class Broker(
         outbound = self._format_room_message_for_skuld(content)
         self._pending_explicit_human_messages.append((content, outbound))
         self._pending_explicit_human_response_count += 1
-        if not self._transport.is_alive:
-            logger.info("Starting transport for explicit human room message")
-            await self._transport.start()
+        await self._ensure_transport_started()
         await self._transport.send_message(outbound)
 
     def _format_room_message_for_skuld(self, content: str) -> str:
@@ -4970,7 +5585,7 @@ class Broker(
         """Recover a resumed native session's durable prefix before the CLI starts."""
         if (
             not self._settings.history_hydration_enabled
-            or not self._settings.session.resume_session_id
+            or (not self._settings.session.resume_session_id and not self._settings.room.enabled)
             or not self.volundr_api_url
             or not self._settings.event_log_enabled
         ):
@@ -4984,13 +5599,18 @@ class Broker(
                 page_size=self._settings.history_hydration_page_size,
                 max_frames=self._settings.history_hydration_max_frames,
                 max_bytes=self._settings.history_hydration_max_bytes,
-                on_frames=self._restore_durable_controls,
+                on_frames=self._restore_durable_runtime_state,
             )
             merged = merge_history_turns(
                 durable, [asdict(turn) for turn in self._conversation_turns]
             )
             hydrated = [ConversationTurn(**turn) for turn in merged]
         except Exception as exc:
+            if self._is_room_only_workflow_session():
+                raise RuntimeError(
+                    "Workflow room durable history could not be restored; refusing to "
+                    "start without complete review evidence"
+                ) from exc
             logger.warning(
                 "Durable history hydration skipped for session %s; preserving local cache: %s",
                 self.session_id,
@@ -5002,6 +5622,9 @@ class Broker(
         self._conversation_turns = hydrated
         self._save_conversation_history()
         logger.info("Hydrated %d conversation turns from durable history", len(hydrated))
+        if self._restored_workflow_terminal_completion is not None:
+            peer_id, frame = self._restored_workflow_terminal_completion
+            await self._maybe_report_flock_completion(peer_id, frame)
 
     def _control_state_path(self) -> Path:
         return self._conversation_history_path().with_name(f"controls_{self.session_id}.json")
@@ -5026,6 +5649,76 @@ class Broker(
         }
         self._save_control_state()
 
+    def _restore_durable_runtime_state(self, frames: list) -> None:
+        """Restore broker-owned state from the frozen durable-log horizon."""
+        self._restore_durable_controls(frames)
+        self._restore_durable_attested_reviews(frames)
+        self._restore_durable_workflow_terminal_completion(frames)
+
+    def _restore_durable_workflow_terminal_completion(self, frames: list) -> None:
+        """Recover an authenticated workflow-runtime stop outcome for republishing."""
+        for frame in frames:
+            if getattr(frame, "kind", "") != "room_outcome":
+                continue
+            payload = getattr(frame, "payload", None)
+            if not isinstance(payload, dict) or payload.get("type") != "room_outcome":
+                continue
+            participant = payload.get("participant")
+            if not isinstance(participant, dict):
+                continue
+            peer_id = str(payload.get("participantId") or "").strip()
+            if (
+                not peer_id
+                or str(participant.get("peer_id") or "").strip() != peer_id
+                or str(participant.get("persona") or "").strip() != "workflow-runtime"
+                or str(participant.get("participant_type") or "").strip() != "workflow"
+                or str(participant.get("participant_kind") or "").strip() != "workflow"
+                or str(payload.get("sourceEventType") or "").strip() != "outcome"
+            ):
+                continue
+            fields = payload.get("fields")
+            if not isinstance(fields, dict):
+                continue
+            normalized = self._authoritative_workflow_terminal_frame(
+                peer_id=peer_id,
+                event_type=str(payload.get("eventType") or "").strip(),
+                fields=fields,
+                valid=payload.get("valid"),
+            )
+            if normalized is not None:
+                self._restored_workflow_terminal_completion = (peer_id, normalized)
+
+    def _restore_durable_attested_reviews(self, frames: list) -> None:
+        """Rebuild authenticated developer review evidence from room outcomes."""
+        for frame in frames:
+            if getattr(frame, "kind", "") != "room_outcome":
+                continue
+            payload = getattr(frame, "payload", None)
+            if not isinstance(payload, dict) or payload.get("type") != "room_outcome":
+                continue
+            participant = payload.get("participant")
+            if not isinstance(participant, dict):
+                continue
+            peer_id = str(payload.get("participantId") or "").strip()
+            if not peer_id or str(participant.get("peer_id") or "").strip() != peer_id:
+                continue
+            persona = str(participant.get("persona") or "").strip()
+            fields = payload.get("fields")
+            if not isinstance(fields, dict):
+                continue
+            outcome = self._attested_review_outcome(
+                peer_id=peer_id,
+                persona=persona,
+                event_type=str(payload.get("eventType") or "").strip(),
+                fields=fields,
+                valid=payload.get("valid"),
+                event_id=str(payload.get("taskId") or payload.get("sourceEventId") or "").strip(),
+                verdict=payload.get("verdict"),
+                summary=payload.get("summary"),
+            )
+            if outcome is not None:
+                self._record_attested_review_outcome(outcome)
+
     def _load_control_state(self) -> None:
         try:
             self._unrestored_questions, self._unrestored_permissions = load_control_state(
@@ -5035,13 +5728,20 @@ class Broker(
             logger.exception("Failed to recover pending control state")
 
 
-# Global broker instance
-broker = Broker()
+# Global broker instance; deployment trust is composed outside the graph/runtime.
+from skuld.main import create_evidence_artifacts, create_evidence_verifier  # noqa: E402
+
+_broker_settings = SkuldSettings()
+broker = Broker(
+    _broker_settings,
+    evidence_verifier=create_evidence_verifier(_broker_settings),
+    evidence_artifacts=create_evidence_artifacts(_broker_settings),
+)
 
 
 # API imports remain late because they bind the completed Broker instance.
 # isort: off
-import skuld.broker_api as _broker_api  # noqa: E402
+from skuld import broker_api as _broker_api  # noqa: E402
 from skuld.broker_api import (  # noqa: E402, F401
     lifespan,
     health,
@@ -5108,6 +5808,9 @@ def main() -> None:
     """Run the broker server."""
     import uvicorn
 
+    from niuu.observability import install_uvicorn_log_redaction
+
+    install_uvicorn_log_redaction()
     settings = SkuldSettings()
     logger.info("Starting Skuld broker on %s:%d", settings.host, settings.port)
     uvicorn.run(app, host=settings.host, port=settings.port, access_log=False)

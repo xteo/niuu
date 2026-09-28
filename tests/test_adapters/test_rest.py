@@ -20,6 +20,7 @@ from tests.conftest import (
     MockGitProvider,
     MockGitRegistry,
     MockPodManager,
+    make_session_participant_service,
 )
 from volundr.adapters.inbound.rest import (
     SessionCreate,
@@ -29,8 +30,17 @@ from volundr.adapters.inbound.rest import (
     _session_proxy_url,
     create_router,
 )
+from volundr.adapters.outbound.k8s_storage import InMemoryStorageAdapter
 from volundr.config import LocalMountsConfig
+from volundr.domain.execution_catalog import (
+    ExecutionCatalogError,
+    ExecutionCatalogIntegrityError,
+    ExecutionCatalogNotFoundError,
+    ExecutionPlanMismatchError,
+    ExecutionSelectionError,
+)
 from volundr.domain.models import GitProviderType, GitSource, RepoInfo, Session, SessionStatus
+from volundr.domain.ports import SessionCapacity
 from volundr.domain.services import RepoService, SessionService, StatsService
 from volundr.domain.services.session import SessionAccessDeniedError
 
@@ -66,9 +76,9 @@ def stats_repo() -> InMemoryStatsRepository:
 
 
 @pytest.fixture
-def stats_service(stats_repo: InMemoryStatsRepository) -> StatsService:
+def stats_service(stats_repo: InMemoryStatsRepository, service: SessionService) -> StatsService:
     """Create a stats service with test repository."""
-    return StatsService(stats_repo)
+    return StatsService(stats_repo, service)
 
 
 @pytest.fixture
@@ -83,7 +93,12 @@ def app(
 ) -> FastAPI:
     """Create a test FastAPI app."""
     app = FastAPI()
-    router = create_router(service, stats_service, pricing_provider=pricing)
+    router = create_router(
+        service,
+        stats_service,
+        pricing_provider=pricing,
+        session_participant_service=make_session_participant_service(service),
+    )
     app.include_router(router)
 
     # Minimal settings stub for endpoints that read app.state.settings
@@ -92,6 +107,7 @@ def app(
 
     app.state.settings = _SettingsStub()
     app.state.admin_settings = {}
+    app.state.storage = InMemoryStorageAdapter()
     return app
 
 
@@ -258,7 +274,14 @@ class TestListSessions:
     ):
         """The canonical /api/v1/forge alias should expose the same routes."""
         app = FastAPI()
-        app.include_router(create_router(service, stats_service, prefix="/api/v1/forge"))
+        app.include_router(
+            create_router(
+                service,
+                stats_service,
+                prefix="/api/v1/forge",
+                session_participant_service=make_session_participant_service(service),
+            )
+        )
 
         client = TestClient(app)
         try:
@@ -317,6 +340,53 @@ class TestCreateSession:
             },
         )
         assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        ("error", "expected_status", "expected_detail"),
+        [
+            (
+                ExecutionSelectionError("conflicting selectors"),
+                422,
+                "Invalid compute execution selection",
+            ),
+            (
+                ExecutionCatalogNotFoundError("unknown execution"),
+                422,
+                "Invalid compute execution selection",
+            ),
+            (
+                ExecutionPlanMismatchError("digest changed"),
+                409,
+                "Compute execution selection conflicts with its durable allocation",
+            ),
+            (
+                ExecutionCatalogIntegrityError("artifact changed"),
+                503,
+                "Compute execution catalog is unavailable",
+            ),
+            (
+                ExecutionCatalogError("cannot read catalog"),
+                503,
+                "Compute execution catalog is unavailable",
+            ),
+        ],
+    )
+    def test_create_session_maps_execution_catalog_errors(
+        self,
+        client: TestClient,
+        service: SessionService,
+        error: Exception,
+        expected_status: int,
+        expected_detail: str,
+    ):
+        with patch.object(service, "start_session", AsyncMock(side_effect=error)):
+            response = client.post(
+                "/api/v1/forge/sessions",
+                json={"name": "catalog-error", "model": "test", "source": {"type": "git"}},
+            )
+
+        assert response.status_code == expected_status
+        assert response.json()["detail"] == expected_detail
 
     def test_create_session_scoped_build_token_missing_scope_is_403(self, client: TestClient):
         """A Valkyrie build token lacking forge:session:create is 403'd."""
@@ -575,6 +645,79 @@ class TestStartSession:
         # code_endpoint set in background task
         # pod_name set in background task
 
+    @pytest.mark.parametrize(
+        ("error", "expected_status", "expected_detail"),
+        [
+            (
+                ExecutionSelectionError("conflicting selectors"),
+                422,
+                "Invalid compute execution selection",
+            ),
+            (
+                ExecutionCatalogNotFoundError("unknown execution"),
+                422,
+                "Invalid compute execution selection",
+            ),
+            (
+                ExecutionPlanMismatchError("digest changed"),
+                409,
+                "Compute execution selection conflicts with its durable allocation",
+            ),
+            (
+                ExecutionCatalogIntegrityError("artifact changed"),
+                503,
+                "Compute execution catalog is unavailable",
+            ),
+            (
+                ExecutionCatalogError("cannot read catalog"),
+                503,
+                "Compute execution catalog is unavailable",
+            ),
+        ],
+    )
+    async def test_start_session_maps_execution_catalog_errors(
+        self,
+        client: TestClient,
+        service: SessionService,
+        error: Exception,
+        expected_status: int,
+        expected_detail: str,
+    ):
+        session = await service.create_session("Catalog error", "test")
+        with patch.object(service, "start_session", AsyncMock(side_effect=error)):
+            response = client.post(f"/api/v1/forge/sessions/{session.id}/start")
+
+        assert response.status_code == expected_status
+        assert response.json()["detail"] == expected_detail
+
+    @pytest.mark.parametrize("error", [ValueError("unrelated"), RuntimeError("unrelated")])
+    async def test_start_session_does_not_swallow_unrelated_errors(
+        self,
+        client: TestClient,
+        service: SessionService,
+        error: Exception,
+    ):
+        session = await service.create_session("Unrelated error", "test")
+        with (
+            patch.object(service, "start_session", AsyncMock(side_effect=error)),
+            pytest.raises(type(error), match="unrelated"),
+        ):
+            client.post(f"/api/v1/forge/sessions/{session.id}/start")
+
+    async def test_restart_forwards_selected_integrations(self, client, service):
+        session = await service.create_session(
+            "Test",
+            "claude",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        with patch.object(service, "start_session", AsyncMock(return_value=session)) as start:
+            response = client.post(
+                f"/api/v1/forge/sessions/{session.id}/start",
+                json={"integration_ids": ["existing-ai", "new-github"]},
+            )
+        assert response.status_code == 200
+        assert start.call_args.kwargs["integration_ids"] == ["existing-ai", "new-github"]
+
     def test_start_session_not_found(self, client: TestClient):
         """Returns 404 for non-existent session."""
         fake_id = uuid4()
@@ -597,6 +740,50 @@ class TestStartSession:
         response = client.post(f"/api/v1/forge/sessions/{session.id}/start")
         assert response.status_code == 409
         assert "cannot start" in response.json()["detail"].lower()
+
+    async def test_start_session_without_a_free_slot_is_409_with_the_remedy(
+        self, client: TestClient, service: SessionService
+    ):
+        """A restart with no capacity is refused up front, and the answer says
+        where the limit is raised; the session is not flipped to starting."""
+        session = await service.create_session(
+            "Test",
+            "claude-sonnet-4",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        full = SessionCapacity(
+            limit=4, active=4, remedy="raise it in Settings → Runtime (/settings/runtime/sessions)"
+        )
+        with patch.object(type(service._pod_manager), "capacity", AsyncMock(return_value=full)):
+            response = client.post(f"/api/v1/forge/sessions/{session.id}/start")
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "4 of 4 sessions are running" in detail
+        assert "/settings/runtime/sessions" in detail
+        assert (await service.get_session(session.id)).status == session.status
+
+    def test_create_session_without_a_free_slot_is_409_and_creates_nothing(
+        self, client: TestClient, service: SessionService
+    ):
+        full = SessionCapacity(limit=2, active=2, remedy="raise pod_manager.max_concurrent")
+        with patch.object(type(service._pod_manager), "capacity", AsyncMock(return_value=full)):
+            response = client.post(
+                "/api/v1/forge/sessions",
+                json={
+                    "name": "no-room",
+                    "model": "claude-sonnet-4",
+                    "source": {
+                        "type": "git",
+                        "repo": "https://github.com/org/repo",
+                        "branch": "main",
+                    },
+                },
+            )
+        assert response.status_code == 409
+        assert "2 of 2 sessions are running" in response.json()["detail"]
+        listed = client.get("/api/v1/forge/sessions").json()
+        items = listed if isinstance(listed, list) else listed.get("items", [])
+        assert "no-room" not in [s["name"] for s in items]
 
 
 class TestStopSession:
@@ -1441,7 +1628,12 @@ class TestWorkflowGateProxy:
         assert response.json() == {"status": "resolved"}
         mock_client.post.assert_awaited_once_with(
             f"http://localhost:8080/s/{session.id}/api/workflow/gates/prd%20review%3Fstep%3D1/resolve",
-            headers={"x-niuu-workflow-gate-intent": "resolve"},
+            headers={
+                "x-niuu-workflow-gate-intent": "resolve",
+                # Stamped once this route's own check_room_access("resolve_gate")
+                # succeeded — see ROOM_ROLE_HEADER in rest.py.
+                "x-niuu-room-role": "approver",
+            },
             json={"decision": "approved", "notes": "looks good", "source": "human"},
         )
 
@@ -1718,6 +1910,12 @@ class TestFeatureFlags:
         assert "local_mounts_enabled" in data
         assert isinstance(data["local_mounts_enabled"], bool)
 
+    def test_feature_flags_report_home_volume_support(self, client: TestClient):
+        """The in-memory storage adapter only simulates storage: no home volumes."""
+        response = client.get("/api/v1/forge/feature-flags")
+        assert response.status_code == 200
+        assert response.json()["home_volumes_supported"] is False
+
     def test_feature_flags_lists_allowed_mount_prefixes(self, client: TestClient):
         """Exposes the configured mount prefix allowlist for UI/automation."""
         response = client.get("/api/v1/forge/feature-flags")
@@ -1821,7 +2019,11 @@ class TestGetStats:
     def test_get_stats_without_service(self, service: SessionService):
         """Returns 503 when stats service is not available."""
         app = FastAPI()
-        router = create_router(service, stats_service=None)
+        router = create_router(
+            service,
+            stats_service=None,
+            session_participant_service=make_session_participant_service(service),
+        )
         app.include_router(router)
         with TestClient(app) as client:
             response = client.get("/api/v1/forge/stats")
@@ -1831,9 +2033,13 @@ class TestGetStats:
     def test_get_stats_with_zero_values(self, service: SessionService):
         """Returns stats with zero values."""
         stats_repo = InMemoryStatsRepository()
-        stats_svc = StatsService(stats_repo)
+        stats_svc = StatsService(stats_repo, service)
         app = FastAPI()
-        router = create_router(service, stats_svc)
+        router = create_router(
+            service,
+            stats_svc,
+            session_participant_service=make_session_participant_service(service),
+        )
         app.include_router(router)
         with TestClient(app) as client:
             response = client.get("/api/v1/forge/stats")
@@ -1880,14 +2086,24 @@ class TestListRepos:
         registry = MockGitRegistry([gh])
         return RepoService(registry)
 
-    @pytest.fixture
-    def repos_client(self, repo_service: RepoService) -> TestClient:
-        """Create a test client with niuu repos router."""
+    @staticmethod
+    def _app(repo_service: RepoService | None) -> FastAPI:
+        """A niuu repos app with the caller resolved to a known person, the way
+        the platform's auth would."""
+        from niuu.adapters.inbound.auth import extract_principal
         from niuu.adapters.inbound.rest_repos import create_repos_router
 
         app = FastAPI()
         app.include_router(create_repos_router(repo_service))
-        client = TestClient(app)
+        app.dependency_overrides[extract_principal] = lambda: Principal(
+            user_id="dev-user", email="dev@example.com", tenant_id="default", roles=[]
+        )
+        return app
+
+    @pytest.fixture
+    def repos_client(self, repo_service: RepoService) -> TestClient:
+        """Create a test client with niuu repos router."""
+        client = TestClient(self._app(repo_service))
         yield client
         client.close()
 
@@ -1905,25 +2121,17 @@ class TestListRepos:
 
     def test_list_repos_without_service(self):
         """Returns 503 when repo service is not available."""
-        from niuu.adapters.inbound.rest_repos import create_repos_router
-
-        app = FastAPI()
-        app.include_router(create_repos_router(None))
-        with TestClient(app) as client:
+        with TestClient(self._app(None)) as client:
             response = client.get("/api/v1/niuu/repos")
         assert response.status_code == 503
         assert "not available" in response.json()["detail"].lower()
 
     def test_list_repos_empty_when_no_orgs(self):
         """Returns empty dict when no providers have orgs configured."""
-        from niuu.adapters.inbound.rest_repos import create_repos_router
-
         gh = MockGitProvider(name="GitHub")
         registry = MockGitRegistry([gh])
         repo_service = RepoService(registry)
-        app = FastAPI()
-        app.include_router(create_repos_router(repo_service))
-        with TestClient(app) as client:
+        with TestClient(self._app(repo_service)) as client:
             response = client.get("/api/v1/niuu/repos")
         assert response.status_code == 200
         assert response.json() == {}

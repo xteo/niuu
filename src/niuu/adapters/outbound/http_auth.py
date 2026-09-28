@@ -176,6 +176,7 @@ class ClientCredentialsBearerTokenAuthAdapter(HttpAuthPort):
         client_id: str,
         client_secret: str = "",
         client_secret_env: str = "",
+        client_secret_file: str = "",
         audience: str = "",
         scope: str = "",
         timeout_seconds: float = 10.0,
@@ -186,6 +187,7 @@ class ClientCredentialsBearerTokenAuthAdapter(HttpAuthPort):
         self._client_id = client_id
         self._client_secret = client_secret
         self._client_secret_env = client_secret_env
+        self._client_secret_file = client_secret_file
         self._audience = audience
         self._scope = scope
         self._timeout_seconds = timeout_seconds
@@ -211,6 +213,14 @@ class ClientCredentialsBearerTokenAuthAdapter(HttpAuthPort):
         client_secret = self._client_secret
         if not client_secret and self._client_secret_env:
             client_secret = os.environ.get(self._client_secret_env, "")
+        if not client_secret and self._client_secret_file:
+            path = Path(self._client_secret_file).expanduser()
+            try:
+                client_secret = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"OAuth client credentials secret file could not be read: {path}"
+                ) from exc
         if not client_secret:
             raise RuntimeError("OAuth client credentials auth requires a client secret")
 
@@ -240,3 +250,41 @@ class ClientCredentialsBearerTokenAuthAdapter(HttpAuthPort):
         self._token = token
         self._expires_at = now + max(0.0, expires_in - self._refresh_skew_seconds)
         return token
+
+
+class RequestBearerTokenAuthAdapter(HttpAuthPort):
+    """Forward the authenticated caller's bearer credential without impersonation."""
+
+    def headers(self) -> dict[str, str]:
+        from niuu.adapters.inbound.auth_context import current_bearer_token
+
+        token = current_bearer_token()
+        if not token:
+            raise RuntimeError("Shared integrations require an authenticated caller bearer token")
+        return {"Authorization": f"Bearer {token}"}
+
+    def invalidate(self) -> bool:
+        return False
+
+
+class FileBearerTokenAuthAdapter(HttpAuthPort):
+    """Read an operator-mounted bearer credential for every request.
+
+    Projected service-account tokens and atomically replaced secret mounts can
+    rotate without restarting the caller. The file content is never logged.
+    """
+
+    def __init__(self, *, token_file: str) -> None:
+        if not token_file:
+            raise ValueError("Bearer authentication requires token_file")
+        self._path = Path(token_file).expanduser()
+
+    def headers(self) -> dict[str, str]:
+        token = self._path.read_text(encoding="utf-8").strip()
+        if not token or any(char.isspace() for char in token):
+            raise ValueError("Bearer token file is empty or contains invalid whitespace")
+        return {"Authorization": f"Bearer {token}"}
+
+    def invalidate(self) -> bool:
+        # A rejection permits one reread in case the token was just rotated.
+        return True

@@ -12,6 +12,9 @@ export default defineConfig({
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'on-first-retry',
+    // The suite describes the Advanced UI; Simple mode (the default for a fresh
+    // browser) has its own spec that opts in per test.
+    storageState: './e2e/advanced-mode.storage.json',
   },
   expect: {
     toHaveScreenshot: {
@@ -25,6 +28,15 @@ export default defineConfig({
   },
   projects: [
     {
+      name: 'webkit-workflow-editor',
+      testMatch: ['workflow-editor.spec.ts', 'ting-work.spec.ts'],
+      use: {
+        ...devices['Desktop Safari'],
+        viewport: { width: 1440, height: 900 },
+        colorScheme: 'dark',
+      },
+    },
+    {
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
@@ -35,9 +47,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    // The app consumes package dist CSS artifacts in workspace mode, so build
-    // package outputs before starting Vite to keep E2E styles in sync with source.
-    command: 'pnpm dev:playwright',
+    // The suite runs against the production bundle: build every package (the app
+    // consumes their dist CSS), build the app, then serve it with vite preview.
+    command: 'pnpm preview:playwright',
     url: 'http://localhost:5173',
     reuseExistingServer: !process.env.CI,
     timeout: 300_000,

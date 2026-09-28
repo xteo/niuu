@@ -22,6 +22,7 @@ from volundr.domain.models import (
     StoredCredential,
 )
 from volundr.domain.ports import SessionContext
+from volundr.domain.services.integration_registry import IntegrationRegistry
 from volundr.domain.services.mount_strategies import SecretMountStrategyRegistry
 
 
@@ -69,11 +70,7 @@ def _definition(
 
 
 def _registry(definitions=None):
-    """Build a mock IntegrationRegistry."""
-    reg = MagicMock()
-    defs = {d.slug: d for d in (definitions or [])}
-    reg.get_definition = lambda slug: defs.get(slug)
-    return reg
+    return IntegrationRegistry(definitions or [])
 
 
 class TestSecretInjectionContributor:
@@ -87,7 +84,7 @@ class TestSecretInjectionContributor:
         assert result.values == {}
         assert result.pod_spec is None
 
-    async def test_no_adapter_returns_openshell_mapping_values(self, session):
+    async def test_openshell_uses_its_native_credential_mapping(self, session):
         defn = _definition(
             slug="openai",
             env_from_credentials={"OPENAI_API_KEY": "api_key"},
@@ -95,6 +92,7 @@ class TestSecretInjectionContributor:
         registry = _registry([defn])
 
         ctx = SessionContext(
+            runtime_backend="openshell",
             integration_connections=(_connection("openai-cred", "openai"),),
         )
         c = SecretInjectionContributor(integration_registry=registry)
@@ -491,15 +489,15 @@ class TestSecretInjectionContributor:
         adapter.pod_spec_additions.assert_not_called()
         assert result.pod_spec is None
 
-    async def test_ensure_failure_skips_volume(self, session):
+    async def test_ensure_failure_stops_credential_launch(self, session):
         adapter = AsyncMock()
         adapter.ensure_secret_provider_class.side_effect = RuntimeError("403")
         ctx = SessionContext(
             integration_connections=(_connection("some-cred"),),
         )
         c = SecretInjectionContributor(secret_injection=adapter)
-        result = await c.contribute(session, ctx)
-        assert result.pod_spec is None
+        with pytest.raises(RuntimeError, match="403"):
+            await c.contribute(session, ctx)
         adapter.pod_spec_additions.assert_not_called()
 
     async def test_cleanup_calls_adapter(self, session):
@@ -532,3 +530,210 @@ class TestSecretsContributor:
     async def test_cleanup_noop_without_repo(self, session):
         c = SecretsContributor()
         await c.cleanup(session, SessionContext())
+
+
+async def test_memory_well_auth_ref_injects_owner_credential_without_manual_selection(session):
+    store = AsyncMock()
+    store.get.return_value = MagicMock(keys=("token",))
+    injection = AsyncMock()
+    injection.pod_spec_additions.return_value = PodSpecAdditions()
+    contributor = SecretInjectionContributor(credential_store=store, secret_injection=injection)
+    context = SessionContext(
+        workload_config={
+            "mimir": {"registry_refs": [{"mount_name": "brain", "auth_ref": "brain-token"}]}
+        }
+    )
+    await contributor.contribute(session, context)
+    store.get.assert_awaited_with("user", session.owner_id, "brain-token")
+    mappings = injection.ensure_secret_provider_class.call_args.args[1]
+    assert mappings[0].file_mappings == {"/run/secrets/mimir/brain-token/token": "token"}
+    injection.ensure_secret_provider_class.side_effect = RuntimeError("credential service down")
+    with pytest.raises(RuntimeError, match="credential service down"):
+        await contributor.contribute(session, context)
+    store.get.return_value = None
+    with pytest.raises(ValueError, match="token field"):
+        await contributor.contribute(session, context)
+
+
+@pytest.mark.asyncio
+async def test_workload_memory_identity_does_not_request_a_stored_token():
+    store = AsyncMock()
+    contributor = SecretInjectionContributor(credential_store=store)
+    context = SessionContext(
+        credential_names=("workload:mimir",),
+        workload_config={
+            "mimir": {"registry_refs": [{"mount_name": "gbrain-ui", "auth_ref": "workload:mimir"}]}
+        },
+    )
+    assert await contributor._build_mappings(context, "user-1") == []
+    store.get.assert_not_called()
+
+
+async def test_source_control_token_is_projected_for_git(session):
+    from dataclasses import replace
+
+    from volundr.domain.services.user_integration import git_token_path
+
+    connection = replace(_connection(), integration_type=IntegrationType.SOURCE_CONTROL)
+    injection = AsyncMock()
+    contributor = SecretInjectionContributor(secret_injection=injection)
+    await contributor.contribute(session, SessionContext(integration_connections=(connection,)))
+    mappings = injection.ensure_secret_provider_class.call_args.args[1]
+    assert mappings[0].file_mappings == {git_token_path(connection.id): "token"}
+
+
+async def test_openshell_source_control_uses_dynamic_provider_without_token_file(session):
+    from dataclasses import replace
+
+    connection = replace(
+        _connection(slug="github"), integration_type=IntegrationType.SOURCE_CONTROL
+    )
+    registry = _registry(
+        [_definition(slug="github", env_from_credentials={"GITHUB_TOKEN": "token"})]
+    )
+    contributor = SecretInjectionContributor(integration_registry=registry)
+    result = await contributor.contribute(
+        session,
+        SessionContext(
+            runtime_backend="openshell",
+            integration_connections=(connection,),
+        ),
+    )
+    assert result.values["openshell"]["credentialMappings"] == [
+        {
+            "credentialName": connection.credential_name,
+            "envMappings": {"GITHUB_TOKEN": "token"},
+            "fileMappings": {},
+        }
+    ]
+
+
+@pytest.mark.parametrize("failure", ["", "tenant", "owner", "stdio", "injector", "revoked"])
+async def test_managed_oauth_projection_preflights_and_checks_scope(session, failure):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from niuu.domain.oauth_credentials import OAUTH_ENGINE, mcp_token_path
+
+    session.tenant_id = "tenant-a"
+    spec = MCPServerSpec(
+        name="remote", transport="http", url="https://mcp.example.test", token_field="token"
+    )
+    if failure == "stdio":
+        spec = MCPServerSpec(name="remote", command="mcp", env_from_credentials={"TOKEN": "token"})
+    connection = _connection()
+    if failure == "owner":
+        connection = replace(connection, owner_id="other")
+    store = AsyncMock()
+    store.get.return_value = SimpleNamespace(
+        metadata={
+            "renewal_owner": OAUTH_ENGINE,
+            "tenant_id": "other" if failure == "tenant" else "tenant-a",
+            "oauth_token_field": "token",
+        }
+    )
+    store.get_value.return_value = {"token": "private-access-token"}
+    if failure == "revoked":
+        store.get_value.side_effect = RuntimeError("reconnect")
+    injection = AsyncMock()
+    injection.supports_managed_oauth = failure != "injector"
+    contributor = SecretInjectionContributor(
+        credential_store=store,
+        secret_injection=injection,
+        integration_registry=_registry([_definition(mcp_server=spec)]),
+    )
+    context = SessionContext(integration_connections=(connection,))
+    if failure:
+        with pytest.raises((ValueError, RuntimeError)):
+            await contributor.contribute(session, context)
+        injection.ensure_secret_provider_class.assert_not_called()
+        return
+    await contributor.contribute(session, context)
+    mapping = injection.ensure_secret_provider_class.call_args.args[1][0]
+    assert mapping.oauth_tenant_id == "tenant-a"
+    assert mapping.oauth_token_documents == (mcp_token_path(connection.id),)
+    assert mapping.file_mappings == {mcp_token_path(connection.id): "token"}
+    assert "private-access-token" not in repr(mapping)
+    store.get_value.assert_awaited_once()
+
+
+async def test_openshell_managed_http_mcp_uses_dynamic_provider(session):
+    from types import SimpleNamespace
+
+    from niuu.domain.oauth_credentials import OAUTH_ENGINE, mcp_token_env
+
+    session.tenant_id = "tenant-a"
+    store = AsyncMock()
+    store.get.return_value = SimpleNamespace(
+        metadata={
+            "renewal_owner": OAUTH_ENGINE,
+            "tenant_id": "tenant-a",
+            "oauth_token_field": "token",
+        }
+    )
+    store.get_value.return_value = {"token": "private-access"}
+    spec = MCPServerSpec(
+        name="remote", transport="http", url="https://mcp.example.test/mcp", token_field="token"
+    )
+    c = SecretInjectionContributor(
+        credential_store=store, integration_registry=_registry([_definition(mcp_server=spec)])
+    )
+    result = await c.contribute(
+        session,
+        SessionContext(runtime_backend="openshell", integration_connections=(_connection(),)),
+    )
+    mapping = result.values["openshell"]["credentialMappings"][0]
+    assert mapping["envMappings"] == {mcp_token_env("conn-1"): "token"}
+    assert mapping["fileMappings"] == {}
+    assert mapping["provider"]["endpoints"][0]["host"] == "mcp.example.test"
+    assert mapping["provider"]["authStyle"] == "bearer"
+    assert "private-access" not in repr(result)
+
+
+@pytest.mark.parametrize("backend", ["vm", "docker", "kubernetes"])
+async def test_brokered_codex_does_not_require_file_or_agent_injection(session, backend):
+    from dataclasses import replace
+
+    from niuu.domain.oauth_credentials import OAUTH_ENGINE
+    from volundr.domain.models import CredentialEnrollmentSpec
+
+    definition = replace(
+        _definition(slug="codex"),
+        credential_enrollment=CredentialEnrollmentSpec(
+            method="codex_device",
+            credential_field="auth.json",
+            default_credential_name="codex-default",
+        ),
+    )
+    store = AsyncMock()
+    store.get.return_value = StoredCredential(
+        id="credential-test",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        name="selected-codex",
+        secret_type=SecretType.OAUTH_TOKEN,
+        owner_type="user",
+        owner_id=session.owner_id,
+        keys=["auth.json"],
+        metadata={
+            "renewal_owner": OAUTH_ENGINE,
+            "tenant_id": session.tenant_id,
+            "oauth_token_field": "auth.json",
+        },
+    )
+    store.get_value.return_value = {"auth.json": "explicit-test-preflight"}
+    contributor = SecretInjectionContributor(
+        credential_store=store,
+        integration_registry=_registry([definition]),
+    )
+    result = await contributor.contribute(
+        session,
+        SessionContext(
+            runtime_backend=backend,
+            integration_connections=(_connection("selected-codex", "codex"),),
+        ),
+    )
+    assert result.pod_spec is None
+    assert result.values["broker"]["codexAuth"]["kwargs"]["credential_name"] == "selected-codex"
+    assert "explicit-test-preflight" not in repr(result)
+    store.get_value.assert_awaited_once_with("user", session.owner_id, "selected-codex")

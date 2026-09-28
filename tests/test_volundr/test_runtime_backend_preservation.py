@@ -100,3 +100,15 @@ def test_legacy_kubernetes_and_openshell_keep_existing_semantics(pod_manager):
     assert _runtime_backend(settings, pod_manager) == "kubernetes"
     settings.pod_manager.adapter = "test.OpenShellPodManager"
     assert _runtime_backend(settings, pod_manager) == "openshell"
+
+
+def test_explicit_backend_overrides_adapter_identity(local):
+    settings, manager = local
+    settings.pod_manager.runtime_backend = "vm"
+    assert _runtime_backend(settings, manager) == "vm"
+
+
+def test_vm_adapter_declares_its_backend():
+    from volundr.adapters.outbound.vm_pod_manager import VmPodManager
+
+    assert VmPodManager.__new__(VmPodManager).runtime_backend == "vm"

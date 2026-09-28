@@ -42,7 +42,7 @@ async def isolated_pool():
 
 async def seed_claims(pool):
     await pool.execute("CREATE TABLE sessions (id UUID PRIMARY KEY)")
-    await pool.execute((MIGRATIONS / "000063_message_delivery_claims.up.sql").read_text())
+    await pool.execute((MIGRATIONS / "000070_message_delivery_claims.up.sql").read_text())
     sid = uuid4()
     await pool.execute("INSERT INTO sessions VALUES ($1)", sid)
     return sid
@@ -127,6 +127,7 @@ async def _old_bootstrap(conn, files):
         try:
             await conn.execute(path.read_text())
         except asyncpg.PostgresError:
+            # This fixture intentionally reproduces the historical migration bug.
             pass
 
 
@@ -322,3 +323,38 @@ async def test_adoption_rejects_conflicting_session_preset_values(isolated_pool)
             await apply_startup_migrations(conn, files)
         row = await conn.fetchrow("SELECT preset_id, launch_spec_id FROM sessions WHERE id=$1", sid)
         assert (row["preset_id"], row["launch_spec_id"]) == (old, new)
+
+
+@pytest.mark.parametrize("version", range(62, 67))
+async def test_forge_numeric_cursor_upgrades_authority_and_vm_schema(isolated_pool, version):
+    from volundr.schema_bridge import prepare_numbered_migrations
+
+    files = sorted(MIGRATIONS.glob("*.up.sql"))
+    # Forge's 62–66 are now canonical 69–73; upstream's 62–68 were absent there.
+    history = [p for p in files if int(p.name[:6]) <= 61]
+    history += [p for p in files if 69 <= int(p.name[:6]) <= version + 7]
+    async with isolated_pool.acquire() as conn:
+        for path in history:
+            await conn.execute(path.read_text())
+        sid = uuid4()
+        await conn.execute(
+            "INSERT INTO sessions (id, name, model) VALUES ($1, 'preserved', 'codex')", sid
+        )
+        await conn.execute("CREATE TABLE schema_migrations (version BIGINT, dirty BOOLEAN)")
+        await conn.execute("INSERT INTO schema_migrations VALUES ($1, false)", version)
+        assert await prepare_numbered_migrations(conn, MIGRATIONS) == 4 + version - 61
+        assert await conn.fetchval("SELECT version FROM schema_migrations") == version
+        for path in files:
+            if int(path.name[:6]) > version:
+                await conn.execute(path.read_text())
+        for table in ("compute_leases", "admin_settings", "session_message_deliveries"):
+            assert await conn.fetchval("SELECT to_regclass($1)", table) is not None
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='personal_access_tokens' "
+                "AND column_name='tenant_id'"
+            )
+            == 1
+        )
+        assert await conn.fetchval("SELECT name FROM sessions WHERE id=$1", sid) == "preserved"

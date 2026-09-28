@@ -11,6 +11,7 @@ from uuid import UUID
 
 import asyncpg
 
+from identity.ports import AuthorizationDeniedError
 from ting.domain.models import Phase, PhaseStatus, Run, RunStatus, Saga, SagaStatus
 from ting.ports.saga_repository import SagaRepository
 
@@ -32,8 +33,8 @@ class PostgresSagaRepository(SagaRepository):
         executor = conn or self._pool
         await executor.execute(
             """
-            INSERT INTO phases (id, saga_id, tracker_id, number, name, status, confidence)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO phases (id, saga_id, tracker_id, number, name, status)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status
             """,
             phase.id,
@@ -42,7 +43,6 @@ class PostgresSagaRepository(SagaRepository):
             phase.number,
             phase.name,
             phase.status.value,
-            phase.confidence,
         )
 
     async def save_run(self, run: Run, *, conn: Any | None = None) -> None:
@@ -51,13 +51,13 @@ class PostgresSagaRepository(SagaRepository):
             """
             INSERT INTO runs
                 (id, phase_id, tracker_id, name, description, acceptance_criteria,
-                 declared_files, estimate_hours, status, confidence, session_id,
+                 declared_files, estimate_hours, status, session_id,
                  branch, chronicle_summary, retry_count, created_at, updated_at,
                  pr_url, pr_id, identifier, url, reviewer_session_id, review_round,
                  structured_outcome, outcome_event_type)
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19, $20, $21, $22, $23::jsonb, $24
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19, $20, $21, $22::jsonb, $23
             )
             ON CONFLICT (id) DO UPDATE SET
                 phase_id = EXCLUDED.phase_id,
@@ -68,7 +68,6 @@ class PostgresSagaRepository(SagaRepository):
                 declared_files = EXCLUDED.declared_files,
                 estimate_hours = EXCLUDED.estimate_hours,
                 status = EXCLUDED.status,
-                confidence = EXCLUDED.confidence,
                 session_id = EXCLUDED.session_id,
                 branch = EXCLUDED.branch,
                 chronicle_summary = EXCLUDED.chronicle_summary,
@@ -92,7 +91,6 @@ class PostgresSagaRepository(SagaRepository):
             run.declared_files,
             run.estimate_hours,
             run.status.value,
-            run.confidence,
             run.session_id,
             run.branch,
             run.chronicle_summary,
@@ -111,26 +109,26 @@ class PostgresSagaRepository(SagaRepository):
 
     async def save_saga(self, saga: Saga, *, conn: Any | None = None) -> None:
         executor = conn or self._pool
-        await executor.execute(
+        result = await executor.execute(
             """
             INSERT INTO sagas
                 (id, tracker_id, tracker_type, slug, name,
-                 repos, feature_branch, base_branch, status, confidence, created_at, owner_id,
+                 repos, feature_branch, base_branch, status, created_at, owner_id,
                  workflow_id, workflow_version, workflow_snapshot, instance_id,
-                 repo_branches, target_tags, target_match)
+                 repo_branches, target_tags, target_match, tenant_id, tracker_connection_id)
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::uuid,
-                 $17::jsonb, $18, $19)
+                ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::uuid,
+                 $16::jsonb, $17, $18, $19, $20)
             ON CONFLICT (id) DO UPDATE SET
                 tracker_id = EXCLUDED.tracker_id,
                 tracker_type = EXCLUDED.tracker_type,
+                tracker_connection_id = EXCLUDED.tracker_connection_id,
                 slug = EXCLUDED.slug,
                 name = EXCLUDED.name,
                 repos = EXCLUDED.repos,
                 feature_branch = EXCLUDED.feature_branch,
                 base_branch = EXCLUDED.base_branch,
                 status = EXCLUDED.status,
-                confidence = EXCLUDED.confidence,
                 owner_id = EXCLUDED.owner_id,
                 workflow_id = EXCLUDED.workflow_id,
                 workflow_version = EXCLUDED.workflow_version,
@@ -139,6 +137,8 @@ class PostgresSagaRepository(SagaRepository):
                 repo_branches = EXCLUDED.repo_branches,
                 target_tags = EXCLUDED.target_tags,
                 target_match = EXCLUDED.target_match
+                WHERE sagas.tenant_id = EXCLUDED.tenant_id
+                  AND sagas.owner_id IS NOT DISTINCT FROM EXCLUDED.owner_id
             """,
             saga.id,
             saga.tracker_id,
@@ -149,7 +149,6 @@ class PostgresSagaRepository(SagaRepository):
             saga.feature_branch,
             saga.base_branch,
             saga.status.value,
-            saga.confidence,
             saga.created_at,
             saga.owner_id,
             saga.workflow_id,
@@ -159,7 +158,11 @@ class PostgresSagaRepository(SagaRepository):
             json.dumps(saga.repo_branches),
             saga.target_tags,
             saga.target_match,
+            saga.tenant_id,
+            saga.tracker_connection_id,
         )
+        if result == "INSERT 0 0":
+            raise AuthorizationDeniedError("Resource ownership is immutable")
 
     async def list_sagas(self, *, owner_id: str | None = None) -> list[Saga]:
         if owner_id is not None:
@@ -173,15 +176,17 @@ class PostgresSagaRepository(SagaRepository):
             )
         return [self._row_to_saga(r) for r in rows]
 
-    async def get_saga(self, saga_id: UUID, *, owner_id: str | None = None) -> Saga | None:
+    async def get_saga(
+        self, saga_id: UUID, *, owner_id: str | None = None, conn: Any | None = None
+    ) -> Saga | None:
         if owner_id is not None:
-            row = await self._pool.fetchrow(
+            row = await (conn or self._pool).fetchrow(
                 "SELECT * FROM sagas WHERE id = $1 AND owner_id = $2",
                 saga_id,
                 owner_id,
             )
         else:
-            row = await self._pool.fetchrow(
+            row = await (conn or self._pool).fetchrow(
                 "SELECT * FROM sagas WHERE id = $1",
                 saga_id,
             )
@@ -209,7 +214,7 @@ class PostgresSagaRepository(SagaRepository):
         owner_filter = " AND owner_id = $2" if owner_id is not None else ""
         query = f"""
             WITH target_saga AS (
-                SELECT id, tracker_id
+                SELECT id, tracker_id, tracker_connection_id
                 FROM sagas
                 WHERE id = $1{owner_filter}
             ),
@@ -233,20 +238,23 @@ class PostgresSagaRepository(SagaRepository):
             ),
             del_run_session_messages AS (
                 DELETE FROM run_session_messages
-                WHERE run_id IN (SELECT id FROM target_runs)
-                   OR tracker_id IN (SELECT tracker_id FROM target_runs)
+                WHERE tracker_connection_id IN (SELECT tracker_connection_id FROM target_saga)
+                  AND (run_id IN (SELECT id FROM target_runs)
+                   OR tracker_id IN (SELECT tracker_id FROM target_runs))
             ),
             del_run_confidence_events AS (
                 DELETE FROM run_confidence_events
-                WHERE run_id IN (SELECT id FROM target_runs)
-                   OR tracker_id IN (SELECT tracker_id FROM target_runs)
+                WHERE tracker_connection_id IN (SELECT tracker_connection_id FROM target_saga)
+                  AND (run_id IN (SELECT id FROM target_runs)
+                   OR tracker_id IN (SELECT tracker_id FROM target_runs))
             ),
             del_run_progress AS (
                 DELETE FROM run_progress
-                WHERE saga_tracker_id IN (SELECT tracker_id FROM target_saga)
+                WHERE tracker_connection_id IN (SELECT tracker_connection_id FROM target_saga)
+                  AND (saga_tracker_id IN (SELECT tracker_id FROM target_saga)
                    OR phase_tracker_id IN (SELECT tracker_id FROM target_phases)
                    OR run_id IN (SELECT id FROM target_runs)
-                   OR tracker_id IN (SELECT tracker_id FROM target_runs)
+                   OR tracker_id IN (SELECT tracker_id FROM target_runs))
             ),
             del_runs AS (
                 DELETE FROM runs
@@ -356,8 +364,8 @@ class PostgresSagaRepository(SagaRepository):
             saga_id,
         )
 
-    async def get_phase(self, phase_id: UUID) -> Phase | None:
-        row = await self._pool.fetchrow(
+    async def get_phase(self, phase_id: UUID, *, conn: Any | None = None) -> Phase | None:
+        row = await (conn or self._pool).fetchrow(
             "SELECT * FROM phases WHERE id = $1",
             phase_id,
         )
@@ -365,8 +373,8 @@ class PostgresSagaRepository(SagaRepository):
             return None
         return self._row_to_phase(row)
 
-    async def get_run(self, run_id: UUID) -> Run | None:
-        row = await self._pool.fetchrow(
+    async def get_run(self, run_id: UUID, *, conn: Any | None = None) -> Run | None:
+        row = await (conn or self._pool).fetchrow(
             "SELECT * FROM runs WHERE id = $1",
             run_id,
         )
@@ -419,7 +427,6 @@ class PostgresSagaRepository(SagaRepository):
             number=row["number"],
             name=row["name"],
             status=PhaseStatus(row.get("status", "PENDING") or "PENDING"),
-            confidence=row["confidence"] or 0.0,
         )
 
     @staticmethod
@@ -441,7 +448,6 @@ class PostgresSagaRepository(SagaRepository):
             declared_files=list(row.get("declared_files") or []),
             estimate_hours=row.get("estimate_hours"),
             status=RunStatus(row.get("status", "PENDING") or "PENDING"),
-            confidence=row.get("confidence") or 0.0,
             session_id=row.get("session_id"),
             branch=row.get("branch"),
             chronicle_summary=row.get("chronicle_summary"),
@@ -469,6 +475,7 @@ class PostgresSagaRepository(SagaRepository):
             id=row["id"],
             tracker_id=row["tracker_id"],
             tracker_type=row["tracker_type"],
+            tracker_connection_id=row.get("tracker_connection_id") or "",
             slug=slug,
             name=row["name"],
             repos=list(row["repos"]),
@@ -476,9 +483,9 @@ class PostgresSagaRepository(SagaRepository):
             feature_branch=row.get("feature_branch") or f"feat/{slug}",
             base_branch=row["base_branch"],
             status=SagaStatus(row.get("status", "ACTIVE") or "ACTIVE"),
-            confidence=row["confidence"] or 0.0,
             created_at=row["created_at"] or datetime.now(UTC),
             owner_id=row.get("owner_id") or "",
+            tenant_id=row["tenant_id"],
             workflow_id=row.get("workflow_id"),
             workflow_version=row.get("workflow_version"),
             workflow_snapshot=workflow_snapshot,

@@ -74,6 +74,19 @@ describe('paged session history', () => {
     expect(result.current.messages.map((row) => row.id)).toEqual(['row-0', 'row-1']);
     expect(send).not.toHaveBeenCalled();
   });
+  it('reads recent and older pages from the resolved Forge endpoint, not the gateway host', async () => {
+    const { fetcher } = mockHistory();
+    const historyEndpoint = 'https://app.test/api/v1/forge/sessions/review/conversation';
+    const { result } = renderHook(() => useSkuldChat(url, { historyEndpoint }));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    await act(async () => result.current.loadOlderHistory());
+    expect(result.current.messages).toHaveLength(20);
+    const targets = fetcher.mock.calls.map(([raw]) => new URL(raw));
+    expect(targets.map((target) => target.origin + target.pathname)).toEqual([
+      historyEndpoint,
+      historyEndpoint,
+    ]);
+  });
   it('keeps the first page visible and reports a failed background catch-up', async () => {
     const { fetcher } = mockHistory(2);
     let release!: (response: Response) => void;

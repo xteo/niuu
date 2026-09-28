@@ -46,17 +46,20 @@ from ravn.cli.commands import (
 from ravn.cli.flock import NodeDef, _write_node_config
 from ravn.config import Settings
 from ravn.domain.models import (
+    Session,
     StreamEvent,
     StreamEventType,
     TokenUsage,
     ToolResult,
     TurnResult,
 )
+from ravn.domain.permission_mode import PermissionMode
 from ravn.domain.profile import RavnProfile
 from ravn.ports.warden_deployer import WardenDeploymentError, WardenDeploymentResult
 from ravn.warden import WardenSpec, WardenStore
 from ravn.warden.artifacts import service_label, start_command, write_runtime_config
 from ravn.warden.models import WardenSupervisor
+from ravn.workflow_runtime import _workflow_result_schema_for_event
 
 runner = CliRunner()
 
@@ -120,7 +123,7 @@ def _build_test_warden_store(tmp_path: Path, *, fail_on: str = "") -> WardenStor
 
 
 class TestFlockNodeConfig:
-    def test_default_node_config_uses_available_vllm_model(self, tmp_path: Path) -> None:
+    def test_default_node_config_bakes_in_no_model_or_endpoint(self, tmp_path: Path) -> None:
         flock_dir = tmp_path / ".flock"
         node = NodeDef(
             index=1,
@@ -143,7 +146,8 @@ class TestFlockNodeConfig:
         )
 
         config = (flock_dir / "node-reviewer.yaml").read_text(encoding="utf-8")
-        assert "model: Qwen/Qwen3.6-35B-A3B-FP8" in config
+        assert "model:" not in config
+        assert "base_url" not in config
 
 
 class TestPrintUsage:
@@ -367,6 +371,67 @@ class TestCliTransportHelpers:
             "approval_policy": "never",
             "sandbox": "workspace-write",
         }
+
+    _SESSION_GATEWAY_ENV = {
+        "SKULD__MODEL_GATEWAY__URL": "http://gateway.test/api/v1/bifrost",
+        "SKULD__MODEL_GATEWAY__TOKEN": "gateway-token",
+    }
+
+    @staticmethod
+    def _cli_persona(**executor_kwargs: object) -> PersonaConfig:
+        return PersonaConfig(
+            name="coder",
+            system_prompt_template="hi",
+            executor=PersonaExecutorConfig(
+                adapter="ravn.adapters.executors.cli.CliTransportExecutor",
+                kwargs={
+                    # Answers with the route it was built for.
+                    "transport_adapter": "tests.test_ravn.test_executor_cli.FakeGatewayTransport",
+                    **executor_kwargs,
+                },
+            ),
+        )
+
+    @staticmethod
+    async def _turn_response(persona: PersonaConfig, model: str) -> str:
+        agent = _build_executor(persona).build(
+            channel=AsyncMock(),
+            system_prompt="hi",
+            session=Session(),
+            model=model,
+            persona=persona.name,
+            permission_mode="workspace_write",
+            tools=[],
+            mcp_servers=[],
+        )
+        return (await agent.run_turn("go")).response
+
+    async def test_build_executor_gives_a_gateway_persona_the_session_gateway(self) -> None:
+        persona = self._cli_persona(model_gateway=True)
+
+        with patch.dict(os.environ, self._SESSION_GATEWAY_ENV, clear=False):
+            response = await self._turn_response(persona, "qwen-coder")
+
+        assert response == "qwen-coder via http://gateway.test/api/v1/bifrost with gateway-token"
+
+    async def test_build_executor_keeps_a_cloud_persona_off_the_session_gateway(self) -> None:
+        """Every session with the model server carries the gateway env, whatever
+        its personas run; its presence alone must not reroute a cloud persona."""
+        persona = self._cli_persona()
+
+        with patch.dict(os.environ, self._SESSION_GATEWAY_ENV, clear=False):
+            response = await self._turn_response(persona, "claude-sonnet-4-6")
+
+        assert response == "claude-sonnet-4-6 via vendor"
+
+    async def test_build_executor_gateway_persona_without_a_session_gateway_fails(self) -> None:
+        persona = self._cli_persona(model_gateway=True)
+
+        with patch.dict(os.environ, {}, clear=False):
+            for name in self._SESSION_GATEWAY_ENV:
+                os.environ.pop(name, None)
+            with pytest.raises(ValueError, match="no gateway URL"):
+                await self._turn_response(persona, "qwen-coder")
 
     def test_uses_cli_transport_executor_prefers_persona_executor(self) -> None:
         persona = PersonaConfig(
@@ -1172,6 +1237,62 @@ class TestWorkflowRuntimeForPersona:
             },
         ]
 
+    def test_strict_review_policy_binds_declared_reviewers_and_outcomes(self) -> None:
+        settings = Settings.model_validate(
+            {
+                "workflow": {
+                    "graph": {
+                        "nodes": [
+                            {
+                                "id": "reviews",
+                                "kind": "stage",
+                                "joinMode": "all",
+                                "stageMembers": [
+                                    {"personaId": "reviewer-a"},
+                                    {"personaId": "reviewer-b"},
+                                ],
+                            },
+                            {
+                                "id": "author",
+                                "kind": "stage",
+                                "joinMode": "any",
+                                "reviewVerdictPolicy": {
+                                    "eventType": "review.completed",
+                                    "passOutcomes": ["plan.approved"],
+                                    "failOutcomes": ["plan.revised"],
+                                    "bindingFields": ["plan_revision"],
+                                },
+                                "stageMembers": [
+                                    {
+                                        "personaId": "analyst",
+                                        "consumesEventTypes": ["review.completed"],
+                                    }
+                                ],
+                            },
+                        ],
+                        "edges": [
+                            {
+                                "source": "reviews",
+                                "target": "author",
+                                "label": "review.completed -> review.completed",
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+
+        runtime = _workflow_runtime_for_persona(settings, "analyst")
+
+        assert runtime is not None
+        assert runtime["consumer_groups"][0]["review_verdict_policy"] == {
+            "event_type": "review.completed",
+            "required_personas": ["reviewer-a", "reviewer-b"],
+            "pass_outcomes": ["plan.approved"],
+            "fail_outcomes": ["plan.revised"],
+            "binding_fields": ["plan_revision"],
+        }
+
     def test_workflow_allowed_task_targets_returns_downstream_stage_personas(self) -> None:
         settings = Settings.model_validate(
             {
@@ -1348,6 +1469,94 @@ class TestWorkflowRuntimeForPersona:
         )
         assert _workflow_stage_context(settings, node_id="missing") == ""
 
+    def test_workflow_stage_context_retains_launch_identity_across_stages(self) -> None:
+        launch_context = (
+            "# Workflow Launch\nTicket: implement the requested utilities\n"
+            '{"repository":"https://example.com/team/repo",'
+            '"campaign_id":"execution-123","base_sha":"frozen-base"}'
+        )
+        settings = Settings.model_validate(
+            {
+                "workflow": {
+                    "initial_context": launch_context,
+                    "graph": {
+                        "nodes": [
+                            {"id": name, "kind": "stage", "label": name}
+                            for name in ("author", "coordinator", "publish")
+                        ],
+                        "edges": [],
+                    },
+                }
+            }
+        )
+        for stage in ("author", "coordinator", "publish"):
+            context = _workflow_stage_context(settings, node_id=stage)
+            assert context == (
+                f"Workflow stage: {stage}\n\nWorkflow launch context:\n{launch_context}"
+            )
+        assert _workflow_stage_context(settings, node_id="missing") == ""
+
+    def test_workflow_result_contract_applies_only_to_terminal_handoff(self) -> None:
+        result_schema = {
+            "type": "object",
+            "properties": {"evidence": {"type": "array", "items": {"type": "string"}}},
+            "required": ["evidence"],
+            "additionalProperties": False,
+        }
+        settings = Settings.model_validate(
+            {
+                "workflow": {
+                    "result_schema": result_schema,
+                    "graph": {
+                        "nodes": [
+                            {"id": "verify", "kind": "stage"},
+                            {"id": "accept", "kind": "stage"},
+                            {
+                                "id": "complete",
+                                "kind": "end",
+                                "completionEvent": "work.completed",
+                            },
+                        ],
+                        "edges": [
+                            {
+                                "source": "verify",
+                                "target": "accept",
+                                "label": "candidate.verified -> candidate.verified",
+                            },
+                            {
+                                "source": "accept",
+                                "target": "complete",
+                                "label": "coordination.accepted -> work.completed",
+                            },
+                        ],
+                    },
+                }
+            }
+        )
+
+        assert (
+            _workflow_result_schema_for_event(
+                settings,
+                node_id="verify",
+                event_type="candidate.verified",
+            )
+            is None
+        )
+        assert (
+            _workflow_result_schema_for_event(
+                settings,
+                node_id="accept",
+                event_type="coordination.accepted",
+            )
+            == result_schema
+        )
+        assert "Inherited terminal result schema" not in _workflow_stage_context(
+            settings, node_id="verify"
+        )
+        assert "Inherited terminal result schema" in _workflow_stage_context(
+            settings, node_id="accept"
+        )
+
     def test_derive_capabilities_prefers_persona_allowed_tools(self) -> None:
         settings = Settings()
         persona = PersonaConfig(
@@ -1442,7 +1651,7 @@ class TestDaemonAgentFactory:
             async def run(self) -> None:
                 return None
 
-        persona = PersonaConfig(name="claude-mimir-researcher")
+        persona = PersonaConfig(name="claude-mimir-researcher", permission_mode="read-only")
 
         with (
             patch("ravn.cli.commands._resolve_workspace", return_value=Path("/tmp/workspace")),
@@ -1485,6 +1694,11 @@ class TestDaemonAgentFactory:
         ]
         publish_inventory.assert_called_once_with(settings, Path("/tmp/workspace"))
         assert recorded[0]["prompt_builder"] is not recorded[1]["prompt_builder"]
+        # The executor receives the parsed mode, the same one the enforcer uses.
+        assert [call["permission_mode"] for call in recorded] == [
+            PermissionMode.READ_ONLY,
+            PermissionMode.READ_ONLY,
+        ]
         assert recorded[0]["mcp_servers"] == [
             {
                 "name": "mimir-local",

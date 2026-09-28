@@ -22,7 +22,11 @@ from niuu.domain.services.forge_session_token import (
     IssuedForgeSessionToken,
 )
 from niuu.domain.services.workload_identity import WorkloadIdentityService
-from tests.conftest import InMemorySessionRepository, MockPodManager
+from tests.conftest import (
+    InMemorySessionRepository,
+    MockPodManager,
+    make_session_participant_service,
+)
 from tests.support.notifications import InMemoryNotificationStore
 from volundr.adapters.inbound.forge_session_auth import ForgeSessionAuthMiddleware
 from volundr.adapters.inbound.rest import create_router
@@ -178,7 +182,13 @@ def build_forge_app(
     app.state.session_service = session_service
     app.state.forge_session_tokens = minted
     app.state.settings = SimpleNamespace(local_mounts=SimpleNamespace())
-    app.include_router(create_router(session_service, prefix=PREFIX))
+    app.include_router(
+        create_router(
+            session_service,
+            prefix=PREFIX,
+            session_participant_service=make_session_participant_service(session_service),
+        )
+    )
     app.include_router(
         create_notifications_router(
             notifications, session_service, prefix=PREFIX, default_page_size=20, max_page_size=50

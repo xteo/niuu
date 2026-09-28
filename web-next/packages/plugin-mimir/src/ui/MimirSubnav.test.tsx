@@ -7,10 +7,16 @@ import { createMimirMockAdapter } from '../adapters/mock';
 import type { IMimirService } from '../ports';
 
 const navigateMock = vi.fn();
+let currentPathname = '/mimir/registry';
 
-// Mock TanStack Router hooks — subnav uses useNavigate
+// Mock TanStack Router hooks — subnav uses useNavigate + useRouterState
 vi.mock('@tanstack/react-router', () => ({
   useNavigate: () => navigateMock,
+  useRouterState: ({
+    select,
+  }: {
+    select: (state: { location: { pathname: string } }) => unknown;
+  }) => select({ location: { pathname: currentPathname } }),
 }));
 
 const mockCtx: PluginCtx = {
@@ -23,6 +29,19 @@ const wrap = (ctx = mockCtx) => renderWithMimir(<MimirSubnav ctx={ctx} />, undef
 describe('MimirSubnav', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    currentPathname = '/mimir/registry';
+  });
+
+  it('renders nothing on the Memory scene route (/mimir) — the scene owns its own context', () => {
+    currentPathname = '/mimir';
+    const { container } = wrap();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('still renders the full subnav on a registry route', () => {
+    currentPathname = '/mimir/registry/health';
+    wrap();
+    expect(screen.getByText('Mount focus')).toBeInTheDocument();
   });
 
   it('renders the mount focus section', () => {
@@ -56,7 +75,7 @@ describe('MimirSubnav', () => {
 
   it('renders wardens roster when ravns are present', async () => {
     wrap();
-    await waitFor(() => expect(screen.getByText('Wardens')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Instance activity')).toBeInTheDocument());
     // ravns from mock: ravn-fjolnir, ravn-skald
     await waitFor(() => expect(screen.getByText('ravn-fjolnir')).toBeInTheDocument());
   });
@@ -111,7 +130,7 @@ describe('MimirSubnav', () => {
     await waitFor(() => expect(screen.getByText('ravn-fjolnir')).toBeInTheDocument());
     fireEvent.click(screen.getByText('ravn-fjolnir'));
     expect(setTweak).toHaveBeenCalledWith('mimir.selectedWardenId', 'ravn-fjolnir');
-    expect(navigateMock).toHaveBeenCalledWith({ to: '/mimir/ravns' });
+    expect(navigateMock).toHaveBeenCalledWith({ to: '/mimir/registry/analytics' });
   });
 
   it('can collapse the Mímir subnav', async () => {
@@ -149,7 +168,7 @@ describe('MimirSubnav', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: /warden ravn-fjolnir/i }));
     expect(setTweak).toHaveBeenCalledWith('mimir.selectedWardenId', 'ravn-fjolnir');
-    expect(navigateMock).toHaveBeenCalledWith({ to: '/mimir/ravns' });
+    expect(navigateMock).toHaveBeenCalledWith({ to: '/mimir/registry/analytics' });
   });
 
   it('omits collapsed warden shortcuts when no wardens are bound', async () => {
@@ -205,4 +224,18 @@ describe('MimirSubnav', () => {
     );
     expect(screen.getByRole('button', { name: /archive/i })).toHaveClass('mm-mount-row--muted');
   });
+});
+
+it('labels access independently from the shared memory role', async () => {
+  const service = createMimirMockAdapter();
+  const [base] = await service.mounts.listMounts();
+  service.mounts.listMounts = async () => [
+    { ...base!, name: 'gbrain-ui', role: 'shared', accessScope: 'tenant' },
+    { ...base!, name: 'gbrain-global', role: 'shared', accessScope: 'global' },
+  ];
+  renderWithMimir(<MimirSubnav ctx={mockCtx} />, service, mockCtx);
+  await waitFor(() => expect(screen.getByText('gbrain-ui')).toBeInTheDocument());
+  expect(screen.getByText('gbrain-ui').closest('button')).toHaveTextContent('Tenant');
+  expect(screen.getByText('gbrain-global').closest('button')).toHaveTextContent('Global');
+  expect(screen.queryByText('shared')).not.toBeInTheDocument();
 });

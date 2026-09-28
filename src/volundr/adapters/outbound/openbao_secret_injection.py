@@ -9,20 +9,27 @@ The resulting flow is:
 1. Volundr stores credentials in OpenBao KV v2 under
    ``<mount>/data/users/{user_id}/{credential_name}``.
 2. When a session starts, Volundr creates a dedicated ServiceAccount and
-   session-specific JWT role bound to that account.
+   session-specific JWT role bound to that account with read-only access to
+   the exact mapped credential paths.
 3. Volundr creates a ConfigMap with OpenBao Agent config that renders the
    requested credential fields to env/file destinations.
 4. The OpenBao injector mutates the session pod and runs the init agent.
-5. On cleanup, the session role, ConfigMap, and ServiceAccount are deleted.
+5. On cleanup, the session role, policy, ConfigMap, and ServiceAccount are deleted.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import textwrap
 
-from volundr.adapters.outbound.openbao import OpenBaoAdminClient, OpenBaoAdminConfig
+from niuu.domain.oauth_credentials import oauth_credential_name
+from volundr.adapters.outbound.openbao import (
+    OpenBaoAdminClient,
+    OpenBaoAdminConfig,
+    OpenBaoJWTAuthRole,
+)
 from volundr.domain.models import CredentialMapping, PodSpecAdditions
 from volundr.domain.ports import SecretInjectionPort
 
@@ -72,6 +79,8 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
         copy_volume_mounts_from: str = "skuld",
         inject_containers: str = "skuld,devrunner",
         role_ttl: str = "1h",
+        oauth_mount_path: str = "",
+        refresh_interval_seconds: int = 30,
         **_extra: object,
     ) -> None:
         self._openbao_url = openbao_url.rstrip("/")
@@ -86,6 +95,14 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
         self._copy_volume_mounts_from = copy_volume_mounts_from
         self._inject_containers = inject_containers
         self._role_ttl = role_ttl
+        if oauth_mount_path and not re.fullmatch(
+            r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", oauth_mount_path
+        ):
+            raise ValueError("oauth_mount_path must be a literal OpenBao mount path")
+        if refresh_interval_seconds <= 0:
+            raise ValueError("refresh_interval_seconds must be positive")
+        self._oauth_mount = oauth_mount_path
+        self._refresh_interval = refresh_interval_seconds
         self._admin = OpenBaoAdminClient(
             OpenBaoAdminConfig(
                 url=self._openbao_url,
@@ -103,6 +120,10 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
             )
         )
 
+    @property
+    def supports_managed_oauth(self) -> bool:
+        return bool(self._oauth_mount)
+
     async def pod_spec_additions(
         self,
         user_id: str,
@@ -113,7 +134,7 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
             _INJECT_ANNOTATION: "true",
             _INIT_FIRST_ANNOTATION: "true",
             _PRE_POPULATE_ANNOTATION: "true",
-            _PRE_POPULATE_ONLY_ANNOTATION: "true",
+            _PRE_POPULATE_ONLY_ANNOTATION: "false" if self._oauth_mount else "true",
             _CONFIG_MAP_ANNOTATION: self._configmap_name(session_id),
             _SECRET_VOLUME_PATH_ANNOTATION: "/run/secrets",
             _AUTH_TYPE_ANNOTATION: "jwt",
@@ -144,22 +165,27 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
         if not credential_mappings or not session_id:
             return
 
+        for mapping in credential_mappings:
+            if mapping.oauth_tenant_id and mapping.oauth_tenant_id != tenant_id:
+                raise ValueError("OAuth credential tenant differs from session tenant")
         service_account_name = self._service_account_name(session_id)
         role_name = self._role_name(session_id)
-        policy_name = self._admin.user_policy_name(self._mount_path, user_id)
+        policy_name = role_name
+        policy = self._session_policy(user_id, credential_mappings)
 
         await self._ensure_service_account(service_account_name, session_id, user_id)
-        await self._admin.ensure_service_account_access(
-            mount_path=self._mount_path,
-            user_id=user_id,
-            tenant_id=tenant_id or "",
-            auth_path=self._auth_path,
-            audience=self._audience,
-            service_account_namespace=self._namespace,
-            service_account_name=service_account_name,
-            policy_name=policy_name,
-            role_name=role_name,
-            ttl=self._role_ttl,
+        await self._admin.ensure_policy(policy_name, policy)
+        await self._admin.ensure_jwt_role(
+            OpenBaoJWTAuthRole(
+                name=role_name,
+                auth_path=self._auth_path,
+                bound_audiences=(self._audience,),
+                bound_subject=self._admin.service_account_subject(
+                    self._namespace, service_account_name
+                ),
+                policies=(policy_name,),
+                ttl=self._role_ttl,
+            )
         )
         await self._create_or_update_configmap(
             name=self._configmap_name(session_id),
@@ -195,8 +221,23 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
         except Exception:
             logger.warning("Failed to delete OpenBao role %s", role_name, exc_info=True)
 
+        await self._admin.delete_policy(role_name)
         await self._delete_configmap(configmap_name)
         await self._delete_service_account(service_account_name)
+
+    def _session_policy(self, user_id: str, mappings: list[CredentialMapping]) -> str:
+        paths = sorted(
+            {
+                self._mapping_path(user_id, mapping)
+                for mapping in mappings
+                if mapping.env_mappings or mapping.file_mappings
+            }
+        )
+        if any(any(char in path for char in ("*", "+", "${", "%{")) for path in paths):
+            raise ValueError("Session credential paths must be literal OpenBao paths")
+        return "\n".join(
+            f'path {json.dumps(path)} {{\n  capabilities = ["read"]\n}}' for path in paths
+        )
 
     def _configmap_name(self, session_id: str) -> str:
         return self._k8s_name(self._configmap_prefix, session_id)
@@ -216,6 +257,14 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
     def _credential_path(self, user_id: str, credential_name: str) -> str:
         return f"{self._mount_path}/data/users/{user_id}/{credential_name}"
 
+    def _mapping_path(self, user_id: str, mapping: CredentialMapping) -> str:
+        if not mapping.oauth_tenant_id:
+            return self._credential_path(user_id, mapping.credential_name)
+        if not self._oauth_mount:
+            raise ValueError("Managed OAuth credentials require oauth_mount_path on injection")
+        key = oauth_credential_name(mapping.oauth_tenant_id, user_id, mapping.credential_name)
+        return f"{self._oauth_mount}/creds/{key}"
+
     def _build_configmap_data(
         self,
         *,
@@ -229,7 +278,9 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
             role_name=role_name,
         )
         return {
-            "config.hcl": config_hcl,
+            "config.hcl": config_hcl.replace("exit_after_auth = true", "exit_after_auth = false")
+            if self._oauth_mount
+            else config_hcl,
             "config-init.hcl": config_hcl,
         }
 
@@ -269,6 +320,16 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
                 f'  namespace = "{self._openbao_namespace}"',
             ]
 
+        if self._oauth_mount:
+            lines.extend(
+                [
+                    "",
+                    "template_config {",
+                    f'  static_secret_render_interval = "{self._refresh_interval}s"',
+                    "  exit_on_retry_failure = true",
+                    "}",
+                ]
+            )
         templates = self._build_template_blocks(user_id, credential_mappings)
         if templates:
             lines.append("")
@@ -285,25 +346,45 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
         env_lines: list[str] = []
 
         for mapping in credential_mappings:
-            secret_path = self._credential_path(user_id, mapping.credential_name)
+            secret_path = self._mapping_path(user_id, mapping)
+            data_path = ".Data" if mapping.oauth_tenant_id else ".Data.data"
+            fields = (
+                {mapping.oauth_token_field: "access_token", "expires_at": "expire_time"}
+                if mapping.oauth_tenant_id
+                else {}
+            )
+            if mapping.oauth_tenant_id:
+                requested = set(mapping.env_mappings.values()) | set(mapping.file_mappings.values())
+                if requested - fields.keys():
+                    raise ValueError("OAuth injection may expose only access token and expiry")
 
             for env_var, field_name in mapping.env_mappings.items():
+                field_name = fields.get(field_name, field_name)
                 env_lines.extend(
                     [
                         f'{{{{ with secret "{secret_path}" }}}}',
-                        f"export {env_var}='{{{{ index .Data.data \"{field_name}\" }}}}'",
+                        f"export {env_var}='{{{{ index {data_path} \"{field_name}\" }}}}'",
                         "{{ end }}",
                     ]
                 )
 
             for target_path, field_name in mapping.file_mappings.items():
+                field_name = fields.get(field_name, field_name)
+                value = f'{{{{ index {data_path} "{field_name}" }}}}'
+                if target_path in mapping.oauth_token_documents:
+                    # One atomic template write keeps the token and its expiry together.
+                    value = (
+                        '{"access_token":{{ index .Data "access_token" | toJSON }},'
+                        '"expires_at":{{ with index .Data "expire_time" }}'
+                        "{{ . | toJSON }}{{ else }}null{{ end }}}"
+                    )
                 blocks.append(
                     self._template_block(
                         destination=target_path,
                         content="\n".join(
                             [
                                 f'{{{{- with secret "{secret_path}" -}}}}',
-                                f'{{{{ index .Data.data "{field_name}" }}}}',
+                                value,
                                 "{{- end -}}",
                             ]
                         ),
@@ -328,6 +409,7 @@ class OpenBaoAgentInjectionAdapter(SecretInjectionPort):
             template {{
               destination = "{destination}"
               perms = "0640"
+              error_on_missing_key = true
               contents = <<EOT
             {content}
             EOT

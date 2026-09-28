@@ -34,7 +34,6 @@ from ting.api.dispatch import resolve_volundr_factory
 from ting.api.research import resolve_workflow_campaign_repo
 from ting.api.tracker import resolve_trackers
 from ting.api.workflows import WorkflowLaunchBody, launch_workflow_execution, resolve_workflow_repo
-from ting.config import ReviewConfig
 from ting.domain.models import (
     CampaignStageState,
     Phase,
@@ -50,6 +49,11 @@ from ting.domain.models import (
     WorkflowCampaignStatus,
     WorkflowDefinition,
     WorkflowScope,
+)
+from ting.domain.tracker_routing import (
+    TrackerRoutingError,
+    select_tracker,
+    select_tracker_for_saga,
 )
 from ting.domain.utils import _session_name, _slugify
 from ting.domain.workflow_snapshot import build_workflow_snapshot, workflow_name_from_snapshot
@@ -308,9 +312,22 @@ async def _resolve_selected_workflow(
     request: Request,
     principal: Principal,
     workflow_id_value: str | None,
+    workflow_version_value: str | None = None,
     use_default_when_missing: bool = False,
 ) -> tuple[UUID | None, str | None, dict | None]:
+    if workflow_version_value and workflow_id_value is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="workflowVersion requires workflow_id",
+        )
     workflow_repo: WorkflowRepository | None = getattr(request.app.state, "workflow_repo", None)
+    if workflow_repo is not None:
+        from ting.domain.services.resource_authorization import AuthorizedWorkflowRepository
+
+        authorization = getattr(request.app.state, "authorization", None)
+        if authorization is None:
+            raise HTTPException(status_code=503, detail="Authorization is not configured")
+        workflow_repo = AuthorizedWorkflowRepository(workflow_repo, authorization, principal)
     if workflow_repo is None:
         if workflow_id_value is None:
             return None, None, None
@@ -328,13 +345,20 @@ async def _resolve_selected_workflow(
                 detail=f"Invalid workflow_id: {workflow_id_value!r}",
             )
 
-        workflow = await workflow_repo.get_workflow(workflow_id)
+        workflow = (
+            await workflow_repo.get_workflow_version(
+                workflow_id,
+                version=workflow_version_value,
+            )
+            if workflow_version_value
+            else await workflow_repo.get_workflow(workflow_id)
+        )
         if workflow is None or not _can_use_workflow(workflow, principal):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Workflow not found: {workflow_id_value}",
             )
-        return workflow.id, workflow.version, build_workflow_snapshot(workflow)
+        return workflow.id, workflow.version, _build_resolved_workflow_snapshot(request, workflow)
 
     if not use_default_when_missing:
         return None, None, None
@@ -356,16 +380,39 @@ async def _resolve_selected_workflow(
     )
     if workflow is None:
         return None, None, None
-    return workflow.id, workflow.version, build_workflow_snapshot(workflow)
+    return workflow.id, workflow.version, _build_resolved_workflow_snapshot(request, workflow)
+
+
+def _build_resolved_workflow_snapshot(
+    request: Request,
+    workflow: WorkflowDefinition,
+) -> dict:
+    try:
+        return build_workflow_snapshot(
+            workflow,
+            persona_source=getattr(request.app.state, "persona_source", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
 
 
 async def _resolve_planning_workflow(
     repo: WorkflowRepository,
     principal: Principal,
     workflow_id: UUID | None = None,
+    workflow_version: str | None = None,
 ) -> WorkflowDefinition:
+    if workflow_version and workflow_id is None:
+        raise HTTPException(status_code=422, detail="workflowVersion requires workflowId")
     if workflow_id is not None:
-        workflow = await repo.get_workflow(workflow_id)
+        workflow = (
+            await repo.get_workflow_version(workflow_id, version=workflow_version)
+            if workflow_version
+            else await repo.get_workflow(workflow_id)
+        )
         if workflow is None or not _can_use_workflow(workflow, principal):
             raise HTTPException(status_code=404, detail=f"Workflow not found: {workflow_id}")
         return workflow
@@ -671,6 +718,7 @@ class SagaListItem(BaseModel):
     id: str
     tracker_id: str
     tracker_type: str
+    tracker_connection_id: str = ""
     slug: str
     name: str
     repos: list[str]
@@ -683,7 +731,6 @@ class SagaListItem(BaseModel):
     issue_count: int = 0
     url: str = ""
     base_branch: str = "main"
-    confidence: float = 0.0
     created_at: str = ""
     phase_summary: PhaseSummaryResponse = Field(default_factory=PhaseSummaryResponse)
     workflow_id: str | None = None
@@ -699,6 +746,7 @@ class SagaDetailResponse(BaseModel):
     id: str
     tracker_id: str
     tracker_type: str
+    tracker_connection_id: str = ""
     slug: str
     name: str
     description: str = ""
@@ -710,7 +758,6 @@ class SagaDetailResponse(BaseModel):
     progress: float = 0.0
     url: str = ""
     base_branch: str = "main"
-    confidence: float = 0.0
     created_at: str = ""
     phase_summary: PhaseSummaryResponse = Field(default_factory=PhaseSummaryResponse)
     phases: list[PhaseResponse]
@@ -735,6 +782,9 @@ class UpdateSagaRequest(BaseModel):
 
 class SagaWorkflowAssignmentRequest(BaseModel):
     workflow_id: str | None = None
+    workflow_version: str | None = Field(default=None, alias="workflowVersion")
+
+    model_config = {"populate_by_name": True}
 
 
 class SagaTargetAssignmentRequest(BaseModel):
@@ -802,6 +852,7 @@ class PlanRequest(BaseModel):
 
     spec: str = Field(min_length=1)
     workflow_id: UUID | None = Field(default=None, alias="workflowId")
+    workflow_version: str | None = Field(default=None, alias="workflowVersion")
     repo: str = ""
     base_branch: str = Field(default="main", description="Base branch for the planning session")
     model: str = Field(default="")
@@ -873,6 +924,10 @@ class CommitRequest(BaseModel):
     phases: list[PhaseSpecRequest]
     transcript: str | None = None
     workflow_id: str | None = None
+    workflow_version: str | None = Field(default=None, alias="workflowVersion")
+    tracker_connection_id: str | None = None
+
+    model_config = {"populate_by_name": True}
 
 
 class CommittedRunResponse(BaseModel):
@@ -895,13 +950,13 @@ class CommittedSagaResponse(BaseModel):
     id: str
     tracker_id: str
     tracker_type: str
+    tracker_connection_id: str = ""
     slug: str
     name: str
     repos: list[str]
     feature_branch: str
     base_branch: str
     status: str
-    confidence: float
     created_at: str
     phase_summary: PhaseSummaryResponse
     phases: list[CommittedPhaseResponse]
@@ -966,16 +1021,23 @@ async def _resolve_git_for_request(request: Request) -> GitPort:
 
 
 async def _find_project(
-    tracker_id: str,
+    saga: Saga | str,
     adapters: list[TrackerPort],
 ) -> TrackerProject | None:
-    """Find a project across all tracker adapters."""
-    for adapter in adapters:
-        try:
-            return await adapter.get_project(tracker_id)
-        except Exception:
-            continue
-    return None
+    """Find a project through the connection that owns the saga."""
+    if isinstance(saga, str):
+        for adapter in adapters:
+            try:
+                return await adapter.get_project(saga)
+            except Exception:
+                continue
+        return None
+    try:
+        adapter = select_tracker_for_saga(adapters, saga)
+        return await adapter.get_project(saga.tracker_id)
+    except Exception:
+        logger.warning("Failed to hydrate tracker project for saga %s", saga.id, exc_info=True)
+        return None
 
 
 async def _build_phase_summary(
@@ -1053,18 +1115,24 @@ def create_sagas_router() -> APIRouter:
         sagas = await repo.list_sagas(owner_id=principal.user_id)
 
         # Fetch all projects once and index by ID
-        all_projects: dict[str, TrackerProject] = {}
+        all_projects: dict[tuple[str, str], TrackerProject] = {}
         for adapter in adapters:
             try:
                 projects = await adapter.list_projects()
                 for p in projects:
-                    all_projects[p.id] = p
+                    all_projects[(adapter.connection_id, p.id)] = p
             except Exception:
                 logger.warning("Failed to list projects from adapter", exc_info=True)
 
         items: list[SagaListItem] = []
         for saga in sagas:
-            project = all_projects.get(saga.tracker_id)
+            project = all_projects.get((saga.tracker_connection_id, saga.tracker_id))
+            if project is None and not saga.tracker_connection_id:
+                try:
+                    owning_adapter = select_tracker_for_saga(adapters, saga)
+                    project = all_projects.get((owning_adapter.connection_id, saga.tracker_id))
+                except TrackerRoutingError:
+                    logger.warning("Cannot route legacy saga %s to one tracker", saga.id)
             phase_summary = await _build_phase_summary(repo, saga.id)
             instance_name = await _resolve_instance_name(request, principal, saga.instance_id)
             items.append(
@@ -1072,6 +1140,7 @@ def create_sagas_router() -> APIRouter:
                     id=str(saga.id),
                     tracker_id=saga.tracker_id,
                     tracker_type=saga.tracker_type,
+                    tracker_connection_id=saga.tracker_connection_id,
                     slug=saga.slug,
                     name=project.name if project else saga.name,
                     repos=saga.repos,
@@ -1084,7 +1153,6 @@ def create_sagas_router() -> APIRouter:
                     issue_count=project.issue_count if project else 0,
                     url=project.url if project else "",
                     base_branch=saga.base_branch,
-                    confidence=saga.confidence,
                     created_at=saga.created_at.isoformat(),
                     phase_summary=phase_summary,
                     workflow_id=str(saga.workflow_id) if saga.workflow_id else None,
@@ -1146,19 +1214,16 @@ def create_sagas_router() -> APIRouter:
         milestones = []
         issues = []
         if saga.tracker_id:
-            for adapter in adapters:
-                try:
-                    if hasattr(adapter, "get_project_full"):
-                        project, milestones, issues = await adapter.get_project_full(
-                            saga.tracker_id
-                        )
-                    else:
-                        project = await adapter.get_project(saga.tracker_id)
-                        milestones = await adapter.list_milestones(saga.tracker_id)
-                        issues = await adapter.list_issues(saga.tracker_id)
-                    break
-                except Exception:
-                    continue
+            try:
+                adapter = select_tracker_for_saga(adapters, saga)
+                if hasattr(adapter, "get_project_full"):
+                    project, milestones, issues = await adapter.get_project_full(saga.tracker_id)
+                else:
+                    project = await adapter.get_project(saga.tracker_id)
+                    milestones = await adapter.list_milestones(saga.tracker_id)
+                    issues = await adapter.list_issues(saga.tracker_id)
+            except Exception:
+                logger.warning("Failed to hydrate saga %s from its tracker", saga.id, exc_info=True)
 
         # Group issues by milestone
         issues_by_milestone: dict[str | None, list] = {}
@@ -1219,6 +1284,7 @@ def create_sagas_router() -> APIRouter:
             id=str(saga.id),
             tracker_id=saga.tracker_id,
             tracker_type=saga.tracker_type,
+            tracker_connection_id=saga.tracker_connection_id,
             slug=saga.slug,
             name=project.name if project else saga.name,
             description=project.description if project else "",
@@ -1230,7 +1296,6 @@ def create_sagas_router() -> APIRouter:
             progress=_display_progress(saga, project, phase_summary),
             url=project.url if project else "",
             base_branch=saga.base_branch,
-            confidence=saga.confidence,
             created_at=saga.created_at.isoformat(),
             phase_summary=phase_summary,
             phases=phase_responses,
@@ -1533,6 +1598,7 @@ def create_sagas_router() -> APIRouter:
                 workflow_repo,
                 principal,
                 body.workflow_id,
+                body.workflow_version,
             )
             plan_name = _plan_name(body.spec)
             provenance = {
@@ -1570,6 +1636,7 @@ def create_sagas_router() -> APIRouter:
             stage_state = _initial_plan_stage_state(execution.workflow_snapshot, now)
             campaign_status = _campaign_status_from_session(execution.session.status)
             campaign = WorkflowCampaign(
+                tenant_id=principal.tenant_id,
                 id=uuid4(),
                 slug=slug,
                 name=plan_name,
@@ -1647,7 +1714,7 @@ def create_sagas_router() -> APIRouter:
 
         await repo.update_saga_status(parsed_id, new_status)
 
-        project = await _find_project(saga.tracker_id, adapters)
+        project = await _find_project(saga, adapters)
         return SagaListItem(
             id=str(saga.id),
             tracker_id=saga.tracker_id,
@@ -1704,6 +1771,7 @@ def create_sagas_router() -> APIRouter:
             request=request,
             principal=principal,
             workflow_id_value=body.workflow_id,
+            workflow_version_value=body.workflow_version,
             use_default_when_missing=False,
         )
 
@@ -1717,7 +1785,7 @@ def create_sagas_router() -> APIRouter:
         updated = await repo.get_saga(parsed_id, owner_id=principal.user_id)
         assert updated is not None
 
-        project = await _find_project(updated.tracker_id, adapters)
+        project = await _find_project(updated, adapters)
         phase_summary = await _build_phase_summary(repo, updated.id)
         instance_name = await _resolve_instance_name(request, principal, updated.instance_id)
         return SagaListItem(
@@ -1736,7 +1804,6 @@ def create_sagas_router() -> APIRouter:
             issue_count=project.issue_count if project else 0,
             url=project.url if project else "",
             base_branch=updated.base_branch,
-            confidence=updated.confidence,
             created_at=updated.created_at.isoformat(),
             phase_summary=phase_summary,
             workflow_id=str(updated.workflow_id) if updated.workflow_id else None,
@@ -1798,7 +1865,7 @@ def create_sagas_router() -> APIRouter:
         )
         await repo.save_saga(updated_saga)
 
-        project = await _find_project(updated_saga.tracker_id, adapters)
+        project = await _find_project(updated_saga, adapters)
         phase_summary = await _build_phase_summary(repo, updated_saga.id)
         instance_name = await _resolve_instance_name(request, principal, updated_saga.instance_id)
         return SagaListItem(
@@ -1817,7 +1884,6 @@ def create_sagas_router() -> APIRouter:
             issue_count=project.issue_count if project else 0,
             url=project.url if project else "",
             base_branch=updated_saga.base_branch,
-            confidence=updated_saga.confidence,
             created_at=updated_saga.created_at.isoformat(),
             phase_summary=phase_summary,
             workflow_id=str(updated_saga.workflow_id) if updated_saga.workflow_id else None,
@@ -1883,7 +1949,7 @@ def create_sagas_router() -> APIRouter:
         updated = await repo.get_saga(parsed_id, owner_id=principal.user_id)
         assert updated is not None
 
-        project = await _find_project(updated.tracker_id, adapters)
+        project = await _find_project(updated, adapters)
         phase_summary = await _build_phase_summary(repo, updated.id)
         return SagaListItem(
             id=str(updated.id),
@@ -1901,7 +1967,6 @@ def create_sagas_router() -> APIRouter:
             issue_count=project.issue_count if project else 0,
             url=project.url if project else "",
             base_branch=updated.base_branch,
-            confidence=updated.confidence,
             created_at=updated.created_at.isoformat(),
             phase_summary=phase_summary,
             workflow_id=str(updated.workflow_id) if updated.workflow_id else None,
@@ -1968,19 +2033,21 @@ def create_sagas_router() -> APIRouter:
                 detail="At least one phase is required",
             )
 
-        tracker = adapters[0] if adapters else None
-        if tracker is None:
+        if not adapters:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="No tracker configured",
             )
-
-        review_cfg: ReviewConfig = getattr(
-            getattr(request.app.state, "settings", None),
-            "review",
-            ReviewConfig(),
-        )
-        initial_confidence = review_cfg.initial_confidence
+        try:
+            tracker = select_tracker(
+                adapters,
+                connection_id=body.tracker_connection_id or "",
+            )
+        except TrackerRoutingError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
 
         now = datetime.now(UTC)
         saga_id = uuid4()
@@ -1989,21 +2056,23 @@ def create_sagas_router() -> APIRouter:
             request=request,
             principal=principal,
             workflow_id_value=body.workflow_id,
+            workflow_version_value=body.workflow_version,
             use_default_when_missing=True,
         )
 
         # Build saga domain object (tracker_id filled after tracker call)
         saga = Saga(
+            tenant_id=principal.tenant_id,
             id=saga_id,
             tracker_id="",
             tracker_type="",
+            tracker_connection_id=tracker.connection_id,
             slug=body.slug,
             name=body.name,
             repos=body.repos,
             feature_branch=feature_branch,
             base_branch=body.base_branch,
             status=SagaStatus.ACTIVE,
-            confidence=initial_confidence,
             created_at=now,
             owner_id=principal.user_id,
             workflow_id=workflow_id,
@@ -2011,8 +2080,27 @@ def create_sagas_router() -> APIRouter:
             workflow_snapshot=workflow_snapshot,
         )
 
+        from identity.adapters.http_auth import authorization_http_errors
+        from identity.models import Resource
+
+        authorization = getattr(request.app.state, "authorization", None)
+        if authorization is None:
+            raise HTTPException(status_code=503, detail="Authorization is not configured")
+        with authorization_http_errors():
+            allowed = await authorization.is_allowed(
+                principal,
+                "create",
+                Resource(
+                    "saga",
+                    str(saga.id),
+                    {"owner_id": saga.owner_id, "tenant_id": saga.tenant_id},
+                ),
+            )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Saga creation denied")
+
         # 1. Create saga in tracker — this MUST succeed or we abort
-        tracker_type = type(tracker).__name__
+        tracker_type = tracker.provider or type(tracker).__name__
         try:
             tracker_saga_id = await tracker.create_saga(saga, description=body.description)
         except Exception as exc:
@@ -2043,7 +2131,6 @@ def create_sagas_router() -> APIRouter:
                 number=phase_num,
                 name=phase_spec.name,
                 status=phase_status,
-                confidence=initial_confidence,
             )
 
             try:
@@ -2072,7 +2159,6 @@ def create_sagas_router() -> APIRouter:
                     declared_files=run_spec.declared_files,
                     estimate_hours=run_spec.estimate_hours,
                     status=RunStatus.PENDING,
-                    confidence=initial_confidence,
                     session_id=None,
                     branch=None,
                     chronicle_summary=None,
@@ -2189,7 +2275,14 @@ def create_sagas_router() -> APIRouter:
         dispatch_service = getattr(request.app.state, "dispatch_service", None)
         if dispatch_service is not None:
             try:
-                await dispatch_service.try_auto_continue(principal.user_id, saga.tracker_id)
+                if saga.tracker_connection_id:
+                    await dispatch_service.try_auto_continue(
+                        principal.user_id,
+                        saga.tracker_id,
+                        tracker_connection_id=saga.tracker_connection_id,
+                    )
+                else:
+                    await dispatch_service.try_auto_continue(principal.user_id, saga.tracker_id)
             except Exception:
                 msg = f"Failed to kick off initial dispatch for saga '{_sanitize_log(body.slug)}'"
                 logger.warning(
@@ -2203,13 +2296,13 @@ def create_sagas_router() -> APIRouter:
             id=str(saga.id),
             tracker_id=saga.tracker_id,
             tracker_type=saga.tracker_type,
+            tracker_connection_id=saga.tracker_connection_id,
             slug=saga.slug,
             name=saga.name,
             repos=saga.repos,
             feature_branch=saga.feature_branch,
             base_branch=saga.base_branch,
             status=saga.status.value,
-            confidence=saga.confidence,
             created_at=saga.created_at.isoformat(),
             phase_summary=PhaseSummaryResponse(
                 total=len(phases),

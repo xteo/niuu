@@ -17,7 +17,11 @@ import contextvars
 import inspect
 import json
 import logging
+import os
 import re
+import tempfile
+import threading
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -26,6 +30,7 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
+from niuu.domain.json_schema import PortableSchemaError, validate_object_instance
 from niuu.domain.mimir import ThreadState
 from niuu.domain.outcome import OutcomeSchema, parse_outcome_block
 from niuu.observability import get_observability
@@ -43,13 +48,12 @@ from ravn.adapters.channels.skuld_channel import SkuldChannel
 from ravn.adapters.channels.task_context import TaskContextChannel
 from ravn.adapters.events.noop_publisher import NoOpEventPublisher
 from ravn.config import (
-    BudgetConfig,
     HttpChannelConfig,
     InitiativeConfig,
     ResidentStateConfig,
     Settings,
 )
-from ravn.domain.budget import DailyBudgetTracker, compute_cost
+from ravn.domain.budget import DailyBudgetTracker, resolve_task_cost_usd
 from ravn.domain.events import RavnEvent, RavnEventType
 from ravn.domain.exceptions import LLMError, PromptBudgetExceededError
 from ravn.domain.help_needed import build_help_needed_event
@@ -65,9 +69,11 @@ from ravn.domain.valkyrie_contracts import (
 )
 from ravn.ports.channel import ChannelPort
 from ravn.ports.event_publisher import EventPublisherPort
+from ravn.ports.resident_budget import ResidentBudgetPort
 from ravn.ports.trigger import TriggerPort
 from ravn.prompt_builder import build_initiative_prompt
 from ravn.reflex import ReflexInjector, build_reflex_injector
+from ravn.workflow_runtime import _workflow_result_schema_for_event
 from sleipnir.domain.events import SleipnirEvent
 
 if TYPE_CHECKING:
@@ -342,6 +348,50 @@ def _build_workflow_outcome_repair_prompt(
         f"{original_response}\n"
         "</original_response>\n\n"
         "Return the complete outcome contract required by your persona."
+    )
+
+
+def _build_workflow_schema_repair_prompt(
+    *,
+    task: AgentTask,
+    original_response: str,
+    validation_errors: list[str],
+    persona_config: PersonaConfig,
+    result_schema: dict[str, Any] | None = None,
+) -> str:
+    """Ask a workflow agent to repair its declared outcome contract once."""
+    schema_fields = getattr(getattr(persona_config, "produces", None), "schema", {}) or {}
+    declared_schema: dict[str, object] = {}
+    if isinstance(schema_fields, dict):
+        for name, field_def in schema_fields.items():
+            description: dict[str, object] = {
+                "type": str(getattr(field_def, "type", "string") or "string"),
+                "required": bool(getattr(field_def, "required", True)),
+            }
+            enum_values = getattr(field_def, "enum_values", None)
+            if isinstance(enum_values, list):
+                description["values"] = enum_values
+            declared_schema[str(name)] = description
+    inherited_contract = ""
+    if result_schema:
+        inherited_contract = (
+            "\n\nInherited terminal result schema:\n"
+            f"{json.dumps(result_schema, indent=2, sort_keys=True)}"
+        )
+    return (
+        "Your previous workflow outcome does not satisfy the declared typed outcome schema. "
+        "Repair the outcome using only evidence and tool results already available. Preserve the "
+        "meaning of valid fields. Do not silently reinterpret or coerce a scalar into an array or "
+        "object, and do not invent findings or evidence. Do not call tools. Return exactly one "
+        "valid YAML outcome block and no prose.\n\n"
+        f"Active workflow node: {task.workflow_node_id}\n"
+        f"Validation errors:\n{json.dumps(validation_errors, indent=2)}\n\n"
+        f"Declared schema:\n{json.dumps(declared_schema, indent=2)}"
+        f"{inherited_contract}\n\n"
+        "Original response:\n"
+        "<original_response>\n"
+        f"{original_response}\n"
+        "</original_response>"
     )
 
 
@@ -742,7 +792,8 @@ def _build_resident_valkyrie_schema_repair_prompt(
         f"{json.dumps(validation_errors, indent=2)}\n\n"
         "Fields parsed from the invalid attempt, if any:\n"
         f"{json.dumps(_json_safe(outcome_fields), indent=2)}\n\n"
-        "Use the original autonomous task context already present in this conversation.\n\n"
+        "Use only the supplied response and parsed fields. Preserve decisions, evidence, "
+        "references and working-state entries; do not invent observations or actions.\n\n"
         "Previous response:\n"
         "<previous_response>\n"
         f"{original_response[:4000]}\n"
@@ -894,6 +945,7 @@ class FanInSlot:
     strategy: str  # all_must_pass, any_pass, majority, merge
     persona_name: str
     root_correlation_id: str
+    cycle_correlation_id: str
     created_at: datetime
     deadline: datetime
 
@@ -906,7 +958,9 @@ class _FanInResult:
     persona_name: str
     merged_context: str
     root_correlation_id: str
+    cycle_correlation_id: str
     triggered_by: str
+    passed: bool = True
 
 
 class FanInBuffer:
@@ -970,6 +1024,7 @@ class FanInBuffer:
                 persona_name=persona_name,
                 merged_context=self._format_single_event(event_type, event_payload),
                 root_correlation_id=root_correlation_id,
+                cycle_correlation_id=cycle_correlation_id or root_correlation_id,
                 triggered_by=f"mesh:outcome:{event_type}",
             )
 
@@ -986,6 +1041,7 @@ class FanInBuffer:
                 strategy=strategy,
                 persona_name=persona_name,
                 root_correlation_id=root_correlation_id,
+                cycle_correlation_id=cycle_id,
                 created_at=now,
                 deadline=now + timedelta(seconds=self._ttl),
             )
@@ -1043,6 +1099,7 @@ class FanInBuffer:
                 strategy="all_must_pass",  # default for producer aggregation
                 persona_name=contributes_to,  # target name, not a persona
                 root_correlation_id=root_correlation_id,
+                cycle_correlation_id=cycle_id,
                 created_at=now,
                 deadline=now + timedelta(seconds=self._ttl),
             )
@@ -1065,6 +1122,66 @@ class FanInBuffer:
         del self._slots[group_key]
         return self._evaluate_and_merge(slot)
 
+    def try_accept_required_personas(
+        self,
+        *,
+        aggregation_key: str,
+        consumer_persona: str,
+        required_personas: list[str],
+        producer_persona: str,
+        event_type: str,
+        event_payload: dict,
+        root_correlation_id: str,
+        cycle_correlation_id: str | None = None,
+        binding_fields: list[str] | None = None,
+    ) -> _FanInResult | None:
+        """Collect one explicit verdict from every graph-declared reviewer."""
+        required = {name for name in required_personas if name}
+        if producer_persona not in required:
+            return None
+        self._contributor_names[aggregation_key] = required
+        cycle_id = cycle_correlation_id or root_correlation_id
+        group_key = f"producer:{aggregation_key}:{cycle_id}"
+        slot = self._slots.get(group_key)
+        now = datetime.now(UTC)
+        if slot is None:
+            slot = FanInSlot(
+                group_key=group_key,
+                required_event_types=required,
+                received={},
+                strategy="explicit_all_must_pass",
+                persona_name=consumer_persona,
+                root_correlation_id=root_correlation_id,
+                cycle_correlation_id=cycle_id,
+                created_at=now,
+                deadline=now + timedelta(seconds=self._ttl),
+            )
+            self._slots[group_key] = slot
+        slot.received[producer_persona] = event_payload
+        if not required.issubset(slot.received):
+            return None
+        del self._slots[group_key]
+        result = self._evaluate_and_merge(slot)
+        mismatched: list[str] = []
+        for field_name in binding_fields or []:
+            values = {
+                str(
+                    (payload.get("outcome") or {}).get(field_name)
+                    if isinstance(payload.get("outcome"), dict)
+                    else ""
+                ).strip()
+                for payload in slot.received.values()
+                if isinstance(payload, dict)
+            }
+            if len(values) != 1 or not next(iter(values), ""):
+                mismatched.append(field_name)
+        if mismatched:
+            result.passed = False
+            result.merged_context += "\nStrict review binding mismatch: " + ", ".join(
+                sorted(mismatched)
+            )
+        return result
+
     # ------------------------------------------------------------------
     # Expiry
     # ------------------------------------------------------------------
@@ -1083,6 +1200,20 @@ class FanInBuffer:
             )
         return expired
 
+    def discard_superseded_review_cycles(
+        self,
+        *,
+        aggregation_key: str,
+        current_cycle_id: str,
+    ) -> list[str]:
+        """Discard incomplete strict-review joins for older artifact cycles."""
+        prefix = f"producer:{aggregation_key}:"
+        current_key = f"{prefix}{current_cycle_id}"
+        discarded = [key for key in self._slots if key.startswith(prefix) and key != current_key]
+        for key in discarded:
+            del self._slots[key]
+        return discarded
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -1097,6 +1228,7 @@ class FanInBuffer:
                 "strategy": slot.strategy,
                 "persona_name": slot.persona_name,
                 "root_correlation_id": slot.root_correlation_id,
+                "cycle_correlation_id": slot.cycle_correlation_id,
                 "created_at": slot.created_at.isoformat(),
                 "deadline": slot.deadline.isoformat(),
             }
@@ -1113,6 +1245,8 @@ class FanInBuffer:
                 strategy=entry["strategy"],
                 persona_name=entry["persona_name"],
                 root_correlation_id=entry.get("root_correlation_id", ""),
+                cycle_correlation_id=entry.get("cycle_correlation_id")
+                or str(entry["group_key"]).rsplit(":", 1)[-1],
                 created_at=datetime.fromisoformat(entry["created_at"]),
                 deadline=datetime.fromisoformat(entry["deadline"]),
             )
@@ -1171,7 +1305,12 @@ class FanInBuffer:
 
         # Evaluate strategy
         strategy_ok = True
-        if slot.strategy == "all_must_pass":
+        if slot.strategy == "explicit_all_must_pass":
+            strategy_ok = all(
+                verdict.strip().casefold() in {"pass", "approve", "approved"}
+                for verdict in verdicts
+            )
+        elif slot.strategy == "all_must_pass":
             strategy_ok = all(v != "fail" for v in verdicts)
         elif slot.strategy == "any_pass":
             strategy_ok = any(v == "pass" for v in verdicts)
@@ -1200,7 +1339,9 @@ class FanInBuffer:
             persona_name=slot.persona_name,
             merged_context="\n".join(context_parts),
             root_correlation_id=slot.root_correlation_id,
+            cycle_correlation_id=slot.cycle_correlation_id,
             triggered_by=f"mesh:fan_in:{'+'.join(sorted(triggered_by_types))}",
+            passed=strategy_ok,
         )
 
 
@@ -1228,6 +1369,7 @@ class DriveLoop:
         event_publisher: EventPublisherPort | None = None,
         resume: bool = False,
         budget: DailyBudgetTracker | None = None,
+        resident_budget: ResidentBudgetPort | None = None,
         mimir: MimirPort | None = None,
         sleipnir_publisher: object | None = None,
     ) -> None:
@@ -1251,6 +1393,15 @@ class DriveLoop:
         self._active_agents: dict[str, object] = {}
         self._semaphore = asyncio.Semaphore(config.max_concurrent_tasks)
         self._journal_path = Path(config.queue_journal_path).expanduser()
+        # Journal writes happen both synchronously on the event loop and from a
+        # worker thread (`_persist_queue_off_loop`). The lock serializes them,
+        # and the generation counter stops an older snapshot finishing late in
+        # the worker thread from overwriting a newer one written on the loop.
+        self._journal_write_lock = threading.Lock()
+        self._journal_generation = 0
+        self._journal_written_generation = 0
+        self._workflow_event_dedupe_limit = config.workflow_event_dedupe_max_entries
+        self._workflow_cycle_limit = config.workflow_cycle_max_entries
         self._source_id = "drive_loop"
         self._counter = 0
         self._rpc_handler: MeshRpcHandler | None = None
@@ -1264,6 +1415,9 @@ class DriveLoop:
         self._workflow_allowed_outcomes_resolver: (
             Callable[[AgentTask, PersonaConfig], set[str] | None] | None
         ) = None
+        self._workflow_review_cycle_sources: set[tuple[str, str]] = set()
+        self._workflow_cycles: OrderedDict[tuple[str, str, str], dict[str, object]] = OrderedDict()
+        self._consumed_workflow_event_ids: OrderedDict[str, str] = OrderedDict()
         self._fan_in = FanInBuffer()
         self._reflex_injector: ReflexInjector | None = None
         # Gauges that describe steady state rather than an event. Published
@@ -1277,17 +1431,18 @@ class DriveLoop:
             "ravn_current_task",
             default=None,
         )
-        budget_cfg = getattr(settings, "budget", None)
-        if isinstance(budget_cfg, BudgetConfig):
-            _cap = budget_cfg.daily_cap_usd
-            _warn = budget_cfg.warn_at_percent
-        else:
-            _cap = 1.0
-            _warn = 80
         self._budget: DailyBudgetTracker = budget or DailyBudgetTracker(
-            daily_cap_usd=_cap,
-            warn_at_percent=_warn,
+            daily_cap_usd=settings.budget.daily_cap_usd,
+            warn_at_percent=settings.budget.warn_at_percent,
         )
+        # resident_budget is only wired in when settings.resident_budget.adapter
+        # names one (see daemon_runtime.py) — an empty adapter is the operator's
+        # decision to run without durable budget reporting (e.g. local/dev CLI
+        # use with no platform to report to), not a broken configuration. When
+        # set, spend is reported synchronously and durably instead of living
+        # only in this process's memory, and identity (ravn_id/tenant_id) is
+        # never this process's concern — the adapter resolves it.
+        self._resident_budget: ResidentBudgetPort | None = resident_budget
 
         # Session-join manager: built once here (composition root) and injected
         # into both this loop's observer and the session_join tool's runtime
@@ -1753,6 +1908,207 @@ class DriveLoop:
         """Register a resolver for node-scoped workflow outcome topics."""
         self._workflow_allowed_outcomes_resolver = resolver
 
+    def set_workflow_review_cycle_sources(self, sources: set[tuple[str, str]]) -> None:
+        """Register graph-derived artifact events that strict reviews resolve."""
+        self._workflow_review_cycle_sources = set(sources)
+
+    def workflow_event_consumed(self, event_id: str) -> bool:
+        """Return whether an exact mesh workflow delivery was durably consumed."""
+        return bool(event_id and event_id in self._consumed_workflow_event_ids)
+
+    async def record_workflow_event_consumed(self, event_id: str) -> None:
+        """Durably mark one immutable mesh event as consumed.
+
+        The bounded insertion-ordered ledger closes the restart window after a
+        workflow task completes while retaining enough history for transport
+        retries. It is a true FIFO window: once at capacity, the oldest entry
+        is evicted to make room for the newest one rather than refusing the
+        write — retention is a rolling budget, not a hard cap the process can
+        get permanently wedged against. Failure to persist raises so the
+        transport can redeliver, and any eviction is rolled back alongside the
+        new entry so a failed persist leaves the ledger exactly as it was.
+
+        This is called once per successfully processed workflow outcome event,
+        which can be the busiest write path in the daemon, and the journal
+        write serializes and rewrites the *entire* queue journal (queue,
+        inflight, cycles, and this ledger) on every call. The mutation itself
+        (updating the in-memory ledger) stays on the event loop since it is
+        pure and fast; only the blocking file write moves to a worker thread
+        via `asyncio.to_thread` so a large journal never stalls the loop that
+        also runs task dispatch and heartbeats.
+        """
+        if not event_id or event_id in self._consumed_workflow_event_ids:
+            return
+        evicted: tuple[str, str] | None = None
+        if len(self._consumed_workflow_event_ids) >= self._workflow_event_dedupe_limit:
+            evicted = self._consumed_workflow_event_ids.popitem(last=False)
+        self._consumed_workflow_event_ids[event_id] = datetime.now(UTC).isoformat()
+        if await self._persist_queue_off_loop():
+            return
+        self._consumed_workflow_event_ids.pop(event_id, None)
+        if evicted is not None:
+            oldest_id, oldest_consumed_at = evicted
+            self._consumed_workflow_event_ids[oldest_id] = oldest_consumed_at
+            self._consumed_workflow_event_ids.move_to_end(oldest_id, last=False)
+        raise RuntimeError("failed to persist consumed workflow event")
+
+    def observe_workflow_cycle(
+        self,
+        *,
+        scope_id: str,
+        node_id: str,
+        event_type: str,
+        event_id: str,
+        outcome: Mapping[str, object],
+        timestamp: datetime,
+    ) -> bool:
+        """Persist the newest authoritative artifact event for a workflow stage.
+
+        Event timestamps come from the producer, so a delayed replay cannot
+        supersede a newer cycle merely because it arrived later.
+        """
+        if (
+            not scope_id
+            or not node_id
+            or not event_type
+            or not event_id
+            or (node_id, event_type) not in self._workflow_review_cycle_sources
+        ):
+            return False
+        key = (scope_id, node_id, event_type)
+        ordering = (timestamp.astimezone(UTC).isoformat(), event_id)
+        current = self._workflow_cycles.get(key)
+        if current is not None:
+            current_ordering = (
+                str(current.get("timestamp") or ""),
+                str(current.get("event_id") or ""),
+            )
+            if ordering <= current_ordering:
+                return False
+        previous = dict(current) if current is not None else None
+        evicted: tuple[tuple[str, str, str], dict[str, object]] | None = None
+        if previous is None and len(self._workflow_cycles) >= self._workflow_cycle_limit:
+            # No single point marks a workflow scope "finished", so this ledger
+            # is a rolling FIFO window like the consumed-event ledger: evict
+            # the oldest cycle record to admit a new scope/node/event_type
+            # triple rather than growing without bound for the daemon's life.
+            evicted = self._workflow_cycles.popitem(last=False)
+        self._workflow_cycles[key] = {
+            "scope_id": scope_id,
+            "node_id": node_id,
+            "event_type": event_type,
+            "event_id": event_id,
+            "outcome": dict(outcome),
+            "timestamp": ordering[0],
+        }
+        if not self._persist_queue():
+            if previous is None:
+                self._workflow_cycles.pop(key, None)
+            else:
+                self._workflow_cycles[key] = previous
+            if evicted is not None:
+                evicted_key, evicted_value = evicted
+                self._workflow_cycles[evicted_key] = evicted_value
+                self._workflow_cycles.move_to_end(evicted_key, last=False)
+            raise RuntimeError("failed to persist authoritative workflow cycle")
+        return True
+
+    def _restore_workflow_cycle_after_publish_failure(
+        self,
+        *,
+        scope_id: str,
+        node_id: str,
+        event_type: str,
+        failed_event_id: str,
+        previous: dict[str, object] | None,
+    ) -> None:
+        """Roll back a reserved cycle only when no newer event replaced it."""
+        key = (scope_id, node_id, event_type)
+        current = self._workflow_cycles.get(key)
+        if current is None or str(current.get("event_id") or "") != failed_event_id:
+            return
+        if previous is None:
+            self._workflow_cycles.pop(key, None)
+        else:
+            self._workflow_cycles[key] = previous
+        if not self._persist_queue():
+            logger.error(
+                "drive_loop: failed to persist workflow-cycle rollback "
+                "node=%s event_type=%s event_id=%s",
+                node_id,
+                event_type,
+                failed_event_id,
+            )
+
+    def validate_workflow_review_cycle(
+        self,
+        *,
+        scope_id: str,
+        node_id: str,
+        event_type: str,
+        event_id: str,
+        outcome: Mapping[str, object],
+        binding_fields: list[str],
+    ) -> tuple[bool, str]:
+        """Validate a reviewer event against the latest causal artifact cycle."""
+        current = self._workflow_cycles.get((scope_id, node_id, event_type))
+        if current is None:
+            return False, "authoritative cycle has not been observed"
+        if str(current.get("event_id") or "") != event_id:
+            return False, "review cycle was superseded"
+        authoritative = current.get("outcome")
+        if not isinstance(authoritative, Mapping):
+            authoritative = {}
+        mismatched = [
+            field_name
+            for field_name in binding_fields
+            if str(authoritative.get(field_name) or "").strip()
+            != str(outcome.get(field_name) or "").strip()
+            or not str(authoritative.get(field_name) or "").strip()
+        ]
+        if mismatched:
+            return False, "review binding mismatch: " + ", ".join(sorted(mismatched))
+        return True, "current"
+
+    def workflow_review_artifact_context(
+        self,
+        *,
+        scope_id: str,
+        node_id: str,
+        event_type: str,
+        event_id: str,
+    ) -> str:
+        """Render the immutable source artifact retained for a strict review cycle."""
+        current = self._workflow_cycles.get((scope_id, node_id, event_type))
+        if current is None or str(current.get("event_id") or "") != event_id:
+            return ""
+        outcome = current.get("outcome")
+        if not isinstance(outcome, Mapping):
+            return ""
+        return "\n".join(
+            [
+                "Authoritative reviewed artifact (runtime-verified; preserve exact fields):",
+                f"Source node: {node_id}",
+                f"Source event type: {event_type}",
+                f"Source event ID: {event_id}",
+                json.dumps(dict(outcome), indent=2, sort_keys=True),
+            ]
+        )
+
+    def task_review_cycle_is_current(self, task: AgentTask) -> bool:
+        """Recheck strict review freshness immediately before publishing its outcome."""
+        if not task.workflow_review_cycle_id:
+            return True
+        scope_id = task.session_id or task.root_correlation_id
+        current = self._workflow_cycles.get(
+            (
+                scope_id,
+                task.workflow_review_source_node_id,
+                task.workflow_review_source_event_type,
+            )
+        )
+        return bool(current and str(current.get("event_id") or "") == task.workflow_review_cycle_id)
+
     def current_task(self) -> AgentTask | None:
         """Return the task currently executing in this context, if any."""
         return self._current_task_var.get()
@@ -2148,6 +2504,8 @@ class DriveLoop:
         self,
         content: str,
         metadata: dict[str, Any] | None = None,
+        *,
+        output_mode: OutputMode = OutputMode.SURFACE,
     ) -> bool:
         """Enqueue a directed message from the browser as an agent task."""
         for handler in list(self._directed_message_interceptors):
@@ -2158,7 +2516,7 @@ class DriveLoop:
             except Exception:
                 logger.exception("drive_loop: directed message interceptor failed")
 
-        if await self._try_steer_active_agent(content):
+        if output_mode == OutputMode.SURFACE and await self._try_steer_active_agent(content):
             return True
 
         import time
@@ -2180,7 +2538,7 @@ class DriveLoop:
             title="Directed message from user",
             initiative_context=self._directed_message_context(content, metadata),
             triggered_by="skuld:directed_message",
-            output_mode=OutputMode.SURFACE,
+            output_mode=output_mode,
             persona=persona,
             priority=0,  # user input precedes autonomous continuation work
             human_initiated=True,
@@ -2237,6 +2595,19 @@ class DriveLoop:
 
     async def run(self) -> None:
         """Start all three internal loops and run until cancelled."""
+        # Create the journal directory before any trigger or mesh delivery can
+        # enqueue work. Each write also ensures it, so this is belt and braces
+        # for the first event arriving right after start.
+        try:
+            self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "drive_loop: could not create queue journal directory %s: %s",
+                self._journal_path.parent,
+                exc,
+            )
+        if self._resident_budget is not None:
+            await self._seed_budget_from_ledger()
         if self._resume:
             self._load_journal()
         elif self._journal_path.exists():
@@ -2288,14 +2659,20 @@ class DriveLoop:
     # ------------------------------------------------------------------
 
     async def _trigger_watcher(self, trigger: TriggerPort) -> None:
-        """Run a single trigger indefinitely, forwarding tasks to the queue."""
+        """Run a single trigger indefinitely, forwarding tasks to the queue.
+
+        Deliberately does not catch-and-log: a trigger source that gives up
+        (e.g. ``ApiTriggerSource`` after too many consecutive poll failures,
+        or any other ``PermanentPollError``) must end the resident process,
+        not degrade into a watcher that silently stops updating while the
+        resident keeps running on whatever cron/event state it last polled —
+        including triggers since deleted. See ``.claude/rules/no-fallbacks.md``.
+        """
         logger.info("drive_loop: starting trigger %r", trigger.name)
         try:
             await trigger.run(self.enqueue)
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            logger.error("drive_loop: trigger %r raised unexpected error: %s", trigger.name, exc)
 
     async def _task_executor(self) -> None:
         """Drain the priority queue and execute tasks with the semaphore cap."""
@@ -2371,6 +2748,106 @@ class DriveLoop:
             task_id=task.task_id,
             root_correlation_id=root_corr,
         )
+
+    def _external_task_channel(self, task: AgentTask) -> ChannelPort | None:
+        """Return the outward channel a task's live events travel on, if any.
+
+        Ambient work speaks on the mesh activity topic; presented work goes to
+        Skuld when attached, else to the mesh. Silent work has no outward
+        channel.
+        """
+        peer_id = self._settings.mesh.own_peer_id if self._settings.mesh.enabled else ""
+        if task.output_mode == OutputMode.AMBIENT:
+            if self._mesh is not None and peer_id:
+                return self._wrap_activity_channel(MeshActivityChannel(self._mesh, peer_id), task)
+            return None
+        if task.output_mode in {
+            OutputMode.PRESENT,
+            OutputMode.URGENT,
+            OutputMode.SURFACE,
+        }:
+            if self._skuld_channel is not None:
+                self._skuld_channel._persona = task.persona
+                return self._wrap_activity_channel(self._skuld_channel, task)
+            if self._mesh is not None and peer_id:
+                return self._wrap_activity_channel(MeshActivityChannel(self._mesh, peer_id), task)
+        return None
+
+    def _task_error_event(self, task: AgentTask, exc: Exception) -> RavnEvent:
+        """Build the terminal error event for a failed task.
+
+        Carries the workflow node the task was running so whoever turns the
+        error into a workflow failure can say which stage failed.
+        """
+        event = RavnEvent.error(
+            source=self._source_id,
+            message=self._format_task_error(task, exc),
+            correlation_id=task.task_id,
+            session_id=task.session_id or task.task_id,
+            task_id=task.task_id,
+            failure_kind=type(exc).__name__,
+        )
+        if task.workflow_node_id:
+            event.payload["workflow_node_id"] = task.workflow_node_id
+        if task.persona:
+            event.payload["persona"] = task.persona
+        return event
+
+    async def _report_task_failure(
+        self,
+        task: AgentTask,
+        exc: Exception,
+        *,
+        channel: ChannelPort | None = None,
+    ) -> None:
+        """Publish a task failure that happened outside the model turn.
+
+        Mirrors what a failed turn publishes — the error on the task's live
+        channel (Skuld turns a peer error into a failed workflow), a failed
+        ``TASK_COMPLETE``, and ``ravn.task.completed`` with outcome ``error``
+        — so a task that dies during setup is as visible as one whose model
+        call failed. Best-effort: reporting must never raise.
+        """
+        reason = f"{type(exc).__name__}: {exc}"
+        try:
+            self._result_store.set_failure(task.task_id, reason)
+        except Exception:
+            logger.warning("drive_loop: could not record task failure", exc_info=True)
+        target = channel if channel is not None else self._external_task_channel(task)
+        if target is not None:
+            try:
+                await target.emit(self._task_error_event(task, exc))
+                await target.emit(
+                    RavnEvent.task_complete(
+                        source=self._source_id,
+                        success=False,
+                        correlation_id=task.task_id,
+                        session_id=task.session_id or task.task_id,
+                        task_id=task.task_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "drive_loop: failed to publish failure of task %s",
+                    task.task_id,
+                    exc_info=True,
+                )
+        try:
+            await self._event_publisher.publish(
+                RavnEvent(
+                    type=RavnEventType.TASK_COMPLETE,
+                    source=self._source_id,
+                    payload={"task_id": task.task_id, "success": False, "error": reason},
+                    timestamp=datetime.now(UTC),
+                    urgency=0.7,
+                    correlation_id=task.task_id,
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                )
+            )
+        except Exception:
+            logger.warning("drive_loop: failed to publish TASK_COMPLETE", exc_info=True)
+        await self._emit_sleipnir_task_completed(task, "error")
 
     def _retrieval_reflex_injector(self) -> ReflexInjector | None:
         """Lazily build the retrieval reflex injector from mimir.reflex config."""
@@ -2545,10 +3022,13 @@ class DriveLoop:
                 "resident_turn_index": task.resident_turn_index,
             },
         )
-        # Budget pre-check: skip when daily cap is reached.
-        # The task is already persisted in the journal and will be retried
-        # after the UTC day rolls over and the budget resets.
-        if not self._budget.can_spend():
+        # Budget pre-check: skip when daily cap is reached. budget.enabled
+        # defaults to True (every already-deployed resident enforces its
+        # cap today) — set it to false to run uncapped, an explicit
+        # operator decision, not a default. The task is already persisted
+        # in the journal and will be retried after the UTC day rolls over
+        # and the budget resets.
+        if self._settings.budget.enabled and not self._budget.can_spend():
             logger.info(
                 "drive_loop: task %s (%r) skipped — daily budget cap reached "
                 "(spent=%.4f remaining=%.4f)",
@@ -2560,6 +3040,10 @@ class DriveLoop:
             await self._emit_sleipnir_task_dropped(task, reason="budget_cap_reached")
             return "budget_dropped"
 
+        # The channel the task would have spoken on, kept outside the setup
+        # ``try`` so a setup failure can still be reported on it.
+        setup_channel: ChannelPort | None = None
+        setup_agent: object | None = None
         try:
             telemetry.event(
                 "ravn.task.lifecycle",
@@ -2569,26 +3053,8 @@ class DriveLoop:
             # Residents with cascade enabled already capture bounded activity;
             # do not change channel behaviour merely to feed the HUD.
             capture_channel: CaptureChannel | None = None
-            peer_id = self._settings.mesh.own_peer_id if self._settings.mesh.enabled else ""
             logger.info("drive_loop: task %s setting up channels", task.task_id)
-            external_channel: ChannelPort | None = None
-            if task.output_mode == OutputMode.AMBIENT:
-                if self._mesh is not None and peer_id:
-                    external_channel = self._wrap_activity_channel(
-                        MeshActivityChannel(self._mesh, peer_id), task
-                    )
-            elif task.output_mode in {
-                OutputMode.PRESENT,
-                OutputMode.URGENT,
-                OutputMode.SURFACE,
-            }:
-                if self._skuld_channel is not None:
-                    self._skuld_channel._persona = task.persona
-                    external_channel = self._wrap_activity_channel(self._skuld_channel, task)
-                elif self._mesh is not None and peer_id:
-                    external_channel = self._wrap_activity_channel(
-                        MeshActivityChannel(self._mesh, peer_id), task
-                    )
+            external_channel = self._external_task_channel(task)
 
             if self._settings.cascade.enabled:
                 http_config = self._settings.gateway.channels.http
@@ -2615,8 +3081,10 @@ class DriveLoop:
                     channel = capture_channel
             else:
                 channel = external_channel or SilentChannel()
+            setup_channel = channel
             logger.info("drive_loop: task %s building agent", task.task_id)
             agent = self._agent_factory(channel, task.task_id, task.persona, task.triggered_by)
+            setup_agent = agent
             telemetry.event(
                 "ravn.task.lifecycle",
                 attributes={
@@ -2670,8 +3138,41 @@ class DriveLoop:
             )
             logger.info("drive_loop: task %s setup complete", task.task_id)
         except Exception as exc:
-            logger.error("drive_loop: task %s failed during setup: %s", task.task_id, exc)
-            raise
+            logger.error(
+                "drive_loop: task %s failed during setup: %s: %s",
+                task.task_id,
+                type(exc).__name__,
+                exc,
+            )
+            telemetry.event(
+                "ravn.task.lifecycle",
+                attributes={
+                    "ravn.task.phase": "setup_failed",
+                    "error.type": type(exc).__name__,
+                },
+                content=str(exc),
+            )
+            # A task that cannot even be set up (e.g. a persona whose required
+            # runtime context is missing) is a terminal failure of this turn.
+            # Report it exactly like a failed model turn so Skuld marks the
+            # workflow failed; re-raising left it logged as "crashed before
+            # completion handling" and nothing downstream ever heard of it.
+            await self._report_task_failure(task, exc, channel=setup_channel)
+            if self._resident_runtime is not None:
+                release = getattr(self._resident_runtime, "release_failed_task", None)
+                if release is not None:
+                    release(task)
+            close_agent = getattr(setup_agent, "close", None)
+            if close_agent is not None and inspect.iscoroutinefunction(close_agent):
+                try:
+                    await close_agent()
+                except Exception:
+                    logger.warning(
+                        "drive_loop: failed to close agent for task %s",
+                        task.task_id,
+                        exc_info=True,
+                    )
+            return "error"
 
         logger.info(
             "drive_loop: executing task %s (%r) triggered_by=%r",
@@ -2738,7 +3239,7 @@ class DriveLoop:
                     },
                     content=getattr(turn_result, "response", ""),
                 )
-                cost_usd = self._record_task_cost(task, turn_result)
+                cost_usd = await self._record_task_cost(task, turn_result, agent)
                 await self._emit_task_usage(channel, task, turn_result, cost_usd, agent)
                 response_text = (
                     capture_channel.response_text
@@ -2751,7 +3252,7 @@ class DriveLoop:
                     response_text=response_text,
                 )
                 if repair_result is not None:
-                    repair_cost_usd = self._record_task_cost(task, repair_result)
+                    repair_cost_usd = await self._record_task_cost(task, repair_result, agent)
                     await self._emit_task_usage(
                         channel, task, repair_result, repair_cost_usd, agent
                     )
@@ -2763,7 +3264,9 @@ class DriveLoop:
                     response_text=response_text,
                 )
                 if workflow_repair_result is not None:
-                    repair_cost_usd = self._record_task_cost(task, workflow_repair_result)
+                    repair_cost_usd = await self._record_task_cost(
+                        task, workflow_repair_result, agent
+                    )
                     await self._emit_task_usage(
                         channel, task, workflow_repair_result, repair_cost_usd, agent
                     )
@@ -2900,16 +3403,7 @@ class DriveLoop:
                     task.task_id,
                     f"{type(exc).__name__}: {exc}",
                 )
-                await channel.emit(
-                    RavnEvent.error(
-                        source=self._source_id,
-                        message=self._format_task_error(task, exc),
-                        correlation_id=task.task_id,
-                        session_id=task.session_id or task.task_id,
-                        task_id=task.task_id,
-                        failure_kind=type(exc).__name__,
-                    )
-                )
+                await channel.emit(self._task_error_event(task, exc))
 
             if success:
                 success = await self._emit_mesh_outcome_event(
@@ -3092,7 +3586,7 @@ class DriveLoop:
         task: AgentTask,
         response_text: str,
     ) -> object | None:
-        """Ask the same agent for one strict contract repair when a resident output is invalid."""
+        """Repair an invalid resident contract without replaying the agent's history."""
         if task.triggered_by == _RESIDENT_VALKYRIE_SCHEMA_REPAIR_TRIGGER:
             return None
         persona_config = getattr(agent, "persona_config", None) or self._persona_config
@@ -3105,8 +3599,8 @@ class DriveLoop:
         )
         if not canonical_event_type or not validation_errors:
             return None
-        run_turn = getattr(agent, "run_turn", None)
-        if run_turn is None or not asyncio.iscoroutinefunction(run_turn):
+        repair_outcome = getattr(agent, "repair_outcome", None)
+        if repair_outcome is None or not asyncio.iscoroutinefunction(repair_outcome):
             return None
 
         logger.warning(
@@ -3122,7 +3616,7 @@ class DriveLoop:
             outcome_fields=outcome_fields,
         )
         try:
-            repair_result = await run_turn(repair_prompt)
+            repair_result = await repair_outcome(repair_prompt)
         except Exception:
             logger.warning(
                 "drive_loop: resident Valkyrie schema repair failed; "
@@ -3249,7 +3743,7 @@ class DriveLoop:
         task: AgentTask,
         response_text: str,
         error: str,
-    ) -> str | None:
+    ) -> object | None:
         """Give a workflow agent one chance to publish artifacts Mímir rejected.
 
         Returns the revised response text, or None when no repair was attempted.
@@ -3308,6 +3802,67 @@ class DriveLoop:
         )
         return repaired
 
+    async def _repair_workflow_schema_outcome(
+        self,
+        *,
+        agent: object | None,
+        task: AgentTask,
+        response_text: str,
+        validation_errors: list[str],
+        persona_config: PersonaConfig,
+        result_schema: dict[str, Any] | None = None,
+    ) -> object | None:
+        """Give a graph workflow one chance to produce its declared typed outcome."""
+        run_turn = getattr(agent, "run_turn", None)
+        if run_turn is None or not asyncio.iscoroutinefunction(run_turn):
+            return None
+        telemetry = get_observability()
+        attributes = {
+            "ravn.task.id": task.task_id,
+            "ravn.workflow.node.id": task.workflow_node_id,
+        }
+        logger.warning(
+            "drive_loop: repairing invalid workflow outcome schema task_id=%s node=%s errors=%s",
+            task.task_id,
+            task.workflow_node_id,
+            validation_errors,
+        )
+        telemetry.event(
+            "ravn.workflow.schema_repair_requested",
+            attributes=attributes,
+            content={"errors": validation_errors},
+        )
+        try:
+            result = await run_turn(
+                _build_workflow_schema_repair_prompt(
+                    task=task,
+                    original_response=response_text,
+                    validation_errors=validation_errors,
+                    persona_config=persona_config,
+                    result_schema=result_schema,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "drive_loop: workflow outcome schema repair failed; reporting original error",
+                exc_info=True,
+            )
+            telemetry.event(
+                "ravn.workflow.schema_repair_failed",
+                attributes={**attributes, "error.type": type(exc).__name__},
+                content={"error": str(exc)},
+            )
+            return None
+        repaired = str(getattr(result, "response", "") or "")
+        if not repaired.strip():
+            return None
+        telemetry.event(
+            "ravn.workflow.schema_repair_completed",
+            attributes=attributes,
+            content=repaired,
+        )
+        return result
+
     async def _emit_unacceptable_outcome_error(
         self,
         task: AgentTask,
@@ -3347,6 +3902,39 @@ class DriveLoop:
                 "drive_loop: failed to announce rejected outcome; continuing",
                 exc_info=True,
             )
+
+    async def _reject_unroutable_workflow_outcome(
+        self,
+        task: AgentTask,
+        channel: ChannelPort | None,
+        *,
+        canonical_event_type: str,
+        alias_event_type: str,
+        verdict: str,
+        outcome_fields: Mapping[str, object],
+        allowed_topics: set[str],
+    ) -> None:
+        """Fail a completed workflow turn whose outcome has no legal route."""
+        selected_topic = alias_event_type or canonical_event_type
+        explanation = str(
+            outcome_fields.get("rationale")
+            or outcome_fields.get("reason")
+            or outcome_fields.get("summary")
+            or ""
+        ).strip()
+        detail = (
+            f"verdict {verdict or '<missing>'!r} selected {selected_topic!r}, "
+            f"but node {task.workflow_node_id or '<unknown>'!r} only allows "
+            f"{sorted(allowed_topics)!r}"
+        )
+        if explanation:
+            detail = f"{detail}: {explanation}"
+        self._result_store.set_failure(
+            task.task_id,
+            "The workflow outcome could not be routed.",
+            [detail],
+        )
+        await self._emit_unacceptable_outcome_error(task, channel, [detail])
 
     async def _emit_sleipnir_task_completed(
         self,
@@ -3413,6 +4001,7 @@ class DriveLoop:
         payload = {
             **self._sleipnir_task_context_payload(task),
             "task_id": task.task_id,
+            "session_id": task.session_id,
             "title": task.title,
             "persona": task.persona or "",
             "triggered_by": task.triggered_by,
@@ -3514,6 +4103,15 @@ class DriveLoop:
         """
         if not event_type:
             return
+        if not self.task_review_cycle_is_current(task):
+            logger.info(
+                "drive_loop: suppressing obsolete review-cycle tool outcome "
+                "event_type=%s task_id=%s cycle=%s",
+                event_type,
+                task.task_id,
+                task.workflow_review_cycle_id,
+            )
+            return
 
         if self._workflow_allowed_outcomes_resolver is not None:
             allowed_topics = self._workflow_allowed_outcomes_resolver(
@@ -3563,7 +4161,20 @@ class DriveLoop:
             root_correlation_id=root_corr,
         )
 
+        authoritative_mesh_failed = False
         if self._mesh is not None:
+            cycle_scope = task.session_id or root_corr
+            cycle_key = (cycle_scope, task.workflow_node_id, event_type)
+            previous_cycle = self._workflow_cycles.get(cycle_key)
+            previous_cycle = dict(previous_cycle) if previous_cycle is not None else None
+            cycle_reserved = self.observe_workflow_cycle(
+                scope_id=cycle_scope,
+                node_id=task.workflow_node_id,
+                event_type=event_type,
+                event_id=event.event_id,
+                outcome=fields,
+                timestamp=event.timestamp,
+            )
             try:
                 logger.info(
                     "drive_loop: publishing tool outcome event_type=%s task_id=%s",
@@ -3572,12 +4183,21 @@ class DriveLoop:
                 )
                 await self._mesh.publish(event, topic=event_type)
             except Exception:
+                if cycle_reserved:
+                    authoritative_mesh_failed = True
+                    self._restore_workflow_cycle_after_publish_failure(
+                        scope_id=cycle_scope,
+                        node_id=task.workflow_node_id,
+                        event_type=event_type,
+                        failed_event_id=event.event_id,
+                        previous=previous_cycle,
+                    )
                 logger.warning(
                     "Failed to publish tool-originated mesh outcome event; continuing.",
                     exc_info=True,
                 )
 
-        if self._skuld_channel is not None:
+        if self._skuld_channel is not None and not authoritative_mesh_failed:
             try:
                 await self._skuld_channel.emit(event)
             except Exception:
@@ -3585,6 +4205,8 @@ class DriveLoop:
                     "Failed to emit tool-originated outcome to skuld; continuing.",
                     exc_info=True,
                 )
+        if authoritative_mesh_failed:
+            raise RuntimeError(f"failed to publish authoritative workflow event {event_type}")
 
     async def _emit_mesh_outcome_event(
         self,
@@ -3595,6 +4217,7 @@ class DriveLoop:
         agent: object | None = None,
         channel: ChannelPort | None = None,
         artifact_repair_attempted: bool = False,
+        schema_repair_attempted: bool = False,
     ) -> bool:
         """Publish persona outcomes for both routing and outward visibility.
 
@@ -3607,6 +4230,13 @@ class DriveLoop:
         are published as routing-only mesh topics so downstream personas can
         react without replacing the canonical outward event.
         """
+        if not self.task_review_cycle_is_current(task):
+            logger.info(
+                "drive_loop: suppressing obsolete review-cycle outcome task_id=%s cycle=%s",
+                task.task_id,
+                task.workflow_review_cycle_id,
+            )
+            return False
         persona_config = self._task_persona_config(task)
         if persona_config is None:
             return success
@@ -3681,6 +4311,77 @@ class DriveLoop:
         question = str(outcome_fields.get("question", "") or "").strip()
         files_changed = outcome_fields.get("files_changed")
         if (synthesized_pass or synthesized_from_tool_write) and not valid:
+            valid = True
+
+        schema_fields = getattr(persona_config.produces, "schema", None)
+        has_persona_schema = isinstance(schema_fields, dict) and bool(schema_fields)
+        result_schema = None
+        if task.workflow_node_id and not is_valkyrie_outcome_event(canonical_event_type):
+            selected_event_type = str(event_type_map.get(verdict) or canonical_event_type)
+            result_schema = _workflow_result_schema_for_event(
+                self._settings,
+                node_id=task.workflow_node_id,
+                event_type=selected_event_type,
+            )
+        if task.workflow_node_id and (has_persona_schema or result_schema is not None):
+            outcome_fields = _omit_optional_null_persona_fields(
+                outcome_fields,
+                persona_config,
+            )
+            schema_errors = _outcome_parse_errors(parsed.errors) if parsed is not None else []
+            if has_persona_schema:
+                schema_errors.extend(
+                    _validate_normalized_persona_schema(outcome_fields, persona_config)
+                )
+            if result_schema is not None:
+                if "result" not in outcome_fields:
+                    schema_errors.append("terminal outcome field 'result' is missing")
+                else:
+                    try:
+                        validate_object_instance(
+                            outcome_fields["result"],
+                            result_schema,
+                            field="result",
+                        )
+                    except PortableSchemaError as exc:
+                        schema_errors.append(str(exc))
+            schema_errors = _dedupe_errors(schema_errors)
+            if schema_errors and not schema_repair_attempted:
+                repair_result = await self._repair_workflow_schema_outcome(
+                    agent=agent,
+                    task=task,
+                    response_text=response_text,
+                    validation_errors=schema_errors,
+                    persona_config=persona_config,
+                    result_schema=result_schema,
+                )
+                if repair_result is not None:
+                    repair_cost_usd = await self._record_task_cost(task, repair_result, agent)
+                    if channel is not None and agent is not None:
+                        await self._emit_task_usage(
+                            channel,
+                            task,
+                            repair_result,
+                            repair_cost_usd,
+                            agent,
+                        )
+                    return await self._emit_mesh_outcome_event(
+                        task,
+                        str(getattr(repair_result, "response", "") or ""),
+                        success,
+                        agent=agent,
+                        channel=channel,
+                        artifact_repair_attempted=artifact_repair_attempted,
+                        schema_repair_attempted=True,
+                    )
+            if schema_errors:
+                self._result_store.set_failure(
+                    task.task_id,
+                    "The workflow outcome did not satisfy its declared schema.",
+                    schema_errors,
+                )
+                await self._emit_unacceptable_outcome_error(task, channel, schema_errors)
+                return False
             valid = True
 
         if is_valkyrie_outcome_event(canonical_event_type):
@@ -3805,6 +4506,7 @@ class DriveLoop:
                     agent=agent,
                     channel=channel,
                     artifact_repair_attempted=True,
+                    schema_repair_attempted=schema_repair_attempted,
                 )
         if not outcome_errors and not artifact_publish_error:
             await self._maybe_materialize_workflow_artifacts(task, outcome_fields)
@@ -3850,7 +4552,49 @@ class DriveLoop:
                     task.workflow_node_id or "-",
                     sorted(allowed_topics),
                 )
+                await self._reject_unroutable_workflow_outcome(
+                    task,
+                    channel,
+                    canonical_event_type=canonical_event_type,
+                    alias_event_type=alias_event_type,
+                    verdict=verdict,
+                    outcome_fields=outcome_fields,
+                    allowed_topics=allowed_topics,
+                )
                 return False
+
+        # Graph-derived allowed topics choose which alias may advance ordinary
+        # workflow nodes, but their canonical outcome remains observable on the
+        # mesh for existing workflows.  A reviewVerdictPolicy writes an explicit
+        # per-task allowlist after its trusted join.  That stricter list must also
+        # suppress a different canonical topic (for example, an approved plan
+        # must not republish the canonical revised-plan event).
+        strict_task_topics = set(task.workflow_allowed_outcome_topics)
+        if strict_task_topics and verdict != "help_needed":
+            selected_topic = alias_event_type or canonical_event_type
+            if selected_topic not in strict_task_topics:
+                logger.info(
+                    "drive_loop: suppressing strict review outcome selected=%s "
+                    "workflow_node=%s allowed=%s",
+                    selected_topic,
+                    task.workflow_node_id or "-",
+                    sorted(strict_task_topics),
+                )
+                await self._reject_unroutable_workflow_outcome(
+                    task,
+                    channel,
+                    canonical_event_type=canonical_event_type,
+                    alias_event_type=alias_event_type,
+                    verdict=verdict,
+                    outcome_fields=outcome_fields,
+                    allowed_topics=strict_task_topics,
+                )
+                return False
+        canonical_mesh_allowed = (
+            verdict == "help_needed"
+            or not strict_task_topics
+            or canonical_event_type in strict_task_topics
+        )
 
         canonical_payload = dict(base_payload)
         canonical_payload["event_type"] = canonical_event_type
@@ -3870,7 +4614,34 @@ class DriveLoop:
             root_correlation_id=root_corr,
         )
 
-        if self._mesh is not None and not outcome_errors:
+        # Artifact persistence and repair may await external work.  Recheck at
+        # the publication boundary so a newer cycle observed during those
+        # awaits cannot race an obsolete approval onto the mesh.
+        if not self.task_review_cycle_is_current(task):
+            logger.info(
+                "drive_loop: suppressing review outcome superseded before publish "
+                "task_id=%s cycle=%s",
+                task.task_id,
+                task.workflow_review_cycle_id,
+            )
+            return False
+
+        canonical_authoritative_mesh_failed = False
+        if self._mesh is not None and not outcome_errors and canonical_mesh_allowed:
+            cycle_scope = task.session_id or root_corr
+            cycle_key = (cycle_scope, task.workflow_node_id, canonical_event_type)
+            previous_cycle = self._workflow_cycles.get(cycle_key)
+            previous_cycle = dict(previous_cycle) if previous_cycle is not None else None
+            cycle_reserved = False
+            if canonical_payload.get("success") is True and canonical_payload.get("valid") is True:
+                cycle_reserved = self.observe_workflow_cycle(
+                    scope_id=cycle_scope,
+                    node_id=task.workflow_node_id,
+                    event_type=canonical_event_type,
+                    event_id=canonical_event.event_id,
+                    outcome=outcome_fields,
+                    timestamp=canonical_event.timestamp,
+                )
             try:
                 logger.info(
                     "drive_loop: publishing canonical outcome event_type=%s task_id=%s",
@@ -3879,12 +4650,21 @@ class DriveLoop:
                 )
                 await self._mesh.publish(canonical_event, topic=canonical_event_type)
             except Exception:
+                if cycle_reserved:
+                    canonical_authoritative_mesh_failed = True
+                    self._restore_workflow_cycle_after_publish_failure(
+                        scope_id=cycle_scope,
+                        node_id=task.workflow_node_id,
+                        event_type=canonical_event_type,
+                        failed_event_id=canonical_event.event_id,
+                        previous=previous_cycle,
+                    )
                 logger.warning(
                     "Failed to publish canonical mesh outcome event; continuing.",
                     exc_info=True,
                 )
 
-        if self._skuld_channel is not None:
+        if self._skuld_channel is not None and not canonical_authoritative_mesh_failed:
             try:
                 await self._skuld_channel.emit(canonical_event)
             except Exception:
@@ -3892,6 +4672,8 @@ class DriveLoop:
                     "Failed to emit canonical outcome to skuld; continuing.",
                     exc_info=True,
                 )
+        if canonical_authoritative_mesh_failed:
+            return False
 
         if is_valkyrie_outcome_event(canonical_event_type):
             await self._emit_sleipnir_valkyrie_outcome(
@@ -3954,6 +4736,16 @@ class DriveLoop:
         if not alias_event_type or alias_event_type == canonical_event_type:
             return True
 
+        if not self.task_review_cycle_is_current(task):
+            logger.info(
+                "drive_loop: suppressing review alias superseded before publish "
+                "task_id=%s cycle=%s alias=%s",
+                task.task_id,
+                task.workflow_review_cycle_id,
+                alias_event_type,
+            )
+            return False
+
         alias_payload = dict(base_payload)
         alias_payload["event_type"] = alias_event_type
         alias_payload["canonical_event_type"] = canonical_event_type
@@ -3971,6 +4763,23 @@ class DriveLoop:
             task_id=task.task_id,
             root_correlation_id=root_corr,
         )
+        alias_cycle_scope = task.session_id or root_corr
+        alias_cycle_key = (alias_cycle_scope, task.workflow_node_id, alias_event_type)
+        previous_alias_cycle = self._workflow_cycles.get(alias_cycle_key)
+        previous_alias_cycle = (
+            dict(previous_alias_cycle) if previous_alias_cycle is not None else None
+        )
+        alias_cycle_reserved = False
+        if alias_payload.get("success") is True and alias_payload.get("valid") is True:
+            alias_cycle_reserved = self.observe_workflow_cycle(
+                scope_id=alias_cycle_scope,
+                node_id=task.workflow_node_id,
+                event_type=alias_event_type,
+                event_id=alias_event.event_id,
+                outcome=outcome_fields,
+                timestamp=alias_event.timestamp,
+            )
+        alias_authoritative_mesh_failed = False
         try:
             logger.info(
                 "drive_loop: publishing routing outcome alias=%s canonical=%s task_id=%s",
@@ -3980,12 +4789,21 @@ class DriveLoop:
             )
             await self._mesh.publish(alias_event, topic=alias_event_type)
         except Exception:
+            if alias_cycle_reserved:
+                alias_authoritative_mesh_failed = True
+                self._restore_workflow_cycle_after_publish_failure(
+                    scope_id=alias_cycle_scope,
+                    node_id=task.workflow_node_id,
+                    event_type=alias_event_type,
+                    failed_event_id=alias_event.event_id,
+                    previous=previous_alias_cycle,
+                )
             logger.warning(
                 "Failed to publish routing mesh outcome alias; continuing.",
                 exc_info=True,
             )
 
-        if self._skuld_channel is not None:
+        if self._skuld_channel is not None and not alias_authoritative_mesh_failed:
             try:
                 await self._skuld_channel.emit(alias_event)
             except Exception:
@@ -3993,6 +4811,8 @@ class DriveLoop:
                     "Failed to emit routing outcome alias to skuld; continuing.",
                     exc_info=True,
                 )
+        if alias_authoritative_mesh_failed:
+            return False
         return True
 
     async def _emit_sleipnir_valkyrie_outcome(
@@ -4122,13 +4942,8 @@ class DriveLoop:
             return
         if self._budget.warn_emitted_today:
             return
-        budget_cfg = getattr(self._settings, "budget", None)
-        if isinstance(budget_cfg, BudgetConfig):
-            daily_cap_usd = budget_cfg.daily_cap_usd
-            warn_at_percent = budget_cfg.warn_at_percent
-        else:
-            daily_cap_usd = self._budget._daily_cap_usd
-            warn_at_percent = self._budget._warn_at_percent
+        daily_cap_usd = self._settings.budget.daily_cap_usd
+        warn_at_percent = self._settings.budget.warn_at_percent
         logger.warning(
             "drive_loop: daily budget warning — spent=%.4f remaining=%.4f cap=%.4f",
             self._budget.spent_today_usd,
@@ -4155,22 +4970,70 @@ class DriveLoop:
             )
         )
 
-    def _record_task_cost(self, task: AgentTask, turn_result: object) -> float | None:
-        """Compute cost from turn_result.usage and record it on the budget tracker."""
+    async def _seed_budget_from_ledger(self) -> None:
+        """Hydrate today's in-memory spend counter from durable state.
+
+        Runs once, before the task executor starts, so a restart resumes the
+        UTC day's real total instead of the cap silently resetting to zero.
+        """
+        assert self._resident_budget is not None  # noqa: S101 — guarded by caller
+        today = datetime.now(UTC).date()
+        spent_usd = await self._resident_budget.seed_today()
+        self._budget.seed(spent_usd, day=today)
+        logger.info("drive_loop: budget seeded from platform — spent_today=%.6f", spent_usd)
+
+    def _model_for_turn(self, agent: object) -> str:
+        """The model that actually served this turn — a persona/runtime
+        override on *agent* takes precedence over the process-wide default,
+        since pricing must match what really ran, not what is configured."""
+        return str(getattr(agent, "_model", "") or self._settings.llm.model)
+
+    async def _record_task_cost(
+        self,
+        task: AgentTask,
+        turn_result: object,
+        agent: object = None,
+    ) -> float | None:
+        """Compute cost from turn_result.usage and report it durably.
+
+        Always runs when there is usage to price — usage events carry
+        ``cost_usd`` regardless of whether cap enforcement or durable
+        reporting is configured (see ``_emit_task_usage``), and this is safe
+        by default because ``pricing_source`` defaults to ``"flat"`` (a
+        per-million-token rate, never a catalog lookup that can fail — see
+        ``ravn.config.BudgetConfig``). ``settings.budget.enabled`` gates only
+        whether the local cap actually blocks new tasks (see the
+        ``can_spend()`` check in ``_run_task_observed``), not pricing.
+
+        Reporting through ``resident_budget`` (when one is wired — see
+        ``settings.resident_budget.adapter``) happens synchronously, in line
+        with the turn it belongs to: a failure raises rather than being
+        logged and dropped, because a silently-lost write is exactly how the
+        daily cap stopped meaning anything before.
+        """
         usage = getattr(turn_result, "usage", None)
         if usage is None:
             return None
         input_tokens: int = getattr(usage, "input_tokens", 0)
         output_tokens: int = getattr(usage, "output_tokens", 0)
-        budget_cfg = getattr(self._settings, "budget", None)
-        if isinstance(budget_cfg, BudgetConfig):
-            input_rate = budget_cfg.input_token_cost_per_million
-            output_rate = budget_cfg.output_token_cost_per_million
-        else:
-            input_rate = 3.0
-            output_rate = 15.0
-        cost_usd = compute_cost(input_tokens, output_tokens, input_rate, output_rate)
+        model = self._model_for_turn(agent)
+        cost_usd = resolve_task_cost_usd(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            pricing_source=self._settings.budget.pricing_source,
+            flat_input_per_million=self._settings.budget.input_token_cost_per_million,
+            flat_output_per_million=self._settings.budget.output_token_cost_per_million,
+            pricing_overrides=self._settings.budget.pricing_overrides,
+        )
         self._budget.record(cost_usd)
+        if self._resident_budget is not None:
+            await self._resident_budget.record_spend(
+                cost_usd=cost_usd,
+                model=model,
+                cap_usd=self._settings.budget.daily_cap_usd,
+                warn_at=self._settings.budget.warn_at_percent / 100,
+            )
         logger.debug(
             "drive_loop: task %s cost=%.6f spent_today=%.6f remaining=%.6f",
             task.task_id,
@@ -4303,26 +5166,106 @@ class DriveLoop:
     # Queue journal
     # ------------------------------------------------------------------
 
-    def _persist_queue(self) -> None:
+    def _persist_queue(self) -> bool:
         """Snapshot pending and in-flight tasks to the journal file."""
         try:
-            self._journal_path.parent.mkdir(parents=True, exist_ok=True)
-            items = list(self._queue._queue)  # type: ignore[attr-defined]
-            records = [self._task_journal_record(task) for _prio, _counter, task in items]
-            inflight = [self._task_journal_record(task) for task in self._inflight_tasks.values()]
-            journal = {"queue": records, "inflight": inflight}
-            if self._fan_in.pending_count > 0:
-                journal["fan_in_pending"] = self._fan_in.to_dict()
-            temporary_path = self._journal_path.with_suffix(f"{self._journal_path.suffix}.tmp")
-            temporary_path.write_text(json.dumps(journal, indent=2))
-            temporary_path.replace(self._journal_path)
+            serialized = self._serialize_journal_snapshot()
         except Exception as exc:
             logger.warning("drive_loop: failed to persist queue journal: %s", exc)
+            return False
+        return self._write_journal_snapshot(serialized, self._next_journal_generation())
+
+    def _next_journal_generation(self) -> int:
+        """Stamp a snapshot taken on the event loop with its ordering."""
+        self._journal_generation += 1
+        return self._journal_generation
+
+    def _serialize_journal_snapshot(self) -> str:
+        """Render current queue/ledger state to journal JSON text.
+
+        Pure and synchronous by design, with no `await` in the middle: a
+        caller that offloads the (slow, blocking) `_write_journal_snapshot`
+        call to a worker thread via `asyncio.to_thread` must first take this
+        snapshot on the event loop so it reflects one consistent point in time
+        instead of racing a concurrent mutation of the same queue or ledger
+        while a worker thread serializes it.
+        """
+        items = list(self._queue._queue)  # type: ignore[attr-defined]
+        records = [self._task_journal_record(task) for _prio, _counter, task in items]
+        inflight = [self._task_journal_record(task) for task in self._inflight_tasks.values()]
+        journal: dict[str, object] = {"queue": records, "inflight": inflight}
+        if self._fan_in.pending_count > 0:
+            journal["fan_in_pending"] = self._fan_in.to_dict()
+        if self._workflow_cycles:
+            journal["workflow_cycles"] = list(self._workflow_cycles.values())
+        if self._consumed_workflow_event_ids:
+            journal["consumed_workflow_events"] = [
+                {"event_id": event_id, "consumed_at": consumed_at}
+                for event_id, consumed_at in self._consumed_workflow_event_ids.items()
+            ]
+        return json.dumps(journal, indent=2)
+
+    def _write_journal_snapshot(self, serialized: str, generation: int | None = None) -> bool:
+        """Write an already-serialized journal snapshot to disk atomically.
+
+        Safe to call concurrently from the event loop and a worker thread.
+        Every write goes through its own uniquely named temporary file in the
+        journal directory (a shared ``queue.json.tmp`` let one writer rename
+        away the other's file, failing the second ``replace`` with ENOENT),
+        and the writes are serialized under a lock. A snapshot older than the
+        last one written is skipped and counts as persisted: the newer
+        snapshot was taken later on the event loop, so it already contains
+        every mutation the older one carried.
+        """
+        with self._journal_write_lock:
+            if generation is not None and generation <= self._journal_written_generation:
+                return True
+            temporary_path: Path | None = None
+            try:
+                directory = self._journal_path.parent
+                directory.mkdir(parents=True, exist_ok=True)
+                fd, temporary_name = tempfile.mkstemp(
+                    dir=directory, prefix=f".{self._journal_path.name}.", suffix=".tmp"
+                )
+                temporary_path = Path(temporary_name)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(serialized)
+                os.replace(temporary_path, self._journal_path)
+                temporary_path = None
+                if generation is not None:
+                    self._journal_written_generation = generation
+                return True
+            except Exception as exc:
+                logger.warning("drive_loop: failed to persist queue journal: %s", exc)
+                return False
+            finally:
+                if temporary_path is not None:
+                    with suppress(OSError):
+                        temporary_path.unlink()
+
+    async def _persist_queue_off_loop(self) -> bool:
+        """Persist the journal without blocking the event loop.
+
+        Used only by the highest-frequency write path
+        (`record_workflow_event_consumed`, called once per processed workflow
+        outcome event) where a growing journal's synchronous rewrite would
+        otherwise stall task dispatch and heartbeats. The snapshot is taken
+        synchronously on the loop (see `_serialize_journal_snapshot`) and only
+        the blocking disk write moves to a worker thread.
+        """
+        try:
+            serialized = self._serialize_journal_snapshot()
+        except Exception as exc:
+            logger.warning("drive_loop: failed to persist queue journal: %s", exc)
+            return False
+        generation = self._next_journal_generation()
+        return await asyncio.to_thread(self._write_journal_snapshot, serialized, generation)
 
     @staticmethod
     def _task_journal_record(task: AgentTask) -> dict[str, object]:
         return {
             "task_id": task.task_id,
+            "session_id": task.session_id,
             "title": task.title,
             "initiative_context": task.initiative_context,
             "triggered_by": task.triggered_by,
@@ -4335,6 +5278,10 @@ class DriveLoop:
             "root_correlation_id": task.root_correlation_id,
             "workflow_parent_event_id": task.workflow_parent_event_id,
             "workflow_node_id": task.workflow_node_id,
+            "workflow_review_cycle_id": task.workflow_review_cycle_id,
+            "workflow_review_source_node_id": task.workflow_review_source_node_id,
+            "workflow_review_source_event_type": task.workflow_review_source_event_type,
+            "workflow_allowed_outcome_topics": list(task.workflow_allowed_outcome_topics),
             "tool_outcomes": task.tool_outcomes,
             "human_initiated": task.human_initiated,
             "resident_case_id": task.resident_case_id,
@@ -4367,6 +5314,8 @@ class DriveLoop:
             records = raw
             inflight_task_ids: set[str] = set()
             fan_in_data: dict = {}
+            workflow_cycle_data: list[object] = []
+            consumed_workflow_event_data: list[object] = []
         else:
             inflight_records = raw.get("inflight", [])
             records = [*inflight_records, *raw.get("queue", [])]
@@ -4376,6 +5325,51 @@ class DriveLoop:
                 if isinstance(record, dict)
             }
             fan_in_data = raw.get("fan_in_pending", {})
+            workflow_cycle_data = raw.get("workflow_cycles", [])
+            consumed_workflow_event_data = raw.get("consumed_workflow_events", [])
+
+        if isinstance(workflow_cycle_data, list):
+            # Same rationale as the consumed-event trim below: a journal from
+            # a since-lowered limit must not wedge a restart.
+            if len(workflow_cycle_data) > self._workflow_cycle_limit:
+                logger.warning(
+                    "drive_loop: workflow cycle journal has %d entries, above the configured "
+                    "retention of %d; trimming to the newest entries",
+                    len(workflow_cycle_data),
+                    self._workflow_cycle_limit,
+                )
+                workflow_cycle_data = workflow_cycle_data[-self._workflow_cycle_limit :]
+            for item in workflow_cycle_data:
+                if not isinstance(item, dict):
+                    continue
+                scope_id = str(item.get("scope_id") or "")
+                node_id = str(item.get("node_id") or "")
+                event_type = str(item.get("event_type") or "")
+                event_id = str(item.get("event_id") or "")
+                if all((scope_id, node_id, event_type, event_id)):
+                    self._workflow_cycles[(scope_id, node_id, event_type)] = dict(item)
+
+        if isinstance(consumed_workflow_event_data, list):
+            # A journal written under a since-lowered retention limit (or one
+            # produced before eviction existed) can carry more rows than the
+            # current window allows. Trim to the newest `max_entries` instead
+            # of refusing to start — a restart must never come back wedged.
+            if len(consumed_workflow_event_data) > self._workflow_event_dedupe_limit:
+                logger.warning(
+                    "drive_loop: consumed workflow event journal has %d entries, above the "
+                    "configured retention of %d; trimming to the newest entries",
+                    len(consumed_workflow_event_data),
+                    self._workflow_event_dedupe_limit,
+                )
+                consumed_workflow_event_data = consumed_workflow_event_data[
+                    -self._workflow_event_dedupe_limit :
+                ]
+            for item in consumed_workflow_event_data:
+                if not isinstance(item, dict):
+                    continue
+                event_id = str(item.get("event_id") or "")
+                if event_id:
+                    self._consumed_workflow_event_ids[event_id] = str(item.get("consumed_at") or "")
 
         restored_tasks: list[tuple[AgentTask, bool]] = []
         for rec in records:
@@ -4401,6 +5395,14 @@ class DriveLoop:
                     root_correlation_id=rec.get("root_correlation_id", ""),
                     workflow_parent_event_id=rec.get("workflow_parent_event_id", ""),
                     workflow_node_id=rec.get("workflow_node_id", ""),
+                    workflow_review_cycle_id=rec.get("workflow_review_cycle_id", ""),
+                    workflow_review_source_node_id=rec.get("workflow_review_source_node_id", ""),
+                    workflow_review_source_event_type=rec.get(
+                        "workflow_review_source_event_type", ""
+                    ),
+                    workflow_allowed_outcome_topics=list(
+                        rec.get("workflow_allowed_outcome_topics") or []
+                    ),
                     tool_outcomes=rec.get("tool_outcomes", {}) or {},
                     human_initiated=rec.get("human_initiated", False),
                     resident_case_id=rec.get("resident_case_id", ""),
@@ -4417,6 +5419,9 @@ class DriveLoop:
                     trace_context=rec.get("trace_context", {}) or {},
                     created_at=created_at,
                 )
+                restored_session_id = str(rec.get("session_id") or "").strip()
+                if restored_session_id:
+                    task.session_id = restored_session_id
                 if deadline is not None and datetime.now(UTC) > deadline:
                     logger.info(
                         "drive_loop: journal task %s deadline exceeded — skipping",

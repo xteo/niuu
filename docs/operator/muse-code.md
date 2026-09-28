@@ -26,8 +26,18 @@ curl -fsSL https://dev.meta.ai/install.sh | bash     # installs ~/.local/bin/mus
 muse --version                                         # Muse Code 1.0.2 or newer
 ```
 
-The transport finds the binary via `MUSE_BIN`, then `PATH`, then the literal `muse`. In a
-container image, install it in the image or mount the binary and set `MUSE_BIN`.
+Skuld and OpenShell images include checksum-pinned Muse Code `1.3.0-R3233.1` for
+Linux amd64 and arm64. Docker, Kubernetes and SSH VM sessions use the Skuld image;
+OpenShell-backed sessions use the OpenShell image. Rebuild those images for this release.
+Mini-mode hosts still need the installation above.
+
+The transport uses `skuld.muse_bin` (`SKULD__MUSE_BIN`), then `PATH`, then `muse`.
+Session definitions and Helm use `broker.museBin` for an explicit executable path.
+
+MSP currently has no system-prompt field. Muse rejects configured system prompts,
+including generated Project briefings, instead of silently dropping them. Select another
+runtime for those sessions, or configure Muse instructions in workspace `AGENTS.md`.
+A failed native resume is an error; it never replaces the session with a fresh one.
 
 Credentials resolve in the host's own order: `META_API_KEY` in the broker's environment wins,
 then a key stored with `printf '%s' "$KEY" | muse auth set --api-key-stdin`, then a browser

@@ -3,7 +3,6 @@ import clsx from 'clsx';
 import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
 import { type PluginCtx, type PluginDescriptor, type PluginTab } from '@niuulabs/plugin-sdk';
 import {
-  LiveBadge,
   Kbd,
   Tooltip,
   TooltipProvider,
@@ -12,6 +11,13 @@ import {
 } from '@niuulabs/ui';
 import { useTheme, type ThemeName } from '@niuulabs/design-tokens';
 import { useShellContext } from './ShellContext';
+import {
+  isVisibleInMode,
+  pluginFace,
+  tabsForMode,
+  useUiMode,
+  useUiModePreferenceSync,
+} from './uiMode';
 import './Shell.css';
 
 function pathMatches(pathname: string, basePath: string): boolean {
@@ -74,17 +80,31 @@ export function ShellLayout() {
   const pathname = location.pathname;
   const { setOpen } = useCommandPalette();
   const { register, unregister } = useCommandPaletteRegistry();
+  const modePreferenceError = useUiModePreferenceSync();
 
   // System plugins (e.g. login) register routes but stay out of the nav rail.
-  const navPlugins = useMemo(() => enabled.filter((p) => !p.system), [enabled]);
+  const allNavPlugins = useMemo(() => enabled.filter((p) => !p.system), [enabled]);
+  const storedMode = useUiMode();
+  // Simple mode only exists when at least one plugin opted into it; a host whose
+  // plugins declare nothing gets the whole shell and no switch.
+  const simpleAvailable = useMemo(() => allNavPlugins.some((p) => p.simple), [allNavPlugins]);
+  const mode = simpleAvailable ? storedMode : 'advanced';
+  const activeId = activePluginId(pathname, allNavPlugins);
+  // Simple mode hides plugins from the rail, never from the router: a plugin reached by
+  // deep link keeps its rail item while it is the active one.
+  const navPlugins = useMemo(
+    () => allNavPlugins.filter((p) => isVisibleInMode(p, mode) || p.id === activeId),
+    [activeId, allNavPlugins, mode],
+  );
   const topPlugins = useMemo(() => navPlugins.filter((p) => p.position !== 'bottom'), [navPlugins]);
   const bottomPlugins = useMemo(
     () => navPlugins.filter((p) => p.position === 'bottom'),
     [navPlugins],
   );
 
-  const activeId = activePluginId(pathname, navPlugins);
   const active = navPlugins.find((p) => p.id === activeId) ?? navPlugins[0] ?? null;
+  const activeTabs = active ? tabsForMode(active, mode) : undefined;
+  const face = (plugin: PluginDescriptor) => pluginFace(plugin, mode);
   const subnavCollapsed = active ? Boolean(ctx.tweaks[`${active.id}.subnavCollapsed`]) : false;
 
   // localStorage follows the router — not the other way around
@@ -105,10 +125,11 @@ export function ShellLayout() {
   // Register "switch plugin" default commands for all nav plugins
   useEffect(() => {
     for (const plugin of navPlugins) {
+      const label = pluginFace(plugin, mode);
       register({
         id: `switch:${plugin.id}`,
-        title: plugin.title,
-        subtitle: plugin.subtitle,
+        title: label.title,
+        subtitle: label.subtitle,
         keywords: ['switch', 'navigate', 'go', 'plugin', plugin.id],
         execute: () => handleSelect(plugin.id),
       });
@@ -118,7 +139,7 @@ export function ShellLayout() {
         unregister(`switch:${plugin.id}`);
       }
     };
-  }, [navPlugins, register, unregister, handleSelect]);
+  }, [navPlugins, mode, register, unregister, handleSelect]);
 
   return (
     <TooltipProvider>
@@ -132,7 +153,7 @@ export function ShellLayout() {
               key={p.id}
               side="right"
               delayMs={0}
-              content={<RailTooltipContent title={p.title} subtitle={p.subtitle} />}
+              content={<RailTooltipContent title={face(p).title} subtitle={face(p).subtitle} />}
             >
               <button
                 type="button"
@@ -141,11 +162,12 @@ export function ShellLayout() {
                   p.icon && 'niuu-shell__rail-item--icon',
                   active?.id === p.id && 'niuu-shell__rail-item--active',
                 )}
-                title={[p.title, p.subtitle].filter(Boolean).join(' · ')}
-                aria-label={p.title}
+                title={[face(p).title, face(p).subtitle].filter(Boolean).join(' · ')}
+                aria-label={face(p).title}
+                data-testid={`rail-item-${p.id}`}
                 onClick={() => handleSelect(p.id)}
               >
-                {p.icon ?? p.rune}
+                {face(p).glyph}
               </button>
             </Tooltip>
           ))}
@@ -155,7 +177,7 @@ export function ShellLayout() {
               key={p.id}
               side="right"
               delayMs={0}
-              content={<RailTooltipContent title={p.title} subtitle={p.subtitle} />}
+              content={<RailTooltipContent title={face(p).title} subtitle={face(p).subtitle} />}
             >
               <button
                 type="button"
@@ -164,11 +186,12 @@ export function ShellLayout() {
                   p.icon && 'niuu-shell__rail-item--icon',
                   active?.id === p.id && 'niuu-shell__rail-item--active',
                 )}
-                title={[p.title, p.subtitle].filter(Boolean).join(' · ')}
-                aria-label={p.title}
+                title={[face(p).title, face(p).subtitle].filter(Boolean).join(' · ')}
+                aria-label={face(p).title}
+                data-testid={`rail-item-${p.id}`}
                 onClick={() => handleSelect(p.id)}
               >
-                {p.icon ?? p.rune}
+                {face(p).glyph}
               </button>
             </Tooltip>
           ))}
@@ -179,24 +202,27 @@ export function ShellLayout() {
           <div className="niuu-shell__topbar-title">
             {active && (
               <>
-                <span className="niuu-shell__rune-mark">{active.rune}</span>
-                <h1>{active.title}</h1>
-                {active.subtitle && (
-                  <span className="niuu-shell__topbar-subtitle">{active.subtitle}</span>
-                )}
+                <span className="niuu-shell__rune-mark">{face(active).glyph}</span>
+                <h1>{face(active).title}</h1>
               </>
             )}
           </div>
-          {active?.tabs && (
+          {active && activeTabs && (
             <div className="niuu-shell__tabs">
-              {active.tabs.map((t) => {
+              {activeTabs.map((t) => {
                 const tabPath = t.path ?? `/${active.id}/${t.id}`;
                 const isActive =
                   active.activeTab != null
                     ? active.activeTab === t.id
                     : tabPath === `/${active.id}`
                       ? pathname === tabPath
-                      : pathname === tabPath || pathname.startsWith(tabPath + '/');
+                      : pathMatches(pathname, tabPath) &&
+                        !activeTabs.some((other) => {
+                          const otherPath = other.path ?? `/${active.id}/${other.id}`;
+                          return (
+                            otherPath.length > tabPath.length && pathMatches(pathname, otherPath)
+                          );
+                        });
                 return (
                   <button
                     key={t.id}
@@ -226,7 +252,9 @@ export function ShellLayout() {
             </div>
           )}
           <div className="niuu-shell__topbar-right">
-            <PluginSlot render={active?.topbarRight ?? null} ctx={ctx} />
+            <div className="niuu-shell__plugin-status">
+              <PluginSlot render={active?.topbarRight ?? null} ctx={ctx} />
+            </div>
             <select
               className="niuu-shell__theme-select"
               aria-label="Color theme"
@@ -238,17 +266,17 @@ export function ShellLayout() {
               <option value="amber">Amber</option>
               <option value="spring">Spring</option>
             </select>
-            <LiveBadge />
-            <div className="niuu-shell__topbar-sep" />
             <button
               type="button"
               className="niuu-shell__cp-btn"
               onClick={() => setOpen(true)}
-              aria-label="Open command palette (⌘K)"
+              aria-label="Open command palette"
             >
               <Kbd>⌘K</Kbd>
             </button>
-            {topbarContent && <div className="niuu-shell__topbar-content">{topbarContent}</div>}
+            {topbarContent ? (
+              <div className="niuu-shell__topbar-content">{topbarContent}</div>
+            ) : null}
           </div>
         </header>
 
@@ -272,6 +300,11 @@ export function ShellLayout() {
             <PluginSlot render={active?.footer ?? null} ctx={ctx} />
           </div>
           <div className="niuu-shell__footer-right">
+            {modePreferenceError ? (
+              <span className="niuu-shell__mode-error" role="alert" title={modePreferenceError}>
+                interface preference unavailable
+              </span>
+            ) : null}
             <span>{enabled.length} plugins loaded</span>
           </div>
         </footer>

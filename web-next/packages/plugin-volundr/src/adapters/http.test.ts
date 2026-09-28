@@ -1044,6 +1044,69 @@ describe('buildVolundrHttpAdapter', () => {
     expect(client.get).toHaveBeenCalledWith('/sessions/s1');
   });
 
+  it('uses an explicit instance for a cold detail read and routes later mutations to it', async () => {
+    const client = makeClient();
+    client.get.mockResolvedValueOnce({
+      id: 'shared-id',
+      name: 'Build session',
+      source: { type: 'local_mount', local_path: '/workspace' },
+      status: 'running',
+    });
+    const service = buildVolundrHttpAdapter(client);
+
+    await service.getSession('shared-id', { instanceId: 'build' });
+    await service.stopSession('shared-id');
+    await service.archiveSession('shared-id');
+
+    expect(client.get).toHaveBeenCalledWith('/sessions/shared-id?instance_id=build');
+    expect(client.post).toHaveBeenCalledWith('/sessions/shared-id/stop?instance_id=build');
+    expect(client.patch).toHaveBeenCalledWith(
+      '/sessions/shared-id/archive?instance_id=build',
+      undefined,
+    );
+  });
+
+  it('rejects a scoped detail response owned by a different instance', async () => {
+    const client = makeClient();
+    client.get.mockResolvedValueOnce({
+      id: 'shared-id',
+      name: 'Unexpected session',
+      instance_id: 'thor',
+      source: { type: 'local_mount', local_path: '/workspace' },
+      status: 'running',
+    });
+    const service = buildVolundrHttpAdapter(client);
+
+    await expect(service.getSession('shared-id', { instanceId: 'build' })).rejects.toThrow(
+      'Session shared-id was returned by thor, expected build',
+    );
+    await service.stopSession('shared-id');
+
+    expect(client.get).toHaveBeenCalledWith('/sessions/shared-id?instance_id=build');
+    expect(client.post).toHaveBeenCalledWith('/sessions/shared-id/stop');
+    expect(client.post).not.toHaveBeenCalledWith('/sessions/shared-id/stop?instance_id=thor');
+  });
+
+  it('does not fall back to a cached owner when an explicit instance has no matching session', async () => {
+    const client = makeClient();
+    client.get
+      .mockResolvedValueOnce({
+        id: 'shared-id',
+        name: 'Thor session',
+        instance_id: 'thor',
+        source: { type: 'local_mount', local_path: '/workspace' },
+        status: 'running',
+      })
+      .mockResolvedValueOnce(null);
+    const service = buildVolundrHttpAdapter(client);
+
+    await service.getSession('shared-id', { instanceId: 'thor' });
+    await expect(service.getSession('shared-id', { instanceId: 'missing' })).resolves.toBeNull();
+
+    expect(client.get).toHaveBeenLastCalledWith('/sessions/shared-id?instance_id=missing');
+    expect(client.get).not.toHaveBeenCalledWith('/sessions/shared-id');
+  });
+
   it('getSession synthesizes trackerIssue from legacy tracker fields', async () => {
     const client = makeClient();
     client.get.mockResolvedValueOnce({
@@ -1077,11 +1140,19 @@ describe('buildVolundrHttpAdapter', () => {
     expect(client.get).toHaveBeenCalledWith('/stats');
   });
 
-  it('getFeatures calls GET /features', async () => {
+  it('getFeatures maps Forge flags and scopes requests to a target', async () => {
     const client = makeClient();
-    await buildVolundrHttpAdapter(client).getFeatures();
-    const sharedClient = getDerivedClient('http://localhost:8080/api/v1');
-    expect(sharedClient.get).toHaveBeenCalledWith('/features');
+    vi.mocked(client.get).mockResolvedValue({
+      local_mounts_enabled: true,
+      file_manager_enabled: false,
+      mini_mode: true,
+    });
+    expect(await buildVolundrHttpAdapter(client).getFeatures('host/a')).toEqual({
+      localMountsEnabled: true,
+      fileManagerEnabled: false,
+      miniMode: true,
+    });
+    expect(client.get).toHaveBeenCalledWith('/feature-flags?instance_id=host%2Fa');
   });
 
   it('getCredentials forwards the optional secret type and applies the fallback type', async () => {
@@ -1262,13 +1333,14 @@ describe('buildVolundrHttpAdapter', () => {
 
     const forgeClient = getDerivedClient('http://localhost:8080/api/v1/forge');
     const catalogClient = getDerivedClient('http://localhost:8080/api/v1/volundr');
-    const sharedClient = getDerivedClient('http://localhost:8080/api/v1');
     const niuuClient = getDerivedClient('http://localhost:8080/api/v1/niuu');
     const credentialsClient = getDerivedClient('http://localhost:8080/api/v1/credentials');
 
     expect(catalogClient.get).toHaveBeenCalledWith('/session-definitions');
     expect(forgeClient.get).not.toHaveBeenCalledWith('/session-definitions');
-    expect(sharedClient.get).toHaveBeenCalledWith('/features');
+    expect(
+      (getDerivedClient('http://localhost:8080/api/v1/forge') ?? client).get,
+    ).toHaveBeenCalledWith('/feature-flags');
     expect(niuuClient.get).toHaveBeenCalledWith('/instances?kind=volundr&enabledOnly=true');
     expect(credentialsClient.get).toHaveBeenCalledWith('/user');
   });
@@ -1284,11 +1356,12 @@ describe('buildVolundrHttpAdapter', () => {
     expect(queryMocks.createApiClient).toHaveBeenCalledWith('http://localhost:8080/api/v1');
     expect(queryMocks.createApiClient).toHaveBeenCalledWith('http://localhost:8080/api/v1/niuu');
 
-    const sharedClient = getDerivedClient('http://localhost:8080/api/v1');
     const niuuClient = getDerivedClient('http://localhost:8080/api/v1/niuu');
 
     expect(client.get).toHaveBeenCalledWith('/sessions/sess-1');
-    expect(sharedClient.get).toHaveBeenCalledWith('/features');
+    expect(
+      (getDerivedClient('http://localhost:8080/api/v1/forge') ?? client).get,
+    ).toHaveBeenCalledWith('/feature-flags');
     expect(niuuClient.get).toHaveBeenCalledWith('/instances?kind=volundr&enabledOnly=true');
   });
 
@@ -1313,7 +1386,7 @@ describe('buildVolundrHttpAdapter', () => {
     await service.getTargets();
 
     expect(queryMocks.createApiClient).not.toHaveBeenCalled();
-    expect(client.get).toHaveBeenCalledWith('/features');
+    expect(client.get).toHaveBeenCalledWith('/feature-flags');
     expect(client.get).toHaveBeenCalledWith('/repos');
     expect(client.get).toHaveBeenCalledWith('/instances?kind=volundr&enabledOnly=true');
   });
@@ -1373,6 +1446,8 @@ describe('buildVolundrHttpAdapter', () => {
         cloneUrl: 'https://github.com/niuulabs/volundr.git',
         defaultBranch: 'main',
         branches: ['main', 'feat/wizard'],
+        // the group key is the account that listed the repository
+        account: 'GitHub',
       }),
     ]);
   });
@@ -1449,6 +1524,26 @@ describe('buildVolundrHttpAdapter', () => {
       terminal_restricted: false,
       instance_id: null,
       workload_config: {},
+    });
+  });
+
+  it('startSession launches a ravn flock when asked', async () => {
+    const client = makeClient();
+    await buildVolundrHttpAdapter(client).startSession({
+      name: 'scout',
+      source: { type: 'git', repo: '', branch: 'main' },
+      model: 'claude-fable-5',
+      workloadType: 'ravn_flock',
+      workloadConfig: { personas: ['research-analyst'] },
+    });
+    expect(client.post).toHaveBeenCalledWith('/sessions', {
+      name: 'scout',
+      source: { type: 'git', repo: '', branch: 'main' },
+      model: 'claude-fable-5',
+      terminal_restricted: false,
+      instance_id: null,
+      workload_type: 'ravn_flock',
+      workload_config: { personas: ['research-analyst'] },
     });
   });
 
@@ -2514,6 +2609,42 @@ describe('buildVolundrHttpAdapter — full method sweep', () => {
     expect(client.post).toHaveBeenCalled();
     expect(client.delete).toHaveBeenCalled();
   });
+});
+
+it('normalizes Settings integration fields for session defaults', async () => {
+  const service = buildVolundrHttpAdapter(makeClient());
+  const sharedClient = getDerivedClient('http://localhost:8080/api/v1');
+  sharedClient.get.mockResolvedValueOnce([
+    {
+      id: 'github',
+      slug: 'github',
+      enabled: true,
+      integration_type: 'source_control',
+      credential_name: 'github-credential',
+      created_at: 'created',
+      updated_at: 'updated',
+    },
+  ]);
+  expect(await service.getIntegrations()).toEqual([
+    {
+      id: 'github',
+      slug: 'github',
+      enabled: true,
+      integrationType: 'source_control',
+      credentialName: 'github-credential',
+      createdAt: 'created',
+      updatedAt: 'updated',
+    },
+  ]);
+});
+
+it('routes personal home operations with encoded cluster and relative path', async () => {
+  const client = makeClient();
+  const service = buildVolundrHttpAdapter(client);
+  await service.listUserHome('cluster-a', 'tmp/cache');
+  expect(client.get).toHaveBeenCalledWith('/storage/home?instance_id=cluster-a&path=tmp%2Fcache');
+  await service.deleteUserHomePath('cluster-b', 'tmp/a b');
+  expect(client.delete).toHaveBeenCalledWith('/storage/home?instance_id=cluster-b&path=tmp%2Fa+b');
 });
 
 describe('session resource byte downloads', () => {

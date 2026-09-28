@@ -6,7 +6,8 @@ Re-exports all public names for backward compatibility so that
 
 from __future__ import annotations
 
-from .chronicle import ChronicleNotFoundError, ChronicleService
+from .chronicle import ChronicleAccessDeniedError, ChronicleNotFoundError, ChronicleService
+from .delivery import DeliveryPolicyNotFoundError, DeliveryService
 from .external_sessions import (
     ExternalSessionAlreadyImportedError,
     ExternalSessionNotFoundError,
@@ -28,11 +29,13 @@ from .repo import ProviderInfo, RepoService
 from .session import (
     RepoValidationError,
     SessionAccessDeniedError,
+    SessionCapacityError,
     SessionNotFoundError,
     SessionService,
     SessionStateError,
 )
 from .session_archive import SessionArchiveNotAvailableError, SessionArchiveService
+from .session_events import SessionEventStream
 from .stats import StatsService
 from .tenant import TenantAlreadyExistsError, TenantNotFoundError, TenantService
 from .token import SessionNotRunningError, TokenService
@@ -42,7 +45,9 @@ from .workspace import WorkspaceService
 
 __all__ = [
     # Exceptions
+    "ChronicleAccessDeniedError",
     "ChronicleNotFoundError",
+    "DeliveryPolicyNotFoundError",
     "ExternalSessionAlreadyImportedError",
     "ExternalSessionNotFoundError",
     "ExternalSessionPathNotAllowedError",
@@ -55,6 +60,7 @@ __all__ = [
     "SessionAccessDeniedError",
     "SessionNotFoundError",
     "SessionNotRunningError",
+    "SessionCapacityError",
     "SessionStateError",
     "TenantAlreadyExistsError",
     "TenantNotFoundError",
@@ -65,6 +71,7 @@ __all__ = [
     "FeatureService",
     "ForgeService",
     "ChronicleService",
+    "DeliveryService",
     "ConfidenceScorer",
     "LaunchSpecService",
     "GitWorkflowService",
@@ -72,6 +79,7 @@ __all__ = [
     "RepoService",
     "SessionArchiveNotAvailableError",
     "SessionArchiveService",
+    "SessionEventStream",
     "SessionService",
     "StatsService",
     "TenantService",

@@ -8,6 +8,7 @@ export { buildCommandList } from './utils/slashCommands';
 export type { SlashCommand } from './utils/slashCommands';
 
 /* Transport */
+export { forgeHistoryEndpoint, type ISessionHistoryLocator } from './hooks/historyPaging';
 export { deriveTerminalWsUrl, normalizeSessionUrl, wsUrlToHttpBase } from './transport';
 
 /* Hooks */
@@ -51,6 +52,8 @@ export { MeshCascadePanel } from './components/MeshCascadePanel';
 export { MeshSidebar } from './components/MeshSidebar';
 export { ChatInput } from './components/ChatInput';
 export { SessionChat } from './components/SessionChat';
+export { ChatDisplayControls } from './components/ChatDisplayControls';
+export type { ChatDisplayControlsProps } from './components/ChatDisplayControls';
 export type { SessionChatProps } from './components/SessionChat';
 
 export { repairCanonicalText } from './hooks/canonicalTextRepair';

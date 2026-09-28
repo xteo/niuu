@@ -3,7 +3,6 @@ import { useQuery } from '@tanstack/react-query';
 import { useService } from '@niuulabs/plugin-sdk';
 import {
   StateDot,
-  ConfidenceBar,
   Tooltip,
   TooltipProvider,
   ToastProvider,
@@ -24,7 +23,6 @@ import { checkFeasibility, type FeasibilityResult } from '../application/dispatc
 import { useDispatcherState } from './useDispatcherState';
 import { useDispatchQueue, type DispatchEntry } from './useDispatchQueue';
 import { WorkflowOverrideModal } from './WorkflowOverrideModal';
-import { ThresholdOverrideModal } from './ThresholdOverrideModal';
 import { EditRulesModal, type RulesFormState } from './EditRulesModal';
 
 // ---------------------------------------------------------------------------
@@ -72,7 +70,6 @@ interface EnrichedEntry extends DispatchEntry {
 
 const GATE_LABELS: Record<string, string> = {
   raven_resolution: 'no raven',
-  confidence: 'low conf',
   upstream_blocked: 'upstream',
   cluster_healthy: 'cluster',
 };
@@ -115,14 +112,12 @@ function BatchDispatchBar({
   onDispatch,
   isDispatching,
   onApplyWorkflow,
-  onOverrideThreshold,
 }: {
   selectedCount: number;
   canDispatch: boolean;
   onDispatch: () => void;
   isDispatching: boolean;
   onApplyWorkflow?: () => void;
-  onOverrideThreshold?: () => void;
 }) {
   if (selectedCount === 0) return null;
 
@@ -142,15 +137,6 @@ function BatchDispatchBar({
           className="niuu:py-1 niuu:px-3 niuu:bg-bg-secondary niuu:text-text-secondary niuu:border niuu:border-border niuu:rounded-sm niuu:cursor-pointer niuu:font-mono niuu:text-xs"
         >
           Apply workflow…
-        </button>
-      )}
-      {onOverrideThreshold && (
-        <button
-          type="button"
-          onClick={onOverrideThreshold}
-          className="niuu:py-1 niuu:px-3 niuu:bg-bg-secondary niuu:text-text-secondary niuu:border niuu:border-border niuu:rounded-sm niuu:cursor-pointer niuu:font-mono niuu:text-xs"
-        >
-          Override threshold
         </button>
       )}
       <Tooltip content={canDispatch ? undefined : 'Select only ready runs to dispatch'} side="top">
@@ -408,15 +394,6 @@ function RunRow({
                 .join(', ')}`}
           </span>
         )}
-        <ConfidenceBar
-          level={
-            entry.run.confidence >= 80 ? 'high' : entry.run.confidence >= 50 ? 'medium' : 'low'
-          }
-          hideLabel
-        />
-        <span className="niuu:text-xs niuu:font-mono niuu:text-text-muted niuu:w-6 niuu:text-right">
-          {entry.run.confidence}
-        </span>
         <span className="niuu:text-[10px] niuu:font-mono niuu:text-text-muted niuu:w-[60px] niuu:text-right">
           {waitLabel}
         </span>
@@ -430,20 +407,17 @@ function RunRow({
 // ---------------------------------------------------------------------------
 
 function DispatchRulesPanel({
-  threshold,
   maxConcurrentRuns,
   autoContinue,
   retryCount,
   onEdit,
 }: {
-  threshold: number;
   maxConcurrentRuns: number;
   autoContinue: boolean;
   retryCount: number;
   onEdit: () => void;
 }) {
   const rules = [
-    { label: 'Confidence threshold', value: `≥ ${(threshold / 100).toFixed(2)}` },
     { label: 'Max concurrent', value: String(maxConcurrentRuns) },
     { label: 'Auto-continue', value: autoContinue ? 'on' : 'off' },
     { label: 'Retry on fail', value: `up to ${retryCount}` },
@@ -535,15 +509,12 @@ function DispatchViewContent() {
 
   // Modal visibility
   const [showWorkflowModal, setShowWorkflowModal] = useState(false);
-  const [showThresholdModal, setShowThresholdModal] = useState(false);
   const [showEditRulesModal, setShowEditRulesModal] = useState(false);
 
   // Local overrides — null = use server state
-  const [thresholdOverride, setThresholdOverride] = useState<number | null>(null);
   const [workflowOverride, setWorkflowOverride] = useState<Map<string, Workflow>>(new Map());
   const [rulesOverride, setRulesOverride] = useState<{
     maxConcurrentRuns: number;
-    autoContinue: boolean;
     retryCount: number;
   } | null>(null);
 
@@ -556,11 +527,9 @@ function DispatchViewContent() {
   const pendingTargetLabel = selectedCluster?.name ?? 'Auto (primary/default)';
 
   // Effective display values (server state + local overrides)
-  const effectiveThreshold = thresholdOverride ?? dispatcherState?.threshold ?? 70;
   const effectiveMaxConcurrent =
     rulesOverride?.maxConcurrentRuns ?? dispatcherState?.maxConcurrentRuns ?? 3;
-  const effectiveAutoContinue =
-    rulesOverride?.autoContinue ?? dispatcherState?.autoContinue ?? false;
+  const effectiveAutoContinue = dispatcherState?.autoContinue ?? false;
   const effectiveRetryCount = rulesOverride?.retryCount ?? DEFAULT_MAX_RETRIES;
 
   // Enrich each entry with feasibility + optimistic status
@@ -749,19 +718,20 @@ function DispatchViewContent() {
     });
   }
 
-  function handleApplyThreshold(threshold: number) {
-    setThresholdOverride(threshold);
-    toast({ title: `Threshold → ${threshold.toFixed(2)}` });
-  }
-
-  function handleSaveRules(rules: RulesFormState) {
-    setThresholdOverride(rules.threshold);
-    setRulesOverride({
-      maxConcurrentRuns: rules.maxConcurrentRuns,
-      autoContinue: rules.autoContinue,
-      retryCount: rules.retryCount,
-    });
-    toast({ title: 'Dispatch rules updated' });
+  async function handleSaveRules(rules: RulesFormState): Promise<boolean> {
+    try {
+      await dispatcherService.setAutoContinue(rules.autoContinue);
+      await dispatcherQuery.refetch();
+      setRulesOverride({
+        maxConcurrentRuns: rules.maxConcurrentRuns,
+        retryCount: rules.retryCount,
+      });
+      toast({ title: 'Dispatch rules updated' });
+      return true;
+    } catch {
+      toast({ title: 'Failed to save auto-continue', tone: 'critical' });
+      return false;
+    }
   }
 
   function toggleId(id: string) {
@@ -816,9 +786,6 @@ function DispatchViewContent() {
               <div className="niuu:flex niuu:items-center niuu:gap-2">
                 {dispatcherState && (
                   <>
-                    <span className="niuu:text-xs niuu:font-mono niuu:bg-bg-elevated niuu:px-2 niuu:py-1 niuu:rounded niuu:text-text-secondary">
-                      threshold <strong className="niuu:text-brand">{effectiveThreshold}%</strong>
-                    </span>
                     <span className="niuu:text-xs niuu:font-mono niuu:bg-bg-elevated niuu:px-2 niuu:py-1 niuu:rounded niuu:text-text-secondary">
                       concurrent <strong>{effectiveMaxConcurrent}</strong>
                     </span>
@@ -883,7 +850,6 @@ function DispatchViewContent() {
             onDispatch={handleDispatch}
             isDispatching={isDispatching}
             onApplyWorkflow={() => setShowWorkflowModal(true)}
-            onOverrideThreshold={() => setShowThresholdModal(true)}
           />
 
           <PendingDispatchBar entries={pendingDispatchEntries} targetLabel={pendingTargetLabel} />
@@ -939,7 +905,6 @@ function DispatchViewContent() {
         >
           {dispatcherState ? (
             <DispatchRulesPanel
-              threshold={effectiveThreshold}
               maxConcurrentRuns={effectiveMaxConcurrent}
               autoContinue={effectiveAutoContinue}
               retryCount={effectiveRetryCount}
@@ -958,17 +923,10 @@ function DispatchViewContent() {
           onApply={handleApplyWorkflow}
         />
       )}
-      <ThresholdOverrideModal
-        open={showThresholdModal}
-        onOpenChange={setShowThresholdModal}
-        currentThreshold={effectiveThreshold / 100}
-        onApply={(v) => handleApplyThreshold(Math.round(v * 100))}
-      />
       <EditRulesModal
         open={showEditRulesModal}
         onOpenChange={setShowEditRulesModal}
         rules={{
-          threshold: effectiveThreshold,
           maxConcurrentRuns: effectiveMaxConcurrent,
           autoContinue: effectiveAutoContinue,
           retryCount: effectiveRetryCount,

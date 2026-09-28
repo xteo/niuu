@@ -24,9 +24,11 @@ from niuu.domain.services.token_scope import (
     VALKYRIE_BUILD_TOKEN_USE,
     bound_workload_scopes,
     claims_have_scope,
+    credential_allows_route,
     require_scope,
     token_has_scope,
     token_requires_scope_check,
+    workload_owner_scoped,
 )
 
 _SIGNING_KEY = "test-only-signing-key-32-bytes-long!"
@@ -92,8 +94,11 @@ class TestKnownWorkloadScopes:
         assert KNOWN_WORKLOAD_SCOPES == frozenset(
             {
                 "forge:session:create",
+                "forge:session:room-role",
+                "ting:workflow:coordinate",
                 "ting:workflow:launch",
                 "observatory:topology:push",
+                "node_join",
                 "forge:notify",
                 "forge:session:read",
                 "forge:session:message",
@@ -136,6 +141,63 @@ class TestTokenHasScope:
     def test_build_token_with_scope_allowed(self) -> None:
         token = _build_token(["forge:session:create"])
         assert token_has_scope(token, "forge:session:create") is True
+
+    def test_execution_coordinator_can_call_delivery_surface(self) -> None:
+        token = _build_token(["ting:workflow:coordinate"])
+        assert credential_allows_route(
+            token,
+            "POST",
+            "/api/v1/forge/delivery/workspaces/verify",
+        )
+        assert not credential_allows_route(
+            token,
+            "POST",
+            "/api/v1/forge/sessions",
+        )
+
+    def test_workflow_launcher_can_call_a2a_jsonrpc_only_with_launch_scope(self) -> None:
+        launcher = _build_token(["ting:workflow:launch"])
+        unrelated = _build_token(["forge:session:create"])
+
+        assert credential_allows_route(launcher, "POST", "/api/v1/ting/a2a")
+        assert not credential_allows_route(unrelated, "POST", "/api/v1/ting/a2a")
+        assert not credential_allows_route(launcher, "GET", "/api/v1/ting/a2a")
+
+    @pytest.mark.parametrize("suffix", ["expansions", "messages", "reconcile", "cancel", "waits"])
+    def test_execution_coordinator_can_call_generic_execution_mutations(self, suffix: str) -> None:
+        token = _build_token(["ting:workflow:coordinate"])
+
+        assert credential_allows_route(
+            token,
+            "POST",
+            f"/api/v1/ting/workflow-executions/execution-1/{suffix}",
+        )
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["expansions", "integration-candidate", "complete", "delivery-authorizations"],
+    )
+    def test_execution_coordinator_can_call_delivery_execution_mutations(self, suffix: str) -> None:
+        token = _build_token(["ting:workflow:coordinate"])
+
+        assert credential_allows_route(
+            token,
+            "POST",
+            f"/api/v1/ting/delivery-executions/execution-1/{suffix}",
+        )
+
+    def test_execution_coordinator_retry_is_post_only_and_gets_remain_denied(self) -> None:
+        token = _build_token(["ting:workflow:coordinate"])
+        retry = "/api/v1/ting/workflow-executions/execution-1/children/api/retry"
+        wait = "/api/v1/ting/workflow-executions/execution-1/waits"
+
+        assert credential_allows_route(token, "POST", retry)
+        assert credential_allows_route(token, "POST", wait)
+        assert not credential_allows_route(token, "GET", retry)
+        assert not credential_allows_route(token, "GET", wait)
+        assert not credential_allows_route(
+            token, "GET", "/api/v1/ting/delivery-executions/execution-1/evidence"
+        )
 
     def test_build_token_missing_scope_denied(self) -> None:
         token = _build_token(["ting:workflow:launch"])
@@ -197,6 +259,33 @@ class TestBoundWorkloadScopes:
             ]
         )
         assert result == ["forge:session:create", "ting:workflow:launch"]
+
+
+class TestWorkloadOwnerScoped:
+    """``workload_owner_scoped`` is how ``PlatformBudgetReporter`` refuses to
+    seed a resident's budget from a caller identity it cannot prove is this
+    resident's own — see ``niuu.domain.services.workload_identity`` for
+    where the ``workload_owner_scoped`` claim is minted."""
+
+    def test_true_when_the_claim_is_true(self) -> None:
+        token = _encode({"workload_owner_scoped": True})
+        assert workload_owner_scoped(token) is True
+
+    def test_false_when_the_claim_is_false(self) -> None:
+        token = _encode({"workload_owner_scoped": False})
+        assert workload_owner_scoped(token) is False
+
+    def test_false_when_the_claim_is_absent(self) -> None:
+        """A token minted before this claim existed, or by a mapping that
+        never set it, must read as NOT scoped — never a permissive default."""
+        token = _encode({})
+        assert workload_owner_scoped(token) is False
+
+    def test_false_for_an_empty_token(self) -> None:
+        assert workload_owner_scoped("") is False
+
+    def test_false_for_a_malformed_token(self) -> None:
+        assert workload_owner_scoped("not-a-jwt") is False
 
 
 class TestRequireScopeFactory:
@@ -301,6 +390,45 @@ class TestForgeSessionScopes:
     def test_malformed_session_scopes_grant_nothing(self) -> None:
         claims = {"token_use": FORGE_SESSION_TOKEN_USE, "scopes": FORGE_NOTIFY_SCOPE}
         assert claims_have_scope(claims, (FORGE_NOTIFY_SCOPE,)) is False
+
+    def test_session_token_admitted_only_on_the_forge_allow_list(self) -> None:
+        session_id = "0b8f5e5a-6f5c-4a3e-9d59-3f1c2b7a9e10"
+        token = _session_token([FORGE_NOTIFY_SCOPE, FORGE_SESSION_READ_SCOPE])
+
+        assert credential_allows_route(token, "GET", "/api/v1/forge/sessions")
+        assert credential_allows_route(
+            token, "POST", f"/api/v1/forge/sessions/{session_id}/notifications"
+        )
+        assert credential_allows_route(token, "POST", "/api/v1/forge/mcp")
+        # Missing grant, a route off the allow-list, and the identity route.
+        assert not credential_allows_route(
+            token, "POST", f"/api/v1/forge/sessions/{session_id}/messages"
+        )
+        assert not credential_allows_route(token, "DELETE", f"/api/v1/forge/sessions/{session_id}")
+        assert not credential_allows_route(token, "GET", "/api/v1/identity/me")
+        assert not credential_allows_route(token, "POST", "/api/v1/ting/a2a")
+
+    def test_session_token_websocket_upgrade_is_checked_as_get(self) -> None:
+        token = _session_token([FORGE_SESSION_READ_SCOPE])
+        assert credential_allows_route(token, "WEBSOCKET", "/api/v1/forge/notifications")
+        assert not credential_allows_route(
+            _session_token([]), "WEBSOCKET", "/api/v1/forge/sessions"
+        )
+
+    def test_pats_cannot_carry_session_scopes(self) -> None:
+        assert token_scope.validate_pat_scopes(["forge:session:create"]) == (
+            "forge:session:create",
+        )
+        with pytest.raises(ValueError, match="PAT scopes"):
+            token_scope.validate_pat_scopes([FORGE_NOTIFY_SCOPE])
+
+    def test_scoped_pat_follows_the_build_family(self) -> None:
+        pat = {"type": "pat", "scope": "ting:workflow:launch"}
+        assert token_requires_scope_check(pat) is True
+        assert claims_have_scope(pat, ("ting:workflow:launch",))
+        assert not claims_have_scope(pat, ("forge:session:create",))
+        # A session-only check does not apply to the build family.
+        assert claims_have_scope(pat, (FORGE_SESSION_READ_SCOPE,))
 
     def test_bound_scopes_to_one_family(self) -> None:
         requested = ["forge:session:create", FORGE_NOTIFY_SCOPE]

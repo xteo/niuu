@@ -8,12 +8,30 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.datastructures import Headers
 
-from niuu.app import SkuldPortRegistry, _proxy_ws_identity
+from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
+from niuu.app import SkuldPortRegistry, _proxy_forward_headers, _proxy_ws_identity
+from niuu.domain.models import Principal
+from niuu.session_proxy import SessionProxyGuardMissingError
+
+
+class _FakeWebSocket(SimpleNamespace):
+    """SimpleNamespace defines __eq__ (attribute comparison), which makes
+    plain instances unhashable — but a real starlette WebSocket has no such
+    override and hashes by identity. SkuldPortRegistry.track_connection
+    puts the connection object in a set, so the fake needs identity hashing
+    too, or every test that reaches that code path fails with "unhashable
+    type" regardless of what it's actually testing."""
+
+    __hash__ = object.__hash__
 
 
 def _ws(headers: dict | None = None, query: dict | None = None):
-    return SimpleNamespace(
+    return _FakeWebSocket(
+        app=SimpleNamespace(state=SimpleNamespace(identity=EnvoyHeaderAuthenticationAdapter())),
+        scope={"type": "websocket"},
+        url=SimpleNamespace(path="/ws"),
         headers=(headers or {}),
         query_params=(query or {}),
     )
@@ -24,9 +42,71 @@ def _jwt(claims: dict) -> str:
     return f"eyJhbGciOiJub25lIn0.{payload}.sig"
 
 
+def _guarded_registry() -> SkuldPortRegistry:
+    reg = SkuldPortRegistry()
+
+    async def allow(session_id, user_id, tenant_id, roles):
+        return True
+
+    reg.set_ownership_guard(allow)
+    return reg
+
+
+class TestProxyForwardHeaders:
+    """What the broker leg is told about the caller's identity."""
+
+    @staticmethod
+    def _browser():
+        return SimpleNamespace(
+            headers=Headers(
+                {
+                    "authorization": "Bearer t",
+                    "cookie": "c",
+                    "x-auth-user-id": "victim",
+                    "x-auth-tenant": "victim-tenant",
+                    "x-auth-roles": "volundr:admin",
+                    "x-unrelated": "no",
+                }
+            ),
+            query_params={"devUserId": "dev-victim", "devRoles": "volundr:admin"},
+        )
+
+    def test_outside_dev_projects_only_the_verified_principal(self):
+        headers = _proxy_forward_headers(
+            self._browser(),
+            include_cookie=True,
+            dev_identity=False,
+            principal=Principal("alice", "alice@example.test", "t1", ["volundr:developer"]),
+        )
+        assert headers == {
+            "authorization": "Bearer t",
+            "cookie": "c",
+            "x-auth-user-id": "alice",
+            "x-auth-email": "alice@example.test",
+            "x-auth-tenant": "t1",
+            "x-auth-roles": "volundr:developer",
+        }
+
+    def test_outside_dev_without_a_verified_principal_forwards_no_identity(self):
+        headers = _proxy_forward_headers(
+            self._browser(), include_cookie=False, dev_identity=False, principal=None
+        )
+        assert headers == {"authorization": "Bearer t"}
+
+    def test_dev_identity_forwards_the_asserted_identity(self):
+        headers = _proxy_forward_headers(
+            self._browser(), include_cookie=False, dev_identity=True, principal=None
+        )
+        # Dev query params win over the headers they map onto.
+        assert headers["x-auth-user-id"] == "dev-victim"
+        assert headers["x-auth-tenant"] == "victim-tenant"
+        assert headers["x-auth-roles"] == "volundr:admin"
+        assert "x-unrelated" not in headers
+
+
 class TestProxyWsIdentity:
-    def test_envoy_headers(self):
-        user, tenant, roles = _proxy_ws_identity(
+    async def test_envoy_headers(self):
+        user, tenant, roles = await _proxy_ws_identity(
             _ws(
                 headers={
                     "x-auth-user-id": "alice",
@@ -39,71 +119,40 @@ class TestProxyWsIdentity:
         assert tenant == "t1"
         assert "volundr:admin" in roles
 
-    def test_dev_query_params(self):
-        user, tenant, roles = _proxy_ws_identity(
-            _ws(query={"devUserId": "bob", "devTenantId": "t2", "devRoles": "volundr:viewer"})
+    @pytest.mark.parametrize(
+        "carrier", ["authorization", "token", "access_token", "protocol", "dev"]
+    )
+    async def test_unsigned_credentials_cannot_establish_identity(self, carrier):
+        token = _jwt({"sub": "alice", "tenant": "t1", "roles": ["volundr:admin"]})
+        ws = {
+            "authorization": _ws(headers={"authorization": f"Bearer {token}"}),
+            "token": _ws(query={"token": token}),
+            "access_token": _ws(query={"access_token": token}),
+            "protocol": _ws(headers={"sec-websocket-protocol": f"volundr.bearer.{token}"}),
+            "dev": _ws(query={"devUserId": "alice", "devRoles": "volundr:admin"}),
+        }[carrier]
+        assert await _proxy_ws_identity(ws) == (None, None, ())
+
+    async def test_missing_claims_are_not_invented(self):
+        assert await _proxy_ws_identity(_ws(headers={"x-auth-user-id": "alice"})) == (
+            "alice",
+            "",
+            (),
         )
-        assert user == "bob"
-        assert tenant == "t2"
-        assert roles == ("volundr:viewer",)
 
-    def test_headers_win_over_query(self):
-        user, tenant, _roles = _proxy_ws_identity(
-            _ws(headers={"x-auth-user-id": "alice"}, query={"devUserId": "bob"})
-        )
-        assert user == "alice"
-        assert tenant == "default"
-
-    def test_no_identity(self):
-        user, tenant, roles = _proxy_ws_identity(_ws())
-        assert user is None
-        assert tenant is None
-        assert roles == ()
-
-    def test_bearer_envoy_token_query_param(self):
-        # web-next uses Envoy's configured ?token=<jwt> extraction on browser
-        # WebSocket upgrades; the app accepts the same token for direct mode.
-        token = _jwt({"sub": "carol", "tenant": "t3", "roles": ["volundr:developer"]})
-        user, tenant, roles = _proxy_ws_identity(_ws(query={"token": token}))
-        assert user == "carol"
-        assert tenant == "t3"
-        assert roles == ("volundr:developer",)
-
-    def test_bearer_access_token_query_param_remains_compatible(self):
-        token = _jwt({"sub": "carol"})
-        user, tenant, _roles = _proxy_ws_identity(_ws(query={"access_token": token}))
-        assert user == "carol"
-        assert tenant == "default"
-
-    def test_bearer_authorization_header(self):
-        token = _jwt({"sub": "dave"})
-        user, _tenant, _roles = _proxy_ws_identity(
-            _ws(headers={"authorization": f"Bearer {token}"})
-        )
-        assert user == "dave"
-
-    def test_bearer_subprotocol(self):
-        token = _jwt({"sub": "erin"})
-        user, _tenant, _roles = _proxy_ws_identity(
-            _ws(headers={"sec-websocket-protocol": f"volundr.bearer.{token}"})
-        )
-        assert user == "erin"
-
-    def test_bearer_keycloak_realm_roles(self):
-        token = _jwt({"sub": "frank", "realm_access": {"roles": ["volundr:admin"]}})
-        _user, _tenant, roles = _proxy_ws_identity(_ws(query={"access_token": token}))
-        assert roles == ("volundr:admin",)
-
-    def test_bearer_without_sub_is_no_identity(self):
-        token = _jwt({"name": "nobody"})
-        user, _tenant, _roles = _proxy_ws_identity(_ws(query={"access_token": token}))
-        assert user is None
+    async def test_no_identity(self):
+        assert await _proxy_ws_identity(_ws()) == (None, None, ())
 
 
 class TestMayAttach:
-    async def test_permissive_without_guard(self):
-        reg = SkuldPortRegistry()
+    async def test_dev_identity_registry_is_permissive_without_guard(self):
+        reg = SkuldPortRegistry(dev_identity=True)
         assert await reg.may_attach("s1", "anyone", None, ()) is True
+
+    async def test_fails_closed_without_guard_outside_dev_identity(self):
+        reg = SkuldPortRegistry()
+        with pytest.raises(SessionProxyGuardMissingError, match="set_ownership_guard"):
+            await reg.may_attach("s1", "anyone", None, ())
 
     async def test_guard_allows_owner(self):
         reg = SkuldPortRegistry()
@@ -195,7 +244,7 @@ class TestOwnershipGuardPolicy:
 async def test_browser_proxy_preserves_recent_replay_negotiation(monkeypatch, history, suffix):
     from niuu import session_proxy
 
-    reg = SkuldPortRegistry()
+    reg = _guarded_registry()
     reg.register("recent-session", 9123)
     ws = _ws(query={"history": history, "access_token": "do-not-forward-in-url"})
     ws.close = AsyncMock()
@@ -213,7 +262,7 @@ async def test_browser_proxy_preserves_recent_replay_negotiation(monkeypatch, hi
 async def test_browser_proxy_forwards_only_allowlisted_history_protocol_fields(monkeypatch):
     from niuu import session_proxy
 
-    reg = SkuldPortRegistry()
+    reg = _guarded_registry()
     reg.register("sender-session", 9123)
     ws = _ws(
         query={

@@ -1,8 +1,9 @@
 """REST adapter for the durable session event log (full-fidelity transcript).
 
-Two endpoints:
+Three endpoints:
   * ``POST /sessions/{id}/log``       — append frames (producer: skuld), idempotent
   * ``GET  /sessions/{id}/log``       — cursor replay (consumers: web, iOS)
+  * ``GET  /sessions/{id}/log/page``  — replay with raw cursor progress metadata
 
 The log is the transcript source of truth. Producers append every frame with a
 monotonic per-session ``seq``; consumers replay from ``?after=<seq>`` so a client
@@ -32,7 +33,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from niuu.domain.services.token_scope import (
     FORGE_NOTIFY_SCOPE,
@@ -200,6 +201,16 @@ class SessionLogEntryResponse(BaseModel):
         )
 
 
+class SessionLogPageResponse(BaseModel):
+    """Public entries plus the cursor position of the raw batch that was scanned."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    entries: list[SessionLogEntryResponse]
+    scanned_through: int = Field(alias="scannedThrough")
+    has_more: bool = Field(alias="hasMore")
+
+
 async def _project_notifications(
     notification_service: NotificationService,
     log_repository: SessionEventLogRepository,
@@ -282,15 +293,15 @@ def create_session_log_router(
     """
     router = APIRouter(prefix=prefix)
 
-    async def _check_access(request: Request, session_id: UUID, action: str) -> Session | None:
+    async def _check_access(request: Request, session_id: UUID, action: str) -> Session:
         if session_service is None:
-            return None
+            raise HTTPException(status_code=503, detail="Session authorization unavailable")
         from volundr.adapters.inbound.auth import extract_principal
 
         principal = await extract_principal(request)
         session = await session_service.get_session(session_id)
         if session is None:
-            return None
+            raise HTTPException(status_code=404, detail="Session not found")
         try:
             await session_service._check_access(session, principal, action)
         except SessionAccessDeniedError:
@@ -346,9 +357,8 @@ def create_session_log_router(
             await _append_conflict_sentinel(
                 log_repository, session_id=session_id, conflicting_seqs=conflicts, ts=now
             )
-        # Notifications are projected from the stored rows before the ack. An orphan
-        # log (no session row) has no owner, so it has no feed to project into.
-        if notification_service is not None and session is not None:
+        # Notifications are projected from the stored rows before the ack.
+        if notification_service is not None:
             await _project_notifications_isolated(
                 notification_service, log_repository, session, entries, conflicts
             )
@@ -374,6 +384,36 @@ def create_session_log_router(
         await _check_access(request, session_id, "read")
         latest = await log_repository.latest_seq(session_id)
         return LogHeadResponse(latest_seq=latest)
+
+    @router.get(
+        "/sessions/{session_id}/log/page",
+        response_model=SessionLogPageResponse,
+        tags=["Events"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
+    async def replay_log_page(
+        request: Request,
+        session_id: UUID = Path(description="Session UUID to replay the log for"),
+        after: int = Query(default=0, ge=0),
+        limit: int = Query(default=DEFAULT_REPLAY_LIMIT, ge=1, le=MAX_REPLAY_LIMIT),
+        show_internal: bool = Query(default=default_show_internal),
+    ) -> SessionLogPageResponse:
+        """Return a public page while preserving progress through filtered raw rows."""
+        await _check_access(request, session_id, "read")
+        raw_entries = await log_repository.read_after(
+            session_id,
+            after_seq=after,
+            limit=limit,
+        )
+        streamable = [
+            entry for entry in raw_entries if not is_read_path_excluded(entry.kind, entry.payload)
+        ]
+        gated = _gate_entries(streamable, show_internal=show_internal)
+        return SessionLogPageResponse(
+            entries=[SessionLogEntryResponse.from_entry(entry) for entry in gated],
+            scanned_through=max((entry.seq for entry in raw_entries), default=after),
+            has_more=len(raw_entries) == limit,
+        )
 
     @router.get(
         "/sessions/{session_id}/log",

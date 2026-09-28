@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path as FilePath
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -32,6 +32,7 @@ from niuu.domain.services.token_scope import (
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
 from niuu.forge_mcp.models import ForgeMcpGrant
+from niuu.room_access import ROOM_ROLE_HEADER
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
 from skuld.conversation_snapshot import (
     ConversationSnapshotTooLargeError,
@@ -46,13 +47,19 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
-from volundr.adapters.inbound.forge_session_auth import require_bound_session, session_token_in
+from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.adapters.inbound.rest_projects import (
     create_projects_router,
     create_session_projects_router,
     project_result,
 )
 from volundr.config import PermissionAutoApprovalConfig
+from volundr.domain.execution_catalog import (
+    ExecutionCatalogError,
+    ExecutionCatalogNotFoundError,
+    ExecutionPlanMismatchError,
+    ExecutionSelectionError,
+)
 from volundr.domain.history_import import (
     HistoryImportConflictError,
     HistoryImportError,
@@ -77,7 +84,6 @@ from volundr.domain.models import (
     SessionActivityState,
     SessionSource,
     SessionStatus,
-    TimelineEvent,
     TimelineEventType,
     WorkspaceStatus,
 )
@@ -90,6 +96,7 @@ from volundr.domain.ports import (
 )
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.services import (
+    ChronicleAccessDeniedError,
     ChronicleNotFoundError,
     ChronicleService,
     ExternalSessionAlreadyImportedError,
@@ -104,6 +111,8 @@ from volundr.domain.services import (
     RepoValidationError,
     SessionAccessDeniedError,
     SessionArchiveNotAvailableError,
+    SessionCapacityError,
+    SessionEventStream,
     SessionNotFoundError,
     SessionNotRunningError,
     SessionService,
@@ -118,6 +127,8 @@ from volundr.domain.services.forge_session_launch import (
 from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
 )
+from volundr.domain.services.session_participants import SessionParticipantService
+from volundr.domain.session_participants import SessionParticipant
 from volundr.domain.session_read_state import (
     SessionReadState,
     SessionReadStateChange,
@@ -137,14 +148,34 @@ OPENSHELL_SERVICE_HOST_SUFFIX = ".openshell.localhost"
 # a short grace is correct: a no-ACK is reported as pending/accepted, never "sent".
 SEND_MESSAGE_ACK_GRACE_SECONDS = 3.0
 
-# Disk root for generated tool-result image previews. ~/.niuu is the platform's
-# durable local-state home (workspaces, forge-state.json), so previews survive
-# restarts by construction. Tests inject their own PreviewCache via create_router.
-_PREVIEW_CACHE_ROOT = FilePath("~/.niuu/preview-cache").expanduser()
+# Default disk root for generated tool-result image previews (the mini-mode
+# host's ~/.niuu tree). volundr.main passes Settings.preview_cache_dir instead;
+# tests inject their own PreviewCache or a tmp preview_cache_dir.
+DEFAULT_PREVIEW_CACHE_DIR = FilePath("~/.niuu/preview-cache").expanduser()
 
 # A tool_use_id's result is immutable — a regenerated preview is byte-equivalent —
 # so previews are safely long-lived cacheable at every layer (incl. URLSession).
 _PREVIEW_RESPONSE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+
+
+def _execution_catalog_http_error(
+    exc: ExecutionCatalogError | ExecutionSelectionError,
+) -> HTTPException:
+    """Map only explicit execution-catalog failures to stable public responses."""
+    if isinstance(exc, (ExecutionSelectionError, ExecutionCatalogNotFoundError)):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid compute execution selection",
+        )
+    if isinstance(exc, ExecutionPlanMismatchError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Compute execution selection conflicts with its durable allocation",
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Compute execution catalog is unavailable",
+    )
 
 
 def _public_session_endpoint(
@@ -692,6 +723,11 @@ class SessionStart(BaseModel):
         description="Launch spec name to use when starting",
     )
 
+    integration_ids: list[str] | None = Field(
+        default=None,
+        description="Integration connection IDs to use on restart; omitted preserves the selection",
+    )
+
     model_config = {
         "json_schema_extra": {
             "example": {
@@ -908,7 +944,7 @@ class SessionResponse(BaseModel):
         description="Kubernetes pod name (null when not running)",
     )
     error: str | None = Field(
-        description="Error message if session is in failed state",
+        description="Failure reason or non-terminal runtime status detail",
     )
     tracker_issue_id: str | None = Field(
         default=None,
@@ -1092,6 +1128,34 @@ class SessionResponse(BaseModel):
             external_session_id=session.external_session_id,
             cli_session_id=session.cli_session_id,
         )
+
+
+class SessionRoomInfo(BaseModel):
+    """The caller's own durable grant on a session they participate in."""
+
+    role: str = Field(description="observer/teacher/debugger/approver")
+    participant_status: str = Field(description="invited/active/revoked")
+    expires_at: str | None = Field(default=None, description="ISO 8601 grant expiry, if any")
+
+
+class SessionRoomSummary(BaseModel):
+    """Room-visibility shape for a session the caller participates in but does
+    not own. Deliberately excludes everything ``SessionResponse`` exposes
+    beyond identity/status: repo, branch, local_path, code_endpoint, pod_name,
+    error, activity_metadata, and external ids stay owner/admin-only — Cedar
+    authorizes this shape through ``read_room``, never ``read`` (see
+    ForgeService.list_participant_only_sessions). The web client uses
+    ``room.role`` to decide whether it can attach at all, and if so with what
+    proxied capability; the actual attach/message gating still runs
+    server-side (session proxy + Skuld broker), this is only for rendering.
+    """
+
+    kind: Literal["room_summary"] = "room_summary"
+    id: UUID = Field(description="Unique session identifier")
+    name: str = Field(description="Human-readable session name")
+    status: SessionStatus = Field(description="Current lifecycle status")
+    owner_id: str | None = Field(default=None, description="User ID of the session owner")
+    room: SessionRoomInfo
 
 
 class SessionEndpoints(BaseModel):
@@ -1440,18 +1504,21 @@ class TimelineEventCreate(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    """Response model for aggregate statistics."""
+    """Response model for aggregate statistics. "Today" is the current UTC day."""
 
     active_sessions: int = Field(default=0, description="Currently running sessions")
     total_sessions: int = Field(default=0, description="Total sessions (all statuses)")
-    sessions_today: int = Field(default=0, description="Sessions created today")
-    tokens_today: int = Field(default=0, description="Tokens consumed today")
-    local_tokens: int = Field(default=0, description="Tokens from local models today")
-    cloud_tokens: int = Field(default=0, description="Tokens from cloud models today")
-    cost_today: float = Field(default=0.0, description="Total cloud cost today in USD")
+    sessions_today: int = Field(default=0, description="Sessions created today (UTC)")
+    tokens_today: int = Field(default=0, description="Tokens consumed today (UTC)")
+    local_tokens: int = Field(default=0, description="Tokens from local models today (UTC)")
+    cloud_tokens: int = Field(default=0, description="Tokens from cloud models today (UTC)")
+    cost_today: float = Field(default=0.0, description="Total cloud cost today (UTC) in USD")
     sparklines: dict[str, list[float]] = Field(
         default_factory=dict,
-        description="Historical KPI samples for lightweight dashboard sparklines",
+        description=(
+            "Historical KPI samples for lightweight dashboard sparklines; "
+            "sessionsToday holds one count per UTC day, oldest first, ending today"
+        ),
     )
 
 
@@ -1565,16 +1632,26 @@ def create_router(
     server_public_host: str = "127.0.0.1",
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     preview_cache: PreviewCache | None = None,
+    preview_cache_dir: FilePath | str = DEFAULT_PREVIEW_CACHE_DIR,
     project_service=None,
     runtime_build: dict | None = None,
     runtime_health_timeout: float = 3.0,
     history_max_turns: int = 15,
     history_max_bytes: int = 256 * 1024,
+    session_participant_service: SessionParticipantService,
 ) -> APIRouter:
     """Create FastAPI router with session, stats, token, repo, and SSE endpoints."""
     router = APIRouter(prefix=prefix)
     if preview_cache is None:
-        preview_cache = PreviewCache(_PREVIEW_CACHE_ROOT)
+        preview_cache = PreviewCache(preview_cache_dir)
+    event_stream = None
+    if broadcaster is not None:
+        if stats_service is None:
+            raise ValueError(
+                "The session event stream computes stats_updated per subscriber; "
+                "pass stats_service together with broadcaster"
+            )
+        event_stream = SessionEventStream(broadcaster, session_service, stats_service)
 
     def _session_response(session: Session) -> SessionResponse:
         return SessionResponse.from_session(session, public_host=server_public_host)
@@ -1603,6 +1680,7 @@ def create_router(
         chronicle_service=chronicle_service,
         archive_service=archive_service,
         project_service=project_service,
+        session_participant_service=session_participant_service,
     )
 
     def _require_bound_workload_session(request: Request, session_id: UUID) -> None:
@@ -1614,27 +1692,33 @@ def create_router(
         Allows dev mode (no IDP) to work without auth headers while
         production deployments enforce tenant/ownership scoping.
 
+        ``strict`` is for endpoints where an unidentified reader is meaningless
+        (e.g. per-reader inbox state): even a dev-mode deployment with no IDP
+        configured must still 401 rather than silently pick a reader.
+
         When a principal is found, also ensures the user row exists
         via the identity adapter's JIT provisioning.
         """
         identity = getattr(request.app.state, "identity", None)
         if identity is None:
+            if strict:
+                raise HTTPException(status_code=401, detail="Reader identity is required")
             return None
 
         from volundr.adapters.inbound.auth import extract_principal
 
-        try:
-            principal = await extract_principal(request)
-        except HTTPException:
-            # A presented session credential is never downgraded to anonymous.
-            if strict or session_token_in(request.scope):
-                raise
-            return None
+        principal = await extract_principal(request)
+
+        from niuu.ports.identity import UserProvisioningError
 
         try:
             await identity.get_or_provision_user(principal)
-        except Exception:
-            logger.warning("JIT user provisioning failed for %s", principal.user_id, exc_info=True)
+        except UserProvisioningError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="User provisioning unavailable",
+                headers={"Retry-After": "5"},
+            ) from exc
 
         return principal
 
@@ -1646,10 +1730,47 @@ def create_router(
 
         return not isinstance(identity, AllowAllIdentityAdapter)
 
+    @contextlib.contextmanager
+    def _chronicle_errors():
+        """Map chronicle scoping and authorization failures onto HTTP statuses.
+
+        History outside the caller's scope is reported as not found, so its
+        existence is not disclosed; history the caller can see but may not
+        change is forbidden.
+        """
+        try:
+            yield
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+        except (ChronicleAccessDeniedError, SessionAccessDeniedError) as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        except (ChronicleNotFoundError, SessionNotFoundError) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+
+    async def _check_room_access(
+        session: Session, principal: Principal | None, action: str
+    ) -> None:
+        """Authorize a room-scoped action (``read_room``/``resolve_gate``).
+
+        Delegates to ``SessionParticipantService`` so an ACTIVE, unexpired
+        participant grant (not just the owner/admin) is honoured.
+        ``session_participant_service`` is a required dependency of this
+        router (see ``create_router``'s signature) — there is no degraded
+        owner/admin-only path when it is missing, because that would
+        silently narrow every room grant back to ownership alone the moment
+        the wiring drifted, which is exactly the failure mode this service
+        exists to prevent.
+        """
+        await session_participant_service.check_room_access(session, principal, action)
+
     if project_service is not None:
 
         async def project_principal(request: Request):
-            return await _optional_principal(request, strict=_strict_identity_enabled(request))
+            return await _optional_principal(request)
 
         router.include_router(create_projects_router(project_service, project_principal))
         router.include_router(create_session_projects_router(project_service, project_principal))
@@ -1663,12 +1784,14 @@ def create_router(
         """
         settings = request.app.state.settings
         admin = request.app.state.admin_settings
+        storage = request.app.state.storage
         # True exactly when the notification feed routes are served on this host.
         notifications = getattr(request.app.state, "notification_service", None) is not None
         session_tokens = getattr(request.app.state, "forge_session_tokens", None)
         return {
             "local_mounts_enabled": settings.local_mounts.enabled,
             "file_manager_enabled": admin.get("storage", {}).get("file_manager_enabled", True),
+            "home_volumes_supported": storage.supports_home_volumes,
             "mini_mode": settings.local_mounts.mini_mode,
             "local_mounts_allowed_prefixes": settings.local_mounts.allowed_prefixes,
             "capabilities": {
@@ -1711,6 +1834,11 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=str(e),
             )
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Could not fetch branches from the Git provider; try again shortly.",
+            ) from e
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1721,39 +1849,14 @@ def create_router(
         """Bind the shared Forge facade to the request-scoped workspace service."""
         return forge.with_workspace_service(request.app.state.workspace_service)
 
-    @router.get(
-        "/sessions",
-        response_model=list[SessionResponse],
-        tags=["Sessions"],
-        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
-    )
-    async def list_sessions(
-        request: Request,
-        response: Response,
-        scope: Literal["local", "guild"] = Query(
-            default="local", description="Standalone Forge always serves its own local sessions"
-        ),
-        status_filter: SessionStatus | None = Query(
-            default=None, alias="status", description="Filter by session status"
-        ),
-        include_archived: bool = Query(
-            default=False, description="Include archived sessions in results"
-        ),
-        project_id: UUID | None = Query(default=None),
-        role: str | None = Query(default=None),
-        parent_session_id: UUID | None = Query(default=None),
-        parent_instance_id: str | None = Query(default=None),
-    ) -> list[SessionResponse]:
-        """List all sessions. Archived sessions are excluded by default."""
-        response.headers["X-Forge-Session-Scope"] = "local"
-        principal = await _optional_principal(request)
-        if principal is None and _strict_identity_enabled(request):
-            return []
-        sessions = await forge.list_sessions(
-            status=status_filter,
-            include_archived=include_archived,
-            principal=principal,
-        )
+    def _coordination_filtered(
+        sessions: list[Session],
+        *,
+        project_id: UUID | None,
+        role: str | None,
+        parent_session_id: UUID | None,
+        parent_instance_id: str | None,
+    ) -> list[Session]:
         if project_id is not None:
             sessions = [
                 s for s in sessions if s.coordination and s.coordination.project_id == project_id
@@ -1775,8 +1878,91 @@ def create_router(
                     or s.coordination.parent.instance_id == parent_instance_id
                 )
             ]
+        return sessions
+
+    def _room_summary(session: Session, grant: SessionParticipant) -> SessionRoomSummary:
+        return SessionRoomSummary(
+            id=session.id,
+            name=session.name,
+            status=session.status,
+            owner_id=session.owner_id,
+            room=SessionRoomInfo(
+                role=grant.role.value,
+                participant_status=grant.status.value,
+                expires_at=grant.expires_at.isoformat() if grant.expires_at else None,
+            ),
+        )
+
+    @router.get(
+        "/sessions",
+        response_model=None,
+        tags=["Sessions"],
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+    )
+    async def list_sessions(
+        request: Request,
+        response: Response,
+        scope: Literal["local", "guild"] = Query(
+            default="local", description="Standalone Forge always serves its own local sessions"
+        ),
+        status_filter: SessionStatus | None = Query(
+            default=None, alias="status", description="Filter by session status"
+        ),
+        include_archived: bool = Query(
+            default=False, description="Include archived sessions in results"
+        ),
+        project_id: UUID | None = Query(default=None),
+        role: str | None = Query(default=None),
+        parent_session_id: UUID | None = Query(default=None),
+        parent_instance_id: str | None = Query(default=None),
+    ) -> list[SessionResponse | SessionRoomSummary]:
+        """List all sessions. Archived sessions are excluded by default.
+
+        A session the caller owns (or is tenant-admin/viewer for) renders as
+        the full ``SessionResponse``. A session the caller only actively
+        participates in (an invited, accepted session_participants grant)
+        renders as the smaller ``SessionRoomSummary`` instead — it is
+        authorized through Cedar's ``read_room``, never ``read``, so it must
+        never carry what ``read`` alone unlocks (repo/branch/local_path,
+        pod_name, error, activity_metadata, external ids).
+        """
+        response.headers["X-Forge-Session-Scope"] = "local"
+        principal = await _optional_principal(request)
+        if principal is None and _strict_identity_enabled(request):
+            return []
+        sessions = await forge.list_sessions(
+            status=status_filter,
+            include_archived=include_archived,
+            principal=principal,
+        )
+        sessions = _coordination_filtered(
+            sessions,
+            project_id=project_id,
+            role=role,
+            parent_session_id=parent_session_id,
+            parent_instance_id=parent_instance_id,
+        )
         sessions = await forge.with_read_states(sessions, principal)
-        return [_session_response(s) for s in sessions]
+        result: list[SessionResponse | SessionRoomSummary] = [
+            _session_response(s) for s in sessions
+        ]
+
+        room_pairs = await forge.list_participant_only_sessions(
+            status=status_filter,
+            include_archived=include_archived,
+            principal=principal,
+            exclude_ids=frozenset(s.id for s in sessions),
+        )
+        room_sessions = _coordination_filtered(
+            [s for s, _grant in room_pairs],
+            project_id=project_id,
+            role=role,
+            parent_session_id=parent_session_id,
+            parent_instance_id=parent_instance_id,
+        )
+        room_session_ids = {s.id for s in room_sessions}
+        result.extend(_room_summary(s, g) for s, g in room_pairs if s.id in room_session_ids)
+        return result
 
     @router.get(
         "/sessions/stream",
@@ -1785,7 +1971,13 @@ def create_router(
     )
     async def stream_sessions(
         request: Request,
-        scope: Literal["local", "guild"] = Query(default="local"),
+        scope: Literal["local"] = Query(
+            default="local",
+            description=(
+                "A standalone Forge streams only its own sessions. Guild aggregation "
+                "is served by the Niuu host's /api/v1/forge/sessions/stream."
+            ),
+        ),
     ) -> StreamingResponse:
         """Stream real-time session updates via Server-Sent Events (SSE).
 
@@ -1797,6 +1989,11 @@ def create_router(
         - heartbeat: Keep-alive signal (every 30s)
         - session_notification: A new notification (sent only to its owner or an admin)
 
+        Session events are scoped like ``GET /sessions``: a caller receives
+        events for its own sessions, or for its tenant's sessions as a tenant
+        admin. ``stats_updated`` carries the figures ``GET /stats`` returns to
+        the same caller.
+
         Events are formatted as SSE:
         ```
         event: session_updated
@@ -1804,12 +2001,18 @@ def create_router(
 
         ```
         """
-        if broadcaster is None:
+        if event_stream is None:
             logger.warning("SSE stream requested but broadcaster is None")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Event streaming not available",
             )
+
+        principal = await _optional_principal(request)
+        try:
+            event_stream.authorize(principal)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
         client_host = request.client.host if request.client else "unknown"
         logger.info("SSE stream: client connected from %s", client_host)
@@ -1817,7 +2020,7 @@ def create_router(
         # receives one. With no identity adapter at all (bare dev app) nothing is
         # scoped; with one, an unidentified client gets no notification events.
         open_stream = getattr(request.app.state, "identity", None) is None
-        viewer = None if open_stream else await _optional_principal(request)
+        viewer = None if open_stream else principal
 
         def _visible(event: RealtimeEvent) -> bool:
             if event.type is not EventType.SESSION_NOTIFICATION or open_stream:
@@ -1835,7 +2038,7 @@ def create_router(
         async def event_generator():
             event_count = 0
             try:
-                async for event in broadcaster.subscribe():
+                async for event in event_stream.subscribe(principal):
                     # Check if client disconnected
                     if await request.is_disconnected():
                         logger.info(
@@ -1946,7 +2149,7 @@ def create_router(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="External session discovery not available",
             )
-        principal = await _optional_principal(request, strict=True)
+        principal = await _optional_principal(request)
         try:
             session = await external_session_service.import_session(
                 provider=data.provider,
@@ -1989,7 +2192,7 @@ def create_router(
         """
         if external_session_service is None:
             raise HTTPException(status_code=503, detail="External session discovery not available")
-        principal = await _optional_principal(request, strict=True)
+        principal = await _optional_principal(request)
         try:
             return await external_session_service.backfill_session(session_id, principal)
         except (SessionAccessDeniedError, ExternalSessionPathNotAllowedError) as e:
@@ -2014,6 +2217,7 @@ def create_router(
         responses={
             422: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
         },
         tags=["Sessions"],
     )
@@ -2033,10 +2237,7 @@ def create_router(
         A Valkyrie build token must carry the ``forge:session:create`` scope;
         ordinary human PATs and workload tokens are unaffected.
         """
-        principal = await _optional_principal(
-            request,
-            strict=data.coordination is not None and _strict_identity_enabled(request),
-        )
+        principal = await _optional_principal(request)
         try:
             started = await project_result(
                 forge.create_and_start_session(data, principal=principal)
@@ -2048,11 +2249,18 @@ def create_router(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(e),
             )
+        except SessionCapacityError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            )
         except SessionStateError as e:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(e),
             )
+        except (ExecutionCatalogError, ExecutionSelectionError) as e:
+            raise _execution_catalog_http_error(e) from e
         return _session_response(started)
 
     @router.get(
@@ -2075,7 +2283,7 @@ def create_router(
 
         principal = await _optional_principal(request)
         try:
-            await forge.ensure_access(session, principal)
+            await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2085,6 +2293,59 @@ def create_router(
         session = (await forge.with_read_states([session], principal))[0]
         return _session_response(session)
 
+    @router.get(
+        "/sessions/{session_id}/room",
+        response_model=SessionRoomSummary,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def get_session_room(
+        request: Request, session_id: UUID = Path(description="Unique session identifier")
+    ) -> SessionRoomSummary:
+        """Room-scoped session view for a participant who does not own the session.
+
+        ``GET /sessions/{id}`` requires "read" (owner/admin/tenant-viewer
+        only) and 403s a participant. This is the room-scoped equivalent,
+        authorized by "read_room" instead — the same action that lets a
+        participant open the room's websocket, gates, and transcript. The
+        owner/admin may call it too; Cedar grants them read_room as well.
+        """
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        principal = await _optional_principal(request)
+        try:
+            await _check_room_access(session, principal, "read_room")
+        except PermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication is required to open this room",
+            )
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+
+        grant = None
+        if principal is not None:
+            grant = await session_participant_service.get_own_grant(session_id, principal.user_id)
+        if grant is not None and grant.is_active:
+            return _room_summary(session, grant)
+        # No active grant: read_room passed some other way (owner/admin),
+        # which Cedar only ever grants that role without a room_* attribute
+        # match.
+        return SessionRoomSummary(
+            id=session.id,
+            name=session.name,
+            status=session.status,
+            owner_id=session.owner_id,
+            room=SessionRoomInfo(role="owner", participant_status="active"),
+        )
+
     @router.get("/sessions/{session_id}/runtime-version", tags=["Sessions"])
     async def get_runtime_version(request: Request, session_id: UUID) -> dict:
         """Inspect the loaded gateway, without restarting it or trusting stored activity."""
@@ -2093,7 +2354,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found")
         principal = await _optional_principal(request)
         try:
-            await forge.ensure_access(session, principal)
+            await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError:
             raise HTTPException(status_code=403, detail="Access denied") from None
         result = {"available": runtime_build, "current": None, "state": "unavailable"}
@@ -2184,7 +2445,7 @@ def create_router(
 
         principal = await _optional_principal(request)
         try:
-            await forge.ensure_access(session, principal, "view")
+            await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2280,7 +2541,9 @@ def create_router(
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
         },
         tags=["Sessions"],
     )
@@ -2290,7 +2553,9 @@ def create_router(
         response_model=SessionResponse,
         responses={
             404: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
         },
         tags=["Sessions"],
     )
@@ -2313,6 +2578,7 @@ def create_router(
                 session_id,
                 launch_spec=launch_spec,
                 principal=principal,
+                integration_ids=data.integration_ids if data else None,
             )
             return _session_response(session)
         except ForgeMcpGrantEscalationError as e:
@@ -2327,11 +2593,18 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session not found: {session_id}",
             )
+        except SessionCapacityError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            )
         except SessionStateError as e:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(e),
             )
+        except (ExecutionCatalogError, ExecutionSelectionError) as e:
+            raise _execution_catalog_http_error(e) from e
 
     @router.post(
         "/sessions/{session_id}/stop",
@@ -2603,13 +2876,16 @@ def create_router(
 
     @router.get("/stats", response_model=StatsResponse, tags=["Models & Stats"])
     async def get_stats(request: Request) -> StatsResponse:
-        """Get aggregate statistics for the dashboard."""
-        if _strict_identity_enabled(request):
-            principal = await _optional_principal(request)
-            if principal is None:
-                return StatsResponse()
+        """Get aggregate statistics over the sessions the caller may list.
+
+        Scoped like ``GET /sessions``: the caller's own sessions, or its
+        tenant's sessions as a tenant admin.
+        """
+        principal = await _optional_principal(request)
         try:
-            stats = await forge.get_stats()
+            stats = await forge.get_stats(principal)
+        except PermissionError as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3049,7 +3325,6 @@ def create_router(
 
         # Keep the caller's identity across a timeout/retry. The broker atomically
         # claims it in durable storage before dispatching to the native process.
-        import re
 
         req_id = body.get("request_id") or str(uuid4())
         if not isinstance(req_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", req_id):
@@ -3403,7 +3678,7 @@ def create_router(
                         logger.info(
                             "[seam] after_id mismatch session=%s after=%d held=%s server=%s",
                             _sanitize_log(session_id),
-                            after,
+                            int(after),
                             _sanitize_log(after_id),
                             _sanitize_log(anchor_id),
                         )
@@ -3459,9 +3734,9 @@ def create_router(
                 detail=f"Session not found: {session_id}",
             )
 
-        principal = await _optional_principal(request, strict=True)
+        principal = await _optional_principal(request)
         try:
-            await forge.ensure_access(session, principal)
+            await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError as exc:
             raise HTTPException(403, f"Access denied to session {session_id}") from exc
 
@@ -4025,6 +4300,26 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session not found: {session_id}",
             )
+        principal = await _optional_principal(request)
+        try:
+            # read_room OR read: the gate list is room state, visible to any
+            # active session_participants grant (read_room), but must not
+            # take away what a tenant volundr:viewer already had under
+            # plain "read" — session-viewer grants "read", never "read_room".
+            await _check_room_access(session, principal, "read_room")
+        except PermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication is required to read gates for this session",
+            )
+        except SessionAccessDeniedError:
+            try:
+                await forge.ensure_access(session, principal, "read")
+            except SessionAccessDeniedError:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to read gates for this session",
+                )
         if not session.chat_endpoint:
             return {"gates": []}
 
@@ -4102,7 +4397,19 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session {session_id} has no active endpoint",
             )
-        if session.owner_id and session.owner_id != principal.user_id:
+        # An empty owner_id must never grant access: delegate to the same
+        # Cedar-backed authorization path every other mutating session route
+        # uses. "resolve_gate" (not "update"): only the owner/admin or an
+        # ACTIVE, unexpired session_participants grant with role=approver may
+        # resolve a gate (session-owner / session-participant-approver).
+        try:
+            await _check_room_access(session, principal, "resolve_gate")
+        except PermissionError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication is required to resolve gates for this session",
+            )
+        except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Not authorized to resolve gates for this session",
@@ -4115,6 +4422,26 @@ def create_router(
         intent = request.headers.get(WORKFLOW_GATE_INTENT_HEADER)
         if intent:
             headers[WORKFLOW_GATE_INTENT_HEADER] = intent
+        # "approver" is the minimum tier check_room_access("resolve_gate") above
+        # could have just accepted (session-owner or session-participant-approver
+        # are Cedar's only permit rules for it), so it always satisfies the
+        # broker's own ROOM_ROLES_MAY_RESOLVE_GATES gate. This header is only
+        # trustworthy when it survives to the broker unmodified: the mini-mode
+        # session proxy forwards it as-is (ws_auth.room_role_source: proxy).
+        # Every other backend (Kubernetes, OpenShell, VM) strips any
+        # client-supplied copy on the way in and ignores it entirely
+        # (ws_auth.room_role_source: deployment, the default) — that pod's
+        # own auth boundary already gates every caller who reaches it, and
+        # participants (so a non-owner "approver" grant) are not supported
+        # there at all, so this header is simply inert on that path, not
+        # load-bearing. Do not try to authenticate that hop with a separate
+        # scoped credential: the sidecar ext_authz routes have no
+        # required_scope concept, so a scoped token is refused there and the
+        # deployment-mode middleware refuses it before that check even runs
+        # on a non-enforced pod — there is no topology where a Skuld-side
+        # scoped token for this route actually works. The Kubernetes owner
+        # already resolves via room_role_source=deployment instead.
+        headers[ROOM_ROLE_HEADER] = "approver"
 
         try:
             proxy_url, routing_headers = _http_proxy_target(
@@ -4167,7 +4494,7 @@ def create_router(
             )
         principal = await _optional_principal(request)
         try:
-            await forge.ensure_access(session, principal, "view")
+            await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4391,6 +4718,8 @@ def create_router(
         response_model=ChronicleResponse,
         status_code=status.HTTP_201_CREATED,
         responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
             404: {"model": ErrorResponse},
             503: {"model": ErrorResponse},
         },
@@ -4405,43 +4734,34 @@ def create_router(
 
         Creates a new DRAFT chronicle or enriches an existing one.
         Mirrors the ``/sessions/{id}/usage`` pattern for token reporting.
+        The caller must be allowed ``report_chronicle`` on the session's history.
         """
-        # Authorization: caller must own the session
         principal = await _optional_principal(request)
-        session = await forge.get_session(session_id)
-        if session is not None and principal is not None:
-            try:
-                await forge.ensure_access(session, principal, "report_chronicle")
-            except SessionAccessDeniedError:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Not authorized to report chronicle for session {session_id}",
-                )
-
-        try:
+        with _chronicle_errors():
             chronicle = await forge.create_or_update_chronicle_from_broker(
                 session_id=session_id,
+                principal=principal,
                 summary=data.summary,
                 key_changes=data.key_changes,
                 unfinished_work=data.unfinished_work,
                 duration_seconds=data.duration_seconds,
             )
-            return ChronicleResponse.from_chronicle(chronicle)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
-        except SessionNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session not found: {session_id}",
-            )
+        return ChronicleResponse.from_chronicle(chronicle)
 
     # --- Chronicle endpoints ---
+    #
+    # Chronicles are scoped like GET /sessions: a caller sees its own history,
+    # or its tenant's as a tenant admin. History outside that scope is 404;
+    # history the caller sees but may not change is 403.
 
-    @router.get("/chronicles", response_model=list[ChronicleResponse], tags=["Chronicles"])
+    @router.get(
+        "/chronicles",
+        response_model=list[ChronicleResponse],
+        responses={401: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        tags=["Chronicles"],
+    )
     async def list_chronicles(
+        request: Request,
         project: str | None = Query(
             default=None,
             description="Filter by project name",
@@ -4470,10 +4790,12 @@ def create_router(
             description="Number of results to skip for pagination",
         ),
     ) -> list[ChronicleResponse]:
-        """List chronicles with optional filters."""
+        """List the chronicles the caller may read, with optional filters."""
         tag_list = [t.strip() for t in tags.split(",")] if tags else None
-        try:
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
             chronicles = await forge.list_chronicles(
+                principal=principal,
                 project=project,
                 repo=repo,
                 model=model_name,
@@ -4481,53 +4803,45 @@ def create_router(
                 limit=limit,
                 offset=offset,
             )
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
         return [ChronicleResponse.from_chronicle(c) for c in chronicles]
 
     @router.post(
         "/chronicles",
         response_model=ChronicleResponse,
         status_code=status.HTTP_201_CREATED,
-        responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
         tags=["Chronicles"],
     )
-    async def create_chronicle(data: ChronicleCreate) -> ChronicleResponse:
+    async def create_chronicle(request: Request, data: ChronicleCreate) -> ChronicleResponse:
         """Create a chronicle from a session's current state."""
-        try:
-            chronicle = await forge.create_chronicle(data.session_id)
-            return ChronicleResponse.from_chronicle(chronicle)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
-        except SessionNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session not found: {data.session_id}",
-            )
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            chronicle = await forge.create_chronicle(data.session_id, principal=principal)
+        return ChronicleResponse.from_chronicle(chronicle)
 
     @router.get(
         "/chronicles/{chronicle_id}",
         response_model=ChronicleResponse,
-        responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        responses={
+            401: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
         tags=["Chronicles"],
     )
     async def get_chronicle(
+        request: Request,
         chronicle_id: UUID = Path(description="Unique chronicle identifier"),
     ) -> ChronicleResponse:
         """Get a chronicle by ID."""
-        try:
-            chronicle = await forge.get_chronicle(chronicle_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            chronicle = await forge.get_chronicle(chronicle_id, principal=principal)
         if chronicle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -4538,121 +4852,121 @@ def create_router(
     @router.patch(
         "/chronicles/{chronicle_id}",
         response_model=ChronicleResponse,
-        responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
         tags=["Chronicles"],
     )
     async def update_chronicle(
+        request: Request,
         chronicle_id: UUID = Path(description="Unique chronicle identifier"),
         data: ChronicleUpdate = ...,
     ) -> ChronicleResponse:
         """Update a chronicle's mutable fields."""
-        try:
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
             chronicle = await forge.update_chronicle(
                 chronicle_id,
+                principal=principal,
                 summary=data.summary,
                 key_changes=data.key_changes,
                 unfinished_work=data.unfinished_work,
                 tags=data.tags,
                 status=data.status,
             )
-            return ChronicleResponse.from_chronicle(chronicle)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
-        except ChronicleNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Chronicle not found: {chronicle_id}",
-            )
+        return ChronicleResponse.from_chronicle(chronicle)
 
     @router.delete(
         "/chronicles/{chronicle_id}",
         status_code=status.HTTP_204_NO_CONTENT,
-        responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
         tags=["Chronicles"],
     )
     async def delete_chronicle(
+        request: Request,
         chronicle_id: UUID = Path(description="Unique chronicle identifier"),
     ) -> None:
         """Delete a chronicle."""
-        try:
-            deleted = await forge.delete_chronicle(chronicle_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
-        if not deleted:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Chronicle not found: {chronicle_id}",
-            )
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            await forge.delete_chronicle(chronicle_id, principal=principal)
 
     @router.post(
         "/chronicles/{chronicle_id}/reforge",
         response_model=SessionResponse,
-        responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
         tags=["Chronicles"],
     )
     async def reforge_chronicle(
+        request: Request,
         chronicle_id: UUID = Path(description="Unique chronicle identifier"),
     ) -> SessionResponse:
-        """Relaunch a session from a chronicle entry."""
+        """Relaunch a session from a chronicle entry, owned by the caller."""
+        principal = await _optional_principal(request)
         try:
-            session = await forge.reforge_chronicle(chronicle_id)
-            return _session_response(session)
-        except RuntimeError as e:
+            with _chronicle_errors():
+                session = await forge.reforge_chronicle(chronicle_id, principal=principal)
+        except RepoValidationError as e:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(e),
-            )
-        except ChronicleNotFoundError:
+            ) from e
+        except SessionCapacityError as e:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Chronicle not found: {chronicle_id}",
-            )
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(e),
+            ) from e
+        return _session_response(session)
 
     @router.get(
         "/chronicles/{chronicle_id}/chain",
         response_model=list[ChronicleResponse],
-        responses={503: {"model": ErrorResponse}},
+        responses={401: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
         tags=["Chronicles"],
     )
     async def get_chronicle_chain(
+        request: Request,
         chronicle_id: UUID = Path(description="Unique chronicle identifier"),
     ) -> list[ChronicleResponse]:
-        """Get the full reforge chain for a chronicle."""
-        try:
-            chain = await forge.get_chronicle_chain(chronicle_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
+        """Get the reforge chain for a chronicle, limited to what the caller may read."""
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            chain = await forge.get_chronicle_chain(chronicle_id, principal=principal)
         return [ChronicleResponse.from_chronicle(c) for c in chain]
 
     @router.get(
         "/sessions/{session_id}/chronicle",
         response_model=ChronicleResponse,
         responses={
+            401: {"model": ErrorResponse},
             404: {"model": ErrorResponse},
             503: {"model": ErrorResponse},
         },
         tags=["Chronicles"],
     )
     async def get_session_chronicle(
+        request: Request,
         session_id: UUID = Path(description="Unique session identifier"),
     ) -> ChronicleResponse:
         """Get the most recent chronicle for a session."""
-        try:
-            chronicle = await forge.get_session_chronicle(session_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            chronicle = await forge.get_session_chronicle(session_id, principal=principal)
         if chronicle is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -4666,22 +4980,20 @@ def create_router(
         "/chronicles/{session_id}/timeline",
         response_model=TimelineResponseModel,
         responses={
+            401: {"model": ErrorResponse},
             404: {"model": ErrorResponse},
             503: {"model": ErrorResponse},
         },
         tags=["Timeline"],
     )
     async def get_timeline(
+        request: Request,
         session_id: UUID = Path(description="Session identifier for timeline lookup"),
     ) -> TimelineResponseModel:
         """Get the event timeline for a session's chronicle."""
-        try:
-            timeline = await forge.get_timeline(session_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            timeline = await forge.get_timeline(session_id, principal=principal)
         if timeline is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -4723,6 +5035,8 @@ def create_router(
         response_model=TimelineEventResponse,
         status_code=status.HTTP_201_CREATED,
         responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
             404: {"model": ErrorResponse},
             503: {"model": ErrorResponse},
         },
@@ -4733,54 +5047,25 @@ def create_router(
         session_id: UUID = Path(description="Session identifier for timeline lookup"),
         data: TimelineEventCreate = ...,
     ) -> TimelineEventResponse:
-        """Add a timeline event for a session's chronicle."""
-        try:
-            chronicle = await forge.ensure_session_chronicle(session_id)
-        except RuntimeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(e),
-            )
-        except SessionNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session not found: {session_id}",
-            )
+        """Add a timeline event for a session's chronicle, creating one if needed.
 
-        # Authorization: caller must own the session
-        principal = await extract_principal(request)
-        session = await forge.get_session(session_id)
-        if session is not None:
-            try:
-                await forge.ensure_access(session, principal, "report_timeline")
-            except SessionAccessDeniedError:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Not authorized to report timeline for session {session_id}",
-                )
-
-        event = TimelineEvent(
-            id=uuid4(),
-            chronicle_id=chronicle.id,
-            session_id=session_id,
-            t=data.t,
-            type=TimelineEventType(data.type),
-            label=data.label,
-            tokens=data.tokens,
-            action=data.action,
-            ins=data.ins,
-            del_=data.del_,
-            hash=data.hash,
-            exit_code=data.exit_code,
-            created_at=datetime.now(UTC),
-        )
-
-        try:
-            stored = await forge.add_timeline_event(session_id, event)
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Timeline service not available",
+        The caller must be allowed ``report_timeline`` on the session's history;
+        nothing is written before that is established.
+        """
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            stored = await forge.add_timeline_event(
+                session_id,
+                principal=principal,
+                t=data.t,
+                type=TimelineEventType(data.type),
+                label=data.label,
+                tokens=data.tokens,
+                action=data.action,
+                ins=data.ins,
+                del_=data.del_,
+                hash=data.hash,
+                exit_code=data.exit_code,
             )
 
         return TimelineEventResponse(
@@ -4801,6 +5086,8 @@ def create_router(
         "/chronicles/{session_id}/diff",
         responses={
             400: {"model": ErrorResponse},
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
             404: {"model": ErrorResponse},
             502: {"model": ErrorResponse},
         },
@@ -4818,7 +5105,10 @@ def create_router(
             description="Diff base: last-commit or default-branch",
         ),
     ) -> dict:
-        """Get git diff for a file in a session workspace via Skuld."""
+        """Get git diff for a file in a session workspace via Skuld.
+
+        The caller must be allowed to ``read`` the session.
+        """
         if base not in ("last-commit", "default-branch"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -4826,6 +5116,10 @@ def create_router(
                     f"Invalid base parameter: {base}. Must be 'last-commit' or 'default-branch'"
                 ),
             )
+
+        principal = await _optional_principal(request)
+        with _chronicle_errors():
+            await forge.get_authorized_session(session_id, principal=principal, action="read")
 
         try:
             _, base_url = await forge.get_session_proxy_target(session_id)

@@ -11,7 +11,7 @@ import httpx
 import pytest
 import respx
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient as _TestClient
 
 from ravn.api import create_app
 from ravn.api.valkyrie_config import (
@@ -42,6 +42,19 @@ from ravn.warden import WardenSpec, WardenStore
 from ravn.warden.artifacts import service_label, start_command, write_runtime_config
 from ravn.warden.models import WardenObservation, WardenSupervisor
 from sleipnir.domain.events import SleipnirEvent
+
+
+def TestClient(app, **kwargs):  # noqa: N802 — test client factory
+    """Simulate identity headers supplied by the trusted Envoy proxy."""
+    return _TestClient(
+        app,
+        headers={
+            "x-auth-user-id": "dev-user",
+            "x-auth-tenant": "default",
+            "x-auth-roles": "volundr:developer",
+        },
+        **kwargs,
+    )
 
 
 class FakeWardenDeployer:
@@ -223,6 +236,70 @@ def test_status_endpoint_reports_discovery_unavailable(client: TestClient):
 
     assert resp.status_code == 503
     assert resp.json()["detail"] == "Ravn runtime discovery is unavailable"
+
+
+class _FailingStandaloneDiscovery:
+    """Simulates a broken standalone-resident discovery adapter chain."""
+
+    async def list_residents(self) -> list:
+        raise RuntimeError("discovery adapter unreachable")
+
+
+@respx.mock
+def test_status_endpoint_is_not_healthy_when_a_managed_runtimes_native_sessions_fail() -> None:
+    """list_ravens does not call list_resident_sessions, so a managed
+    runtime's own native-session listing failing does not raise there —
+    only list_sessions sees it, previously via a swallow that just skipped
+    the runtime with a warning log. The old behavior therefore reported
+    "healthy": True with an undercount: fewer sessions, no trace of why. It
+    must be additively reported instead, on both the body and the
+    X-Niuu-Source-Failures header."""
+    runtime = {
+        "id": "runtime-flaky",
+        "name": "Flaky Resident",
+        "capabilities": ["session.list"],
+    }
+    respx.get("http://localhost:8080/api/v1/forge/resident-runtimes").mock(
+        return_value=httpx.Response(200, json=[runtime])
+    )
+    respx.get("http://localhost:8080/api/v1/forge/resident-runtimes/runtime-flaky/sessions").mock(
+        return_value=httpx.Response(500)
+    )
+    respx.get("http://localhost:8080/api/v1/forge/sessions").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    app_client = TestClient(create_app())
+
+    resp = app_client.get("/api/v1/ravn/status")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["healthy"] is False
+    failures = json.loads(resp.headers["X-Niuu-Source-Failures"])
+    assert failures[0]["instanceId"] == "runtime-flaky"
+    assert failures[0]["name"] == "Flaky Resident"
+
+
+@respx.mock
+def test_get_session_endpoint_fails_loud_when_standalone_discovery_fails() -> None:
+    """A single-session lookup that falls through to standalone discovery
+    must not silently answer "not found" when discovery itself is down —
+    that would misreport an unreachable resident as one that never existed."""
+    respx.get("http://localhost:8080/api/v1/forge/sessions/missing-session").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("http://localhost:8080/api/v1/forge/resident-runtimes/missing-session").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get("http://localhost:8080/api/v1/forge/resident-runtimes").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    app_client = TestClient(create_app(resident_discovery=_FailingStandaloneDiscovery()))
+
+    resp = app_client.get("/api/v1/ravn/sessions/missing-session")
+
+    assert resp.status_code == 503
+    assert "discovery adapter unreachable" in resp.json()["detail"]
 
 
 def test_valkyrie_dashboard_projection(client: TestClient):
@@ -1687,7 +1764,7 @@ def test_valkyrie_dashboard_accepts_typed_catalog_config(monkeypatch):
 
     dashboard = ValkyrieDashboardProjection(config).dashboard()
 
-    assert [environment["id"] for environment in dashboard["environments"]] == ["env-midgard"]
+    assert [environment["id"] for environment in dashboard["environments"]] == ["env-k8s-midgard"]
 
 
 def test_valkyrie_dashboard_rejects_malformed_typed_catalog():
@@ -1759,6 +1836,8 @@ def test_valkyrie_dashboard_telemetry_nats_subscription_supports_multiple_stream
     monkeypatch.setenv("RAVN_VALKYRIE_TELEMETRY_START_TIMEOUT_SECONDS", "3")
     monkeypatch.setenv("RAVN_VALKYRIE_TELEMETRY_NATS_CONNECT_TIMEOUT_SECONDS", "1.5")
     monkeypatch.setenv("RAVN_VALKYRIE_TELEMETRY_NATS_MAX_RECONNECT_ATTEMPTS", "0")
+    monkeypatch.setenv("RAVN_VALKYRIE_TELEMETRY_CONSUMER_HEALTH_CHECK_INTERVAL_SECONDS", "7.0")
+    monkeypatch.setenv("RAVN_VALKYRIE_TELEMETRY_CONSUMER_RECOVERY_BACKOFF_SECONDS", "[2.0, 4.0]")
     monkeypatch.setenv(
         "RAVN_VALKYRIE_TELEMETRY_NATS_STREAMS",
         (
@@ -1780,6 +1859,8 @@ def test_valkyrie_dashboard_telemetry_nats_subscription_supports_multiple_stream
     assert created[0].kwargs["replay_from_time"] is not None
     assert created[0].kwargs["connect_timeout_s"] == 1.5
     assert created[0].kwargs["max_reconnect_attempts"] == 0
+    assert created[0].kwargs["consumer_health_check_interval_s"] == 7.0
+    assert created[0].kwargs["consumer_recovery_backoff_s"] == [2.0, 4.0]
     assert created[1].kwargs["stream_name"] == "obs-valhalla-events"
     assert created[1].kwargs["subject_prefix"] == "obs.valhalla"
     assert created[1].kwargs["consumer_group"] == "dashboard-obs-valhalla-events"
@@ -2284,7 +2365,7 @@ def test_resident_create_lifecycle_and_delete_proxy_target_control_plane(client:
         b'{"name":"Muninn","profile_id":"ravn-helm","persona_name":"","model":"",'
         b'"flock_id":"11111111-1111-4111-8111-111111111111",'
         b'"flock_member_id":"22222222-2222-4222-8222-222222222222",'
-        b'"flock_role":"coordinator","flock_peer_id":"ravn-muninn"}'
+        b'"flock_role":"coordinator","flock_peer_id":"ravn-muninn","realm_id":null}'
     )
     assert suspended.status_code == 200
     assert deleted.status_code == 204
@@ -3015,3 +3096,67 @@ def test_undirected_huddle_message_without_room_bridge_still_records(monkeypatch
     assert projection.dashboard()["huddles"][0]["messages"][0]["body"] == (
         "Room note for whoever reads the transcript."
     )
+
+
+@pytest.mark.parametrize("resident_id, environment_id", [("regin", "niuu"), ("ivaldi", "workshop")])
+def test_observed_residents_use_the_same_autonomy_roster(monkeypatch, resident_id, environment_id):
+    monkeypatch.setenv("RAVN_VALKYRIE_DASHBOARD_ENVIRONMENTS_JSON", _valkyrie_catalog())
+    projection = ValkyrieDashboardProjection()
+    projection.record_event(
+        SleipnirEvent(
+            event_type="valkyrie.presence.announced",
+            source=resident_id,
+            summary="resident present",
+            urgency=0,
+            domain="infrastructure",
+            timestamp=datetime.now(UTC),
+            payload={"environment_id": environment_id, "valkyrie_id": resident_id},
+        )
+    )
+    app = FastAPI()
+    app.include_router(create_valkyrie_router(projection))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/ravn/valkyrie/autonomy",
+            json={
+                "valkyrieId": resident_id,
+                "mode": "autonomous",
+                "reason": "operator change",
+            },
+        )
+        assert response.status_code == 200
+        for dashboard in (response.json(), projection.dashboard(), projection.dashboard()):
+            residents = [r for r in dashboard["valkyries"] if r["id"] == resident_id]
+            assert len(residents) == 1
+            assert residents[0]["autonomyMode"] == "autonomous"
+
+
+def test_workshop_inventory_and_telemetry_share_environment_id(monkeypatch):
+    monkeypatch.setenv(
+        "RAVN_VALKYRIE_DASHBOARD_ENVIRONMENTS_JSON",
+        json.dumps(
+            {
+                "environments": [
+                    {"id": "workshop", "kind": "workshop", "valkyrie": {"valkyrieId": "ivaldi"}}
+                ],
+            }
+        ),
+    )
+    projection = ValkyrieDashboardProjection()
+    projection.record_event(
+        SleipnirEvent(
+            event_type="valkyrie.runtime.started",
+            source="ivaldi",
+            summary="resident present",
+            urgency=0,
+            domain="infrastructure",
+            timestamp=datetime.now(UTC),
+            payload={"environment_id": "workshop", "valkyrie_id": "ivaldi", "source_count": 1},
+        )
+    )
+    dashboard = projection.dashboard()
+    env_id = dashboard["environments"][0]["id"]
+    assert dashboard["environments"][0]["kind"] == "workshop"
+    assert dashboard["environments"][0]["identitySource"] == "observed"
+    assert dashboard["valkyries"][0]["environmentId"] == env_id
+    assert dashboard["telemetry"]["runtime"][0]["environmentId"] == env_id

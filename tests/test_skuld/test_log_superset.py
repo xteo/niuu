@@ -166,6 +166,39 @@ class TestSupersetInvariant:
         for frame in broadcast_log:
             assert id(frame) in logged_ids, f"frame broadcast but not logged: {frame}"
 
+    async def test_room_outcome_is_logged_before_live_broadcast(self, tmp_path):
+        b = _broker(tmp_path, room={"enabled": True})
+        assert b._room_bridge is not None
+        await b._room_bridge.register_mesh_peer(
+            "flock-analyst",
+            "Analyst",
+            participant_kind="mesh",
+        )
+        logged_when_broadcast: list[bool] = []
+        original_broadcast = b._channels.broadcast
+
+        async def _record(frame: dict) -> None:
+            if frame.get("type") == "room_outcome":
+                logged_when_broadcast.append(id(frame) in _logged_payload_ids(b))
+            await original_broadcast(frame)
+
+        b._channels.broadcast = _record  # type: ignore[method-assign]
+
+        await b._room_bridge.handle_collaboration_frame(
+            "flock-analyst",
+            {
+                "kind": "outcome",
+                "sourceEventId": "plan-1",
+                "eventType": "developer.plan.approved",
+                "fields": {"verdict": "approved"},
+            },
+        )
+
+        assert logged_when_broadcast == [True]
+        room_outcomes = [entry for entry in b._event_log_buffer if entry["kind"] == "room_outcome"]
+        assert len(room_outcomes) == 1
+        assert room_outcomes[0]["payload"]["eventType"] == "developer.plan.approved"
+
 
 class _FakeWebsocket:
     query_params = {}
@@ -292,11 +325,16 @@ class TestFirstConnectSupersetOverPerChannelSends:
         assert "slash_commands" in self._logged_kinds(b)
 
     async def test_room_prompt_resent_ack_is_logged(self, tmp_path):
+        from skuld.channels import WebSocketChannel
+
         b = _broker(tmp_path)
         transport = AsyncMock()
         transport.capabilities = TransportCapabilities()
         b._transport = transport
         ws = AsyncMock()
+        # resend_initial_prompt is owner-only; register this connection as
+        # owner so the room-role gate doesn't preempt the behavior under test.
+        b._channels.add(WebSocketChannel(ws, room_role="owner"))
 
         async def _resend(**_kwargs):
             return "msg-99"

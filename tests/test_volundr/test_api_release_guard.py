@@ -212,6 +212,7 @@ def test_window_rejects_invalid_or_insufficient_time(manifest, bad):
         release.LocalRelease(manifest).window()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="systemd process identity requires Linux /proc")
 def test_unit_identity_hashes_no_environment_or_argv_export(manifest, monkeypatch):
     runner = release.LocalRelease(manifest)
     file = manifest["stable_files"][0]
@@ -260,11 +261,13 @@ def test_snapshot_includes_terminal_live_rows_and_archived_replay(manifest, monk
         {"id": "stopped-but-live", "status": "stopped"},
         {"id": "archived", "status": "archived"},
     ]
-    runner.api = MagicMock(side_effect=[rows, {"turns": [{"content": "private"}]}])
+    runner.api = MagicMock(
+        side_effect=[rows, {"turns": [{"content": "private-transcript-marker"}]}]
+    )
     snapshot = runner.snapshot()
     assert snapshot["live_gateway_state"] == state
     assert snapshot["replay"]["archived"]["turns"] == 1
-    assert "private" not in json.dumps(snapshot)
+    assert "private-transcript-marker" not in json.dumps(snapshot)
     assert runner.api.call_args_list[0].args[0].endswith("?include_archived=true")
     Path(manifest["state_file"]).write_text("{}")
     with pytest.raises(release.GuardError, match="Uninventoried"):
@@ -308,6 +311,9 @@ def test_release_audit_rejects_wrong_source_and_backend(manifest, monkeypatch):
             runner.release(manifest["candidate"])
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="systemd process inventory requires Linux /proc"
+)
 def test_process_inventory_includes_owned_anchor_and_exact_gateway_detection():
     processes, _ = release.protected_processes([os.getpid()])
     assert processes[str(os.getpid())] == release.identity(os.getpid())

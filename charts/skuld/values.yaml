@@ -35,6 +35,9 @@ session:
   # -- Initial user message sent when the CLI starts
   initialPrompt: ""
 
+# -- MCP server configurations supplied by session contributors. Use credential references, not tokens.
+mcpServers: []
+
 # Container image for the Skuld broker
 # Note: repository and tag are updated by CI/CD pipeline
 # Default values are for local development
@@ -180,6 +183,9 @@ persistence:
 # Credential files are mounted from a K8s Secret and symlinked into
 # $HOME/<destDir>/ so they auto-update when the secret changes (~60s).
 homeVolume:
+  # -- Store /tmp per session/container and shared caches in the user home PVC.
+  # Enable only with a suitably sized home claim (64 GiB recommended).
+  persistentTmp: false
   # -- Enable persistent home volume
   enabled: false
   # -- Name of an existing PVC to use for the home directory
@@ -205,8 +211,13 @@ git:
   branch: ""
   # -- Base branch to create feature branch from if it doesn't exist on the remote
   baseBranch: ""
+  # -- Default commit identity, used only when Git has no identity configured
+  userName: ""
+  userEmail: ""
   # Credentials for private repos (HTTPS token auth)
   credentials:
+    # -- Session-injected integration token file; takes precedence over secretName
+    tokenFile: ""
     # -- Name of a Kubernetes secret containing a git token
     secretName: ""
     # -- Key within the secret that holds the token
@@ -222,12 +233,42 @@ git:
     pullPolicy: IfNotPresent
 
 # Broker configuration (Skuld application settings)
+workflow:
+  # -- Deployment-owned verifier adapter and kwargs for deterministic evidence gates.
+  # Imported workflows specify policies, never signing keys or trust configuration.
+  evidenceVerifier: null
+  # -- Artifact digest resolver adapter and kwargs (such as a mounted workspace root).
+  evidenceArtifacts: null
+
 broker:
+  conversationRecentMaxTurns: 15
+  conversationRecentMaxBytes: 262144
+  conversationSnapshotMaxBytes: 921600
+  liveFrameMaxBytes: 921600
+  codexReceiveMaxBytes: 16777216
+  historyHydrationEnabled: true
+  historyHydrationTimeoutSeconds: 30
+  historyHydrationPageSize: 1000
+  historyHydrationMaxFrames: 100000
+  historyHydrationMaxBytes: 67108864
+  effortControlTimeoutSeconds: 15
+  # PI paths refer to the session container, not the API host.
+  pi:
+    binary: pi
+    agent_dir: ""
+    session_dir: ""
+    command_timeout_s: 30
+    turn_timeout_s: 1800
+    shutdown_timeout_s: 5
   historyReadTimeoutSeconds: 2.0
   historyBootstrapMaxFrames: 256
   # Native question proof bounds and optional Muse executable override.
   tmuxQuestionTranscriptMaxBytes: 1048576
   tmuxQuestionResultHistoryLimit: 128
+  # -- Longest a PreToolUse hook waits for the native transcript text before that tool
+  tmuxNativeTextWaitSeconds: 0.1
+  # -- Interval between native transcript reads while that wait is open
+  tmuxNativeTextPollSeconds: 0.005
   museBin: ""
   # -- (DEPRECATED) AI CLI backend: "claude" (Claude Code, default) or "codex" (OpenAI Codex).
   # Use broker.transportAdapter instead. Kept for backward compatibility during rollout.
@@ -279,6 +320,13 @@ envSecrets:
     secretName: anthropic-api-key
     secretKey: api-key
 
+claude:
+  # -- Keep Claude Code from updating itself in cluster sessions. The CLI is
+  # pinned in the image; a self-update restarts it mid-start-up (breaking the
+  # interactive transport's readiness and delivery checks) and fails anyway
+  # without write access to the npm prefix. Sets DISABLE_AUTOUPDATER=1.
+  disableAutoUpdate: true
+
 # -- Plain environment variables injected into the skuld broker container.
 # Use for non-secret configuration like proxy URLs or auth tokens.
 envVars:
@@ -295,6 +343,32 @@ envVars:
 
 # Envoy sidecar proxy (JWT validation, header extraction)
 envoy:
+  authorization:
+    # Optional central identity/PAT revocation check before gateway admission.
+    # Use identity.adapters.remote.RemoteHeaderAuthenticationAdapter with HTTPS authority_url.
+    identity: null
+    # Keep outside localServices.portRange (9001-9020).
+    port: 9000
+    # -- Envoy's budget for the authorization decision. When identityAuthority is
+    # enabled, identityAuthority.timeout is added so the identity lookup fits.
+    timeout: 1s
+    shutdownGraceSeconds: 5
+    extraVolumeMounts: []
+    readinessProbe:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    roleMapping:
+      admin: volundr:admin
+      developer: volundr:developer
+      viewer: volundr:viewer
   # -- Enable Envoy sidecar proxy
   enabled: false
   image:
@@ -326,6 +400,10 @@ envoy:
     email: x-auth-email
     tenant: x-auth-tenant
     roles: x-auth-roles
+    # A client-supplied copy must never reach the broker: only the session
+    # proxy (niuu.session_proxy) is trusted to stamp this, from a verified
+    # session_participants grant (see the room-scoped Cedar actions).
+    roomRole: x-niuu-room-role
   # JWT authentication (via Keycloak)
   jwt:
     # -- Enable JWT authentication filter
@@ -355,6 +433,7 @@ envoy:
     keycloakPort: 8080
     # -- Enable TLS for Keycloak upstream
     keycloakTls: false
+    keycloakCaFile: /etc/ssl/certs/ca-certificates.crt
     # -- Additional JWT claim-to-header mappings
     extraClaimHeaders: []
     workload:
@@ -372,6 +451,7 @@ envoy:
       jwksPort: 443
       # -- Enable TLS for the workload JWKS cluster
       jwksTls: true
+      jwksCaFile: /etc/ssl/certs/ca-certificates.crt
       # -- JWKS fetch timeout
       jwksTimeout: "5s"
       # -- JWKS cache duration in seconds
@@ -383,6 +463,7 @@ envoy:
       # -- Additional workload JWT claim-to-header mappings
       extraClaimHeaders: []
   # -- Extra HTTP filters (inserted before the router filter)
+  extraVolumeMounts: []
   extraHttpFilters: []
   # -- Extra upstream clusters
   extraClusters: []
@@ -428,6 +509,8 @@ gateway:
     audiences: []
     # -- JWKS URI for key retrieval
     jwksUri: ""
+    tenantClaim: tenant_id
+    rolesClaim: resource_access.volundr-api.roles
     workload:
       # -- Enable workload JWT validation as an additional session-route provider
       enabled: false
@@ -437,6 +520,8 @@ gateway:
       audiences: []
       # -- JWKS URI for workload JWT key retrieval
       jwksUri: ""
+      tenantClaim: tenant_id
+      rolesClaim: resource_access.volundr-api.roles
 
 # Pod configuration
 # -- Extra labels applied to session pods (e.g. volundr/owner for PVC isolation)
@@ -453,7 +538,14 @@ affinity: {}
 # -- Runtime class name for the pod (e.g., "nvidia", "kata", "gvisor")
 runtimeClassName: ""
 
-# -- Service account name for the pod (set by secret injection contributor)
+# -- Service account name for the pod. For ordinary session pods, set by a
+# secret injection contributor. For a resident release, Völundr sets this to
+# "resident-<runtime.id>" (volundr/adapters/outbound/flux.py
+# _resident_release_name) — templates/serviceaccount.yaml then creates a
+# ServiceAccount by this exact name, giving the resident's own projected
+# workload-identity token (niuu-workload-identity, see deployment.yaml) a
+# subject unique to it, instead of every resident sharing the namespace
+# default ServiceAccount's identity.
 serviceAccountName: ""
 
 # -- Additional init containers to add to the session pod.
@@ -522,6 +614,17 @@ resident:
   # -- Secrets injected only into the resident Ravn daemon.
   # Uses the same envVar/secretName/secretKey shape as top-level envSecrets.
   envSecrets: []
+  # -- Realm (Simple mode) this resident is deployed for. Empty slug = no
+  # realm binding, unchanged behavior. Distinct from resident.flock, which
+  # names a Flock mesh group, not a niuu governance Realm.
+  realm:
+    # -- niuu Realm slug, e.g. from ResidentRuntime.realmId.
+    slug: ""
+  # -- Expose the resident's read-only HUD endpoints (ravn gateway.channels.http).
+  hudEnabled: false
+  # -- Seconds between the resident's own stewardship/home-wake passes.
+  # Empty uses ravn's own default (resident_state.stewardship_interval_seconds).
+  stewardshipIntervalSeconds: ""
   # -- Optional heterogeneous flock membership supplied by Volundr.
   flock:
     id: ""
@@ -561,6 +664,23 @@ resident:
     #     defaults:
     #       gate_auto_forward_after: ""
     workflowAliases: {}
+  triggers:
+    # -- Have this resident load and run its own durable triggers
+    # (POST /api/v1/ravn/triggers) over the platform gateway above. Requires
+    # resident.platform.enabled — the chart fails the render otherwise, since
+    # a resident with nothing to poll would gate/retry forever for no reason.
+    enabled: false
+    # -- Seconds between polls of the durable trigger store.
+    pollIntervalSeconds: 60
+    # -- Give up (and end the resident process) after this many consecutive
+    # poll failures, instead of retrying an unreachable store forever.
+    maxConsecutivePollFailures: 5
+  budget:
+    # -- Have this resident read/report its own spend
+    # (GET/POST /api/v1/ravn/budget/me,/spend) over the platform gateway
+    # above, instead of only gating locally from an in-memory counter that
+    # resets on restart. Requires resident.platform.enabled.
+    enabled: false
   mimir:
     sourceTrigger:
       # -- Automatically synthesize unprocessed Mímir sources.
@@ -580,6 +700,18 @@ resident:
     audience: "volundr-api"
     # -- Expiration (seconds) for the projected serviceAccountToken
     expirationSeconds: 1200
+  serviceAccount:
+    # -- Whether THIS release should create the ServiceAccount named by
+    # serviceAccountName (below/top-level). Default false: several resident
+    # releases can share one existingSecret's worth of infrastructure
+    # (Fleet-managed, e.g. a bundle's own serviceaccount.yaml, or another
+    # controller) naming the SAME ServiceAccount — this chart creating it too
+    # would fail on Helm ownership (two releases claiming the same object),
+    # and uninstalling any ONE such release would delete an SA every other
+    # resident still uses. volundr.adapters.outbound.flux.FluxPodManager
+    # sets this to true only when it assigns the resident its own unique
+    # "resident-<runtime.id>" name — a name no other release can already own.
+    create: false
 
 # -- Secret mapping manifest for file-based credential injection.
 # Rendered into a ConfigMap and mounted at /run/secrets/manifest.json.
@@ -594,3 +726,54 @@ securityContext:
   runAsUser: 1000
   # -- Filesystem group ID
   fsGroup: 1000
+
+# Authentication is optional for mini-mode and explicitly trusted deployments.
+# Enable only behind a JWT-verifying proxy that strips caller identity headers.
+wsAuth:
+  authorization:
+    adapter: identity.adapters.cedar.CedarAuthorizationAdapter
+    kwargs: {}
+    secret_kwargs_env: {}
+  enforce_ownership: false
+  websocket_check_interval: 5
+  admin_roles: ["volundr:admin"]
+  allow_loopback: false
+  # How a missing x-niuu-room-role header resolves. "deployment" (the
+  # DEFAULT — unchanged, byte-identical behavior for every existing
+  # cluster): this pod's own auth boundary already gates every caller who
+  # reaches it, so a missing header means owner, unconditionally, and
+  # session_participants invites are refused with 409 for this backend.
+  # "proxy" is rendered directly by the process-backend's local launcher
+  # (volundr.adapters.outbound.local_process), never by this chart — do not
+  # set it here. "remote" asks Forge for the caller's grant on every
+  # request and lifts the 409 — Forge's own pod_manager.room_role_source
+  # setting renders this automatically per session (see
+  # RoomRoleSourceContributor); only set it here directly for a standalone
+  # chart install Forge does not manage. REQUIRES enforce_ownership: false
+  # (the Helm template fails the render otherwise — see skuld-configmap.yaml
+  # — because the ext_authz sidecar's owner/admin-only "start" gate would
+  # block every participant before a remote room-role lookup ever ran).
+  room_role_source: deployment
+  # room_role_remote (the dynamic skuld.room_role_port.RoomRoleResolverPort
+  # adapter used when room_role_source is "remote") is deliberately absent
+  # here — existing clusters must render byte-identical wsAuth until they
+  # opt in. skuld-configmap.yaml renders it ONLY when room_role_source is
+  # "remote", defaulting adapter/token_file/volundr_api_url (from
+  # volundr.apiUrl below) so a standalone install needs no further values;
+  # override wsAuth.room_role_remote.adapter/kwargs/secret_kwargs_env here
+  # (or via RoomRoleSourceContributor's per-session values) to change them.
+
+# Limit pod ingress to the authenticated gateway, including direct pod-IP traffic.
+# Add explicit peer selectors/ports for direct Flokk mesh deployments.
+networkPolicy:
+  enabled: false
+  ingressFrom: []
+  extraIngress: []
+
+# Shared identity service: fresh membership, role and credential checks.
+# Point at the canonical identity service, never back at this client service.
+identityAuthority:
+  enabled: false
+  url: ""
+  timeout: 5
+  caFile: ""

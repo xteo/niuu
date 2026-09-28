@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
 from ting.domain.models import (
-    ConfidenceEvent,
     Phase,
     PhaseStatus,
     Run,
@@ -20,6 +20,23 @@ from ting.domain.models import (
 )
 
 
+@dataclass(frozen=True)
+class TrackerResolutionFailure:
+    """Sanitized failure for one configured tracker connection."""
+
+    connection_id: str
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class TrackerResolution:
+    """Resolved tracker adapters plus visible configuration failures."""
+
+    adapters: tuple[TrackerPort, ...]
+    failures: tuple[TrackerResolutionFailure, ...] = ()
+
+
 class TrackerFactory(Protocol):
     """Protocol for resolving per-owner TrackerPort adapters."""
 
@@ -29,6 +46,28 @@ class TrackerFactory(Protocol):
 
 class TrackerPort(ABC):
     """Abstract interface for tracker integration (Linear, Jira, etc.)."""
+
+    _tracker_connection_id: str = ""
+    _tracker_provider: str = ""
+    _tracker_name: str = ""
+
+    def bind_connection(self, *, connection_id: str, provider: str, name: str) -> None:
+        """Attach the integration identity used to construct this adapter."""
+        self._tracker_connection_id = connection_id
+        self._tracker_provider = provider
+        self._tracker_name = name
+
+    @property
+    def connection_id(self) -> str:
+        return self._tracker_connection_id
+
+    @property
+    def provider(self) -> str:
+        return self._tracker_provider
+
+    @property
+    def connection_name(self) -> str:
+        return self._tracker_name
 
     # -- CRUD: create entities in the external tracker --
 
@@ -115,7 +154,7 @@ class TrackerPort(ABC):
     ) -> list[TrackerIssue]:
         raise NotImplementedError
 
-    # -- Run progress: operational state (status, session, confidence, PR) --
+    # -- Run progress: operational state (status, session, PR) --
 
     @abstractmethod
     async def update_run_progress(
@@ -124,12 +163,12 @@ class TrackerPort(ABC):
         *,
         status: RunStatus | None = None,
         session_id: str | None = None,
-        confidence: float | None = None,
         pr_url: str | None = None,
         pr_id: str | None = None,
         retry_count: int | None = None,
         reason: str | None = None,
         owner_id: str | None = None,
+        tenant_id: str | None = None,
         phase_tracker_id: str | None = None,
         saga_tracker_id: str | None = None,
         chronicle_summary: str | None = None,
@@ -142,6 +181,30 @@ class TrackerPort(ABC):
     async def get_run_progress_for_saga(self, saga_tracker_id: str) -> list[Run]:
         raise NotImplementedError
 
+    async def get_authorized_run_progress_for_saga(
+        self,
+        saga_tracker_id: str,
+        *,
+        owner_id: str,
+        tenant_id: str,
+    ) -> list[Run]:
+        """Read operational links scoped to the authorized saga identity.
+
+        External adapters must override this method.  The default fails closed
+        so callers never turn legacy unscoped progress into session links.
+        """
+        raise NotImplementedError
+
+    async def has_unscoped_run_progress_for_saga(
+        self,
+        saga_tracker_id: str,
+        *,
+        owner_id: str,
+        tenant_id: str,
+    ) -> bool:
+        """Whether legacy progress was withheld for missing tenant attribution."""
+        return False
+
     @abstractmethod
     async def get_run_by_session(self, session_id: str) -> Run | None:
         raise NotImplementedError
@@ -152,16 +215,6 @@ class TrackerPort(ABC):
 
     @abstractmethod
     async def get_run_by_id(self, run_id: UUID) -> Run | None:
-        raise NotImplementedError
-
-    # -- Confidence events --
-
-    @abstractmethod
-    async def add_confidence_event(self, tracker_id: str, event: ConfidenceEvent) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def get_confidence_events(self, tracker_id: str) -> list[ConfidenceEvent]:
         raise NotImplementedError
 
     # -- Phase gate management --

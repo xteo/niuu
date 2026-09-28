@@ -12,6 +12,8 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, 
 from fastapi.responses import StreamingResponse
 
 from niuu.adapters.inbound.auth import extract_principal
+from niuu.adapters.pat_revocation_middleware import PATRevocationMiddleware
+from niuu.cors import apply_cors_middleware
 from niuu.domain.agent_directory import (
     AgentDirectoryEntry,
     AgentDirectoryFilters,
@@ -20,6 +22,7 @@ from niuu.domain.agent_directory import (
 from niuu.domain.models import Principal
 from niuu.domain.observatory import ObservatoryFragment
 from niuu.service_databases import apply_service_database_settings, database_pool
+from niuu.service_runtime import create_identity_adapter
 from niuu.settings_schema import (
     SettingsFieldSchema,
     SettingsProviderSchema,
@@ -36,6 +39,7 @@ from observatory.registry import (
     RegistryNotFoundError,
     RegistryValidationError,
 )
+from volundr.adapters.outbound.postgres_users import PostgresUserRepository
 from volundr.config import Settings
 
 KEEPALIVE_INTERVAL = 15.0
@@ -428,6 +432,9 @@ def create_app(
             return
 
         async with database_pool(loaded_settings.database) as pool:
+            app.state.identity = create_identity_adapter(
+                loaded_settings, PostgresUserRepository(pool)
+            )
             repo = PostgresObservatoryRegistryRepository(pool)
             await repo.ensure_seeded()
             app.state.registry_repository = repo
@@ -436,6 +443,39 @@ def create_app(
             yield
 
     app = FastAPI(title="Observatory API", lifespan=lifespan)
+
+    # Configured and instrumented here, not in lifespan: Starlette builds and
+    # caches its middleware stack on the app's first ASGI __call__ (which is
+    # also how the lifespan startup event arrives), so instrumenting from
+    # inside a lifespan handler has no effect. Observatory reuses
+    # volundr.config.Settings wholesale (see the import above), so
+    # observability.service_name would default to "volundr" unless told
+    # otherwise — default_service_name gives it its own identity unless the
+    # operator explicitly set observability.service_name in its own config.
+    from niuu.observability import (
+        configure_observability,
+        install_uvicorn_log_redaction,
+        instrument_fastapi_app,
+        instrument_httpx_client,
+    )
+
+    telemetry = configure_observability(
+        loaded_settings.observability,
+        resource_attributes={"service.namespace": "observatory"},
+        component="observatory",
+        default_service_name="observatory",
+    )
+    instrument_fastapi_app(app, telemetry, component="observatory")
+    install_uvicorn_log_redaction()
+    instrument_httpx_client(telemetry)
+
+    app.state.identity = create_identity_adapter(loaded_settings, user_repository=None)
+    app.add_middleware(
+        PATRevocationMiddleware,
+        authenticate_http=True,
+        websocket_check_interval=loaded_settings.pat.websocket_check_interval,
+    )
+    apply_cors_middleware(app, loaded_settings.cors)
     app.state.settings = loaded_settings
     app.state.registry_repository = registry_repository or InMemoryObservatoryRegistryRepository()
     app.state.discovery_service = discovery

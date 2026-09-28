@@ -29,10 +29,6 @@ _DEFAULT_BASE_URL = "http://localhost:11434"
 # nomic-embed-text default dimension
 _DEFAULT_DIMENSION = 768
 
-#: Context length assumed when the server will not say what the model's is.
-#: nomic-embed-text is 2048; erring low costs a little recall, erring high costs the turn.
-_FALLBACK_CONTEXT_TOKENS = 2048
-
 #: Characters per token, used to turn a token budget into a character budget without pulling in a
 #: tokenizer for the model. English prose runs ~4; 3.0 is deliberately conservative, because the
 #: cost of guessing high is a hard 400 and the cost of guessing low is a slightly shorter input.
@@ -83,30 +79,23 @@ class OllamaEmbeddingAdapter(EmbeddingPort):
     async def _context_length(self) -> int:
         """The model's context length in tokens, asked once and cached.
 
-        Asked rather than hardcoded: the budget belongs to whichever model is configured, and a
-        wrong constant fails as a hard 400 on exactly the long inputs that matter most. If the
-        server will not say, the conservative fallback applies.
+        Configure max_input_chars explicitly for servers without model metadata.
+        Discovery failures propagate so a broken configured service remains visible.
         """
         if self._context_tokens is not None:
             return self._context_tokens
-        try:
-            response = await self._get_client().post(
-                f"{self._base_url}/api/show", json={"model": self._model}
-            )
-            response.raise_for_status()
-            info = response.json().get("model_info") or {}
-            for key, value in info.items():
-                if key.endswith(".context_length") and isinstance(value, int) and value > 0:
-                    self._context_tokens = value
-                    break
-        except Exception as exc:  # noqa: BLE001 — a hint must never break the thing it improves
-            # Deliberately broad: this probe only refines a budget that already has a safe
-            # default, so no failure of it — a proxy that 500s, an old server with no /api/show,
-            # a test harness that mocks only /api/embed — may cost the caller its embedding.
-            logger.debug("embed: could not read %s context length (%s)", self._model, exc)
-        if self._context_tokens is None:
-            self._context_tokens = _FALLBACK_CONTEXT_TOKENS
-        return self._context_tokens
+        response = await self._get_client().post(
+            f"{self._base_url}/api/show", json={"model": self._model}
+        )
+        response.raise_for_status()
+        info = response.json().get("model_info") or {}
+        for key, value in info.items():
+            if key.endswith(".context_length") and type(value) is int and value > 0:
+                self._context_tokens = value
+                return value
+        raise ValueError(
+            f"Ollama model {self._model!r} has no context length; configure max_input_chars"
+        )
 
     async def _budget_chars(self) -> int:
         if self._max_input_chars is not None:

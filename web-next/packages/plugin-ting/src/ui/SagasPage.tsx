@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { useNavigate, useParams } from '@tanstack/react-router';
+import { useNavigate, useParams, useSearch } from '@tanstack/react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useService } from '@niuulabs/plugin-sdk';
 import {
@@ -26,6 +26,7 @@ import type {
   TrackerProject,
 } from '../ports';
 import { useSagas } from './useSagas';
+import { useWorkflows, useWorkflowVersions } from './useWorkflows';
 import { SagaDetailPage } from './SagaDetailPage';
 
 type SagaBucket = 'active' | 'review' | 'complete' | 'failed';
@@ -68,6 +69,10 @@ function trackerProjectSlug(project: TrackerProject): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+function trackerSourceKey(trackerId: string, connectionId?: string): string {
+  return `${connectionId ?? ''}:${trackerId}`;
 }
 
 function downloadJson(filename: string, data: string): void {
@@ -194,13 +199,15 @@ function SagasPageContent() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const params = useParams({ strict: false }) as { sagaId?: string };
+  const routeSearch = useSearch({ strict: false }) as { import?: string; returnTo?: string };
   const ting = useService<ITingService>('ting');
   const tracker = useService<ITrackerBrowserService>('ting.tracker');
   const dispatchBus = useService<IDispatchBus>('ting.dispatch');
   const repoCatalog = useService<RepoCatalogService>('niuu.repos');
   const { data: sagas, isLoading, isError, error } = useSagas();
+  const workflowsQuery = useWorkflows();
   const [showNewSagaModal, setShowNewSagaModal] = useState(false);
-  const [showImportModal, setShowImportModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(routeSearch.import === '1');
   const [search, setSearch] = useState('');
   const [selectedSagaIdState, setSelectedSagaIdState] = useState<string | null>(
     params.sagaId ?? null,
@@ -210,6 +217,8 @@ function SagasPageContent() {
   const [repoCandidate, setRepoCandidate] = useState('');
   const [baseBranch, setBaseBranch] = useState('main');
   const [selectedInstanceId, setSelectedInstanceId] = useState('');
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState('');
+  const [selectedWorkflowVersion, setSelectedWorkflowVersion] = useState('');
   const [targetMode, setTargetMode] = useState<ImportTargetMode>('default');
   const [targetTagsDraft, setTargetTagsDraft] = useState('');
   const [targetMatch, setTargetMatch] = useState<'all' | 'any'>('all');
@@ -219,12 +228,24 @@ function SagasPageContent() {
     () => selectedRepoRefs.map((entry) => entry.repo),
     [selectedRepoRefs],
   );
+  const workflows = workflowsQuery.data ?? [];
+  const selectedWorkflow = workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null;
+  const workflowVersionsQuery = useWorkflowVersions(selectedWorkflowId);
+  const workflowVersions = workflowVersionsQuery.data ?? [];
+  const effectiveWorkflowVersion =
+    workflowVersions.find((entry) => entry.version === selectedWorkflowVersion)?.version ??
+    selectedWorkflow?.version ??
+    '';
 
   const allSagas = useMemo(() => sagas ?? [], [sagas]);
   const selectedSagaId = selectedSagaIdState ?? allSagas[0]?.id ?? null;
   const importedTrackerIds = useMemo(
     () =>
-      new Set(allSagas.filter((saga) => saga.status !== 'complete').map((saga) => saga.trackerId)),
+      new Set(
+        allSagas
+          .filter((saga) => saga.status !== 'complete')
+          .map((saga) => trackerSourceKey(saga.trackerId, saga.trackerConnectionId)),
+      ),
     [allSagas],
   );
   const existingSagaSlugs = useMemo(() => new Set(allSagas.map((saga) => saga.slug)), [allSagas]);
@@ -262,17 +283,32 @@ function SagasPageContent() {
     [targetTagsDraft],
   );
   const effectiveBaseBranch = selectedRepoRefs[0]?.branch ?? baseBranch;
+  const defaultSelectedProject =
+    trackerProjects.find(
+      (project) =>
+        !importedTrackerIds.has(trackerSourceKey(project.id, project.trackerConnectionId)),
+    ) ?? trackerProjects[0];
   const effectiveSelectedProjectId =
-    showImportModal && !selectedProjectId && trackerProjects.length > 0
-      ? (
-          trackerProjects.find((project) => !importedTrackerIds.has(project.id)) ??
-          trackerProjects[0]!
-        ).id
+    showImportModal && !selectedProjectId && defaultSelectedProject
+      ? trackerSourceKey(defaultSelectedProject.id, defaultSelectedProject.trackerConnectionId)
       : selectedProjectId;
   const effectiveSelectedProject =
-    trackerProjects.find((project) => project.id === effectiveSelectedProjectId) ?? null;
+    trackerProjects.find(
+      (project) =>
+        trackerSourceKey(project.id, project.trackerConnectionId) === effectiveSelectedProjectId,
+    ) ?? null;
   const selectedProjectHasSlugConflict =
     effectiveSelectedProject !== null &&
+    allSagas.some(
+      (saga) =>
+        saga.slug === trackerProjectSlug(effectiveSelectedProject) &&
+        (!saga.trackerConnectionId ||
+          !effectiveSelectedProject.trackerConnectionId ||
+          saga.trackerConnectionId === effectiveSelectedProject.trackerConnectionId),
+    );
+  const selectedProjectNeedsSourceSuffix =
+    effectiveSelectedProject !== null &&
+    !selectedProjectHasSlugConflict &&
     existingSagaSlugs.has(trackerProjectSlug(effectiveSelectedProject));
   const selectedProjectSlug = effectiveSelectedProject
     ? trackerProjectSlug(effectiveSelectedProject)
@@ -283,7 +319,9 @@ function SagasPageContent() {
     selectedRepoRefs.every((entry) => entry.repo.trim() && entry.branch.trim()) &&
     (targetMode !== 'instance' || Boolean(selectedInstanceId.trim())) &&
     (targetMode !== 'tags' || targetTags.length > 0) &&
-    !importedTrackerIds.has(effectiveSelectedProject.id) &&
+    !importedTrackerIds.has(
+      trackerSourceKey(effectiveSelectedProject.id, effectiveSelectedProject.trackerConnectionId),
+    ) &&
     !selectedProjectHasSlugConflict &&
     !isImporting;
 
@@ -334,6 +372,8 @@ function SagasPageContent() {
     setRepoCandidate('');
     setBaseBranch('');
     setSelectedInstanceId('');
+    setSelectedWorkflowId('');
+    setSelectedWorkflowVersion('');
     setTargetMode('default');
     setTargetTagsDraft('');
     setTargetMatch('all');
@@ -347,6 +387,8 @@ function SagasPageContent() {
     setRepoCandidate('');
     setBaseBranch('');
     setSelectedInstanceId('');
+    setSelectedWorkflowId('');
+    setSelectedWorkflowVersion('');
     setTargetMode('default');
     setTargetTagsDraft('');
     setTargetMatch('all');
@@ -358,6 +400,9 @@ function SagasPageContent() {
       return;
     }
     closeImportModal();
+    if (routeSearch.returnTo) {
+      void navigate({ to: routeSearch.returnTo as never });
+    }
   }
 
   async function handleImportProject() {
@@ -373,6 +418,13 @@ function SagasPageContent() {
         targetMode === 'instance' ? selectedInstanceId || undefined : undefined,
         {
           repoRefs: selectedRepoRefs,
+          trackerConnectionId: effectiveSelectedProject.trackerConnectionId,
+          ...(selectedWorkflowId
+            ? {
+                workflowId: selectedWorkflowId,
+                workflowVersion: effectiveWorkflowVersion || undefined,
+              }
+            : {}),
           target:
             targetMode === 'tags'
               ? { mode: 'tags', tags: targetTags, match: targetMatch }
@@ -385,6 +437,13 @@ function SagasPageContent() {
       setSelectedSagaIdState(importedSaga.id);
       closeImportModal();
       toast({ title: `Imported ${effectiveSelectedProject.name}`, tone: 'success' });
+      if (routeSearch.returnTo === '/ting/work') {
+        void navigate({
+          to: '/ting/work/$workId' as never,
+          params: { workId: `project:${importedSaga.id}` } as never,
+        });
+        return;
+      }
       void navigate({ to: '/ting/sagas/$sagaId', params: { sagaId: importedSaga.id } });
     } catch (importError) {
       toast({
@@ -475,7 +534,7 @@ function SagasPageContent() {
                 </h2>
                 <p className="niuu:m-0 niuu:mt-2 niuu:text-[14px] niuu:leading-6 niuu:text-text-secondary">
                   Every saga is a decomposed tracker issue driven by a workflow. Select one to
-                  inspect phases, runs, and confidence movement.
+                  inspect phases and runs.
                 </p>
               </div>
             </div>
@@ -544,7 +603,7 @@ function SagasPageContent() {
           <div className="niuu:rounded-xl niuu:border niuu:border-border-subtle niuu:bg-bg-secondary niuu:p-6">
             <EmptyState
               title="Select a saga"
-              description="Choose a saga to inspect phases, runs, and confidence movement."
+              description="Choose a saga to inspect phases and runs."
             />
           </div>
         )}
@@ -606,14 +665,23 @@ function SagasPageContent() {
                   />
                 ) : (
                   trackerProjects.map((project: TrackerProject) => {
-                    const imported = importedTrackerIds.has(project.id);
-                    const slugConflict = existingSagaSlugs.has(trackerProjectSlug(project));
-                    const selected = effectiveSelectedProjectId === project.id;
+                    const sourceKey = trackerSourceKey(project.id, project.trackerConnectionId);
+                    const imported = importedTrackerIds.has(sourceKey);
+                    const slugConflict = allSagas.some(
+                      (saga) =>
+                        saga.slug === trackerProjectSlug(project) &&
+                        (!saga.trackerConnectionId ||
+                          !project.trackerConnectionId ||
+                          saga.trackerConnectionId === project.trackerConnectionId),
+                    );
+                    const needsSourceSuffix =
+                      !slugConflict && existingSagaSlugs.has(trackerProjectSlug(project));
+                    const selected = effectiveSelectedProjectId === sourceKey;
                     return (
                       <button
-                        key={project.id}
+                        key={sourceKey}
                         type="button"
-                        onClick={() => setSelectedProjectId(project.id)}
+                        onClick={() => setSelectedProjectId(sourceKey)}
                         className={[
                           'niuu:w-full niuu:rounded-lg niuu:border niuu:p-3 niuu:text-left niuu:transition-colors',
                           selected
@@ -630,14 +698,19 @@ function SagasPageContent() {
                               <span className="niuu:rounded niuu:bg-bg-elevated niuu:px-2 niuu:py-0.5 niuu:text-[11px] niuu:font-mono niuu:text-text-muted">
                                 {project.status}
                               </span>
+                              {(project.trackerName || project.trackerType) && (
+                                <span className="niuu:rounded niuu:bg-bg-elevated niuu:px-2 niuu:py-0.5 niuu:text-[11px] niuu:font-mono niuu:text-text-muted">
+                                  {project.trackerName || project.trackerType}
+                                </span>
+                              )}
                               {imported && (
                                 <span className="niuu:rounded niuu:bg-brand/15 niuu:px-2 niuu:py-0.5 niuu:text-[11px] niuu:font-mono niuu:text-brand">
                                   imported
                                 </span>
                               )}
-                              {!imported && slugConflict && (
+                              {!imported && (slugConflict || needsSourceSuffix) && (
                                 <span className="niuu:rounded niuu:bg-amber-500/15 niuu:px-2 niuu:py-0.5 niuu:text-[11px] niuu:font-mono niuu:text-amber-300">
-                                  slug conflict
+                                  {slugConflict ? 'slug conflict' : 'name adjusted'}
                                 </span>
                               )}
                             </div>
@@ -692,6 +765,7 @@ function SagasPageContent() {
                                       {label}
                                     </span>
                                     <BranchSelect
+                                      loadBranches={repoCatalog.getBranches}
                                       repos={availableRepos}
                                       selectedRepos={[repoUrl]}
                                       value={entry.branch}
@@ -788,6 +862,55 @@ function SagasPageContent() {
                       )}
                     </div>
 
+                    <div className="niuu:grid niuu:grid-cols-[minmax(0,1fr)_140px] niuu:gap-2">
+                      <label className="niuu:block">
+                        <span className="niuu:block niuu:mb-1.5 niuu:text-xs niuu:font-mono niuu:text-text-muted">
+                          Workflow
+                        </span>
+                        <select
+                          value={selectedWorkflowId}
+                          onChange={(event) => {
+                            setSelectedWorkflowId(event.target.value);
+                            setSelectedWorkflowVersion('');
+                          }}
+                          className="niuu:w-full niuu:rounded-md niuu:border niuu:border-border niuu:bg-bg-tertiary niuu:px-3 niuu:py-2 niuu:text-sm niuu:text-text-primary"
+                        >
+                          <option value="">Use project default</option>
+                          {workflows.map((workflow) => (
+                            <option key={workflow.id} value={workflow.id}>
+                              {workflow.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="niuu:block">
+                        <span className="niuu:block niuu:mb-1.5 niuu:text-xs niuu:font-mono niuu:text-text-muted">
+                          Version
+                        </span>
+                        <select
+                          value={effectiveWorkflowVersion}
+                          onChange={(event) => setSelectedWorkflowVersion(event.target.value)}
+                          disabled={!selectedWorkflowId || workflowVersionsQuery.isLoading}
+                          className="niuu:w-full niuu:rounded-md niuu:border niuu:border-border niuu:bg-bg-tertiary niuu:px-3 niuu:py-2 niuu:text-sm niuu:text-text-primary niuu:disabled:opacity-50"
+                        >
+                          {!selectedWorkflowId ? <option value="">Default</option> : null}
+                          {selectedWorkflowId &&
+                          workflowVersions.length === 0 &&
+                          selectedWorkflow ? (
+                            <option value={selectedWorkflow.version}>
+                              {selectedWorkflow.version}
+                            </option>
+                          ) : null}
+                          {workflowVersions.map((entry) => (
+                            <option key={entry.documentRevision} value={entry.version}>
+                              {entry.version}
+                              {entry.isHead ? ' · current' : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+
                     <div className="niuu:block">
                       <span className="niuu:block niuu:mb-1.5 niuu:text-xs niuu:font-mono niuu:text-text-muted">
                         Volundr target
@@ -849,11 +972,18 @@ function SagasPageContent() {
                     </div>
 
                     <div className="niuu:rounded-md niuu:bg-bg-tertiary niuu:p-3 niuu:text-xs niuu:leading-5 niuu:text-text-secondary">
-                      {importedTrackerIds.has(effectiveSelectedProject.id)
+                      {importedTrackerIds.has(
+                        trackerSourceKey(
+                          effectiveSelectedProject.id,
+                          effectiveSelectedProject.trackerConnectionId,
+                        ),
+                      )
                         ? 'This tracker project is already imported into Ting.'
                         : selectedProjectHasSlugConflict
                           ? `A saga with slug "${selectedProjectSlug}" already exists in Ting.`
-                          : 'Select one or more repositories to bind the imported saga to.'}
+                          : selectedProjectNeedsSourceSuffix
+                            ? `The saga name "${selectedProjectSlug}" already exists; Ting will add the tracker source.`
+                            : 'Select one or more repositories to bind the imported saga to.'}
                     </div>
                   </>
                 ) : (

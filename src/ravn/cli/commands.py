@@ -27,13 +27,17 @@ from ravn.cli.mcp_runtime import (  # noqa: F401
 from ravn.config import ProjectConfig, Settings
 from ravn.domain.checkpoint import InterruptReason
 from ravn.domain.models import (
-    AgentTask,
+    AgentTask as AgentTask,
+)
+from ravn.domain.models import (
     Message,
-    OutputMode,
     Session,
     TodoItem,
     TodoStatus,
     TokenUsage,
+)
+from ravn.domain.models import (
+    OutputMode as OutputMode,
 )
 from ravn.domain.profile import RavnProfile
 from ravn.ports.checkpoint import CheckpointPort
@@ -52,8 +56,6 @@ from ravn.workflow_runtime import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
-# Extracted runtime wrappers resolve these legacy module globals at call time.
-_RUNTIME_MODEL_EXPORTS = (AgentTask, OutputMode)
 
 app = typer.Typer(
     name="ravn",
@@ -182,6 +184,7 @@ from ravn.cli.runtime_builders import (  # noqa: E402, F401
     _build_mimir_auth,
     _build_permission,
     _build_tool_build_backend,
+    _effective_permission_mode,
     _constructor_accepts_kwarg,
     _get_tool_group,
     _with_mimir_fact_capture,
@@ -508,9 +511,7 @@ def _build_agent(
     resolved_model = _resolve_persona_model(settings, persona_config)
 
     workspace = _resolve_workspace(settings)
-    permission_mode = settings.permission.mode
-    if persona_config is not None and persona_config.permission_mode:
-        permission_mode = persona_config.permission_mode
+    permission_mode = _effective_permission_mode(settings, persona_config)
     cli_transport_executor = _uses_cli_transport_executor(persona_config)
     llm = None if cli_transport_executor else _build_llm(settings)
     session = session or Session()
@@ -991,9 +992,6 @@ def _build_tool_mcp_tools(settings: Settings, *, persona_config: Any | None) -> 
         memory=memory,
         iteration_budget=_build_iteration_budget(settings, max_iterations),
         mimir=mimir,
-        inject_learnings=settings.reflection.inject_learnings,
-        max_learnings_injected=settings.reflection.max_learnings_injected,
-        learning_token_budget=settings.reflection.learning_token_budget,
         persona_config=persona_config,
         permission=_build_permission(
             settings,
@@ -1078,7 +1076,6 @@ def inbox_migrate(
     before its original file is removed, so an interrupted run simply resumes.
     Reports counts so the operator can reconcile before and after.
     """
-    import asyncio  # noqa: PLC0415
 
     from ravn.resident_inbox import LocalResidentInbox  # noqa: PLC0415
 
@@ -1113,7 +1110,6 @@ def memory_backfill_embeddings(
     each batch commits before the next is fetched, so a run interrupted or
     refused partway can simply be run again.
     """
-    import asyncio  # noqa: PLC0415
 
     if config:
         os.environ["RAVN_CONFIG"] = config
@@ -1443,9 +1439,7 @@ async def _run_gateway(
         # Per-session: fresh session, budget, and tools
         session = Session()
         budget = _build_iteration_budget(settings, max_iterations)
-        permission_mode = settings.permission.mode
-        if persona_config is not None and persona_config.permission_mode:
-            permission_mode = persona_config.permission_mode
+        permission_mode = _effective_permission_mode(settings, persona_config)
         permission = _build_permission(
             settings,
             workspace,
@@ -1752,6 +1746,7 @@ _TRIGGER_WIRING_NAMES = frozenset(
     (
         "_wire_mimir_triggers",
         "_wire_cron",
+        "_wire_api_triggers",
         "_wire_task_dispatch",
         "_derive_capabilities",
         "_wire_cascade",
@@ -1761,6 +1756,7 @@ _wire_mimir_triggers = _runtime_wrapper(
     _trigger_wiring, "_wire_mimir_triggers", _TRIGGER_WIRING_NAMES
 )
 _wire_cron = _runtime_wrapper(_trigger_wiring, "_wire_cron", _TRIGGER_WIRING_NAMES)
+_wire_api_triggers = _runtime_wrapper(_trigger_wiring, "_wire_api_triggers", _TRIGGER_WIRING_NAMES)
 _wire_task_dispatch = _runtime_wrapper(
     _trigger_wiring, "_wire_task_dispatch", _TRIGGER_WIRING_NAMES
 )
@@ -2129,17 +2125,17 @@ def _build_single_mimir(settings: Settings, name: str) -> Any:
     for inst in settings.mimir.instances:
         if inst.name != name:
             continue
-        if inst.path:
-            from mimir.adapters.markdown import MarkdownMimirAdapter
+        from mimir.connections import resolve_mimir_connection
 
-            return MarkdownMimirAdapter(root=inst.path)
-        if inst.url:
-            from ravn.adapters.mimir.http import HttpMimirAdapter
-
-            auth = None
-            if inst.auth is not None:
-                auth = _build_mimir_auth(settings, inst.auth)
-            return HttpMimirAdapter(base_url=inst.url, auth=auth)
+        return resolve_mimir_connection(
+            adapter=inst.adapter,
+            kwargs=inst.kwargs,
+            secret_kwargs_env=inst.secret_kwargs_env,
+            path=inst.path,
+            url=inst.url,
+            environment_id=settings.environment.id,
+            auth=_build_mimir_auth(settings, inst.auth) if inst.auth is not None else None,
+        )
 
     # No instances configured — accept "local" as alias for the single path adapter
     if not settings.mimir.instances and name == "local":

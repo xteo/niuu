@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import respx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from httpx import ConnectError, Response
+from httpx import ConnectError, ConnectTimeout, Response
+from starlette.responses import Response as StarletteResponse
 
+from identity.adapters.identity import AllowAllIdentityAdapter
 from niuu.adapters.inbound.rest_volundr import create_volundr_router
 from niuu.domain.models import InstanceKind, InstanceVisibility, Principal, RegisteredInstance
 
@@ -28,6 +33,12 @@ def _instance(
     config: dict[str, Any] | None = None,
 ) -> RegisteredInstance:
     now = datetime.now(UTC)
+    # These fixtures exist to exercise aggregate-routing behavior, not the
+    # transport-security policy, so http:// fixtures opt into plaintext by
+    # default; a test exercising that policy itself overrides
+    # allow_plaintext explicitly (see test_guild_transport.py /
+    # test_rest_ravn.py's dedicated transport-security tests).
+    merged_config: dict[str, Any] = {"allow_plaintext": True, **(config or {})}
     return RegisteredInstance(
         id=instance_id,
         kind=InstanceKind.VOLUNDR,
@@ -39,7 +50,7 @@ def _instance(
         tenant_id=tenant_id,
         enabled=enabled,
         is_default=is_default,
-        config=config or {},
+        config=merged_config,
         created_at=now,
         updated_at=now,
         tags=tags or [],
@@ -92,6 +103,7 @@ def _client(
     embedded_forge_app: FastAPI | None = None,
 ) -> TestClient:
     app = FastAPI()
+    app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
     app.include_router(  # type: ignore[arg-type]
         create_volundr_router(
             StubInstanceService(instances),
@@ -107,6 +119,176 @@ def _headers() -> dict[str, str]:
         "x-auth-user-id": "user-a",
         "x-auth-tenant": "tenant-a",
     }
+
+
+DELIVERY_OPERATIONS = (
+    "refs/resolve",
+    "forge/reviews",
+    "forge/branches",
+    "workspaces/allocate",
+    "workspaces/verify",
+    "workspaces/integration/inspect",
+    "workspaces/integration/inspect-chain",
+    "evidence/policy",
+    "evidence/validate",
+    "workspaces/integrate",
+    "forge/inspect",
+    "forge/merge",
+    "forge/reconcile",
+)
+
+
+def test_delivery_operation_dispatches_to_embedded_target_without_mutating_evidence() -> None:
+    embedded = FastAPI()
+    observed: dict[str, Any] = {}
+    response_body = b'{"valid":true,"evidence":{"signature":"signed"}}'
+
+    @embedded.post("/api/v1/forge/delivery/evidence/validate")
+    async def validate_evidence(request: Request) -> StarletteResponse:
+        observed["body"] = await request.body()
+        observed["query"] = str(request.url.query)
+        observed["authorization"] = request.headers.get("authorization")
+        observed["user_id"] = request.headers.get("x-auth-user-id")
+        return StarletteResponse(content=response_body, media_type="application/json")
+
+    client = _client(
+        [
+            _instance(
+                "local",
+                base_url="embedded://local-forge",
+                tags=["delivery"],
+                config={"transport": "embedded"},
+            )
+        ],
+        embedded_forge_app=embedded,
+    )
+    request_body = (
+        b'{"evidence":{"payload":{"candidate_sha":"aaaaaaaa"},'
+        b'"signature":"signed"},"policy_id":"strict"}'
+    )
+
+    response = client.post(
+        "/api/v1/forge/delivery/evidence/validate?target_tags=delivery&target_match=all",
+        headers={**_headers(), "content-type": "application/json"},
+        content=request_body,
+    )
+
+    assert response.status_code == 200
+    assert response.content == response_body
+    assert observed == {
+        "body": request_body,
+        "query": "",
+        "authorization": "Bearer test-token",
+        "user_id": "user-a",
+    }
+
+
+@pytest.mark.parametrize("operation", DELIVERY_OPERATIONS)
+@respx.mock
+def test_delivery_typed_operations_proxy_to_selected_remote_instance(operation: str) -> None:
+    client = _client(
+        [
+            _instance("default", base_url="http://default", is_default=True),
+            _instance("target", base_url="http://target"),
+        ]
+    )
+    status_code = 201 if operation == "workspaces/allocate" else 200
+    upstream_body = b'{"evidence":{"signature":"upstream-signed"}}'
+    route = respx.post(f"http://target/api/v1/forge/delivery/{operation}").mock(
+        return_value=Response(
+            status_code,
+            content=upstream_body,
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    response = client.post(
+        f"/api/v1/forge/delivery/{operation}?instance_id=target",
+        headers=_headers(),
+        json={"operation": operation},
+    )
+
+    assert response.status_code == status_code
+    assert response.content == upstream_body
+    assert route.called
+    request = route.calls.last.request
+    assert request.url.query == b""
+    assert request.headers["authorization"] == "Bearer test-token"
+    # A remote Guild instance never sees a client-supplied x-auth-* header.
+    assert "x-auth-user-id" not in request.headers
+
+
+def test_request_remote_returns_502_on_a_tls_pin_mismatch(monkeypatch) -> None:
+    """_request_remote's own guild_transport enforcement (build_guild_httpx_client
+    raising GuildTransportError) maps to a 502 — the upstream is never
+    contacted at all when the pin fails."""
+    monkeypatch.setattr(
+        "niuu.adapters.outbound.guild_transport.fetch_leaf_certificate_der",
+        lambda *a, **k: b"not the pinned certificate",
+    )
+    pinned_fingerprint = hashlib.sha256(b"the actual expected certificate").hexdigest()
+    client = _client(
+        [
+            _instance(
+                "target",
+                base_url="https://target",
+                config={"tls_fingerprint": pinned_fingerprint},
+            )
+        ]
+    )
+
+    response = client.post(
+        "/api/v1/forge/delivery/refs/resolve?instance_id=target",
+        headers=_headers(),
+        json={"operation": "refs/resolve"},
+    )
+
+    assert response.status_code == 502
+    assert "does not match" in response.json()["detail"]
+
+
+@respx.mock
+def test_delivery_proxy_preserves_upstream_authorization_failure() -> None:
+    client = _client([_instance("target", base_url="http://target")])
+    route = respx.post("http://target/api/v1/forge/delivery/refs/resolve").mock(
+        return_value=Response(
+            403,
+            content=b'{"detail":"Delivery operation denied"}',
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    response = client.post(
+        "/api/v1/forge/delivery/refs/resolve?instance_id=target",
+        headers=_headers(),
+        json={"repository": "org/repo", "ref": "main"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Delivery operation denied"}
+    assert route.called
+
+
+@respx.mock
+def test_delivery_proxy_rejects_inaccessible_instance_and_unknown_operation() -> None:
+    client = _client([_instance("hidden", base_url="http://hidden", tenant_id="other")])
+
+    inaccessible = client.post(
+        "/api/v1/forge/delivery/refs/resolve?instance_id=hidden",
+        headers=_headers(),
+        json={"repository": "org/repo", "ref": "main"},
+    )
+    unknown = client.post(
+        "/api/v1/forge/delivery/admin/reload?instance_id=hidden",
+        headers=_headers(),
+        json={},
+    )
+
+    assert inaccessible.status_code == 404
+    assert inaccessible.json()["detail"] == "Target not found: hidden"
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "Unknown delivery operation"
+    assert len(respx.calls) == 0
 
 
 def test_list_sessions_can_dispatch_to_embedded_local_target() -> None:
@@ -227,6 +409,32 @@ def test_resident_control_dispatches_through_embedded_target() -> None:
     assert created_session.json()["instance_id"] == "local"
 
 
+def test_upstream_error_detail_is_forwarded_without_a_second_wrapper() -> None:
+    """A Forge 409 arrives as its own message, not as a JSON body inside detail."""
+    from fastapi import HTTPException
+
+    from niuu.adapters.inbound.rest_volundr import _ensure_remote_success
+
+    body = {"detail": "No session slot is free: 4 of 4 sessions are running on this host."}
+    response = httpx.Response(409, json=body, request=httpx.Request("POST", "http://forge/x"))
+    with pytest.raises(HTTPException) as info:
+        _ensure_remote_success(response)
+    assert info.value.status_code == 409
+    assert info.value.detail == body["detail"]
+
+    plain = httpx.Response(502, text="Bad Gateway", request=httpx.Request("GET", "http://f/y"))
+    with pytest.raises(HTTPException) as info:
+        _ensure_remote_success(plain)
+    assert info.value.detail == "Bad Gateway"
+
+    empty = httpx.Response(503, request=httpx.Request("GET", "http://f/z"))
+    with pytest.raises(HTTPException) as info:
+        _ensure_remote_success(empty)
+    assert info.value.detail == "Service Unavailable"
+
+    _ensure_remote_success(httpx.Response(200, request=httpx.Request("GET", "http://f/ok")))
+
+
 def test_embedded_target_fails_loud_without_local_app() -> None:
     client = _client(
         [
@@ -278,7 +486,7 @@ def test_list_sessions_merges_visible_instances_and_forwards_auth() -> None:
         }
     ]
     assert sessions_route.calls.last.request.headers["authorization"] == "Bearer test-token"
-    assert sessions_route.calls.last.request.headers["x-auth-tenant"] == "tenant-a"
+    assert "x-auth-tenant" not in sessions_route.calls.last.request.headers
 
 
 @respx.mock
@@ -301,6 +509,75 @@ def test_get_session_searches_visible_instances() -> None:
     assert payload["id"] == "s2"
     assert payload["instance_id"] == "beta"
     assert payload["instance_name"] == "Instance beta"
+
+
+@pytest.mark.parametrize("resource", ["sessions", "resident-runtimes"])
+@respx.mock
+def test_owner_lookup_finds_resource_despite_unreachable_instance(resource: str) -> None:
+    client = _client(
+        [
+            _instance("offline", base_url="http://offline"),
+            _instance("noatun", base_url="http://noatun"),
+        ]
+    )
+    respx.get(f"http://offline/api/v1/forge/{resource}/s2").mock(
+        side_effect=ConnectTimeout("offline")
+    )
+    respx.get(f"http://noatun/api/v1/forge/{resource}/s2").mock(
+        return_value=Response(200, json={"id": "s2", "status": "running"})
+    )
+    response = client.get(f"/api/v1/forge/{resource}/s2", headers=_headers())
+    assert response.status_code == 200
+    assert response.json()["instance_id"] == "noatun"
+
+
+@respx.mock
+def test_incomplete_owner_lookup_is_not_reported_as_missing() -> None:
+    client = _client(
+        [
+            _instance("offline", base_url="http://offline"),
+            _instance("noatun", base_url="http://noatun"),
+        ]
+    )
+    respx.get("http://offline/api/v1/forge/sessions/s2").mock(side_effect=ConnectTimeout("offline"))
+    respx.get("http://noatun/api/v1/forge/sessions/s2").mock(return_value=Response(404))
+    response = client.get("/api/v1/forge/sessions/s2", headers=_headers())
+    assert response.status_code == 502
+
+
+async def test_owner_lookup_cancels_stalled_probes_after_finding_owner(monkeypatch) -> None:
+    import asyncio
+
+    from fastapi import Request
+
+    from niuu.adapters.inbound import rest_volundr
+
+    cancelled = asyncio.Event()
+
+    async def probe(instance, request, **kwargs):
+        if instance.id == "offline":
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return Response(200, json={"id": "s2"})
+
+    monkeypatch.setattr(rest_volundr, "_request_remote", probe)
+    service = StubInstanceService(
+        [
+            _instance("offline", base_url="http://offline"),
+            _instance("noatun", base_url="http://noatun"),
+        ]
+    )
+    principal = Principal(user_id="user-a", email="", tenant_id="tenant-a", roles=[])
+    owner, _ = await asyncio.wait_for(
+        rest_volundr._find_session_owner(
+            service, principal, Request({"type": "http", "query_string": b""}), "s2"
+        ),
+        timeout=1,
+    )
+    assert owner.id == "noatun"
+    assert cancelled.is_set()
 
 
 @respx.mock
@@ -356,6 +633,18 @@ def test_list_sessions_ignores_errors_and_sorts_last_active_descending() -> None
 
     assert response.status_code == 200
     assert [item["id"] for item in response.json()] == ["s2", "s1"]
+    # A failed instance's contribution is dropped from the merged list, but
+    # not silently — it is named, additively, on the response so a caller
+    # can tell "nothing reported" apart from "one node was unreachable".
+    failures = json.loads(response.headers["X-Niuu-Source-Failures"])
+    assert failures == [
+        {
+            "instanceId": "gamma",
+            "name": "Instance gamma",
+            "status": "unreachable",
+            "error": "HTTP 503",
+        }
+    ]
 
 
 @pytest.mark.parametrize("archived", [False, True])
@@ -1234,7 +1523,6 @@ def test_send_preserves_pending_http_status_and_client_request_identity() -> Non
     )
     assert response.status_code == 202
     assert response.json() == payload
-    import json
 
     assert json.loads(route.calls.last.request.content)["request_id"] == "client-1"
 
@@ -1403,14 +1691,18 @@ def test_session_stream_scopes_visible_hosts_and_stamps_owning_instance(
     from niuu.adapters.inbound import rest_volundr
 
     embedded = FastAPI()
+    subscribers = []
 
-    async def subscribe():
+    async def subscribe(principal):
+        subscribers.append(principal.user_id)
         yield SimpleNamespace(
             type=SimpleNamespace(value="session_activity"),
             data={"session_id": "local-session", "state": "idle"},
         )
 
-    embedded.state.broadcaster = SimpleNamespace(subscribe=subscribe)
+    embedded.state.session_event_stream = SimpleNamespace(
+        authorize=lambda principal: None, subscribe=subscribe
+    )
     remote = respx.get("http://bro/api/v1/forge/sessions/stream").mock(
         return_value=Response(
             200,
@@ -1419,7 +1711,7 @@ def test_session_stream_scopes_visible_hosts_and_stamps_owning_instance(
     )
     captured = []
 
-    async def finite_merge(sources):
+    async def finite_merge(sources, **_kwargs):
         captured.extend(sources)
         for source in sources.values():
             reader = source()
@@ -1449,9 +1741,12 @@ def test_session_stream_scopes_visible_hosts_and_stamps_owning_instance(
     assert captured == expected
     for host in expected:
         assert f"session_activity:{host}:{host}-session" in response.text
+    # The embedded Forge is subscribed as the caller, so it can scope events.
+    assert subscribers == (["user-a"] if "local" in expected else [])
     if "bro" in expected:
         assert remote.calls[0].request.url.query == b""  # No recursive fleet fan-out.
-        assert remote.calls[0].request.headers["x-auth-user-id"] == "user-a"
+        assert remote.calls[0].request.headers["authorization"] == "Bearer test-token"
+        assert "x-auth-user-id" not in remote.calls[0].request.headers
 
 
 @respx.mock
@@ -1506,6 +1801,101 @@ def test_event_log_replay_passes_list_through_verbatim() -> None:
 
     assert isinstance(payload, list)
     assert [entry["seq"] for entry in payload] == [1, 2]
+
+
+@respx.mock
+def test_event_log_page_forwards_cursor_visibility_and_authorization() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2"})
+    )
+    page = respx.get(
+        "http://beta/api/v1/forge/sessions/s2/log/page",
+        params={"after": "3", "limit": "25", "show_internal": "false"},
+    ).mock(
+        return_value=Response(
+            200,
+            json={"entries": [], "scannedThrough": 28, "hasMore": True},
+        )
+    )
+
+    response = client.get(
+        "/api/v1/forge/sessions/s2/log/page",
+        headers=_headers(),
+        params={"after": 3, "limit": 25, "show_internal": "false"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"entries": [], "scannedThrough": 28, "hasMore": True}
+    assert page.called
+    assert page.calls[0].request.headers["authorization"] == "Bearer test-token"
+
+
+@respx.mock
+def test_event_log_page_preserves_upstream_authorization_failure() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2"})
+    )
+    respx.get("http://beta/api/v1/forge/sessions/s2/log/page").mock(
+        return_value=Response(403, json={"detail": "Session log access denied"})
+    )
+
+    response = client.get(
+        "/api/v1/forge/sessions/s2/log/page",
+        headers=_headers(),
+        params={"after": 0, "limit": 25, "show_internal": "false"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Session log access denied"}
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+@respx.mock
+def test_home_storage_routes_only_to_selected_visible_cluster(method):
+    instances = [
+        _instance("a", base_url="https://a.test"),
+        _instance("b", base_url="https://b.test"),
+    ]
+    route = respx.route(
+        method=method, url="https://b.test/api/v1/forge/storage/home?path=tmp%2Fcache"
+    ).mock(return_value=Response(200, json={"status": "ready"}))
+    response = _client(instances).request(
+        method, "/api/v1/forge/storage/home?instance_id=b&path=tmp%2Fcache", headers=_headers()
+    )
+    assert response.status_code == 200
+    assert route.called
+    assert route.calls[0].request.headers["authorization"] == "Bearer test-token"
+    assert (
+        _client(instances)
+        .request(method, "/api/v1/forge/storage/home?instance_id=hidden", headers=_headers())
+        .status_code
+        == 404
+    )
+
+
+@respx.mock
+def test_feature_flags_select_requested_instance() -> None:
+    client = _client(
+        [
+            _instance("alpha", base_url="http://alpha", is_default=True),
+            _instance("beta", base_url="http://beta"),
+        ]
+    )
+    route = respx.get("http://beta/api/v1/forge/feature-flags").mock(
+        return_value=Response(200, json={"mini_mode": False, "local_mounts_enabled": False})
+    )
+    response = client.get("/api/v1/forge/feature-flags?instance_id=beta", headers=_headers())
+    assert response.status_code == 200
+    assert response.json()["mini_mode"] is False
+    assert route.called
+
+
+def test_feature_flags_reject_invisible_instance() -> None:
+    client = _client([_instance("private", base_url="http://private", tenant_id="other")])
+    response = client.get("/api/v1/forge/feature-flags?instance_id=private", headers=_headers())
+    assert response.status_code == 404
 
 
 @respx.mock
@@ -1632,8 +2022,7 @@ def test_read_state_is_forwarded_to_owning_instance(method, status_code):
         )
     assert response.status_code == status_code
     assert route.called
-    assert route.calls[0].request.headers["x-auth-user-id"] == "user-a"
+    assert route.calls[0].request.headers["authorization"] == "Bearer test-token"
+    assert "x-auth-user-id" not in route.calls[0].request.headers
     if method == "PATCH":
-        import json
-
         assert json.loads(route.calls[0].request.content) == body

@@ -26,7 +26,7 @@ using the same append path as present-file.
 Notification id: `notification_id(turn_dedupe_key(session_id, turn.id, kind))`,
 where `session_id` is the Forge session UUID string.
 
-## 2. Storage: migration `000069_forge_notifications` (core)
+## 2. Storage: migration `000084_forge_notifications` (core)
 
 Idempotent SQL, written in all three places: `migrations/`,
 `charts/volundr/templates/migrations-configmap.yaml` and `src/cli/migrations/volundr/`.

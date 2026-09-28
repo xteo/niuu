@@ -1,88 +1,149 @@
-# Configuration Reference
+# Configuration
 
-Understand how Niuu services are configured.
+Configure the process you are starting. The Niuu host CLI, a standalone service,
+and a Helm chart have related but different configuration schemas.
 
-Services load YAML configuration with environment variable overrides. Nested environment overrides use `__`.
+## Local Niuu host
 
-## Common config files
+`niuu platform init` writes the local host configuration. By default it uses
+`~/.niuu/config.yaml`. Select another file with the root `--config` option or
+`NIUU_CONFIG`. In the current source, initialization respects that selection.
 
-| Service | Config file |
-| --- | --- |
-| Völundr | `config.yaml` or `/etc/volundr/config.yaml` |
-| Bifröst | `bifrost.yaml` |
-| Ting | `ting.yaml` |
-| Ravn | `ravn.yaml` |
+```bash
+niuu --config ./niuu.yaml platform init
+niuu --config ./niuu.yaml platform up
+```
+
+Initialization asks before overwriting an existing file. The second command runs
+in the foreground; stop it with Ctrl+C. Use a dedicated directory if you want an
+independent configuration, and also choose separate database, workspace, and port
+settings before running two hosts at once.
+
+The host schema is `CLISettings` in `src/cli/config.py`. This is a valid local
+configuration fragment to merge into the generated file:
+
+```yaml
+server:
+  host: 127.0.0.1
+  port: 8080
+pod_manager:
+  adapter: volundr.adapters.outbound.local_process.LocalProcessPodManager
+  workspaces_dir: ~/.niuu/workspaces
+  max_concurrent: 4
+  sdk_port_start: 9100
+```
+
+The local host adapter's arguments sit directly under `pod_manager`. They are
+passed to the selected adapter. `server.external_host` controls a browser-facing
+host when it differs from the listen address; it does not configure TLS or login.
+
+### Authentication mode (`host_auth`)
+
+Mini mode and docker mode have no Envoy JWT filter in front of them, so
+`host_auth.mode` says explicitly how the host trusts a caller — it defaults
+to `none` (today's behaviour: every caller is admin) and is never inferred.
+It is named `host_auth`, not `auth`: Ting's own `Settings` reads a top-level
+`auth:` key from this same file for an unrelated, differently-shaped config.
+
+```yaml
+host_auth:
+  mode: none # or: oidc — see operations/security-and-permissions.md
+  oidc:
+    issuers:
+      - issuer: "https://keycloak.example.com/realms/volundr"
+        audiences: ["volundr-api"]
+        jwks_uri: "" # empty = resolve via OIDC discovery; must be HTTPS
+    clock_leeway_seconds: 60
+    jwks_cache_ttl_seconds: 300
+    jwks_timeout_seconds: 5.0
+    min_refresh_interval_seconds: 5.0
+    user_id_claim: sub
+    email_claim: email
+    tenant_claim: tenant_id
+    roles_claim: resource_access.volundr.roles
+```
+
+`host_auth.mode: oidc` requires at least one `host_auth.oidc.issuers` entry
+(issuer and one or more audiences); the CLI settings loader raises at
+config-load time otherwise, as it does when a plugin or Bifröst mode not yet
+covered by `oidc` (Mímir, Guild, an open Bifröst gateway) is still enabled.
+See [Authentication mode on hosts without
+Envoy](../operations/security-and-permissions.md#authentication-mode-on-hosts-without-envoy)
+for what each mode covers today, path by path.
 
 ## Environment overrides
 
-```bash
-DATABASE__HOST=postgres.local
-DATABASE__PASSWORD=secret
-GIT__GITHUB__TOKEN=ghp_xxxx
-EVENT_PIPELINE__OTEL__ENABLED=true
-```
-
-## Völundr pod manager
-
-Völundr launches Forge sessions through a dynamic `pod_manager` adapter. The
-`adapter` value is a fully qualified Python class name. Values under `kwargs`
-are passed to that adapter.
-
-```yaml
-pod_manager:
-  adapter: "volundr.adapters.outbound.flux.FluxPodManager"
-  kwargs:
-    namespace: volundr
-```
-
-Environment overrides use the same nested shape. For a directly started
-Völundr service, adapter kwargs live under `POD_MANAGER__KWARGS__...`:
+The Niuu CLI uses `NIUU_` and `__` for nested fields. For one foreground run on a
+different port:
 
 ```bash
-POD_MANAGER__ADAPTER=volundr.adapters.outbound.openshell_gateway.OpenShellGatewayPodManager
-POD_MANAGER__KWARGS__GATEWAY_ENDPOINT=openshell.openshell.svc.cluster.local:8080
+NIUU_SERVER__PORT=8081 niuu platform up
 ```
 
-The local `niuu platform` CLI uses the `NIUU_` prefix for its own config and
-then exports service-level settings when it starts Völundr. The canonical
-service fields are `server_host`, `server_public_host`, `server_port`, and
-`openshell_internal_gateway_url`; the legacy `NIUU_SERVER_*` and
-`OPENSHELL_INTERNAL_GATEWAY_URL` names remain typed environment aliases.
-OpenShell endpoint and OIDC values belong in `pod_manager.kwargs`, with secrets
-resolved explicitly through `secret_kwargs_env`; the former flat `OPENSHELL_*`
-variables remain compatibility aliases at the Settings boundary.
+Explicit constructor settings take precedence over environment settings, which
+take precedence over YAML in the CLI settings loader. When a value surprises you,
+check the selected config file and relevant exported overrides. Do not print an
+entire environment or configuration containing credentials into a shared log.
 
-Deployments can use mini mode, cluster mode, or OpenShell mode. OpenShell mode
-keeps the normal Skuld broker/session protocol but creates each session through
-the OpenShell gateway API:
+## Observability (OpenTelemetry)
+
+Every process that owns a composition root — Völundr, Ting, Bifröst, Skuld,
+Ravn, Mímir, Observatory, and the local `niuu` host itself
+(`src/cli/shared_host.py`, the "Niuu Shared Services" app) — reads its own
+`observability:` block from the shared
+`niuu.domain.observability.ObservabilityConfig` shape:
 
 ```yaml
-pod_manager:
-  adapter: "volundr.adapters.outbound.openshell_gateway.OpenShellGatewayPodManager"
-  kwargs:
-    gateway_endpoint: "openshell.openshell.svc.cluster.local:8080"
-    token_url: "https://keycloak.niuu.world/realms/volundr/protocol/openid-connect/token"
-    client_id: "openshell-volundr-agent"
-    sandbox_image: "ghcr.io/niuulabs/skuld:openshell-codex-openbao-20260709-7"
-    sandbox_command: ["/opt/niuu/bin/python", "-m", "skuld"]
-    service_port: 9200
-  secret_kwargs_env:
-    client_secret: OPENSHELL_OIDC_CLIENT_SECRET
+observability:
+  enabled: true
+  trace_endpoint: "http://otel-collector:4317"     # OTLP/gRPC
+  metric_endpoint: "http://otel-collector:4318/v1/metrics"  # OTLP/HTTP
+  insecure: true          # disable TLS on the gRPC trace exporter
+  capture_content: false  # redacted, size-bounded event content on spans
+  headers: {}              # optional OTLP headers (e.g. auth), both exporters
 ```
 
-OpenShell-specific controls are split across three layers:
+`enabled: true` requires both `trace_endpoint` and `metric_endpoint` — it fails
+loudly at startup otherwise, per the no-fallbacks rule: a configured-but-broken
+exporter must stop the process, not run quietly without traces. `enabled` false
+(the default) is a decision, not a degraded fallback.
 
-| Control | Where to configure it |
-| --- | --- |
-| Authentication | Keycloak client credentials from `OPENSHELL_OIDC_CLIENT_SECRET`; the token is sent as `Authorization: Bearer ...` to the gateway. |
-| CPU and memory | Session `resources` values; the adapter maps them to OpenShell template resources. |
-| Scheduling | Session `nodeSelector`, `tolerations`, `runtimeClassName`, and `priorityClassName`; the adapter maps them to Kubernetes driver config. |
-| Runtime env | Session env and pod-spec literal env values; secret `valueFrom` env requires a follow-up gateway-compatible secret path. |
-| Service exposure | OpenShell `ExposeService`; Völundr stores the returned Skuld chat/code endpoints. |
+Each service's own `service_name` default (`volundr`, `ting`, `bifrost`, `skuld`,
+`ravn`, `mimir`, `niuu-mini`) makes it identifiable in the trace backend without
+you setting it. Observatory is the one exception — it reuses
+`volundr.config.Settings` wholesale, so its `observability.service_name`
+defaults to `volundr` too; set it explicitly in Observatory's own
+`config.yaml` if you run both. The mini-mode host (`niuu platform up`) exposes the same block
+under `CLISettings.observability` (`src/cli/config.py`) as the one place to
+point the whole local stack at a collector; when several services share that
+one process, only the first to configure wins the process-wide identity — see
+`configure_observability`'s docstring in `src/niuu/observability.py`. See
+[Diagnose an operation across services](../operations/observability.md) for
+what one trace shows and how to point it at Tempo, Jaeger, or any other OTLP
+collector.
 
-See [OpenShell runtime](../operations/openshell-runtime.md) for the gateway
-runtime shape.
+## Standalone services
 
-## Local stack
+Service settings belong to their own configuration models, such as
+`src/volundr/config.py`, `src/ravn/config.py`, and `src/mimir/config.py`.
+A standalone Völundr `pod_manager` uses `adapter` plus a nested `kwargs` mapping.
+Do not paste the host's flattened adapter shape into that schema.
 
-`./start-dev` sets the local host profile and aligns service URLs so embedded services can call back into the shared platform host.
+Secret-backed adapter arguments use explicit secret mappings. For OpenShell,
+service configuration uses `secret_kwargs_env`; Helm uses `podManager.secretKwargs`.
+See [OpenShell configuration](../operations/openshell-runtime.md).
+
+## Helm values
+
+Chart values are a third schema. Within the umbrella chart, Völundr values belong
+under `volundr`, Ting values under `ting`, and so on. A root
+`database.external.host` does not configure every subchart's database.
+
+Inspect and render the selected chart version before deploying:
+
+```bash
+helm show values ./charts/niuu
+```
+
+Use [the Helm reference](helm-charts.md) for chart scope and
+[deployment](../operations/kubernetes-deployment.md) for rendering and validation.

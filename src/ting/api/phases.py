@@ -13,6 +13,7 @@ from ting.adapters.inbound.auth import extract_principal
 from ting.api.sagas import resolve_saga_repo
 from ting.api.tracker import resolve_trackers
 from ting.domain.models import PhaseStatus, RunStatus, TrackerIssue, TrackerMilestone
+from ting.domain.tracker_routing import select_tracker_for_saga
 from ting.ports.saga_repository import SagaRepository
 from ting.ports.tracker import TrackerPort
 
@@ -29,7 +30,6 @@ class RunPhaseItemResponse(BaseModel):
     declared_files: list[str]
     estimate_hours: float | None
     status: str
-    confidence: float
     session_id: str | None = None
     reviewer_session_id: str | None = None
     review_round: int = 0
@@ -47,7 +47,6 @@ class SagaPhaseItemResponse(BaseModel):
     number: int
     name: str
     status: str
-    confidence: float
     runs: list[RunPhaseItemResponse]
 
 
@@ -100,7 +99,6 @@ def _fallback_run(issue: TrackerIssue, *, phase_id: str) -> RunPhaseItemResponse
         declared_files=[],
         estimate_hours=issue.estimate,
         status=_coerce_issue_status(issue),
-        confidence=100.0 if issue.status_type.lower() == "completed" else 0.0,
         session_id=None,
         reviewer_session_id=None,
         review_round=0,
@@ -161,7 +159,6 @@ async def _hydrate_tracker_backed_phases(
                         declared_files=run.declared_files,
                         estimate_hours=run.estimate_hours,
                         status=run.status.value.lower(),
-                        confidence=run.confidence,
                         session_id=run.session_id,
                         reviewer_session_id=run.reviewer_session_id,
                         review_round=run.review_round,
@@ -175,11 +172,6 @@ async def _hydrate_tracker_backed_phases(
             except Exception:
                 run_items.append(_fallback_run(issue, phase_id=milestone.id))
 
-        phase_confidence = (
-            sum(run.confidence for run in run_items) / len(run_items)
-            if run_items
-            else milestone.progress * 100.0
-        )
         responses.append(
             SagaPhaseItemResponse(
                 id=milestone.id,
@@ -188,7 +180,6 @@ async def _hydrate_tracker_backed_phases(
                 number=index,
                 name=milestone.name,
                 status=_coerce_phase_status(run_items, milestone),
-                confidence=phase_confidence,
                 runs=run_items,
             )
         )
@@ -213,7 +204,6 @@ async def _hydrate_tracker_backed_phases(
                         declared_files=run.declared_files,
                         estimate_hours=run.estimate_hours,
                         status=run.status.value.lower(),
-                        confidence=run.confidence,
                         session_id=run.session_id,
                         reviewer_session_id=run.reviewer_session_id,
                         review_round=run.review_round,
@@ -227,9 +217,6 @@ async def _hydrate_tracker_backed_phases(
             except Exception:
                 run_items.append(_fallback_run(issue, phase_id=phase_id))
 
-        phase_confidence = (
-            sum(run.confidence for run in run_items) / len(run_items) if run_items else 0.0
-        )
         responses.append(
             SagaPhaseItemResponse(
                 id=phase_id,
@@ -238,7 +225,6 @@ async def _hydrate_tracker_backed_phases(
                 number=len(ordered_milestones) + 1,
                 name="Unassigned",
                 status=_coerce_phase_status(run_items, None),
-                confidence=phase_confidence,
                 runs=run_items,
             )
         )
@@ -279,15 +265,14 @@ def create_saga_phases_router() -> APIRouter:
 
         phases = await repo.get_phases_by_saga(parsed_saga_id)
         if not phases and saga.tracker_id:
-            for tracker in trackers:
-                try:
-                    return await _hydrate_tracker_backed_phases(
-                        tracker,
-                        saga_id=str(saga.id),
-                        tracker_project_id=saga.tracker_id,
-                    )
-                except Exception:
-                    continue
+            tracker = select_tracker_for_saga(trackers, saga)
+            return await _hydrate_tracker_backed_phases(
+                tracker,
+                saga_id=str(saga.id),
+                tracker_project_id=saga.tracker_id,
+            )
+
+        saga_tracker = select_tracker_for_saga(trackers, saga) if trackers else None
 
         responses: list[SagaPhaseItemResponse] = []
         for phase in phases:
@@ -298,7 +283,7 @@ def create_saga_phases_router() -> APIRouter:
                 url = run.url
                 if run.tracker_id and (not identifier or not url):
                     tracker_identifier, tracker_url = await _tracker_run_metadata(
-                        trackers,
+                        [saga_tracker] if saga_tracker is not None else [],
                         run.tracker_id,
                     )
                     identifier = identifier or tracker_identifier
@@ -316,7 +301,6 @@ def create_saga_phases_router() -> APIRouter:
                         declared_files=run.declared_files,
                         estimate_hours=run.estimate_hours,
                         status=run.status.value.lower(),
-                        confidence=run.confidence,
                         session_id=run.session_id,
                         reviewer_session_id=run.reviewer_session_id,
                         review_round=run.review_round,
@@ -335,7 +319,6 @@ def create_saga_phases_router() -> APIRouter:
                     number=phase.number,
                     name=phase.name,
                     status=phase.status.value.lower(),
-                    confidence=phase.confidence,
                     runs=run_items,
                 )
             )

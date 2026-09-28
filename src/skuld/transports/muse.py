@@ -476,7 +476,11 @@ class MuseMSPTransport(CLITransport):
         self._muse_bin_override = muse_bin
         self._skip_permissions = skip_permissions
         self._agent_teams = agent_teams  # accepted for parity; Muse fans out on its own
-        self._system_prompt = system_prompt  # MSP has no system-prompt slot (AGENTS.md instead)
+        if system_prompt:
+            raise ValueError(
+                "Muse MSP cannot apply system_prompt (including project briefings); "
+                "use a runtime with system-prompt support, or configure Muse workspace AGENTS.md"
+            )
         self._initial_prompt = initial_prompt
         self._reasoning_effort = _resolve_reasoning_effort(reasoning_effort)
         self._prompt_timeout = acp_prompt_timeout_s
@@ -852,6 +856,7 @@ class MuseMSPTransport(CLITransport):
                 except Exception as exc:
                     logger.exception("Muse MSP frame handling failed: %r (%s)", exc, raw[:200])
         except asyncio.CancelledError:
+            # Cancellation stops the reader and runs host-exit cleanup in finally.
             pass
         except Exception as exc:
             logger.exception("Muse MSP reader loop error: %r", exc)
@@ -943,15 +948,8 @@ class MuseMSPTransport(CLITransport):
 
     async def _open_session(self) -> None:
         if self._resume_session_id:
-            try:
-                await self._resume_session(self._resume_session_id)
-                return
-            except Exception as exc:
-                logger.warning(
-                    "Muse MSP could not resume session %s (%r) — starting a fresh one",
-                    self._resume_session_id,
-                    exc,
-                )
+            await self._resume_session(self._resume_session_id)
+            return
         params: dict[str, Any] = {
             "commandId": _uuid7(),
             "workspaceRoot": os.path.abspath(self.workspace_dir),

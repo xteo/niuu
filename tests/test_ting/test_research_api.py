@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from niuu.domain.models import Principal
 from ting.adapters.memory_event_bus import InMemoryEventBus
 from ting.api.dispatch import resolve_volundr_factory
@@ -63,9 +64,28 @@ class InMemoryWorkflowRepository(WorkflowRepository):
         self._workflows[workflow.id] = workflow
         return workflow
 
+    async def list_workflow_versions(self, workflow_id):
+        return []
+
+    async def get_workflow_version(self, workflow_id, *, version=None, document_revision=None):
+        workflow = await self.get_workflow(workflow_id)
+        return workflow if workflow is not None and workflow.version == version else None
+
+    async def save_workflow_version(self, workflow, **kwargs):
+        raise NotImplementedError
+
     async def delete_workflow(self, workflow_id: UUID) -> bool:
         removed = self._workflows.pop(workflow_id, None)
         return removed is not None
+
+    async def has_recorded_version_history(self, workflow_id: UUID) -> bool:
+        return True
+
+    async def adopt_legacy_bundled(self, seed):
+        return await self.save_workflow(seed)
+
+    async def reclassify_orphaned_bundled_as_authored(self, workflow_id):
+        return await self.get_workflow(workflow_id)
 
 
 class InMemoryWorkflowCampaignRepository(WorkflowCampaignRepository):
@@ -372,6 +392,7 @@ def _make_client(
     volundr_factory: RecordingVolundrFactory,
 ) -> TestClient:
     app = FastAPI()
+    app.state.authorization = AllowAllAuthorizationAdapter()
     app.include_router(create_research_router())
     app.state.settings = Settings(auth=AuthConfig(allow_anonymous_dev=False))
     app.state.event_bus = InMemoryEventBus()
@@ -892,7 +913,7 @@ def test_detail_survives_mimir_timeout_without_regressing_stage_state(
         raise httpx.ReadTimeout("mimir took too long")
 
     monkeypatch.setattr(
-        "ting.api.research.MarkdownMimirAdapter.list_pages",
+        "mimir.adapters.markdown.MarkdownMimirAdapter.list_pages",
         _timeout,
         raising=False,
     )
@@ -1190,7 +1211,7 @@ async def test_artifact_summaries_read_each_mount_once(tmp_path: Path, monkeypat
     manifest.write_text("# Manifest\nresearch/campaigns/first/final.md", encoding="utf-8")
 
     monkeypatch.setattr(
-        research_api, "_resolve_campaign_mimir_port", lambda campaign, settings: adapter
+        research_api, "_campaign_knowledge", lambda campaign, settings, **kwargs: adapter
     )
     campaigns = [
         _a2a_campaign(snapshot=None, slug=f"{slug}-abc123", workflow_slug=slug)
@@ -1240,7 +1261,7 @@ async def test_artifact_summaries_do_not_leak_between_campaigns(
         path.write_text("# Page\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        research_api, "_resolve_campaign_mimir_port", lambda campaign, settings: adapter
+        research_api, "_campaign_knowledge", lambda campaign, settings, **kwargs: adapter
     )
     campaigns = [_a2a_campaign(snapshot=None, slug="alpha-abc123", workflow_slug="alpha")]
 
@@ -1255,7 +1276,7 @@ async def test_artifact_summaries_report_unknown_without_a_mount(monkeypatch) ->
     from ting.api import research as research_api
 
     monkeypatch.setattr(
-        research_api, "_resolve_campaign_mimir_port", lambda campaign, settings: None
+        research_api, "_campaign_knowledge", lambda campaign, settings, **kwargs: None
     )
 
     (summary,) = await research_api._campaign_artifact_summaries(
@@ -1278,7 +1299,7 @@ async def test_artifact_summaries_report_unknown_when_mimir_raises(monkeypatch) 
             return None
 
     monkeypatch.setattr(
-        research_api, "_resolve_campaign_mimir_port", lambda campaign, settings: _Broken()
+        research_api, "_campaign_knowledge", lambda campaign, settings, **kwargs: _Broken()
     )
 
     (summary,) = await research_api._campaign_artifact_summaries(

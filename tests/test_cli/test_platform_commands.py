@@ -12,23 +12,29 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from bifrost.config import BifrostConfig
 from cli.commands.platform import (
     _build_init_config,
     _build_preflight_config,
     _build_up_callback,
+    _check_auth_env_conflicts,
     _collect_service_definitions,
+    _effective_bifrost_config,
+    _host_resident_platform_url,
     _prompt_mode_selection,
     _resolve_enabled_services,
     _resolve_local_pod_manager_env,
     _route_inventory_payload,
     create_platform_commands,
+    model_server_seed_connections,
 )
-from cli.config import CLISettings, PerServiceConfig, PodManagerConfig
+from cli.config import AuthConfig, CLISettings, PerServiceConfig, PluginConfig, PodManagerConfig
 from cli.registry import PluginRegistry
 from cli.server import MountedRouteDomain
 from cli.services.manager import ServiceManager
 from niuu.ports.plugin import ServiceDefinition
 from tests.test_cli.conftest import FakePlugin, StubService
+from volundr.adapters.outbound.contributors.model_gateway import OPEN_GATEWAY_TOKEN
 
 runner = CliRunner()
 
@@ -459,6 +465,30 @@ class TestCreatePlatformCommands:
         assert "status" in names
         assert "init" in names
 
+    def test_platform_ravn_runs_the_ravn_cli_for_compiled_residents(self, monkeypatch) -> None:
+        import ravn.cli.commands
+
+        calls: list[tuple[list[str], str]] = []
+        monkeypatch.setattr(
+            ravn.cli.commands,
+            "app",
+            lambda *, args, prog_name: calls.append((args, prog_name)),
+        )
+        platform, *_ = self._make_platform()
+
+        result = runner.invoke(
+            platform,
+            ["ravn", "daemon", "--config", "/r/ravn.yaml", "--persona", "steward", "--help"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            (
+                ["daemon", "--config", "/r/ravn.yaml", "--persona", "steward", "--help"],
+                "ravn",
+            )
+        ]
+
     def test_platform_down_command(self) -> None:
         platform, *_ = self._make_platform()
         result = runner.invoke(platform, ["down"])
@@ -479,6 +509,18 @@ class TestCreatePlatformCommands:
                 result = runner.invoke(platform, ["init"])
         assert result.exit_code == 0
         assert "setup complete" in result.output.lower()
+
+    def test_platform_init_respects_selected_config(self, tmp_path, monkeypatch) -> None:
+        config = tmp_path / "isolated" / "config.yaml"
+        monkeypatch.setenv("NIUU_CONFIG", str(config))
+        platform, *_ = self._make_platform()
+        result = runner.invoke(platform, ["init"], input="1\n")
+        assert result.exit_code == 0, result.output
+        assert "mode: mini" in config.read_text()
+        original = config.read_text()
+        result = runner.invoke(platform, ["init"], input="n\n")
+        assert result.exit_code == 0, result.output
+        assert config.read_text() == original
 
     def test_platform_status_no_services(self) -> None:
         platform, *_ = self._make_platform()
@@ -606,9 +648,45 @@ class TestBuildInitConfig:
         assert ":latest" not in skuld_image
         assert ":" in skuld_image  # has a version tag
 
+    def test_mini_runtime_runs_ravn_residents_as_host_processes_by_default(self) -> None:
+        from volundr.config import ResidentRuntimesConfig
+
+        settings = CLISettings(mode="mini", server={"host": "0.0.0.0", "port": 8181})
+
+        env = _resolve_local_pod_manager_env(settings)
+        resident_config = ResidentRuntimesConfig.model_validate_json(env["RESIDENT_RUNTIMES"])
+
+        assert settings.residents.runtime == "process"
+        (controller,) = resident_config.controllers
+        assert controller.adapter.endswith("HostProcessResidentRuntimeController")
+        assert controller.kwargs == {
+            "residents_dir": "~/.niuu/residents",
+            "volundr_api_url": "http://127.0.0.1:8181",
+        }
+        assert resident_config.session_controllers == []
+        (profile,) = resident_config.profiles
+        values = profile.deployment["values"]
+        assert (profile.id, profile.backend.value, profile.engine.value) == (
+            "ravn-local",
+            "local",
+            "ravn",
+        )
+        assert "image" not in values
+        assert "runtime" not in values
+        assert values["resident"]["platform"]["baseUrl"] == "http://127.0.0.1:8181"
+        assert values["resident"]["llm"]["provider"]["kwargs"]["base_url"] == (
+            "http://127.0.0.1:8181/api/v1/bifrost"
+        )
+
+    def test_host_resident_platform_url_keeps_a_specific_bind_address(self) -> None:
+        settings = CLISettings(mode="mini", server={"host": "192.0.2.10", "port": 9000})
+
+        assert _host_resident_platform_url(settings) == "http://192.0.2.10:9000"
+
     def test_mini_runtime_exposes_local_resident_profiles(self) -> None:
         settings = CLISettings(
             mode="mini",
+            residents={"runtime": "docker"},
             bifrost={
                 "providers": {
                     "local-vllm": {
@@ -625,6 +703,11 @@ class TestBuildInitConfig:
         assert resident_config["controllers"][0]["adapter"].endswith(
             "LocalContainerResidentRuntimeController"
         )
+        assert resident_config["controllers"][0]["kwargs"] == {
+            "residents_dir": "~/.niuu/residents",
+            "volundr_api_url": "http://host.docker.internal:8080",
+        }
+        assert resident_config["profiles"][0]["deployment"]["values"]["image"]
         assert {profile["id"] for profile in resident_config["profiles"]} == {
             "ravn-local",
             "nemoclaw-local",
@@ -641,6 +724,140 @@ class TestBuildInitConfig:
         ]
         assert resident_config["profiles"][1]["default_model"] == ("niuu/nvidia/nemotron-test")
         assert "FileCredentialStore" in json.loads(env["CREDENTIAL_STORE"])["adapter"]
+
+    def test_bifrost_config_stays_open_under_host_auth_none(self) -> None:
+        """OWNER CONSTRAINT: host_auth.mode: none must not touch bifrost.auth_mode."""
+        settings = CLISettings(mode="mini")
+        assert settings.host_auth.mode == "none"
+
+        env = _resolve_local_pod_manager_env(settings)
+
+        bifrost_config = json.loads(env["BIFROST_CONFIG"])
+        assert bifrost_config["auth_mode"] == "open"
+        assert bifrost_config["oidc_kwargs"] == {}
+
+    def test_bifrost_config_forced_into_oidc_under_host_auth_oidc(self) -> None:
+        """host_auth.mode: oidc must mean Bifröst verifies too, even if the
+
+        operator left bifrost.auth_mode at its 'open' default in config.yaml —
+        oidc is a host-wide claim, not a per-service opt-in (see
+        cli.commands.platform._effective_bifrost_config).
+        """
+        settings = CLISettings(
+            mode="mini",
+            host_auth={
+                "mode": "oidc",
+                "oidc": {
+                    "issuers": [
+                        {"issuer": "https://kc.example/realms/volundr", "audiences": ["api"]}
+                    ]
+                },
+            },
+            # bifrost itself must be disabled to run oidc today (see
+            # cli.config.CLISettings._OIDC_UNCOVERED_PLUGINS['bifrost']) —
+            # this test only checks what BIFROST_CONFIG *would* compute to,
+            # independent of whether the plugin actually starts.
+            plugins={"enabled": {"guild": False, "bifrost": False}},
+        )
+
+        env = _resolve_local_pod_manager_env(settings)
+
+        bifrost_config = json.loads(env["BIFROST_CONFIG"])
+        assert bifrost_config["auth_mode"] == "oidc"
+        assert bifrost_config["oidc_kwargs"]["issuers"][0]["issuer"] == (
+            "https://kc.example/realms/volundr"
+        )
+        # Same computed kwargs as every other co-hosted oidc slot.
+        assert bifrost_config["oidc_kwargs"] == json.loads(env["IDENTITY__KWARGS"])
+
+    def test_mimir_auth_env_selects_allow_all_under_host_auth_none(self) -> None:
+        settings = CLISettings(mode="mini")
+        env = _resolve_local_pod_manager_env(settings)
+        assert env["MIMIR_AUTH__ADAPTER"] == (
+            "identity.adapters.identity.AllowAllHeaderAuthenticationAdapter"
+        )
+
+    def test_mimir_auth_env_selects_jwks_bearer_under_host_auth_oidc(self) -> None:
+        settings = CLISettings(
+            mode="mini",
+            host_auth={
+                "mode": "oidc",
+                "oidc": {
+                    "issuers": [
+                        {"issuer": "https://kc.example/realms/volundr", "audiences": ["api"]}
+                    ]
+                },
+            },
+            plugins={"enabled": {"guild": False, "bifrost": False}},
+        )
+        env = _resolve_local_pod_manager_env(settings)
+        assert env["MIMIR_AUTH__ADAPTER"] == (
+            "identity.adapters.jwks.JwksBearerAuthenticationAdapter"
+        )
+        assert json.loads(env["MIMIR_AUTH__KWARGS"])["issuers"][0]["issuer"] == (
+            "https://kc.example/realms/volundr"
+        )
+
+    _OIDC_HOST_AUTH = {
+        "mode": "oidc",
+        "oidc": {
+            "issuers": [{"issuer": "https://kc.example/realms/volundr", "audiences": ["api"]}]
+        },
+    }
+
+    def test_effective_bifrost_config_raises_on_explicit_auth_mode_override(self) -> None:
+        """An operator-set bifrost.auth_mode would be silently discarded by
+
+        the oidc override — refuse instead of discarding it quietly. Built
+        via model_construct: host_auth.mode: oidc with the bifrost plugin
+        enabled cannot pass CLISettings's own oidc-coverage validator today
+        (see _OIDC_UNCOVERED_PLUGINS['bifrost']) — this pins down
+        _effective_bifrost_config's own check in isolation, for the day that
+        block is lifted (a real per-session credential exists) and this
+        combination becomes reachable through the normal constructor too.
+        """
+        settings = CLISettings.model_construct(
+            mode="mini",
+            host_auth=AuthConfig(**self._OIDC_HOST_AUTH),
+            plugins=PluginConfig(),  # bifrost enabled by default (empty `enabled` map)
+            bifrost=BifrostConfig(auth_mode="mesh"),
+        )
+        with pytest.raises(typer.BadParameter, match="bifrost.auth_mode"):
+            _effective_bifrost_config(settings)
+
+    def test_effective_bifrost_config_does_not_raise_when_bifrost_plugin_disabled(self) -> None:
+        """A stale bifrost.auth_mode is inert while the plugin itself never
+
+        starts (nothing reads BIFROST_CONFIG then) — CLISettings._OIDC_
+        UNCOVERED_PLUGINS['bifrost'] already says the plugin can't run
+        under oidc; this must not be a second, redundant way to say it.
+        """
+        settings = CLISettings(
+            mode="mini",
+            host_auth=self._OIDC_HOST_AUTH,
+            plugins={"enabled": {"guild": False, "bifrost": False}},
+            bifrost={"auth_mode": "mesh"},
+        )
+        _effective_bifrost_config(settings)  # must not raise
+
+    def test_effective_bifrost_config_pat_revocation_survives_the_oidc_override(self) -> None:
+        """bifrost.pat_revocation is not discarded under oidc — it is applied
+
+        by OidcAuthAdapter too, when the verified bearer happens to be a
+        PAT (see bifrost.app._build_pat_revocation_validator).
+        """
+        settings = CLISettings(
+            mode="mini",
+            host_auth=self._OIDC_HOST_AUTH,
+            plugins={"enabled": {"guild": False, "bifrost": False}},
+            bifrost={"pat_revocation": {"enabled": False}},
+        )
+        effective = _effective_bifrost_config(settings)
+        assert effective.pat_revocation.enabled is False
+
+    def test_effective_bifrost_config_untouched_under_host_auth_none(self) -> None:
+        settings = CLISettings(mode="mini", bifrost={"auth_mode": "mesh"})
+        assert _effective_bifrost_config(settings) is settings.bifrost
 
 
 class TestRouteInventoryPayload:
@@ -666,6 +883,10 @@ class TestRouteInventoryPayload:
 
 
 class TestInitOverwriteProtection:
+    @pytest.fixture(autouse=True)
+    def use_default_config_path(self, monkeypatch) -> None:
+        monkeypatch.delenv("NIUU_CONFIG", raising=False)
+
     def test_aborts_when_config_exists_and_user_declines(self) -> None:
         import tempfile
         from pathlib import Path
@@ -936,3 +1157,178 @@ class TestPlatformInventoryCommand:
         assert result.exit_code == 0
         assert out_path.exists()
         assert '"name": "niuu-api"' in out_path.read_text()
+
+
+class TestCheckAuthEnvConflicts:
+    def test_no_existing_env_passes(self, monkeypatch) -> None:
+        monkeypatch.delenv("IDENTITY__ADAPTER", raising=False)
+        _check_auth_env_conflicts({"IDENTITY__ADAPTER": "a.B"}, "none")
+
+    def test_matching_existing_env_passes(self, monkeypatch) -> None:
+        monkeypatch.setenv("IDENTITY__ADAPTER", "a.B")
+        _check_auth_env_conflicts({"IDENTITY__ADAPTER": "a.B"}, "none")
+
+    def test_disagreeing_existing_env_raises(self, monkeypatch) -> None:
+        monkeypatch.setenv("IDENTITY__ADAPTER", "operator.CustomAdapter")
+        with pytest.raises(typer.BadParameter, match="IDENTITY__ADAPTER"):
+            _check_auth_env_conflicts(
+                {"IDENTITY__ADAPTER": "identity.adapters.jwks.JwksIdentityAdapter"}, "oidc"
+            )
+
+    def test_disagreeing_bifrost_config_env_raises(self, monkeypatch) -> None:
+        monkeypatch.setenv("BIFROST_CONFIG", '{"auth_mode": "open"}')
+        with pytest.raises(typer.BadParameter, match="BIFROST_CONFIG"):
+            _check_auth_env_conflicts({"BIFROST_CONFIG": '{"auth_mode": "oidc"}'}, "oidc")
+
+    def test_matching_bifrost_config_env_passes(self, monkeypatch) -> None:
+        monkeypatch.setenv("BIFROST_CONFIG", '{"auth_mode": "oidc"}')
+        _check_auth_env_conflicts({"BIFROST_CONFIG": '{"auth_mode": "oidc"}'}, "oidc")
+
+
+@pytest.mark.parametrize("mode", ["mini", "cluster"])
+def test_only_mini_selects_no_auth(mode, monkeypatch):
+    from ravn.config import Settings as RavnSettings
+    from ting.config import Settings as TingSettings
+
+    env = _resolve_local_pod_manager_env(CLISettings(mode=mode))
+    auth_keys = {"RAVN_API_AUTH__ADAPTER", "AUTH__ALLOW_ANONYMOUS_DEV", "AUTHORIZATION__ADAPTER"}
+    if mode != "mini":
+        assert auth_keys.isdisjoint(env)
+        return
+    for key in auth_keys:
+        monkeypatch.setenv(key, env[key])
+    assert RavnSettings().api_auth.adapter.endswith("AllowAllHeaderAuthenticationAdapter")
+    assert TingSettings().auth.allow_anonymous_dev is True
+    assert TingSettings().authorization.adapter.endswith("AllowAllAuthorizationAdapter")
+
+
+def test_compute_pod_manager_environment_preserves_typed_kwargs() -> None:
+    settings = CLISettings(
+        mode="mini",
+        pod_manager={
+            "adapter": "volundr.adapters.outbound.vm_pod_manager.VmPodManager",
+            "runtime_backend": "openshell",
+            "profile": "cpu",
+            "pool_id": "acme-forge",
+            "max_machines": 1,
+            "poll_interval_seconds": 5,
+        },
+        compute={
+            "pool_id": "acme-forge",
+            "max_machines": 1,
+            "provider": {"adapter": "private.Provider", "kwargs": {}},
+            "auth": {"adapter": "private.Auth", "kwargs": {}},
+            "runtime": {"adapter": "private.Runtime", "kwargs": {}},
+        },
+    )
+
+    env = _resolve_local_pod_manager_env(settings)
+    pod_manager = json.loads(env["POD_MANAGER"])
+
+    assert pod_manager["runtime_backend"] == "openshell"
+    assert "runtime_backend" not in pod_manager["kwargs"]
+    assert pod_manager["kwargs"]["max_machines"] == 1
+    assert pod_manager["kwargs"]["poll_interval_seconds"] == 5
+    assert "POD_MANAGER__KWARGS__MAX_MACHINES" not in env
+
+
+class TestModelServerSeeds:
+    """Every model server the bundle routes is seeded as a "Model server" AI provider."""
+
+    def _settings(self, **docker: object) -> CLISettings:
+        return CLISettings(
+            mode="docker",
+            docker={
+                "vllm": {"enabled": True, "model": "nvidia/nemotron-test"},
+                "model_server": {
+                    "enabled": True,
+                    "base_url": "http://host.docker.internal:11434",
+                    "models": ["llama3.2:latest", "qwen3:8b"],
+                },
+                **docker,
+            },
+            pod_manager={
+                "adapter": "volundr.adapters.outbound.docker_container.DockerContainerPodManager"
+            },
+        )
+
+    def test_seeds_one_connection_per_model_server(self) -> None:
+        seeds = model_server_seed_connections(self._settings())
+        assert [s["credential_name"] for s in seeds] == [
+            "model-server-vllm",
+            "model-server-local",
+        ]
+        local = seeds[1]
+        assert local["slug"] == "model-server"
+        assert local["integration_type"] == "ai_provider"
+        assert local["owner_id"] == "dev-user"
+        assert local["credential"] == {"secret_type": "generic", "data": {"provider": "local"}}
+        assert local["config"] == {
+            "provider": "local",
+            "gateway_url": "http://niuu:8080/api/v1/bifrost",
+            "token": OPEN_GATEWAY_TOKEN,
+            "models": ["llama3.2:latest", "qwen3:8b"],
+        }
+        assert seeds[0]["config"]["models"] == ["nvidia/nemotron-test"]
+
+    def test_gateway_url_follows_where_sessions_reach_the_platform(self) -> None:
+        host = CLISettings(
+            mode="mini",
+            docker={"model_server": {"enabled": True, "base_url": "http://x:1", "models": ["m"]}},
+        )
+        assert model_server_seed_connections(host)[0]["config"]["gateway_url"] == (
+            "http://127.0.0.1:8080/api/v1/bifrost"
+        )
+        explicit = CLISettings(
+            mode="docker",
+            docker={"model_server": {"enabled": True, "base_url": "http://x:1", "models": ["m"]}},
+            pod_manager={
+                "adapter": "volundr.adapters.outbound.docker_container.DockerContainerPodManager",
+                "platform_url": "http://platform.internal:9000/",
+            },
+        )
+        assert model_server_seed_connections(explicit)[0]["config"]["gateway_url"] == (
+            "http://platform.internal:9000/api/v1/bifrost"
+        )
+
+    def test_container_view_reads_the_gateway_providers(self) -> None:
+        """Inside the platform container only NIUU_BIFROST carries the servers."""
+        settings = CLISettings(
+            mode="mini",
+            bifrost={
+                "providers": {
+                    "local": {"base_url": "http://host.docker.internal:11434", "models": ["m"]},
+                    "vllm": {"base_url": "http://vllm:8000", "models": ["org/x"]},
+                    "openai": {"base_url": "https://api.openai.com", "models": ["gpt-x"]},
+                }
+            },
+        )
+        seeds = model_server_seed_connections(settings)
+        assert [(s["config"]["provider"], s["config"]["models"]) for s in seeds] == [
+            ("local", ["m"]),
+            ("vllm", ["org/x"]),
+        ]
+
+    def test_the_gateways_builtin_local_entry_is_not_a_server(self) -> None:
+        settings = CLISettings(
+            mode="mini", bifrost={"providers": {"local": {"models": ["llama3.2:latest"]}}}
+        )
+        assert model_server_seed_connections(settings) == []
+
+    def test_nothing_seeded_without_model_servers(self) -> None:
+        assert model_server_seed_connections(CLISettings(mode="docker")) == []
+        assert "INTEGRATIONS__SEED_CONNECTIONS" not in _resolve_local_pod_manager_env(
+            CLISettings(mode="docker")
+        )
+
+    def test_seeds_reach_volundr_settings_through_the_env(self, monkeypatch) -> None:
+        from volundr.config import Settings as VolundrSettings
+
+        env = _resolve_local_pod_manager_env(self._settings())
+        monkeypatch.setenv("INTEGRATIONS__SEED_CONNECTIONS", env["INTEGRATIONS__SEED_CONNECTIONS"])
+        seeds = VolundrSettings().integrations.seed_connections
+        assert [s.slug for s in seeds] == ["model-server", "model-server"]
+        assert seeds[1].config["gateway_url"] == "http://niuu:8080/api/v1/bifrost"
+        assert seeds[1].config["token"] == OPEN_GATEWAY_TOKEN
+        assert seeds[1].credential is not None
+        assert seeds[1].credential.data == {"provider": "local"}

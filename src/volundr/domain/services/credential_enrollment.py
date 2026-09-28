@@ -23,11 +23,18 @@ from volundr.domain.ports import (
     IntegrationRepository,
 )
 from volundr.domain.services.integration_registry import IntegrationRegistry
+from volundr.domain.services.oauth_clients import DEFAULT_APP
 
 DEFAULT_CREDENTIAL_ENROLLMENT_TTL_SECONDS = 900
 CREDENTIAL_ENROLLMENT_RECONCILE_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+# Sign-ins whose token cannot be refreshed: the worker reports when it runs
+# out, and the wizard asks for a new sign-in then.
+METHODS_WITH_FIXED_LIFETIME = frozenset({"claude_setup", "grok_device"})
+# Sign-ins that run through an OAuth application the install owns.
+OAUTH_DEVICE_METHOD = "oauth_device"
 
 
 class CredentialEnrollmentError(ValueError):
@@ -61,6 +68,7 @@ class CredentialEnrollmentService:
         slug: str,
         credential_name: str = "",
         connection_id: str = "",
+        oauth_app: str = "",
     ) -> CredentialEnrollment:
         definition = self._integration_registry.get_definition(slug)
         spec = definition.credential_enrollment if definition is not None else None
@@ -68,18 +76,31 @@ class CredentialEnrollmentService:
             raise CredentialEnrollmentError("Integration does not support interactive enrollment")
         if not self._runner.supports_enrollment(spec.method):
             raise CredentialEnrollmentError("Interactive enrollment is unavailable on this runtime")
+        if not self._runner.available_for(slug, spec.method):
+            raise CredentialEnrollmentError(
+                f"Sign-in for {slug} is not configured on this install; use an API key or "
+                f"configure it (for OAuth device sign-in: oauth.clients.{slug}.client_id)"
+            )
 
         connection = await self._resolve_connection(
             principal=principal,
             slug=slug,
             connection_id=connection_id,
             credential_name=credential_name or spec.default_credential_name,
+            oauth_app=oauth_app,
         )
         active = await self._repository.find_active(connection.id)
         if active is not None:
+            if active.tenant_id != principal.tenant_id:
+                raise CredentialEnrollmentError("Credential enrollment not found")
             return active
 
         now = datetime.now(UTC)
+        # The account's own OAuth application (GitHub, GitLab) travels with the
+        # attempt so the runner never falls back to another account's app.
+        runner_ref: dict = {}
+        if spec.method == OAUTH_DEVICE_METHOD:
+            runner_ref["oauth_app"] = str(connection.config.get("oauth_app") or DEFAULT_APP)
         enrollment = CredentialEnrollment(
             id=uuid4(),
             connection_id=connection.id,
@@ -89,7 +110,7 @@ class CredentialEnrollmentService:
             credential_name=connection.credential_name,
             method=spec.method,
             state=CredentialEnrollmentState.PENDING,
-            runner_ref={},
+            runner_ref=runner_ref,
             verification_uri="",
             user_code="",
             expires_at=now + timedelta(seconds=self._ttl_seconds),
@@ -113,12 +134,35 @@ class CredentialEnrollmentService:
                 state="auth_required",
                 error_code="enrollment_failed",
             )
-            raise CredentialEnrollmentError("Could not start provider login") from exc
+            # The provider's answer (an unknown client id, a refused scope) is
+            # the one thing the person needs to see; never hide it.
+            # The slug comes from the request; the provider's answer is what matters.
+            logger.error("Provider login could not start: %s", exc)
+            raise CredentialEnrollmentError(f"Could not start provider login: {exc}") from exc
+        if spec.method == OAUTH_DEVICE_METHOD and started.runner_ref.get("base_url"):
+            connection = replace(
+                connection, config={**connection.config, "base_url": started.runner_ref["base_url"]}
+            )
+            await self._integration_repository.save_connection(connection)
         return await self._repository.save(started)
+
+    def available(self, slug: str) -> bool:
+        """Whether the catalog entry *slug* can be signed into on this install."""
+        definition = self._integration_registry.get_definition(slug)
+        spec = definition.credential_enrollment if definition is not None else None
+        if spec is None:
+            return False
+        return self._runner.supports_enrollment(spec.method) and self._runner.available_for(
+            slug, spec.method
+        )
 
     async def get(self, enrollment_id: UUID, principal: Principal) -> CredentialEnrollment:
         enrollment = await self._repository.get(enrollment_id)
-        if enrollment is None or enrollment.owner_id != principal.user_id:
+        if (
+            enrollment is None
+            or enrollment.owner_id != principal.user_id
+            or enrollment.tenant_id != principal.tenant_id
+        ):
             raise CredentialEnrollmentError("Credential enrollment not found")
         if enrollment.state not in {
             CredentialEnrollmentState.PENDING,
@@ -169,24 +213,34 @@ class CredentialEnrollmentService:
                     enrollment.owner_id,
                     enrollment.credential_name,
                 )
-                existing_values = await self._credential_store.get_value(
-                    "user",
-                    enrollment.owner_id,
-                    enrollment.credential_name,
+                existing_values = (
+                    {}
+                    if stored and stored.metadata.get("renewal_owner")
+                    else await self._credential_store.get_value(
+                        "user",
+                        enrollment.owner_id,
+                        enrollment.credential_name,
+                    )
                 )
                 updated_values = dict(existing_values or {})
                 updated_values.update(poll.credential_data)
                 metadata = dict(stored.metadata) if stored is not None else {}
                 metadata.update(
                     {
+                        "tenant_id": enrollment.tenant_id,
+                        "oauth_app": str(connection.config.get("oauth_app") or DEFAULT_APP),
+                        "oauth_token_field": spec.credential_field,
                         "source": "credential_enrollment",
+                        "enrollment_method": enrollment.method,
                         "integration": enrollment.provider_slug,
-                        "auth_type": "device_code",
+                        "auth_type": definition.auth_type,
                         "auth_state": "active",
                         "auth_state_updated_at": now.isoformat(),
                     }
                 )
                 metadata.pop("auth_error_code", None)
+                if enrollment.method in METHODS_WITH_FIXED_LIFETIME:
+                    metadata["auth_expires_at"] = poll.credential_data["expires_at"]
                 await self._credential_store.store(
                     "user",
                     enrollment.owner_id,
@@ -217,11 +271,25 @@ class CredentialEnrollmentService:
             )
             return await self._repository.save(terminal)
 
+        if poll.state == CredentialEnrollmentState.AWAITING_USER:
+            return await self._repository.save(
+                replace(
+                    enrollment,
+                    state=poll.state,
+                    verification_uri=poll.verification_uri or enrollment.verification_uri,
+                    user_code=poll.user_code or enrollment.user_code,
+                    updated_at=now,
+                )
+            )
         return enrollment
 
     async def cancel(self, enrollment_id: UUID, principal: Principal) -> CredentialEnrollment:
         enrollment = await self._repository.get(enrollment_id)
-        if enrollment is None or enrollment.owner_id != principal.user_id:
+        if (
+            enrollment is None
+            or enrollment.owner_id != principal.user_id
+            or enrollment.tenant_id != principal.tenant_id
+        ):
             raise CredentialEnrollmentError("Credential enrollment not found")
         if enrollment.state in {
             CredentialEnrollmentState.PENDING,
@@ -237,6 +305,21 @@ class CredentialEnrollmentService:
                     state="auth_required",
                     error_code="enrollment_cancelled",
                 )
+        return enrollment
+
+    async def submit_code(
+        self, enrollment_id: UUID, principal: Principal, code: str
+    ) -> CredentialEnrollment:
+        enrollment = await self.get(enrollment_id, principal)
+        if (
+            enrollment.method != "claude_setup"
+            or enrollment.state != CredentialEnrollmentState.AWAITING_USER
+        ):
+            raise CredentialEnrollmentError("This login is not waiting for an authorization code")
+        # A terminal control sequence must never reach the provider's CLI.
+        if not code or len(code) > 4096 or any(ord(char) < 33 or ord(char) > 126 for char in code):
+            raise CredentialEnrollmentError("Invalid authorization code")
+        await self._runner.submit_code(enrollment, code)
         return enrollment
 
     async def expire_stale(self, now: datetime | None = None) -> int:
@@ -275,6 +358,7 @@ class CredentialEnrollmentService:
         slug: str,
         connection_id: str,
         credential_name: str,
+        oauth_app: str = "",
     ) -> IntegrationConnection:
         if connection_id:
             connection = await self._integration_repository.get_connection(connection_id)
@@ -284,11 +368,27 @@ class CredentialEnrollmentService:
                 or connection.slug != slug
             ):
                 raise CredentialEnrollmentError("Integration connection not found")
+            await self._check_credential_tenant(principal, connection.credential_name)
             return connection
 
+        await self._check_credential_tenant(principal, credential_name)
+        # One connection per account: the same slug with another credential
+        # name is a second account, never the first one signed in again.
         existing = await self._integration_repository.list_connections(principal.user_id)
-        matching = next((item for item in existing if item.slug == slug), None)
+        matching = next(
+            (
+                item
+                for item in existing
+                if item.slug == slug and item.credential_name == credential_name
+            ),
+            None,
+        )
         if matching is not None:
+            if oauth_app and matching.config.get("oauth_app") != oauth_app:
+                # The person picked another application for this account
+                # (a retry, or the first attempt went through the wrong one).
+                matching = replace(matching, config={**matching.config, "oauth_app": oauth_app})
+                await self._integration_repository.save_connection(matching)
             return matching
 
         definition = self._integration_registry.get_definition(slug)
@@ -301,13 +401,22 @@ class CredentialEnrollmentService:
             integration_type=definition.integration_type,
             adapter=definition.adapter,
             credential_name=credential_name,
-            config={},
+            config={"oauth_app": oauth_app} if oauth_app else {},
             enabled=True,
             created_at=now,
             updated_at=now,
             slug=slug,
         )
         return await self._integration_repository.save_connection(connection)
+
+    async def _check_credential_tenant(self, principal: Principal, name: str) -> None:
+        stored = await self._credential_store.get("user", principal.user_id, name)
+        if (
+            stored
+            and stored.metadata.get("tenant_id")
+            and stored.metadata["tenant_id"] != principal.tenant_id
+        ):
+            raise CredentialEnrollmentError("Integration connection not found")
 
     async def _mark_credential_state(
         self,
@@ -321,17 +430,22 @@ class CredentialEnrollmentService:
             connection.owner_id,
             connection.credential_name,
         )
-        values = await self._credential_store.get_value(
-            "user",
-            connection.owner_id,
-            connection.credential_name,
+        values = (
+            {}
+            if stored and stored.metadata.get("renewal_owner")
+            else await self._credential_store.get_value(
+                "user",
+                connection.owner_id,
+                connection.credential_name,
+            )
         )
         metadata = dict(stored.metadata) if stored is not None else {}
+        definition = self._integration_registry.get_definition(connection.slug)
         metadata.update(
             {
                 "source": "credential_enrollment",
                 "integration": connection.slug,
-                "auth_type": "device_code",
+                "auth_type": definition.auth_type if definition is not None else "device_code",
                 "auth_state": state,
                 "auth_state_updated_at": datetime.now(UTC).isoformat(),
             }

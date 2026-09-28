@@ -318,7 +318,6 @@ class ResidentRuntime:
                 content=prior.content,
             )
         a2a_tasks = await self.find_a2a_tasks(
-            case_id=task.resident_case_id,
             active_only=True,
             limit=10,
         )
@@ -406,6 +405,7 @@ class ResidentRuntime:
             ),
             case_started_at=value("case_started_at"),
             push_registered=push_registered,
+            request_fingerprint=value("request_fingerprint"),
             update_fingerprint=value("update_fingerprint"),
         )
         return await write(record)
@@ -434,6 +434,7 @@ class ResidentRuntime:
             haystack = " ".join(
                 (
                     record.task_id,
+                    record.request_fingerprint,
                     record.agent_id,
                     record.skill_id,
                     record.prompt,
@@ -446,7 +447,7 @@ class ResidentRuntime:
         found = [record for record in records if matches(record)]
         found.sort(key=lambda record: record.updated_at, reverse=True)
         rendered = [_a2a_record_payload(record) for record in found[: max(1, limit)]]
-        if rendered or not needle:
+        if rendered or not needle or active_only:
             return rendered
 
         # Older turns predate the registry. Existing state search remains the
@@ -997,11 +998,10 @@ class ResidentRuntime:
             content={"decision": decision, "rationale": rationale},
         )
         logger.warning(
-            "resident %s: reached decision %r %d times running without its tools returning "
+            "resident %s: repeated the same decision %d times without its tools returning "
             "anything new (stuck for %.0fs) — escalating to the operator instead of "
             "sleeping again",
             self._resident_id,
-            decision or "unknown",
             streak.count,
             stuck_for,
         )
@@ -1409,9 +1409,11 @@ class ResidentRuntime:
         now = datetime.now(UTC)
         context_lines = [
             "Resident home turn over durable, unconsumed observations.",
-            "Judge what these observations mean. Retrieve full evidence only when it can "
-            "improve the judgment. Investigate, research, collaborate, ask the operator, "
-            "act, schedule a recheck, or stop as appropriate.",
+            (
+                "Judge what these observations mean. Retrieve full evidence only when it can "
+                "improve the judgment. Investigate, research, collaborate, ask the operator, "
+                "act, schedule a recheck, or stop as appropriate."
+            ),
             "",
         ]
         if self._resident_personality or self._charter:
@@ -1516,8 +1518,10 @@ class ResidentRuntime:
         telemetry = get_observability()
         case_id = f"resident-stewardship-{now.strftime('%Y%m%dT%H%M%SZ')}"
         context_lines = [
-            "Resident stewardship turn. No new observation prompted this; the "
-            "environment has simply gone unexamined for a while.",
+            (
+                "Resident stewardship turn. No new observation prompted this; the "
+                "environment has simply gone unexamined for a while."
+            ),
             "",
             f"Time since the resident last recorded working state: {_duration(quiet_seconds)}.",
             f"Last examined: {last_examined or 'never — this is the first stewardship turn'}.",
@@ -1849,6 +1853,7 @@ def _a2a_record_payload(record: ResidentA2ATaskRecord) -> dict[str, Any]:
         "case_output_tokens": record.case_output_tokens,
         "case_started_at": record.case_started_at,
         "push_registered": record.push_registered,
+        "request_fingerprint": record.request_fingerprint,
         "update_fingerprint": record.update_fingerprint,
         "updated_at": record.updated_at.isoformat(),
     }
@@ -1932,8 +1937,14 @@ def _extreme_payload_lines(
     if signal.observation_count <= 1 or not extremes:
         return []
     lines = ["  Observations at numeric extremes:"]
+    keys_by_ref: dict[str, list[str]] = {}
     for key in sorted(extremes):
-        ref = extremes[key]
+        keys_by_ref.setdefault(extremes[key], []).append(key)
+    # Several sensor extrema can refer to the same event. Include it once,
+    # and share this slot's payload budget across the distinct events.
+    payload_budget = max(1, budget // len(keys_by_ref))
+    for ref, keys in keys_by_ref.items():
+        key = ", ".join(keys)
         record = archive.read(ref) if archive is not None else None
         payload = (record or {}).get("signal", {}).get("payload") if record else None
         if payload is None:
@@ -1952,7 +1963,7 @@ def _extreme_payload_lines(
                             ensure_ascii=False,
                             default=str,
                         ),
-                        budget,
+                        payload_budget,
                     ),
                     "  ",
                 ),

@@ -18,13 +18,15 @@ from __future__ import annotations
 import os
 from pathlib import Path as _Path
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
+
+from niuu.domain.observability import ObservabilityConfig
 
 
 def _config_paths() -> list[_Path]:
@@ -149,6 +151,32 @@ class EvidenceConfig(BaseModel):
     )
 
 
+class LiveActivityConfig(BaseModel):
+    """In-memory live read/write activity window for the 3D memory UI.
+
+    Backs ``GET /mimir/activity/live`` (``mimir.live_activity.LiveActivityRecorder``).
+    This is presence, not the durable ``/activity`` log — process-local,
+    never persisted, and bounded so it cannot grow without limit.
+    """
+
+    buffer_size: int = Field(
+        default=2000,
+        ge=1,
+        description="Maximum number of recent read/write events retained in memory.",
+    )
+    window_seconds: int = Field(
+        default=900,
+        ge=1,
+        description="Only events within this many seconds of now are ever returned.",
+    )
+
+
+class MimirObservabilityConfig(ObservabilityConfig):
+    """OpenTelemetry settings with Mímir's stable service identity."""
+
+    service_name: str = Field(default="mimir")
+
+
 class MimirServiceConfig(BaseSettings):
     """Configuration for a Mímir service instance (standalone or plugin).
 
@@ -203,6 +231,44 @@ class MimirServiceConfig(BaseSettings):
         default=None,
         description="Category filter for domain-scoped Mímirs. None means all categories.",
     )
+    tenant_id: str = Field(default="", description="Owning tenant; enforced on instance API calls.")
+
+    auth_mode: str = Field(
+        default="envoy",
+        validation_alias=AliasChoices("AUTH_MODE", "auth_mode"),
+        description=(
+            "How this Mímir instance trusts identity: 'envoy' (default — an Envoy "
+            "sidecar, or the shared niuu host process, has already verified the "
+            "caller and forwards trusted x-auth-* headers), 'none' (explicit "
+            "no-auth), or 'oidc' (in-process JWT verification via JWKS, for a host "
+            "without Envoy). Set by the mini/docker CLI host from host_auth.mode "
+            "(cli.config.AuthConfig) via the AUTH_MODE env var — the same variable "
+            "every other co-hosted service reads "
+            "(niuu.service_runtime._get_auth_mode). Bypasses the MIMIR__ env "
+            "prefix deliberately so one host-wide setting covers every service."
+        ),
+    )
+    identity_adapter: str = Field(
+        default="identity.adapters.identity.EnvoyHeaderAuthenticationAdapter",
+        validation_alias=AliasChoices("MIMIR_AUTH__ADAPTER", "identity_adapter"),
+        description=(
+            "Fully-qualified niuu.ports.identity.HeaderAuthenticationPort class used "
+            "to extract a verified Principal from inbound requests (_require_deploy_auth, "
+            "enforce_instance_tenant, and per-request tenant scoping). Validated against "
+            "auth_mode at startup by niuu.service_runtime._validate_identity_adapter_class — "
+            "an Envoy-trusting adapter cannot be configured for auth_mode: oidc or none, "
+            "and vice versa. Set by the CLI host via the MIMIR_AUTH__ADAPTER env var."
+        ),
+    )
+    identity_kwargs: dict = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("MIMIR_AUTH__KWARGS", "identity_kwargs"),
+        description=(
+            "Kwargs for identity_adapter (e.g. oidc issuers for JwksBearerAuthenticationAdapter). "
+            "Set by the CLI host via the MIMIR_AUTH__KWARGS env var (JSON)."
+        ),
+    )
+
     announce_url: str | None = Field(
         default=None,
         description=(
@@ -248,6 +314,9 @@ class MimirServiceConfig(BaseSettings):
             "On by default; disable for privacy-sensitive deployments."
         ),
     )
+    deployment: dict | None = Field(
+        default=None, description="Dynamic knowledge deployment adapter and constructor kwargs."
+    )
     ranking: RankingConfig = Field(
         default_factory=RankingConfig,
         description="Post-retrieval ranking boosts (NIU-1057/1058/1062).",
@@ -256,3 +325,8 @@ class MimirServiceConfig(BaseSettings):
         default_factory=EvidenceConfig,
         description="Evidence-counted belief thresholds (NIU-1062).",
     )
+    live_activity: LiveActivityConfig = Field(
+        default_factory=LiveActivityConfig,
+        description="In-memory live read/write activity window (GET /activity/live).",
+    )
+    observability: MimirObservabilityConfig = Field(default_factory=MimirObservabilityConfig)

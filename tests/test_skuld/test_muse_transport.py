@@ -327,7 +327,7 @@ class TestConstruction:
             resume_session_id="",
             skip_permissions=False,
             agent_teams=True,
-            system_prompt="be brief",
+            system_prompt="",
             initial_prompt="do the thing",
             reasoning_effort="ultra",
             acp_prompt_timeout_s=12.0,
@@ -465,7 +465,7 @@ class TestLifecycle:
             await t.stop()
 
     @pytest.mark.asyncio
-    async def test_resume_failure_falls_back_to_a_fresh_session(self, tmp_path):
+    async def test_resume_failure_propagates_without_replacing_native_identity(self, tmp_path):
         host = _FakeHost()
         t = MuseMSPTransport(str(tmp_path), resume_session_id="dead-session")
         with patch(
@@ -495,9 +495,10 @@ class TestLifecycle:
                     }
                 )
             )
-            await host.answer("session/start", {"session": _session(), "viewCursor": "v:1"})
-            await task
-        assert t.session_id == SID
+            with pytest.raises(Exception, match="session not found"):
+                await task
+        assert not host.sent("session/start")
+        assert t._process is None
         await t.stop()
 
     @pytest.mark.asyncio
@@ -1875,3 +1876,8 @@ class TestProtocolError:
         )
         assert exc.code == -32030 and exc.kind == "commandRejected" and exc.reason == "missing_run"
         assert "commandRejected" in str(exc)
+
+
+def test_muse_rejects_system_instructions_it_cannot_apply(tmp_path):
+    with pytest.raises(ValueError, match="cannot apply system_prompt"):
+        MuseMSPTransport(str(tmp_path), system_prompt="project briefing")

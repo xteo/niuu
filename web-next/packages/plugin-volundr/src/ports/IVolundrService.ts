@@ -101,6 +101,20 @@ export interface ResolveWorkflowGateRequest {
   source?: string;
 }
 
+export interface UserHomeListing {
+  status: 'starting' | 'ready';
+  detail?: string;
+  path?: string;
+  capacity_bytes?: number;
+  available_bytes?: number;
+  entries?: Array<{
+    name: string;
+    path: string;
+    kind: 'directory' | 'file' | 'symlink';
+    size: number;
+  }>;
+}
+
 export interface SessionReadOptions {
   instanceId?: string;
   signal?: AbortSignal;
@@ -114,18 +128,20 @@ export interface RuntimeVersion {
 
 export interface IVolundrService {
   // Feature flags
-  getFeatures(): Promise<VolundrFeatures>;
+  getFeatures(instanceId?: string): Promise<VolundrFeatures>;
 
   // Session definitions
   getSessionDefinitions(): Promise<SessionDefinition[]>;
 
   // Sessions
   getSessions(options?: SessionReadOptions): Promise<VolundrSession[]>;
-  getSession(id: string): Promise<VolundrSession | null>;
+  getSession(id: string, options?: SessionReadOptions): Promise<VolundrSession | null>;
   getActiveSessions(): Promise<VolundrSession[]>;
   getStats(options?: SessionReadOptions): Promise<VolundrStats>;
   getRepos(): Promise<VolundrRepo[]>;
   getTargets(): Promise<VolundrTarget[]>;
+  listUserHome(instanceId: string, path: string): Promise<UserHomeListing>;
+  deleteUserHomePath(instanceId: string, path: string): Promise<void>;
   getProjects(options?: SessionReadOptions): Promise<ForgeProject[]>;
   getSessionProject(
     sessionId: string,
@@ -183,6 +199,8 @@ export interface IVolundrService {
     resourceConfig?: Record<string, string | undefined>;
     systemPrompt?: string;
     initialPrompt?: string;
+    /** What the session runs: an ordinary coding session (default) or `ravn_flock`. */
+    workloadType?: 'session' | 'ravn_flock';
     workloadConfig?: Record<string, unknown>;
   }): Promise<VolundrSession>;
   evaluatePermissionAutoApproval(
@@ -346,6 +364,6 @@ export interface IVolundrService {
 
   // Personal Access Tokens
   listTokens(): Promise<PersonalAccessToken[]>;
-  createToken(name: string): Promise<CreatePATResult>;
+  createToken(name: string, scopes?: string[]): Promise<CreatePATResult>;
   revokeToken(id: string): Promise<void>;
 }

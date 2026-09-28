@@ -28,7 +28,6 @@ import { useSendRunMessage } from './useRunMessages';
 import { WorkflowCard } from './WorkflowCard';
 import { SagaWorkflowModal } from './SagaWorkflowModal';
 import { StageProgressRail } from './StageProgressRail';
-import { ConfidenceDriftCard } from './ConfidenceDriftCard';
 
 function statusLabel(status: RunStatus | Saga['status'] | Phase['status']): string {
   switch (status) {
@@ -57,6 +56,7 @@ function statusLabel(status: RunStatus | Saga['status'] | Phase['status']): stri
 
 type RepoCatalogService = {
   getRepos(): Promise<RepoRecord[]>;
+  getBranches(repoUrl: string): Promise<string[]>;
 };
 
 function repoRefsForSaga(saga: Saga): SagaRepoRef[] {
@@ -105,30 +105,6 @@ function statusClasses(status: RunStatus | Saga['status'] | Phase['status']): st
   if (status === 'escalated' || status === 'gated')
     return `${base} niuu:border-accent-amber/45 niuu:text-accent-amber niuu:bg-accent-amber/10`;
   return `${base} niuu:border-border niuu:text-text-muted niuu:bg-bg-tertiary`;
-}
-
-function confidenceTone(value: number): string {
-  if (value >= 85) return 'niuu:bg-brand';
-  if (value >= 65) return 'niuu:bg-brand/80';
-  if (value >= 45) return 'niuu:bg-accent-amber';
-  return 'niuu:bg-critical';
-}
-
-function ConfidenceMeter({ value }: { value: number }) {
-  const clamped = Math.max(0, Math.min(100, value));
-  return (
-    <div className="niuu:flex niuu:items-center niuu:gap-3 niuu:justify-end">
-      <div className="niuu:w-14 niuu:h-1 niuu:rounded-full niuu:bg-bg-elevated niuu:overflow-hidden">
-        <div
-          className={['niuu:h-full niuu:rounded-full', confidenceTone(clamped)].join(' ')}
-          style={{ width: `${clamped}%` }}
-        />
-      </div>
-      <span className="niuu:min-w-6 niuu:text-right niuu:font-mono niuu:text-[12px] niuu:text-text-muted">
-        {Math.round(clamped)}
-      </span>
-    </div>
-  );
 }
 
 function roleForRun(run: Run): PersonaRole {
@@ -460,6 +436,7 @@ function TargetCard({
 }
 
 function SagaReposCard({
+  loadBranches,
   saga,
   repos,
   isLoading,
@@ -467,6 +444,7 @@ function SagaReposCard({
   onSave,
 }: {
   saga: Saga;
+  loadBranches: (repoUrl: string) => Promise<string[]>;
   repos: RepoRecord[];
   isLoading: boolean;
   isUpdating: boolean;
@@ -568,6 +546,7 @@ function SagaReposCard({
                   </span>
                   {repos.length > 0 ? (
                     <BranchSelect
+                      loadBranches={loadBranches}
                       repos={repos}
                       selectedRepos={[entry.repo]}
                       value={entry.branch}
@@ -723,7 +702,6 @@ function PhaseCard({ phase }: { phase: Phase }) {
         </div>
         <div className="niuu:flex niuu:items-center niuu:gap-4 niuu:shrink-0">
           <span className={statusClasses(phase.status)}>{statusLabel(phase.status)}</span>
-          <ConfidenceMeter value={phase.confidence} />
         </div>
       </div>
       <div className="niuu:px-5 niuu:pb-3">
@@ -735,7 +713,7 @@ function PhaseCard({ phase }: { phase: Phase }) {
               <div
                 key={run.id}
                 className="niuu:grid niuu:items-center niuu:gap-4 niuu:py-3 niuu:border-t niuu:border-border-subtle"
-                style={{ gridTemplateColumns: '18px 96px minmax(0,1fr) 34px 170px 78px' }}
+                style={{ gridTemplateColumns: '18px 96px minmax(0,1fr) 34px 170px' }}
               >
                 <span className={runDotClasses(run.status)} />
                 <span className="niuu:font-mono niuu:text-[12px] niuu:text-text-secondary">
@@ -746,7 +724,6 @@ function PhaseCard({ phase }: { phase: Phase }) {
                 </span>
                 <RunPersona run={run} />
                 <span className={statusClasses(run.status)}>{statusLabel(run.status)}</span>
-                <ConfidenceMeter value={run.confidence} />
               </div>
             ))}
           </div>
@@ -871,6 +848,7 @@ export function SagaDetailPage({ sagaId, hideBackButton = false }: SagaDetailPag
         <div className="niuu:space-y-4">
           <SagaFeedbackPanel runs={activeRuns} />
           <SagaReposCard
+            loadBranches={repoCatalog.getBranches}
             saga={saga}
             repos={repoCatalogQuery.data ?? []}
             isLoading={repoCatalogQuery.isLoading}
@@ -892,7 +870,6 @@ export function SagaDetailPage({ sagaId, hideBackButton = false }: SagaDetailPag
             onClear={saga.workflowId ? () => handleAssignWorkflow(null) : undefined}
           />
           <StageProgressRail phases={allPhases} />
-          <ConfidenceDriftCard confidence={saga.confidence} phases={phases ?? []} />
         </div>
       </div>
       {showWorkflowModal && (

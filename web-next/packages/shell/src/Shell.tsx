@@ -48,12 +48,16 @@ export function Shell({
 
   const ctx: PluginCtx = useMemo(() => ({ tweaks, setTweak }), [tweaks, setTweak]);
 
-  // Rebuild the router whenever the enabled plugin set changes. Passing
-  // _testHistory lets tests inject a memory history to avoid clobbering
-  // window.location between specs.
+  // Catalog refreshes often leave the route set unchanged. Keep that router
+  // alive; replacing it also requires remounting its transition state.
+  const routeKey = JSON.stringify(enabled.map((plugin) => plugin.id));
   const router = useMemo(
-    () => composeRouter(enabled, { history: _testHistory }),
-    [enabled, _testHistory],
+    () =>
+      composeRouter(
+        (JSON.parse(routeKey) as string[]).map((id) => plugins.find((plugin) => plugin.id === id)!),
+        { history: _testHistory },
+      ),
+    [plugins, routeKey, _testHistory],
   );
 
   return (
@@ -61,7 +65,7 @@ export function Shell({
       <ShellContext.Provider value={{ enabled, brand, version, ctx, topbarContent }}>
         <PluginCtxProvider value={ctx}>
           <CommandPaletteProvider>
-            <RouterProvider router={router} />
+            <RouterProvider key={routeKey} router={router} />
           </CommandPaletteProvider>
         </PluginCtxProvider>
       </ShellContext.Provider>

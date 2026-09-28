@@ -110,7 +110,6 @@ data:
 
     ALTER TABLE niuu_instances
         DROP COLUMN IF EXISTS tags;
-{{- end }}
 
   000061_observatory_fragments.up.sql: |
     -- Push inbox for topology fragments.
@@ -139,3 +138,208 @@ data:
   000061_observatory_fragments.down.sql: |
     DROP INDEX IF EXISTS observatory_fragments_received_at_idx;
     DROP TABLE IF EXISTS observatory_fragments;
+
+  000062_pat_authority.up.sql: |
+    -- Existing unattributed PATs remain recorded but are not valid credentials.
+    -- Rotate them through the authenticated issuance path to establish tenant/scope metadata.
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS scopes TEXT[];
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_pats_tenant_owner ON personal_access_tokens(tenant_id, owner_id);
+
+  000062_pat_authority.down.sql: |
+    -- Revoke scoped credentials before older code can treat them as unrestricted.
+    -- Preserve the audit record; token_hash no longer matches any presented JWT.
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'personal_access_tokens' AND column_name = 'scopes'
+        ) THEN
+            UPDATE personal_access_tokens
+            SET token_hash = 'revoked:' || token_hash
+            WHERE scopes IS NOT NULL AND token_hash NOT LIKE 'revoked:%';
+        END IF;
+    END $$;
+    DROP INDEX IF EXISTS idx_pats_tenant_owner;
+    ALTER TABLE personal_access_tokens DROP COLUMN IF EXISTS scopes;
+    ALTER TABLE personal_access_tokens DROP COLUMN IF EXISTS tenant_id;
+
+
+  000063_topology_source_authority.up.sql: |
+    -- Legacy fragments remain quarantined until ownership is audited.
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_observatory_fragments_tenant ON observatory_fragments(tenant_id);
+
+  000063_topology_source_authority.down.sql: |
+    DROP INDEX IF EXISTS idx_observatory_fragments_tenant;
+    ALTER TABLE observatory_fragments DROP COLUMN IF EXISTS owner_id;
+    ALTER TABLE observatory_fragments DROP COLUMN IF EXISTS tenant_id;
+
+  000064_instance_tenant_attribution.up.sql: |
+    ALTER TABLE niuu_instances DROP CONSTRAINT IF EXISTS niuu_instances_scope_check;
+    ALTER TABLE niuu_instances ADD CONSTRAINT niuu_instances_scope_check CHECK (
+        (visibility = 'system' AND owner_id IS NULL)
+        OR (visibility = 'tenant' AND owner_id IS NULL AND tenant_id IS NOT NULL)
+        OR (visibility = 'user' AND owner_id IS NOT NULL)
+    );
+
+  000064_instance_tenant_attribution.down.sql: |
+    -- Preserve recorded tenant attribution on rollback; older code may ignore it.
+    -- The relaxed constraint is additive and also accepts the old user-row shape.
+    SELECT 1;
+
+  000065_admin_settings.up.sql: |
+    -- Admin settings edited on the Settings page (Forge → Storage) persist across
+    -- restarts instead of living in process memory. One row per settings section.
+    CREATE TABLE IF NOT EXISTS admin_settings (
+        section     TEXT PRIMARY KEY,
+        data        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+
+  000065_admin_settings.down.sql: |
+    DROP TABLE IF EXISTS admin_settings;
+
+  000077_instance_health.up.sql: |
+    -- Server-side reachability tracking for registered runtime instances. Guild
+    -- probes each instance on register and on a periodic loop, and records the
+    -- result here so an offline node is reported as such instead of looking like
+    -- an idle one that simply has no sessions.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS health TEXT NOT NULL DEFAULT 'unknown';
+    -- last_seen_at: the last time a probe SUCCEEDED — "when did it last work".
+    -- last_checked_at: the last time a probe was ATTEMPTED, success or not —
+    -- "when did we last look". A never-reachable instance has a last_checked_at
+    -- but no last_seen_at; conflating the two would let the UI invent a "just
+    -- now" last-seen time for a node that has never actually answered.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'niuu_instances_health_check'
+        ) THEN
+            ALTER TABLE niuu_instances
+                ADD CONSTRAINT niuu_instances_health_check
+                CHECK (health IN ('unknown', 'ok', 'unreachable'));
+        END IF;
+    END $$;
+
+  000077_instance_health.down.sql: |
+    ALTER TABLE niuu_instances DROP CONSTRAINT IF EXISTS niuu_instances_health_check;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_error;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_checked_at;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_seen_at;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS health;
+
+  000083_guild_node_join.up.sql: |
+    -- `niuu join` — machines (K8s clusters, DGX Sparks, laptops in mini/docker
+    -- mode) joined to Guild via a single-use pairing code, and the nodes that
+    -- results in. See docs/operator/joining-machines.md.
+
+    -- Server-side record of a minted pairing code. The code itself is a scoped
+    -- workload JWT (token_use=valkyrie_build, scopes=["node_join"]) so entry to
+    -- the join route is gated by the existing require_scope("node_join")
+    -- machinery; this table exists in addition to that so the code can be spent
+    -- exactly once even though the JWT itself stays structurally valid until it
+    -- expires (see .claude/rules/architecture.md).
+    CREATE TABLE IF NOT EXISTS niuu_pairing_codes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code_hash TEXT NOT NULL UNIQUE,
+        created_by TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        -- Operator consent, recorded at mint time, for the joining node to
+        -- register a plaintext (http://) instance URL. A node can never grant
+        -- itself this — only whoever minted the code decides.
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        -- Operator consent, recorded at mint time, for a node that does not
+        -- itself verify caller identity (host_auth.mode: none) to join a Guild
+        -- that runs host_auth.mode: oidc. Without this, Guild forwards a
+        -- caller's real bearer token to an instance that trusts everyone —
+        -- an explicit, admin-granted exception, never a node self-declaration.
+        allow_untrusted_node_auth BOOLEAN NOT NULL DEFAULT false,
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        consumed_by_node_id UUID,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_pairing_codes_expires
+        ON niuu_pairing_codes(expires_at);
+
+    -- A machine joined through a pairing code. Node-originated calls
+    -- (heartbeat/leave) are authenticated by an Ed25519 signature checked
+    -- against public_key, never a bearer JWT.
+    CREATE TABLE IF NOT EXISTS niuu_nodes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        -- Base64-encoded raw 32-byte Ed25519 public key.
+        public_key TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL,
+        -- Copied once from the pairing code that admitted this node (never
+        -- writable afterward — there is no node-update endpoint at all) so
+        -- every later heartbeat re-registration enforces the same
+        -- operator-granted transport consent, not a value the node supplies.
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ,
+        -- Strictly-increasing replay-protection watermark (Unix MILLISECONDS,
+        -- not seconds — a heartbeat and a leave issued within the same second
+        -- must both be able to advance it) for signed node requests. NULL
+        -- before the node's first signed call. Advanced only by the single
+        -- atomic conditional UPDATE in PostgresNodeRepository.try_advance_watermark;
+        -- never read-then-written from application code.
+        last_request_at BIGINT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_public_key
+        ON niuu_nodes(public_key);
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_nodes_tenant
+        ON niuu_nodes(tenant_id);
+
+    -- Node display names are shown to admins choosing what to revoke, so a
+    -- second node cannot masquerade as an existing one within the same tenant.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_tenant_name
+        ON niuu_nodes(tenant_id, name);
+
+    -- The real ownership link for instances a node registers. This column is
+    -- never exposed on InstanceCreateRequest/InstanceUpdateRequest, so the
+    -- authenticated PATCH /api/v1/niuu/instances/{id} route can never set or
+    -- clear it — only GuildJoinRepository (join/heartbeat) writes it. A slug
+    -- derived from the operator-chosen node *name* must never be the ownership
+    -- key (a node named to collide with an existing slug must not be able to
+    -- adopt that row) — node_id is a Guild-assigned UUID the node never
+    -- chooses, so it cannot be gamed the same way.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS node_id UUID
+        REFERENCES niuu_nodes(id) ON DELETE CASCADE;
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_instances_node_id
+        ON niuu_instances(node_id);
+
+    -- One row per (node, kind): concurrent heartbeats deciding "no existing row
+    -- for this kind, insert a new one" at the same time would otherwise both
+    -- succeed and leave two rows for the same node+kind. The second concurrent
+    -- INSERT now fails fast on this constraint instead of silently duplicating.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_instances_node_kind
+        ON niuu_instances(node_id, kind) WHERE node_id IS NOT NULL;
+  000083_guild_node_join.down.sql: |
+    DROP INDEX IF EXISTS idx_niuu_instances_node_kind;
+    DROP INDEX IF EXISTS idx_niuu_instances_node_id;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS node_id;
+
+    DROP INDEX IF EXISTS idx_niuu_nodes_tenant_name;
+    DROP INDEX IF EXISTS idx_niuu_nodes_tenant;
+    DROP INDEX IF EXISTS idx_niuu_nodes_public_key;
+    DROP TABLE IF EXISTS niuu_nodes;
+
+    DROP INDEX IF EXISTS idx_niuu_pairing_codes_expires;
+    DROP TABLE IF EXISTS niuu_pairing_codes;
+
+
+{{- end }}

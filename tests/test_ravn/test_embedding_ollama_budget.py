@@ -1,4 +1,4 @@
-"""Ollama embedding inputs are bounded, and a failed embedding never costs a turn.
+"""Ollama embedding inputs are bounded, and configured embedding failures are explicit.
 
 The failure this covers, from the journal at 22:01:13 on 2026-08-14:
 
@@ -87,14 +87,14 @@ class TestInputBudget:
 
         assert len(client.embed_inputs[-1][0]) == 8192 * 3
 
-    async def test_an_unknown_context_length_falls_back_conservatively(self) -> None:
-        """Erring low costs recall; erring high costs the turn."""
+    async def test_context_discovery_failure_propagates(self) -> None:
+        """A failed configured server must not silently substitute a budget."""
         client = _FakeClient(context_length=None)
         adapter = _adapter(client)
 
-        await adapter.embed("x" * 50_000)
-
-        assert len(client.embed_inputs[-1][0]) == 2048 * 3
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.embed("x" * 50_000)
+        assert client.embed_inputs == []
 
     async def test_an_explicit_override_wins_and_asks_nothing(self) -> None:
         client = _FakeClient(context_length=8192)
@@ -131,13 +131,9 @@ class TestInputBudget:
 
 
 @pytest.mark.asyncio
-class TestIndexSurvivesAFailedEmbedding:
-    async def test_a_document_is_still_indexed_when_embedding_fails(self, tmp_path: Any) -> None:
-        """The second half of the bug: the write must not die with the vector.
-
-        Truncation fixes today's 400, but an embedding backend that is down, mid-pull, or simply
-        slow would take the turn down by the same route. The row goes in unembedded instead.
-        """
+class TestConfiguredEmbeddingFailures:
+    async def test_a_document_is_not_indexed_when_embedding_fails(self, tmp_path: Any) -> None:
+        """Configured semantic indexing must not silently store an unembedded row."""
         from niuu.adapters.search.sqlite import SqliteSearchAdapter
 
         async def _explode(_content: str) -> list[float]:
@@ -148,19 +144,13 @@ class TestIndexSurvivesAFailedEmbedding:
         adapter = SqliteSearchAdapter(str(tmp_path / "search.db"), embed_fn=_explode)
         await adapter.initialize()
 
-        await adapter.index("doc-1", "a memory worth keeping", {})
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.index("doc-1", "a memory worth keeping", {})
+        assert await adapter.unembedded(limit=10) == []
+        await adapter.close()
 
-        assert [row[0] for row in await adapter.unembedded(limit=10)] == ["doc-1"]
-        assert [r.id for r in await adapter.search("memory")] == ["doc-1"]
-
-    async def test_recall_degrades_to_keywords_when_the_query_cannot_be_embedded(
-        self, tmp_path: Any
-    ) -> None:
-        """The turn-path failure Damien hit: recall runs before the agent answers.
-
-        A raised embedding error here meant the agent produced nothing at all. Keyword results are
-        a worse answer than hybrid ones and an enormously better one than silence.
-        """
+    async def test_recall_fails_when_the_query_cannot_be_embedded(self, tmp_path: Any) -> None:
+        """Configured semantic recall must not silently downgrade to keyword search."""
         from niuu.adapters.search.sqlite import SqliteSearchAdapter
 
         state = {"fail": False}
@@ -179,6 +169,6 @@ class TestIndexSurvivesAFailedEmbedding:
         await adapter.index("doc-1", "the broker listens on 7503", {})
 
         state["fail"] = True
-        results = await adapter.search("broker")
-
-        assert [r.id for r in results] == ["doc-1"]
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.search("broker")
+        await adapter.close()

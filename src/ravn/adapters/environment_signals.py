@@ -6,10 +6,13 @@ import hashlib
 import inspect
 import json
 import os
+import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from observatory.contracts import ObservatoryFragment
 from ravn.domain.environment import (
@@ -354,6 +357,227 @@ class KubernetesSignalAdapter(_IterableSignalAdapter):
                 "uid": _text(_field(involved, "uid")),
             },
             provenance={"adapter": "kubernetes.events", "source_id": self.source_id},
+        )
+
+
+_RFC3339_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def _parse_rfc3339(value: Any) -> datetime:
+    """Parse Alertmanager timestamps, which carry nanoseconds Python rejects."""
+    if isinstance(value, str) and value:
+        value = _RFC3339_FRACTION.sub(r"\1", value)
+    return _parse_timestamp(value)
+
+
+class AlertmanagerSignalAdapter(_IterableSignalAdapter):
+    """Turn firing Prometheus alerts into signals for a resident Valkyrie.
+
+    Polls the Alertmanager v2 API (``GET /api/v2/alerts``) the way the
+    Kubernetes adapter polls events. Each firing episode of an alert is one
+    signal: the dedupe key is the alert fingerprint plus its ``startsAt``, so
+    an alert that keeps firing is judged once, and an alert that resolves and
+    fires again is new. Severity mirrors the alert's own ``severity`` label
+    (critical/warning, anything else is info); the adapter adds no opinion.
+    """
+
+    signal_type: NormalizedSignalType = "metrics"
+
+    def __init__(
+        self,
+        *,
+        environment: Environment,
+        source_id: str = "alertmanager",
+        raw_items: Iterable[Any] | None = None,
+        raw_items_file: str = "",
+        provider: RawProvider | None = None,
+        url: str = "",
+        timeout_seconds: float = 10.0,
+        include_silenced: bool = False,
+        include_inhibited: bool = False,
+        label_filters: list[str] | None = None,
+        exclude_alertnames: list[str] | None = None,
+        group_by_alertname: bool = False,
+        transport: Any | None = None,
+    ) -> None:
+        self._url = url.rstrip("/")
+        self._group_by_alertname = group_by_alertname
+        self._timeout_seconds = timeout_seconds
+        self._include_silenced = include_silenced
+        self._include_inhibited = include_inhibited
+        self._label_filters = list(label_filters or [])
+        self._exclude_alertnames = {name.lower() for name in exclude_alertnames or []}
+        self._transport = transport
+        selected_provider = provider
+        if selected_provider is None and raw_items is None and not raw_items_file:
+            if not self._url:
+                raise ValueError(
+                    f"signal source {source_id!r}: url is required "
+                    "(Alertmanager base URL, e.g. http://alertmanager:9093)"
+                )
+            selected_provider = self._provider_from_alertmanager
+        super().__init__(
+            environment=environment,
+            source_id=source_id,
+            raw_items=raw_items,
+            raw_items_file=raw_items_file,
+            provider=selected_provider,
+        )
+
+    async def _provider_from_alertmanager(self) -> list[Any]:
+        params: list[tuple[str, str]] = [
+            ("active", "true"),
+            ("silenced", "true" if self._include_silenced else "false"),
+            ("inhibited", "true" if self._include_inhibited else "false"),
+        ]
+        params.extend(("filter", matcher) for matcher in self._label_filters)
+        async with httpx.AsyncClient(
+            timeout=self._timeout_seconds, transport=self._transport
+        ) as client:
+            response = await client.get(f"{self._url}/api/v2/alerts", params=params)
+        response.raise_for_status()
+        alerts = response.json()
+        if not isinstance(alerts, list):
+            raise ValueError(f"Alertmanager {self._url} returned a non-list alerts payload")
+        return alerts
+
+    async def collect(self) -> list[NormalizedSignal]:
+        raw_items = list(await self._raw())
+        if self._exclude_alertnames:
+            raw_items = [
+                raw
+                for raw in raw_items
+                if _text((_field(raw, "labels", default={}) or {}).get("alertname")).lower()
+                not in self._exclude_alertnames
+            ]
+        if self._group_by_alertname:
+            return self.normalize_groups(raw_items)
+        return [self.normalize_alert(raw) for raw in raw_items]
+
+    def normalize_groups(self, raw_items: list[Any]) -> list[NormalizedSignal]:
+        """One signal per (alertname, severity): the situation, not each instance.
+
+        61 degraded volumes are one thing for a resident to think about. The
+        episode starts when the first member fired; members joining a group
+        that is already firing do not re-signal.
+        """
+        groups: dict[tuple[str, str], list[NormalizedSignal]] = {}
+        for raw in raw_items:
+            signal = self.normalize_alert(raw)
+            key = (
+                _text(signal.normalized_payload.get("alertname")),
+                signal.severity,
+            )
+            groups.setdefault(key, []).append(signal)
+        grouped: list[NormalizedSignal] = []
+        for (alertname, severity), members in groups.items():
+            if len(members) == 1:
+                grouped.append(members[0])
+                continue
+            members.sort(key=lambda item: item.timestamp)
+            first = members[0]
+            subjects = [_text(member.object_ref.get("subject")) for member in members]
+            episode = f"{alertname}@{first.timestamp.isoformat()}"
+            dedupe_key = f"alertmanager:group:{episode}"
+            grouped.append(
+                NormalizedSignal(
+                    source_id=self.source_id,
+                    environment_id=self.environment.id,
+                    environment_type=self.environment.type,
+                    signal_type="metrics",
+                    severity=severity,  # type: ignore[arg-type]
+                    timestamp=first.timestamp,
+                    raw_payload_ref=f"alertmanager://{self.source_id}/group/{alertname}",
+                    normalized_payload={
+                        "alertname": alertname,
+                        "state": first.normalized_payload.get("state"),
+                        "severity_label": first.normalized_payload.get("severity_label"),
+                        "summary": (
+                            f"{alertname}: {len(members)} instances firing "
+                            f"(first: {first.normalized_payload.get('summary')})"
+                        ),
+                        "description": first.normalized_payload.get("description"),
+                        "count": len(members),
+                        "subjects": subjects,
+                        "labels": dict(first.normalized_payload.get("labels") or {}),
+                        "annotations": dict(first.normalized_payload.get("annotations") or {}),
+                        "starts_at": first.normalized_payload.get("starts_at"),
+                        "generator_url": first.normalized_payload.get("generator_url"),
+                    },
+                    dedupe_key=dedupe_key,
+                    correlation_id=_correlation(self.environment, dedupe_key),
+                    provider="alertmanager",
+                    provider_event_id=f"group:{episode}",
+                    object_ref={
+                        "kind": "AlertGroup",
+                        "name": alertname,
+                        "namespace": first.object_ref.get("namespace", ""),
+                        "subject": ", ".join(subjects[:5])
+                        + (f" +{len(subjects) - 5} more" if len(subjects) > 5 else ""),
+                        "fingerprints": [
+                            _text(member.object_ref.get("fingerprint")) for member in members
+                        ],
+                    },
+                    provenance={"adapter": "alertmanager.alerts", "source_id": self.source_id},
+                )
+            )
+        return grouped
+
+    def normalize_alert(self, raw: Any) -> NormalizedSignal:
+        labels = dict(_field(raw, "labels", default={}) or {})
+        annotations = dict(_field(raw, "annotations", default={}) or {})
+        alertname = _text(labels.get("alertname"), default="UnknownAlert")
+        fingerprint = _text(_field(raw, "fingerprint", default=""))
+        if not fingerprint:
+            fingerprint = hashlib.sha256(json.dumps(labels, sort_keys=True).encode()).hexdigest()[
+                :16
+            ]
+        starts_at_raw = _text(_field(raw, "startsAt", "starts_at", default=""))
+        timestamp = _parse_rfc3339(starts_at_raw)
+        state = _text(_field(raw, "status.state", default="active"))
+        declared = _text(labels.get("severity")).lower()
+        severity = declared if declared in {"warning", "critical"} else "info"
+        episode = f"{fingerprint}@{timestamp.isoformat()}"
+        dedupe_key = f"alertmanager:{episode}"
+        namespace = _text(labels.get("namespace"))
+        subject = _text(
+            labels.get("name")
+            or labels.get("volume")
+            or labels.get("harvester_node")
+            or labels.get("node")
+            or labels.get("instance"),
+        )
+        return NormalizedSignal(
+            source_id=self.source_id,
+            environment_id=self.environment.id,
+            environment_type=self.environment.type,
+            signal_type="metrics",
+            severity=severity,  # type: ignore[arg-type]
+            timestamp=timestamp,
+            raw_payload_ref=f"alertmanager://{self.source_id}/{fingerprint}",
+            normalized_payload={
+                "alertname": alertname,
+                "state": state,
+                "severity_label": declared,
+                "summary": _text(annotations.get("summary")),
+                "description": _text(annotations.get("description")),
+                "labels": labels,
+                "annotations": annotations,
+                "starts_at": starts_at_raw,
+                "generator_url": _text(_field(raw, "generatorURL", "generator_url")),
+            },
+            dedupe_key=dedupe_key,
+            correlation_id=_correlation(self.environment, dedupe_key),
+            provider="alertmanager",
+            provider_event_id=episode,
+            object_ref={
+                "kind": "Alert",
+                "name": alertname,
+                "namespace": namespace,
+                "subject": subject,
+                "fingerprint": fingerprint,
+            },
+            provenance={"adapter": "alertmanager.alerts", "source_id": self.source_id},
         )
 
 

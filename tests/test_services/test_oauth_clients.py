@@ -1,0 +1,204 @@
+"""The install's own OAuth applications: configured as the base, registered on top."""
+
+from __future__ import annotations
+
+import pytest
+
+from volundr.adapters.outbound.file_credential_store import FileCredentialStore
+from volundr.config import _default_integration_definitions
+from volundr.domain.services.integration_registry import (
+    IntegrationRegistry,
+    definitions_from_config,
+)
+from volundr.domain.services.oauth_clients import (
+    APP_REGISTRY_OWNER_ID,
+    APP_REGISTRY_OWNER_TYPE,
+    SOURCE_CONFIGURED,
+    SOURCE_REGISTERED,
+    OAuthClient,
+    OAuthClientError,
+    OAuthClientRegistry,
+    app_key,
+)
+
+
+def _integrations() -> IntegrationRegistry:
+    return IntegrationRegistry(
+        definitions_from_config([d.model_dump() for d in _default_integration_definitions()])
+    )
+
+
+def _registry(store: FileCredentialStore, **configured: OAuthClient) -> OAuthClientRegistry:
+    return OAuthClientRegistry(
+        credential_store=store, integration_registry=_integrations(), configured=configured
+    )
+
+
+@pytest.fixture
+def store(tmp_path) -> FileCredentialStore:
+    return FileCredentialStore(base_dir=str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_registered_applications_survive_a_restart_and_win_over_config(store) -> None:
+    configured = OAuthClient(
+        slug="github", client_id="Iv1.cfg", client_secret="", source=SOURCE_CONFIGURED
+    )
+    registry = _registry(store, github=configured)
+    await registry.load()
+    assert registry.get("github") == configured
+    assert registry.get("gitlab") is None
+
+    registered = await registry.register("gitlab", "  glpub  ", "shh")
+    assert registered == OAuthClient(
+        slug="gitlab", client_id="glpub", client_secret="shh", source=SOURCE_REGISTERED
+    )
+    await registry.register("github", "Iv1.mine")
+
+    fresh = _registry(store, github=configured)
+    await fresh.load()
+    assert fresh.get("gitlab") == registered
+    assert fresh.get("github") is not None
+    assert fresh.get("github").client_id == "Iv1.mine"  # the wizard replaces a stale config id
+    assert [client.slug for client in fresh.list()] == ["github", "gitlab"]
+
+    stored = await store.get_value(APP_REGISTRY_OWNER_TYPE, APP_REGISTRY_OWNER_ID, "gitlab")
+    assert stored == {"client_id": "glpub", "client_secret": "shh", "base_url": ""}
+
+
+@pytest.mark.asyncio
+async def test_a_provider_can_have_an_application_per_account(store) -> None:
+    registry = _registry(store)
+    await registry.load()
+    await registry.register("github", "Iv1.personal")
+    niuu = await registry.register("github", "Iv1.org", "", app="niuu-org")
+
+    assert niuu.app == "niuu-org"
+    assert registry.get("github").client_id == "Iv1.personal"
+    assert registry.get("github", "niuu-org") == niuu
+    assert registry.get("github", "nope") is None
+    assert registry.has_any("github") and not registry.has_any("gitlab")
+    assert [c.app for c in registry.list_for("github")] == ["default", "niuu-org"]
+    stored = await store.get_value(
+        APP_REGISTRY_OWNER_TYPE, APP_REGISTRY_OWNER_ID, "github--niuu-org"
+    )
+    assert stored == {"client_id": "Iv1.org", "client_secret": "", "base_url": ""}
+
+    fresh = _registry(store)
+    await fresh.load()
+    assert fresh.get("github", "niuu-org") == niuu
+    await fresh.remove("github", "niuu-org")
+    assert fresh.get("github", "niuu-org") is None
+    assert fresh.get("github").client_id == "Iv1.personal"
+
+    with pytest.raises(OAuthClientError, match="letters, digits and dashes"):
+        await registry.register("github", "x", app="Niuu Org")
+    assert app_key(" Niuu Org! ") == "niuu-org"
+    assert app_key("") == "default"
+
+
+@pytest.mark.asyncio
+async def test_oauth_integrations_take_an_application(store) -> None:
+    registry = _registry(store)
+    await registry.load()
+    assert registry.supports("github")
+    assert registry.supports("gitlab")
+    assert registry.supports("jira")
+    assert not registry.has_usable("jira")
+    assert not registry.supports("anthropic")
+    assert not registry.supports("nope")
+    with pytest.raises(OAuthClientError, match="does not sign in through"):
+        await registry.register("anthropic", "x")
+    with pytest.raises(OAuthClientError, match="client id is required"):
+        await registry.register("github", "   ")
+    with pytest.raises(OAuthClientError, match="client secret is required"):
+        await registry.register("jira", "jira-client")
+    jira = await registry.register("jira", "jira-client", "jira-secret")
+    assert jira.client_secret == "jira-secret"
+    assert registry.has_usable("jira")
+
+
+@pytest.mark.asyncio
+async def test_remove_forgets_registered_applications_only(store) -> None:
+    configured = OAuthClient(slug="github", client_id="Iv1.cfg", source=SOURCE_CONFIGURED)
+    registry = _registry(store, github=configured)
+    await registry.load()
+    await registry.register("gitlab", "glpub")
+    await registry.remove("gitlab")
+    assert registry.get("gitlab") is None
+    assert await store.get(APP_REGISTRY_OWNER_TYPE, APP_REGISTRY_OWNER_ID, "gitlab") is None
+    with pytest.raises(OAuthClientError, match="No registered"):
+        await registry.remove("github")
+    assert registry.get("github") == configured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "slug,api_url",
+    [
+        ("gitlab", "https://git.company.test"),
+        ("github", "https://git.company.test/api/v3"),
+    ],
+)
+async def test_self_hosted_application_survives_reload_and_routes_endpoints(store, slug, api_url):
+    registry = _registry(store)
+    await registry.register(slug, "client", app="work", base_url="https://git.company.test/")
+    fresh = _registry(store)
+    await fresh.load()
+    client = fresh.get(slug, "work")
+    assert client.base_url == "https://git.company.test"
+    assert client.api_base_url("https://public.test") == api_url
+    assert (
+        client.endpoint("https://public.test/oauth/token") == "https://git.company.test/oauth/token"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git.company.test",
+        "ftp://git.test",
+        "https://user:pass@git.test",
+        "https://git.test/path",
+        "https://git.test?x=1",
+        "https://git.test#x",
+    ],
+)
+async def test_oauth_host_rejects_non_origins(store, url):
+    with pytest.raises(OAuthClientError, match="HTTP"):
+        await _registry(store).register("gitlab", "client", base_url=url)
+
+
+async def test_managed_store_provisions_registration_and_restart(store):
+    from unittest.mock import AsyncMock
+
+    from niuu.ports.credentials import OAuthApplicationStorePort
+
+    applications = AsyncMock(spec=OAuthApplicationStorePort)
+    registry = OAuthClientRegistry(
+        credential_store=store,
+        integration_registry=_integrations(),
+        application_store=applications,
+    )
+    await registry.register(
+        "gitlab", "client", "secret", app="work", base_url="https://git.example.test"
+    )
+    applications.configure_oauth_application.assert_awaited_once_with(
+        slug="gitlab",
+        app="work",
+        client_id="client",
+        client_secret="secret",
+        authorize_url="https://git.example.test/oauth/authorize",
+        token_url="https://git.example.test/oauth/token",
+    )
+    applications.configure_oauth_application.reset_mock()
+    await registry.load()
+    applications.configure_oauth_application.assert_awaited_once()
+    applications.configure_oauth_application.side_effect = RuntimeError("vault unavailable")
+    with pytest.raises(RuntimeError, match="vault unavailable"):
+        await registry.register("gitlab", "replacement", "secret", app="work")
+    assert registry.get("gitlab", "work").client_id == "client"
+    assert (await store.get_value("system", "oauth-clients", "gitlab--work"))[
+        "client_id"
+    ] == "client"

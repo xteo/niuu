@@ -79,6 +79,7 @@ class CreateResidentRuntimeRequest(BaseModel):
     flock_member_id: UUID | None = None
     flock_role: str = Field(default="", max_length=100)
     flock_peer_id: str = Field(default="", max_length=255)
+    realm_id: UUID | None = None
 
 
 class ResidentUsageRequest(BaseModel):
@@ -152,6 +153,7 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
                 flock_member_id=body.flock_member_id,
                 flock_role=body.flock_role,
                 flock_peer_id=body.flock_peer_id,
+                realm_id=body.realm_id,
             )
         except Exception as exc:
             raise _resident_error(exc) from exc
@@ -272,7 +274,7 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
     ) -> None:
         from niuu.app import _proxy_ws_identity
 
-        user_id, tenant_id, roles = _proxy_ws_identity(websocket)
+        user_id, tenant_id, roles = await _proxy_ws_identity(websocket)
         if not user_id:
             await websocket.close(code=1008, reason="Not authorized for this resident")
             return
@@ -304,6 +306,7 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         except WebSocketDisconnect:
+            # Browser disconnect ends the relay; both tasks are cleaned up below.
             pass
         finally:
             for task in tasks:
@@ -354,6 +357,7 @@ def create_resident_runtimes_router(service: ResidentRuntimeService) -> APIRoute
         try:
             await service.delete(principal, runtime_id)
         except ResidentRuntimeNotFoundError:
+            # DELETE is idempotent when the resident has already been removed.
             pass
         except Exception as exc:
             raise _resident_error(exc) from exc

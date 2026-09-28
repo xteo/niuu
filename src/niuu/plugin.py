@@ -42,12 +42,14 @@ class NiuuPlugin(ServicePlugin):
                 name="niuu-shared-api",
                 prefixes=(
                     "/api/v1/tokens",
+                    "/api/v1/realms",
                     "/api/v1/identity",
                     "/api/v1/features",
                     "/api/v1/personas",
                     "/api/v1/ravn/personas",
+                    "/api/v1/niuu/setup",
                 ),
-                description="Shared identity, PAT, feature, and persona routes.",
+                description="Shared identity, PAT, feature, persona, and setup routes.",
             ),
         )
 

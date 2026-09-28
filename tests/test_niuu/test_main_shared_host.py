@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 import cli.shared_host as niuu_main
@@ -15,6 +17,8 @@ from volundr.config import Settings
 
 
 class _DummyGitRegistry:
+    providers: tuple[object, ...] = ()
+
     async def close(self) -> None:
         return None
 
@@ -41,7 +45,16 @@ async def _idle_reconcile(_service) -> None:
     await asyncio.Event().wait()
 
 
-def test_create_app_mounts_shared_identity_features_and_personas(monkeypatch) -> None:
+@pytest.mark.parametrize("mini,enabled", [(False, True), (True, False), (True, True)])
+def test_create_app_mounts_shared_identity_features_and_personas(
+    monkeypatch, mini, enabled
+) -> None:
+    # Factory is synchronous; the loop is replaced so no background I/O occurs.
+    from unittest.mock import MagicMock
+
+    refresh_factory = MagicMock()
+    monkeypatch.setattr(niuu_main, "create_oauth_token_refresh_service", refresh_factory)
+    monkeypatch.setattr(niuu_main, "refresh_oauth_tokens_loop", _idle_reconcile)
     monkeypatch.setattr(niuu_main, "create_git_registry", lambda _cfg: _DummyGitRegistry())
     monkeypatch.setattr(niuu_main, "database_pool", _fake_database_pool)
     monkeypatch.setattr(niuu_main, "create_storage_adapter", lambda _settings: object())
@@ -56,6 +69,21 @@ def test_create_app_mounts_shared_identity_features_and_personas(monkeypatch) ->
         lambda *_args, **_kwargs: _DummyPATValidator(),
     )
     monkeypatch.setattr(niuu_main, "create_credential_store", lambda _settings: object())
+
+    async def _no_registered_clients() -> None:
+        return None
+
+    oauth_client_registry = SimpleNamespace(
+        load=_no_registered_clients, get=lambda _slug, _app="default": None
+    )
+    monkeypatch.setattr(
+        niuu_main,
+        "create_oauth_client_registry",
+        lambda _settings, **kwargs: oauth_client_registry,
+    )
+    monkeypatch.setattr(
+        niuu_main, "with_oauth_device_runner", lambda runner, _clients, _registry: runner
+    )
     monkeypatch.setattr(niuu_main, "release_credential_store", lambda _settings: None)
     monkeypatch.setattr(niuu_main, "TenantService", _DummyTenantService)
     monkeypatch.setattr(
@@ -98,6 +126,15 @@ def test_create_app_mounts_shared_identity_features_and_personas(monkeypatch) ->
     )
     monkeypatch.setattr(niuu_main, "reconcile_credential_enrollments_loop", _idle_reconcile)
 
+    repo_services: list[tuple[object, object]] = []
+    real_repo_service = niuu_main.RepoService
+
+    def _spy_repo_service(git_registry, user_integration=None):
+        repo_services.append((git_registry, user_integration))
+        return real_repo_service(git_registry, user_integration=user_integration)
+
+    monkeypatch.setattr(niuu_main, "RepoService", _spy_repo_service)
+
     enrollment_services: list[object] = []
     real_router = niuu_main.create_canonical_integrations_router
 
@@ -107,23 +144,40 @@ def test_create_app_mounts_shared_identity_features_and_personas(monkeypatch) ->
 
     monkeypatch.setattr(niuu_main, "create_canonical_integrations_router", _spy_router)
 
+    oauth_router_registries: list[object] = []
+    real_oauth_router = niuu_main.create_canonical_oauth_router
+
+    def _spy_oauth_router(*args, **kwargs):
+        oauth_router_registries.append(kwargs.get("oauth_clients"))
+        return real_oauth_router(*args, **kwargs)
+
+    monkeypatch.setattr(niuu_main, "create_canonical_oauth_router", _spy_oauth_router)
+
     app = niuu_main.create_app(
         git_config=GitConfig(),
         settings=Settings(
+            local_mounts={"mini_mode": mini},
+            oauth={"mini_mode_refresh_enabled": enabled},
             auth_discovery={
                 "issuer": "https://issuer.example.com",
                 "cli_client_id": "volundr-cli",
                 "scopes": "openid profile email",
-            }
+            },
         ),
     )
 
     with TestClient(app) as client:
         response = client.get("/api/v1/identity/auth/config")
         assert response.status_code == 200
+        assert refresh_factory.call_count == int(mini and enabled)
         assert response.json()["issuer"] == "https://issuer.example.com"
+        # /api/v1/niuu/repos lists the person's own accounts, not only config
+        assert repo_services and repo_services[0][1] is not None
 
         paths = set(client.get("/openapi.json").json()["paths"])
+        assert "/api/v1/realms" in paths
+        assert app.state.realm_service is not None
+        assert client.get("/api/v1/realms").status_code == 401
         assert "/api/v1/niuu/repos" in paths
         assert "/api/v1/identity/auth/config" in paths
         assert "/api/v1/features" in paths
@@ -142,9 +196,16 @@ def test_create_app_mounts_shared_identity_features_and_personas(monkeypatch) ->
         assert "/api/v1/integrations/enrollments" in paths
         assert "/internal/api/v1/integrations/enrollments" in paths
         assert enrollment_services and all(s is not None for s in enrollment_services)
+        assert oauth_router_registries == [oauth_client_registry]
         assert "/api/v1/integrations/catalog" in paths
         assert "/api/v1/tracker/status" in paths
         assert "/api/v1/tracker/issues" in paths
         assert "/api/v1/tracker/repo-mappings" in paths
         assert "/api/v1/niuu/instances" not in paths
         assert "/api/v1/forge/sessions" not in paths
+        app.dependency_overrides[niuu_main.extract_principal] = object
+        app.state.realm_service.list_realms = AsyncMock(return_value=[])
+        response = client.get("/api/v1/realms")
+        assert response.status_code == 200
+        assert response.json() == []
+        app.state.realm_service.list_realms.assert_awaited_once()

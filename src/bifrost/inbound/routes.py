@@ -19,10 +19,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
 import bifrost.metrics as _metrics
 from bifrost import catalog as _catalog
-from bifrost.auth import AgentIdentity
+from bifrost.auth import AgentIdentity, AuthMode
 from bifrost.config import AgentPermissions, AuditDetailLevel, BifrostConfig, BudgetGuardrailConfig
 from bifrost.domain.models import RequestLog, TokenUsage
 from bifrost.domain.routing import RuleRejectError
@@ -44,6 +45,13 @@ from bifrost.inbound.ollama import (
     ollama_error_response,
     ollama_generate_to_anthropic,
 )
+from bifrost.inbound.responses import (
+    ResponsesRequest,
+    UnsupportedResponsesInputError,
+    anthropic_response_to_responses,
+    anthropic_stream_to_responses,
+    responses_request_to_anthropic,
+)
 from bifrost.inbound.tracking import (
     _HEADER_QUOTA_WARNING,
     _log_request,
@@ -57,12 +65,35 @@ from bifrost.ports.events import BudgetDegradedEvent, CostEventEmitter
 from bifrost.ports.rules import RoutingContext
 from bifrost.ports.usage_store import UsageRecord, UsageStore
 from bifrost.pricing import ModelPricing, calculate_cost
-from bifrost.router import ModelRouter, RouterError
+from bifrost.router import ModelRouter, RouterError, record_genai_span_attributes
 from bifrost.translation.models import AnthropicRequest, AnthropicResponse
 from niuu.domain.model_catalog import ProviderHealthState
 from niuu.settings_schema import SettingsFieldSchema, SettingsProviderSchema, SettingsSectionSchema
 
 logger = logging.getLogger(__name__)
+
+
+_VALIDATION_ERRORS_SHOWN = 3
+_VALIDATION_INPUT_SHOWN = 80
+
+
+def _validation_summary(exc: Exception) -> str:
+    """The first few validation problems, so a client can see what it sent wrong."""
+    if isinstance(exc, ValidationError):
+        parts = []
+        for error in exc.errors()[:_VALIDATION_ERRORS_SHOWN]:
+            location = ".".join(str(item) for item in error.get("loc", ())) or "body"
+            got = repr(error.get("input"))
+            if len(got) > _VALIDATION_INPUT_SHOWN:
+                got = got[:_VALIDATION_INPUT_SHOWN] + "…"
+            parts.append(f"{location}: {error.get('msg', 'invalid')} (got {got})")
+        more = exc.error_count() - len(parts)
+        return "; ".join(parts) + (f" (+{more} more)" if more > 0 else "")
+    # Anything else here is the body failing to parse before validation. The
+    # exception text is not returned: it can carry internals, and the client
+    # only needs to know the body was not JSON.
+    return "the body is not valid JSON"
+
 
 # Header injected on responses when the agent's budget is approaching or at the
 # warn threshold.  Callers can inspect this header to adjust their behaviour.
@@ -165,6 +196,14 @@ async def _try_cache_hit(
         return None
     latency_ms = (time.monotonic() - start) * 1000
     await store.record(_cache_hit_record(request_id, identity, model, provider, latency_ms))
+    record_genai_span_attributes(
+        requested_model=model,
+        provider=provider,
+        failover_attempts=0,
+        cache_hit=True,
+        response_model=cached.model,
+        usage=cached.usage,
+    )
     content = response_transform(cached) if response_transform else cached.model_dump()
     return JSONResponse(content=content)
 
@@ -646,6 +685,59 @@ def create_router(
 
     api_router = APIRouter()
 
+    async def _prepare_model_route(request, routing_ctx, identity, agent_perms, request_id):
+        if not router.has_model_routes:
+            return request
+
+        async def record_judge(provider, model, response, elapsed):
+            usage = TokenUsage(
+                input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens
+            )
+            cost = calculate_cost(model, usage, pricing_overrides)
+            await store.record(
+                UsageRecord(
+                    request_id=f"{request_id}:classifier:{uuid.uuid4().hex}",
+                    agent_id=identity.agent_id,
+                    tenant_id=identity.tenant_id,
+                    session_id=identity.session_id,
+                    saga_id=identity.saga_id,
+                    model=model,
+                    provider=provider,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost_usd=cost,
+                    timestamp=datetime.now(UTC),
+                    latency_ms=elapsed * 1000,
+                )
+            )
+            _metrics.record_request(
+                provider=provider,
+                model=model,
+                status="200",
+                duration_seconds=elapsed,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cost_usd=cost,
+            )
+            await emit_cost_events(
+                event_emitter,
+                store,
+                identity,
+                cost,
+                usage.input_tokens + usage.output_tokens,
+                model,
+                agent_perms.quota.max_cost_per_day,
+                config.events.budget_warning_threshold_pct,
+            )
+            await _check_quotas(identity, config, store, agent_perms)
+
+        return await router.prepare(
+            request,
+            routing_ctx,
+            authorize=lambda model: _check_model_access(identity, model, agent_perms),
+            record_call=record_judge,
+        )
+
     async def _emit_events(
         identity: AgentIdentity,
         cost: float,
@@ -684,7 +776,8 @@ def create_router(
         return {"status": "ok"}
 
     @api_router.get("/settings", response_model=SettingsProviderSchema)
-    async def settings() -> SettingsProviderSchema:
+    async def settings(raw_request: Request) -> SettingsProviderSchema:
+        await auth_adapter.extract(raw_request)
         return SettingsProviderSchema(
             title="Bifrost",
             subtitle="model catalog and routing settings",
@@ -746,8 +839,9 @@ def create_router(
         )
 
     @api_router.get("/models")
-    async def list_catalog_models() -> list[dict]:
+    async def list_catalog_models(raw_request: Request) -> list[dict]:
         """Return the canonical Bifrost-owned model catalog for platform consumers."""
+        await auth_adapter.extract(raw_request)
         return [
             {
                 "id": model.id,
@@ -773,8 +867,9 @@ def create_router(
         ]
 
     @api_router.get("/models/{model_id}")
-    async def get_catalog_model(model_id: str) -> dict:
+    async def get_catalog_model(model_id: str, raw_request: Request) -> dict:
         """Return one canonical model entry, resolving aliases on lookup."""
+        await auth_adapter.extract(raw_request)
         model = _catalog.get_model(config, model_id)
         if model is None:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
@@ -800,15 +895,17 @@ def create_router(
         }
 
     @api_router.get("/aliases")
-    async def list_catalog_aliases() -> list[dict]:
+    async def list_catalog_aliases(raw_request: Request) -> list[dict]:
         """Return configured model aliases."""
+        await auth_adapter.extract(raw_request)
         return [
             {"alias": item.alias, "target": item.target} for item in _catalog.list_aliases(config)
         ]
 
     @api_router.get("/providers")
-    async def list_catalog_providers() -> list[dict]:
+    async def list_catalog_providers(raw_request: Request) -> list[dict]:
         """Return configured providers without performing active probes."""
+        await auth_adapter.extract(raw_request)
         return [
             {
                 "key": provider.key,
@@ -824,8 +921,9 @@ def create_router(
         ]
 
     @api_router.get("/providers/health")
-    async def list_provider_health() -> list[dict]:
+    async def list_provider_health(raw_request: Request) -> list[dict]:
         """Return provider entries plus observed reachability health."""
+        await auth_adapter.extract(raw_request)
         states, details = await _provider_health_snapshot(config)
         return [
             {
@@ -852,7 +950,7 @@ def create_router(
         Returns hit/miss counts, hit rate, and saved token counts since the
         process started.  Statistics are per-instance and reset on restart.
         """
-        auth_adapter.extract(raw_request)
+        await auth_adapter.extract(raw_request)
         s = _cache.stats()
         return {
             "hits": s.hits,
@@ -873,8 +971,16 @@ def create_router(
         containers without a shell, or Windows).
 
         Authentication is enforced according to the configured auth mode —
-        in PAT or mesh mode a valid credential is required to call this
-        endpoint, preventing unauthenticated disruption of the adapter cache.
+        in PAT, oidc or mesh mode a valid credential is required to call
+        this endpoint, preventing unauthenticated disruption of the adapter
+        cache. In PAT and oidc mode the credential must additionally carry
+        an admin role (`admin` or `volundr:admin`) — those modes have a
+        per-caller role concept; mesh's XFCC-derived service identity does
+        not, so a verified mesh credential remains sufficient there, as it
+        always has been. A PAT minted without a `roles` claim (e.g. via
+        `niuu.adapters.memory_token_issuer.MemoryTokenIssuer`, which never
+        sets one) cannot satisfy this — mint one with an IDP-backed issuer
+        that includes it, or use SIGHUP instead.
 
         After this call, all cached provider adapters are discarded and
         will be rebuilt with the freshly loaded keys on the next request.
@@ -882,17 +988,25 @@ def create_router(
         Returns:
             ``{"status": "ok"}``
         """
-        auth_adapter.extract(raw_request)
+        identity = await auth_adapter.extract(raw_request)
+        if config.auth_mode in (
+            AuthMode.PAT,
+            AuthMode.OIDC,
+        ) and not {"admin", "volundr:admin"}.intersection(identity.roles):
+            raise HTTPException(
+                status_code=403, detail="Reloading provider keys requires an admin role"
+            )
         router.reload_keys()
         return {"status": "ok"}
 
     @api_router.get("/v1/models")
-    async def list_models() -> dict:
+    async def list_models(raw_request: Request) -> dict:
         """List models available across all configured providers.
 
         Returns an OpenAI-compatible list response including both canonical
         model IDs and any configured aliases.
         """
+        await auth_adapter.extract(raw_request)
         data: list[dict[str, str]] = []
         for model in _catalog.list_models(config):
             if not model.enabled:
@@ -928,14 +1042,15 @@ def create_router(
         Token usage is tracked per-request and attributed to the caller.
         """
         # --- Authentication ---
-        identity = auth_adapter.extract(raw_request)
+        identity = await auth_adapter.extract(raw_request)
 
         try:
             body = await raw_request.json()
             request = AnthropicRequest.model_validate(body)
         except Exception as exc:
-            logger.debug("Request validation failed: %s", exc)
-            raise HTTPException(status_code=422, detail="Invalid request body.") from exc
+            reason = _validation_summary(exc)
+            logger.warning("Rejected /v1/messages request: %s", reason)
+            raise HTTPException(status_code=422, detail=f"Invalid request body: {reason}") from exc
 
         # Resolve permissions once — used by both access control and quota checks.
         agent_perms = config.permissions_for_agent(identity.agent_id)
@@ -960,6 +1075,10 @@ def create_router(
         agent_budget_limit = agent_perms.quota.max_cost_per_day
 
         try:
+            request = await _prepare_model_route(
+                request, routing_ctx, identity, agent_perms, request_id
+            )
+            provider = request._routed_provider or provider
             if request.stream:
                 stream_resp = StreamingResponse(
                     _stream_with_tracking(
@@ -1159,6 +1278,7 @@ def create_router(
 
     @api_router.get("/v1/usage")
     async def usage_endpoint(
+        raw_request: Request,
         agent_id: str | None = None,
         tenant_id: str | None = None,
         model: str | None = None,
@@ -1171,7 +1291,8 @@ def create_router(
 
         Query parameters:
             agent_id:    Filter by agent identifier.
-            tenant_id:   Filter by tenant identifier.
+            tenant_id:   Filter by tenant identifier — ignored outside 'open'
+                         mode (see below).
             model:       Filter by model name.
             since:       ISO-8601 datetime (inclusive lower bound).
             until:       ISO-8601 datetime (inclusive upper bound).
@@ -1180,9 +1301,31 @@ def create_router(
                          When provided, the response includes a ``timeseries``
                          array with per-bucket aggregates.
 
+        Requires the configured auth mode's credential like every other
+        endpoint. Outside 'open' mode, the ``tenant_id`` query parameter is
+        always ignored in favour of ``identity.tenant_id`` — a caller can
+        never simply ask for another tenant's usage by passing its id — but
+        how trustworthy that tenant actually is depends on the mode:
+        'oidc' — a signature-verified claim (a tenant-less token is refused
+        outright, see ``OidcAuthAdapter``); 'pat' — a claim on the PAT's own
+        payload if present, else every tenant-less PAT pools into the
+        shared 'default' tenant (unlike oidc, this is *not* rejected here —
+        ``niuu.adapters.memory_token_issuer.MemoryTokenIssuer`` never sets a
+        tenant_id claim at all today, so PATs minted through it always fall
+        into this case; rejecting them would break ordinary PAT auth, not
+        harden it); 'mesh' — the caller-supplied ``X-Tenant-Id`` application
+        header, not cryptographically verified at all (mesh mode verifies
+        the *agent* identity via XFCC/SPIFFE, not a tenant claim). 'open'
+        has no identity to scope by, so the query parameter is honoured
+        as-is, matching its existing trust-all posture.
+
         Returns a summary (totals + per-model/provider breakdown), an optional
         time-series breakdown, and the raw record list.
         """
+        identity = await auth_adapter.extract(raw_request)
+        if config.auth_mode != AuthMode.OPEN:
+            tenant_id = identity.tenant_id
+
         since_dt: datetime | None = None
         until_dt: datetime | None = None
 
@@ -1292,14 +1435,17 @@ def create_router(
         path is supported; token usage is extracted and logged on each request.
         """
         # --- Authentication ---
-        identity = auth_adapter.extract(raw_request)
+        identity = await auth_adapter.extract(raw_request)
 
         try:
             body = await raw_request.json()
             oai_request = OpenAIChatRequest.model_validate(body)
         except Exception as exc:
-            logger.warning("Invalid OpenAI chat completion request: %s", exc)
-            return openai_error_response(422, "Invalid request body.", "invalid_request_error")
+            reason = _validation_summary(exc)
+            logger.warning("Rejected /v1/chat/completions request: %s", reason)
+            return openai_error_response(
+                422, f"Invalid request body: {reason}", "invalid_request_error"
+            )
 
         request = openai_request_to_anthropic(oai_request)
 
@@ -1331,6 +1477,10 @@ def create_router(
         agent_budget_limit = agent_perms.quota.max_cost_per_day
 
         try:
+            request = await _prepare_model_route(
+                request, routing_ctx, identity, agent_perms, request_id
+            )
+            provider = request._routed_provider or provider
             if request.stream:
                 message_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 stream_resp = StreamingResponse(
@@ -1532,6 +1682,276 @@ def create_router(
             )
             return openai_error_response(502, "Upstream routing failed.", "server_error")
 
+    @api_router.post("/v1/responses", response_model=None)
+    async def responses_api(raw_request: Request) -> JSONResponse | StreamingResponse:
+        """OpenAI Responses API-compatible endpoint (what the Codex CLI speaks).
+
+        Same pipeline as chat completions with the Responses request and
+        event shapes; the gateway keeps no response state, so every request
+        carries the full conversation.
+        """
+        # --- Authentication ---
+        identity = await auth_adapter.extract(raw_request)
+
+        try:
+            body = await raw_request.json()
+            responses_request = ResponsesRequest.model_validate(body)
+        except Exception as exc:
+            reason = _validation_summary(exc)
+            logger.warning("Rejected /v1/responses request: %s", reason)
+            return openai_error_response(
+                422, f"Invalid request body: {reason}", "invalid_request_error"
+            )
+
+        try:
+            request = responses_request_to_anthropic(responses_request)
+        except UnsupportedResponsesInputError as exc:
+            logger.warning("Rejected /v1/responses request: %s", exc.message)
+            return openai_error_response(400, exc.message, "invalid_request_error")
+
+        # --- Model access control ---
+        agent_perms = config.permissions_for_agent(identity.agent_id)
+        try:
+            _check_model_access(identity, request.model, agent_perms)
+        except HTTPException as exc:
+            return openai_error_response(exc.status_code, exc.detail, "invalid_request_error")
+
+        # --- Quota check (before routing) ---
+        try:
+            warnings, agent_cost_today = await _check_quotas(identity, config, store, agent_perms)
+        except HTTPException as exc:
+            return openai_error_response(exc.status_code, exc.detail, "rate_limit_error")
+
+        # --- Guardrail evaluation (budget + context-window) ---
+        # Pass agent_cost_today to avoid a duplicate store query.
+        try:
+            request, routing_ctx, budget_warn = await _evaluate_guardrails(
+                request, identity, config, store, agent_perms, event_emitter, agent_cost_today
+            )
+        except HTTPException as exc:
+            return openai_error_response(exc.status_code, exc.detail, "rate_limit_error")
+
+        request_id = str(raw_request.state.correlation_id)
+        start = time.monotonic()
+        provider = config.provider_for_model(request.model) or ""
+        agent_budget_limit = agent_perms.quota.max_cost_per_day
+
+        try:
+            request = await _prepare_model_route(
+                request, routing_ctx, identity, agent_perms, request_id
+            )
+            provider = request._routed_provider or provider
+            if request.stream:
+                response_id = f"resp_{uuid.uuid4().hex[:24]}"
+                stream_resp = StreamingResponse(
+                    anthropic_stream_to_responses(
+                        _stream_with_tracking(
+                            router.stream(request, routing_ctx),
+                            request.model,
+                            start,
+                            identity,
+                            store,
+                            pricing_overrides,
+                            request_id,
+                            provider=provider,
+                            emitter=event_emitter,
+                            agent_budget_limit=agent_budget_limit,
+                            budget_warning_threshold_pct=config.events.budget_warning_threshold_pct,
+                            sleipnir_publisher=getattr(
+                                raw_request.app.state, "sleipnir_publisher", None
+                            ),
+                        ),
+                        response_id=response_id,
+                        model=request.model,
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "cache-control": "no-cache",
+                        "x-accel-buffering": "no",
+                        "connection": "keep-alive",
+                    },
+                )
+                if warnings:
+                    stream_resp.headers[_HEADER_QUOTA_WARNING] = "; ".join(warnings)
+                if budget_warn:
+                    stream_resp.headers[_HEADER_BUDGET_WARNING] = budget_warn
+                return stream_resp
+
+            # --- Exact response cache (non-streaming only) ---
+            cache_key = _compute_cache_key(identity.tenant_id, request)
+            hit_resp = await _try_cache_hit(
+                _cache,
+                cache_key,
+                identity,
+                request_id,
+                request.model,
+                provider,
+                start,
+                store,
+                response_transform=lambda response: anthropic_response_to_responses(
+                    response,
+                    response_id=f"resp_{uuid.uuid4().hex[:24]}",
+                    created_at=int(time.time()),
+                ),
+            )
+            if hit_resp is not None:
+                _schedule_audit(
+                    _build_audit_event(
+                        config=config,
+                        request_id=request_id,
+                        identity=identity,
+                        model=request.model,
+                        provider=provider,
+                        outcome="cache_hit",
+                        status_code=200,
+                        latency_ms=(time.monotonic() - start) * 1000,
+                        cache_hit=True,
+                        request=request,
+                    )
+                )
+                _metrics.record_cache_hit(provider=provider, model=request.model)
+                if warnings:
+                    hit_resp.headers[_HEADER_QUOTA_WARNING] = "; ".join(warnings)
+                return hit_resp
+
+            _metrics.record_cache_miss(provider=provider, model=request.model)
+            response = await router.complete(request, routing_ctx)
+            latency_ms = (time.monotonic() - start) * 1000
+            usage = TokenUsage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+                reasoning_tokens=0,
+            )
+            _log_request(
+                RequestLog(
+                    timestamp=datetime.now(UTC),
+                    model=request.model,
+                    usage=usage,
+                    latency_ms=latency_ms,
+                    stream=False,
+                )
+            )
+
+            cost = calculate_cost(request.model, usage, pricing_overrides)
+            _metrics.record_request(
+                provider=provider,
+                model=request.model,
+                status="200",
+                duration_seconds=latency_ms / 1000.0,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                cost_usd=cost,
+            )
+            await store.record(
+                UsageRecord(
+                    request_id=request_id,
+                    agent_id=identity.agent_id,
+                    tenant_id=identity.tenant_id,
+                    session_id=identity.session_id,
+                    saga_id=identity.saga_id,
+                    model=request.model,
+                    provider=provider,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_read_tokens=0,
+                    cache_write_tokens=0,
+                    reasoning_tokens=0,
+                    cost_usd=cost,
+                    latency_ms=latency_ms,
+                    streaming=False,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+            _schedule_audit(
+                _build_audit_event(
+                    config=config,
+                    request_id=request_id,
+                    identity=identity,
+                    model=request.model,
+                    provider=provider,
+                    outcome="success",
+                    status_code=200,
+                    latency_ms=latency_ms,
+                    tokens_input=usage.input_tokens,
+                    tokens_output=usage.output_tokens,
+                    cost_usd=cost,
+                    request=request,
+                    response=response,
+                )
+            )
+            await _emit_events(
+                identity,
+                cost,
+                usage.input_tokens + usage.output_tokens,
+                request.model,
+                agent_budget_limit,
+                raw_request=raw_request,
+            )
+            await _cache.set(cache_key, response, config.cache.default_ttl)
+
+            json_resp = JSONResponse(
+                content=anthropic_response_to_responses(
+                    response,
+                    response_id=f"resp_{uuid.uuid4().hex[:24]}",
+                    created_at=int(time.time()),
+                )
+            )
+            if warnings:
+                json_resp.headers[_HEADER_QUOTA_WARNING] = "; ".join(warnings)
+            if budget_warn:
+                json_resp.headers[_HEADER_BUDGET_WARNING] = budget_warn
+            return json_resp
+
+        except RuleRejectError as exc:
+            _schedule_audit(
+                _build_audit_event(
+                    config=config,
+                    request_id=request_id,
+                    identity=identity,
+                    model=request.model,
+                    provider=provider,
+                    outcome="rejected",
+                    status_code=400,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    error_message=exc.message,
+                    request=request,
+                )
+            )
+            _metrics.record_request(
+                provider=provider,
+                model=request.model,
+                status="400",
+                duration_seconds=(time.monotonic() - start),
+            )
+            return openai_error_response(400, exc.message, "invalid_request_error")
+        except RouterError as exc:
+            _metrics.record_request(
+                provider=provider,
+                model=request.model,
+                status="502",
+                duration_seconds=(time.monotonic() - start),
+            )
+            logger.error("Routing failed: %s", exc)
+            _schedule_audit(
+                _build_audit_event(
+                    config=config,
+                    request_id=request_id,
+                    identity=identity,
+                    model=request.model,
+                    provider=provider,
+                    outcome="error",
+                    status_code=502,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    error_message=str(exc),
+                    request=request,
+                )
+            )
+            return openai_error_response(502, "Upstream routing failed.", "server_error")
+
     # -----------------------------------------------------------------------
     # Ollama-compatible endpoints
     # -----------------------------------------------------------------------
@@ -1561,7 +1981,7 @@ def create_router(
                 → dict`` — translates a non-streaming Anthropic response to Ollama
                 format.
         """
-        identity = auth_adapter.extract(raw_request)
+        identity = await auth_adapter.extract(raw_request)
 
         try:
             body = await raw_request.json()
@@ -1598,6 +2018,10 @@ def create_router(
         agent_budget_limit = agent_perms.quota.max_cost_per_day
 
         try:
+            request = await _prepare_model_route(
+                request, routing_ctx, identity, agent_perms, request_id
+            )
+            provider = request._routed_provider or provider
             if request.stream:
                 stream_resp = StreamingResponse(
                     stream_translate_fn(
@@ -1798,12 +2222,13 @@ def create_router(
             return ollama_error_response(502, "Upstream provider error")
 
     @api_router.get("/api/tags")
-    async def ollama_tags() -> dict:
+    async def ollama_tags(raw_request: Request) -> dict:
         """List available models in Ollama /api/tags format.
 
         Maps the internal model registry to the Ollama model list shape so
         that tools like Open WebUI can discover available models automatically.
         """
+        await auth_adapter.extract(raw_request)
         return {
             "models": [
                 {

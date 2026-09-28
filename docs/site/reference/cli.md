@@ -1,38 +1,53 @@
-# CLI Reference
+# Command-line tools
 
-The platform ships two command-line tools. They cover different layers, and
-most work uses one or the other rather than both.
+Niuu ships a platform CLI and an agent-runtime CLI. Choose the one that owns the
+operation you want to perform.
 
-| Tool | Use it for | Full reference |
+| Tool | Responsibility | Reference |
 | --- | --- | --- |
-| `niuu` | The platform: authentication, server contexts, the local stack, coding sessions, runs, and sagas. | [niuu CLI reference](cli-niuu.md) |
-| `ravn` | The agent runtime: conversations and daemons, personas and profiles, rooms, flocks, and wardens on the local host. | [ravn CLI reference](cli-ravn.md) |
+| `niuu` | Start the platform, select server contexts, authenticate, and operate sessions and runs | [Niuu commands](cli-niuu.md) |
+| `ravn` | Run conversations and daemons, select personas, and operate rooms, flocks, and wardens | [Ravn commands](cli-ravn.md) |
 
-Each reference page opens with worked examples for the common tasks, then
-lists every command and option. Both are generated from the live command
-trees, so everything on them exists as written.
+## Inspect before running
 
-## Where to start
+```bash
+niuu --help
+niuu platform up --help
+ravn --help
+ravn run --help
+```
 
-**Running the platform locally** — `./start-dev` is the short path; see
-[run the local stack](cli-niuu.md#run-the-local-stack) for the CLI equivalent
-and for choosing which services start.
+The command reference is generated from the current command trees. That verifies
+available commands and options, not provider access or successful execution of
+every example. Use the [quick start](../get-started/first-local-stack.md) for the
+validated local lifecycle, and [Ravn setup](../get-started/direct-and-resident-assistants.md)
+for the model configuration needed by direct agent calls.
 
-**Talking to an agent** — `ravn run` takes a prompt for a single turn or opens
-a REPL. See [talk to an agent](cli-ravn.md#talk-to-an-agent).
+## Lifecycle shortcuts
 
-**Running several agents together** — a room is a local collaboration space
-that needs no platform services. See
-[start a room and put agents in it](cli-ravn.md#start-a-room-and-put-agents-in-it).
+`niuu up`, `niuu down`, and `niuu status` are shortcuts for `niuu platform up`,
+`niuu platform down`, and `niuu platform status` with default flags. Use the
+`platform` group when you need the per-service `--<service>/--no-<service>`
+flags, `--host-profile`, or `--mounts`. In docker mode `niuu up` starts the
+Docker compose bundle instead of host processes; `niuu doctor` runs the host
+checks for the configured mode without starting anything. Both spellings are
+supported; the shortcuts are what the installer and the setup wizard print.
 
-## Regenerating the reference pages
+## Server contexts and local processes
 
-The two reference pages are generated. After adding or changing a command:
+A CLI operation against a configured server context is different from starting
+a host locally. `niuu platform up` runs in its own process; stop it in that
+terminal with Ctrl+C. Do not expect a separate CLI process to share its in-memory
+service manager.
+
+## Maintain the reference
+
+After changing CLI help or command definitions, regenerate both pages:
 
 ```bash
 uv run python scripts/generate_cli_docs.py
 ```
 
-Commit the regenerated pages with the change that prompted them. A test
-(`tests/test_cli_help_coverage.py`) fails if a command or a visible option
-lacks help text, so a new flag cannot land undocumented.
+Review the result with the implementation change. The CLI help-coverage test
+requires descriptions for visible commands and options. Tests of runtime behavior
+and the release smoke test provide separate execution evidence.

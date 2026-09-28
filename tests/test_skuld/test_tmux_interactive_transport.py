@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -37,6 +38,8 @@ class FakeTmuxInteractiveTransport(TmuxInteractiveTransport):
         self.commands: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
         self.loaded_buffers: list[str] = []
         self.session_exists = False
+        # A running REPL shows its input prompt; tests that model a booting or
+        # menu-showing pane override this.
         self.capture_stdout = "❯ "
         self.pane_lines = ["%1\t0\tmain\t1\tclaude\t200\t50\t2\t47"]
         # pane_id -> the pane's `#{pane_start_command}` (what `display-message` returns). Lets a
@@ -144,6 +147,114 @@ async def test_start_creates_session_emits_init_and_pane(tmp_path: Path) -> None
     assert init["terminal"]["transport"] == "tmux_interactive"
     assert init["terminal"]["hook_endpoint"] == "http://127.0.0.1:8081/api/claude/hooks"
     assert any(command["name"] == "/compact" for command in init["slash_commands"])
+
+
+@pytest.mark.asyncio
+async def test_start_answers_the_cli_first_run_dialogs_in_its_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A fresh sandbox has no CLI state; the REPL would sit on the onboarding,
+    login, trust and bypass-permissions dialogs with nobody at the keyboard."""
+    config_dir = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    transport = FakeTmuxInteractiveTransport(str(workspace), skip_permissions=True)
+    transport._socket_dir = tmp_path / "fake-sockets"
+    transport._socket_path = transport._socket_dir / f"{transport._session_name}.sock"
+
+    await transport.start()
+    settings = json.loads(transport._hook_settings_path.read_text(encoding="utf-8"))
+    await transport.stop()
+
+    config = json.loads((config_dir / ".claude.json").read_text(encoding="utf-8"))
+    assert config["hasCompletedOnboarding"] is True
+    assert config["theme"] == "dark"
+    assert config["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+    assert not (config_dir / "settings.json").exists()
+    assert settings["skipDangerousModePermissionPrompt"] is True
+
+
+def test_prepare_claude_config_keeps_existing_state(tmp_path: Path) -> None:
+    """An existing config (a persisted home, a later restart) keeps everything
+    it had; only the dialog answers are added, and an unchanged file is left alone."""
+    config_path = tmp_path / ".claude.json"
+    config_path.write_text(
+        json.dumps({"theme": "light", "userID": "u-1", "projects": {"/other": {"x": 1}}}),
+        encoding="utf-8",
+    )
+    transport = FakeTmuxInteractiveTransport(str(tmp_path / "ws"), skip_permissions=False)
+    env = {"HOME": str(tmp_path)}
+
+    transport._prepare_claude_config(env)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["theme"] == "light"
+    assert config["userID"] == "u-1"
+    assert config["projects"]["/other"] == {"x": 1}
+    assert config["projects"][str(tmp_path / "ws")]["hasTrustDialogAccepted"] is True
+    assert config["hasCompletedOnboarding"] is True
+    # permissions are not bypassed, so no notice to acknowledge
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+
+    stamp = config_path.stat().st_mtime_ns
+    transport._prepare_claude_config(env)
+    assert config_path.stat().st_mtime_ns == stamp
+
+
+def test_prepare_claude_config_never_exposes_a_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another session may read the config while this one rewrites it."""
+    config_path = tmp_path / ".claude.json"
+    config_path.write_text(json.dumps({"theme": "light"}), encoding="utf-8")
+    config_path.chmod(0o600)
+    seen_at_replace: list[dict] = []
+    real_replace = os.replace
+
+    def observing_replace(source, destination):
+        seen_at_replace.append(json.loads(Path(destination).read_text(encoding="utf-8")))
+        real_replace(source, destination)
+
+    monkeypatch.setattr("skuld.transports.tmux_interactive.os.replace", observing_replace)
+    transport = FakeTmuxInteractiveTransport(str(tmp_path / "ws"), skip_permissions=True)
+
+    transport._prepare_claude_config({"HOME": str(tmp_path)})
+
+    assert seen_at_replace == [{"theme": "light"}]
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    assert written["hasCompletedOnboarding"] is True
+    assert written["theme"] == "light"
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    assert [entry.name for entry in tmp_path.iterdir() if entry.name.endswith(".tmp")] == []
+
+
+@pytest.mark.parametrize("hook_events_enabled,sdk_port", [(False, 0), (True, 8081)])
+def test_prepare_claude_config_keeps_other_user_settings(
+    tmp_path: Path, hook_events_enabled: bool, sdk_port: int
+) -> None:
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    projected = tmp_path / "projected-settings.json"
+    original = json.dumps({"model": "opus", "hooks": {}})
+    projected.write_text(original, encoding="utf-8")
+    projected.chmod(0o444)
+    settings_path.symlink_to(projected)
+    transport = FakeTmuxInteractiveTransport(
+        str(tmp_path / "ws"),
+        skip_permissions=True,
+        sdk_port=sdk_port,
+    )
+
+    transport._hook_events_enabled = hook_events_enabled
+    transport._prepare_claude_config({"HOME": str(tmp_path)})
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings == {"model": "opus", "hooks": {}}
+    assert settings_path.is_symlink()
+    assert projected.read_text() == original
+    transport._write_hook_settings()
+    argv = transport._interactive_argv()
+    overlay = Path(argv[argv.index("--settings") + 1])
+    assert json.loads(overlay.read_text())["skipDangerousModePermissionPrompt"] is True
 
 
 @pytest.mark.asyncio
@@ -255,6 +366,117 @@ async def test_paste_confirm_stops_after_composer_clears(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_composer_state_treats_v2_1_history_echo_as_clear(tmp_path: Path) -> None:
+    """Claude Code v2.1.x echoes the just-submitted turn back into the transcript with
+    the same '❯ ' prefix the live composer uses. A plain substring search over the
+    whole snapshot can't tell that echo apart from the message still sitting, unsent,
+    in the composer — it used to read the echo as 'still typed' and spin Enter retries
+    against a message Claude had already consumed (real incident: niuulabs/niuu,
+    session d8210020-fad6-4459-b55a-91a0d4a355f9, 2026-09-26 23:41 and 23:49 UTC:
+    'message may not have submitted' logged even though the pane already showed
+    Claude's reply). The row(s) after our text tail settle it: an assistant row here
+    proves Claude moved on."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    await transport.start()
+    transport.capture_stdout = "\n".join(["❯ hello there", "", "● Here's what I see next."])
+    target = transport._target_pane()  # noqa: SLF001 - direct unit test of the helper
+    state = await transport._composer_state("hello there", target)  # noqa: SLF001
+    assert state == "clear"
+    await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_composer_state_still_holds_under_the_v2_1_idle_footer(tmp_path: Path) -> None:
+    """Guard against over-fixing the history-echo case above: the v2.1.x idle status
+    footer ('bypass permissions on (shift+tab to cycle) · ← for agents', replacing the
+    older '? for shortcuts') sits directly under the live composer even when nothing
+    has been submitted yet, and must not itself be mistaken for new turn activity."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    await transport.start()
+    transport.capture_stdout = "\n".join(
+        [
+            "❯ hello there",
+            "────────────────────────────────────────",
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        ]
+    )
+    target = transport._target_pane()  # noqa: SLF001
+    state = await transport._composer_state("hello there", target)  # noqa: SLF001
+    assert state == "holds"
+    await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_paste_confirm_stops_when_message_is_echoed_in_v2_1_history(
+    tmp_path: Path,
+) -> None:
+    """End-to-end regression for the composer-echo false positive above: once Claude's
+    reply has rendered below our echoed text, the confirm loop must not press Enter
+    again."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    await _collect_events(transport)
+    await transport.start()
+
+    transport.capture_stdout = "\n".join(["❯ hello there", "", "● Here's what I see next."])
+    await transport.send_message("hello there")
+    await asyncio.sleep(1.0)  # past every backoff hop
+    enters = [
+        args
+        for args, _ in transport.commands
+        if args and args[0] == "send-keys" and args[-1] == "Enter"
+    ]
+    assert len(enters) == 1  # the submit Enter only — no false retries into history
+    await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_question_page_matches_strips_v2_1_panel_border(tmp_path: Path) -> None:
+    """Claude Code v2.1.282 prefixes the active tab's question text with a dim '│ '
+    left-gutter in a multi-question AskUserQuestion (tabs across the top, one per
+    question, plus a Submit tab) — see the sanitised capture from niuulabs/niuu session
+    d8210020-fad6-4459-b55a-91a0d4a355f9 (request tty-1-03824702). Before the
+    `_strip_question_border` fix this stray glyph defeated the exact-text comparison in
+    `_question_page_matches`, so `_wait_question_screen` never saw the first page as
+    ready and answering failed forever with 'The live Claude menu does not match the
+    pending question state'."""
+    screen = "\n".join(
+        [
+            "←  ☐ Deck  ☐ Wall details  ☐ Roof & trim  ☐ Props  ✔ Submit  →",
+            "",
+            "│ How far should the deck wrap? Pick the option that best matches the photo.",
+            "",
+            "❯ 1. Front + right side (Recommended)",
+            "     Matches the photo: L-shaped deck, rails on the side runs.",
+            "  2. Front + both sides",
+            "  3. All four sides",
+            "  4. Type something.",
+            "────────────────────────────────────────────────────────────────────────",
+            "  5. Chat about this",
+            "",
+            "Enter to select · Tab/Arrow keys to navigate · Esc to cancel",
+        ]
+    )
+    plan = {
+        "text": "How far should the deck wrap? Pick the option that best matches the photo.",
+        "labels": ["Front + right side (Recommended)", "Front + both sides", "All four sides"],
+        "multi": False,
+    }
+    assert TmuxInteractiveTransport._question_page_matches(screen, plan) is True  # noqa: SLF001
+    # And the older, non-tabbed rendering (no border) still matches — the strip is a
+    # a no-op when there's nothing to strip.
+    old_style = "\n".join(
+        [
+            "☐ Deck",
+            "How far should the deck wrap? Pick the option that best matches the photo.",
+            "❯ 1. Front + right side (Recommended)",
+            "  2. Front + both sides",
+            "  3. All four sides",
+        ]
+    )
+    assert TmuxInteractiveTransport._question_page_matches(old_style, plan) is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_terminal_controls_send_keys_input_and_resize(tmp_path: Path) -> None:
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
     events = await _collect_events(transport)
@@ -354,6 +576,34 @@ async def test_discover_slash_commands_scrapes_terminal_menu(tmp_path: Path, mon
     assert ("send-keys", "-t", "%1", "/") in sent_keys
     assert ("send-keys", "-t", "%1", "Down") in sent_keys
     assert any(event["type"] == "slash_commands" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_slash_discovery_waits_for_menu_dismissal_before_clearing_input(
+    tmp_path: Path, monkeypatch
+) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    composer = ""
+    menu_open = False
+
+    def dismiss_menu() -> None:
+        nonlocal menu_open
+        menu_open = False
+
+    async def send_key(key: str, *, pane_id: str | None = None) -> None:
+        nonlocal composer, menu_open
+        if key == "/":
+            composer += key
+            menu_open = True
+        elif key == "Escape" and menu_open:
+            asyncio.get_running_loop().call_later(transport._menu_poll_step_s / 2, dismiss_menu)
+        elif key == "C-u" and not menu_open:
+            composer = ""
+
+    monkeypatch.setattr(transport, "_send_key_raw", send_key)
+    await transport._discover_slash_commands_from_terminal()
+
+    assert composer == ""
 
 
 @pytest.mark.asyncio
@@ -1524,6 +1774,55 @@ async def test_correlated_prompt_captures_claude_native_session_id(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_pasted_content_wrapped_prompt_still_correlates(tmp_path: Path) -> None:
+    """Regression from a live valhalla session (Smidja/Dvalin, skuld image
+    dev-1ae47c7a5, Claude Code CLI v2.1.282): a multi-line/long message delivered
+    via tmux paste is echoed back by ``UserPromptSubmit`` wrapped in that CLI
+    version's new ``<pasted_content id="...">...</pasted_content id="...">``
+    markup (visible in the session's own transcript jsonl), e.g.::
+
+        \\n\\n<pasted_content id="e274">\\nA highly detailed 1900s blacksmith
+        shop. ...\\nModel id: blacksmith-shop\\n</pasted_content id="e274">\\n
+
+    ``_match_prompt_correlation`` only collapses whitespace (``_normalize_prompt``)
+    before comparing against the exact text we pasted, so the wrapper tags make
+    the strings permanently unequal. ``_claude_native_session_id`` is then NEVER
+    captured for the rest of the session, so every later ``AskUserQuestion`` fails
+    ``_question_native_identity`` and answering it raises
+    ``ControlRecoveryError("This question has no verifiable native tool identity")``
+    (reproduced live: skuld-31d63b02-ea47-44e8-9357-220f5cdebc0f, request_id
+    tty-1-93075cc2). This must correlate exactly like an unwrapped echo does.
+    """
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    await _collect_events(transport)
+    await transport.start()
+    assert transport.session_id is None
+
+    delivered = (
+        "A highly detailed 1900s blacksmith shop. It will need to be detailed to "
+        "perfection with the idea of producting this as a craftman kit in the "
+        "future so interior and exterior details matter, construction realism "
+        "matters, so framing and such needs to be excellent.\n\n"
+        "Reference images for this model: "
+        "405e9b10-965d-4c24-9ecf-4b96be42d811.png (list_references / "
+        "get_reference).\n\nModel id: blacksmith-shop"
+    )
+    await transport.send_message(delivered, msg_id="m-1")
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": f'\n\n<pasted_content id="e274">\n{delivered}\n</pasted_content id="e274">\n',
+            "session_id": "f0ad66c4-6fc0-45fb-bbcb-16a59c278222",
+        }
+    )
+    assert transport.session_id == "f0ad66c4-6fc0-45fb-bbcb-16a59c278222", (
+        "a prompt echoed back wrapped in Claude Code v2.1.282's <pasted_content> "
+        "markup must still correlate to the message skuld delivered"
+    )
+    await transport.stop()
+
+
+@pytest.mark.asyncio
 async def test_turn_end_resolves_stale_prompt(tmp_path: Path) -> None:
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
     events = await _collect_events(transport)
@@ -1557,6 +1856,38 @@ async def test_initial_prompt_waits_for_repl_ready_then_delivers(tmp_path: Path)
     assert any("seed prompt here" in buf for buf in transport.loaded_buffers), (
         "the seed prompt must be delivered after the REPL prompt rendered"
     )
+
+
+@pytest.mark.asyncio
+async def test_user_message_waits_for_repl_ready_before_pasting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A message that arrives while the CLI is still booting used to be pasted at
+    once: the text landed in the input box, the Enter was swallowed by the
+    startup screen, and the message sat there unsent."""
+    monkeypatch.setenv("SKULD__TMUX_REPL_READY_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("SKULD__TMUX_MENU_POLL_STEP_SECONDS", "0.02")
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    transport.capture_stdout = "Welcome to Claude Code\nstill booting"
+    # start() itself now waits for the prompt, so the message races a boot in progress.
+    startup = asyncio.create_task(transport.start())
+    delivery = asyncio.create_task(transport.send_message("hello there"))
+    await asyncio.sleep(0.15)
+    assert not any("hello there" in buf for buf in transport.loaded_buffers), (
+        "nothing may be pasted before the REPL prompt has rendered"
+    )
+    transport.capture_stdout = "Welcome to Claude Code\n❯ "
+    await asyncio.wait_for(startup, timeout=3)
+    await asyncio.wait_for(delivery, timeout=3)
+    assert any("hello there" in buf for buf in transport.loaded_buffers)
+
+    # Readiness stays cached; each delivery still checks for a workspace-trust dialog.
+    before = len([args for args, _ in transport.commands if args[0] == "capture-pane"])
+    await transport.send_message("second")
+    after = len([args for args, _ in transport.commands if args[0] == "capture-pane"])
+    assert after == before + 1
+    assert transport._startup_ready
+    await transport.stop()
 
 
 @pytest.mark.asyncio
@@ -1828,6 +2159,19 @@ def _async_return(value: Any):
     return _coro()
 
 
+def test_spawn_env_routes_through_the_model_gateway(tmp_path):
+    transport = FakeTmuxInteractiveTransport(
+        str(tmp_path),
+        model_gateway_url="http://niuu:8080/api/v1/bifrost",
+        model_gateway_token="niuu-gateway",
+    )
+    with patch.dict("os.environ", {"PATH": "/usr/bin", "ANTHROPIC_API_KEY": "sk-p"}, clear=True):
+        env = transport._spawn_env()
+    assert env["ANTHROPIC_BASE_URL"] == "http://niuu:8080/api/v1/bifrost"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "niuu-gateway"
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 @pytest.mark.asyncio
 async def test_workspace_trust_menu_is_not_a_prompt_and_cannot_receive_chat(tmp_path):
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
@@ -1874,3 +2218,31 @@ async def test_seed_prompt_and_command_discovery_reject_workspace_trust_menu(tmp
     with pytest.raises(RuntimeError, match="Workspace trust"):
         await transport._wait_for_repl_ready()
     assert not transport.loaded_buffers
+
+
+def test_composer_suggestion_counts_as_an_empty_prompt(tmp_path):
+    """Claude Code v2.1.x shows `❯ Try "…"` in the empty composer and its footer no
+    longer says "? for shortcuts": start-up must still see the REPL as ready."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    screen = (
+        "Claude Code v2.1.282\n"
+        "Opus 5.5 · Claude API\n"
+        "\n"
+        '❯ Try "how does work?"\n'
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+    )
+    assert transport._repl_looks_ready(screen)
+    assert transport._is_empty_prompt_row('❯ Try "edit to..."')
+    assert not transport._is_empty_prompt_row("❯ Build the freight shed")
+    assert not transport._is_empty_prompt_row('❯ Try "x" and more')
+
+
+def test_suggestion_row_ends_the_assistant_response():
+    rows = [
+        "❯ build a shed",
+        "● Building the walls now.",
+        "",
+        '❯ Try "how does work?"',
+    ]
+    response = FakeTmuxInteractiveTransport._extract_assistant_response(rows)
+    assert response == "Building the walls now."

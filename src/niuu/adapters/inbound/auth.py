@@ -1,10 +1,11 @@
-"""Shared Niuu auth dependency for co-hosted local and browser flows."""
+"""Shared authentication dependency; honors the application's configured identity adapter."""
 
 from __future__ import annotations
 
 from fastapi import HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
+from identity.adapters.http_auth import extract_principal as extract_identity_principal
 from niuu.domain.models import Principal
 from niuu.domain.services.forge_session_token import (
     FORGE_SESSION_ROLES,
@@ -16,10 +17,6 @@ from niuu.forge_mcp.credentials import is_forge_session_claims, token_scopes, un
 #: The only API a ``forge_session`` credential may call through a Niuu host.
 FORGE_API_PREFIX = "/api/v1/forge/"
 _BEARER_PREFIX = "bearer "
-
-
-def _split_roles(raw: str) -> list[str]:
-    return [role.strip() for role in raw.split(",") if role.strip()]
 
 
 def presented_session_claims(connection: HTTPConnection) -> dict | None:
@@ -67,43 +64,14 @@ def _session_principal(request: Request) -> Principal | None:
 
 
 async def extract_principal(request: Request) -> Principal:
-    """Extract a principal from trusted headers or fall back to local dev defaults.
-
-    The shared Niuu surfaces are commonly used from the in-app browser against
-    a local shell. When no forwarded identity headers are present, we provide a
-    stable local developer principal so browsing the shell in anonymous-dev mode
-    stays safe by default. Explicit `x-auth-*` headers always take precedence
-    and are used by the guild proof to validate tenancy behavior. Non-production
-    browser flows may also supply the same values through `dev*` query params.
+    """Resolve the caller through the application's configured identity adapter.
 
     A Forge session credential comes first: it names its own owner and scopes,
-    and is confined to the Forge API (see :func:`_session_principal`).
+    is confined to the Forge API (see :func:`_session_principal`) and is verified
+    by the Forge node the Guild facade forwards it to. Every other caller goes
+    through :func:`identity.adapters.http_auth.extract_principal`.
     """
     session_principal = _session_principal(request)
     if session_principal is not None:
         return session_principal
-
-    user_id = request.headers.get("x-auth-user-id", "").strip()
-    if user_id:
-        return Principal(
-            user_id=user_id,
-            email=request.headers.get("x-auth-email", ""),
-            tenant_id=request.headers.get("x-auth-tenant", ""),
-            roles=_split_roles(request.headers.get("x-auth-roles", "volundr:developer")),
-        )
-
-    dev_user_id = request.query_params.get("devUserId", "").strip()
-    if dev_user_id:
-        return Principal(
-            user_id=dev_user_id,
-            email=request.query_params.get("devEmail", "").strip(),
-            tenant_id=request.query_params.get("devTenantId", "").strip(),
-            roles=_split_roles(request.query_params.get("devRoles", "volundr:developer")),
-        )
-
-    return Principal(
-        user_id="dev-user",
-        email="",
-        tenant_id="default",
-        roles=["volundr:developer"],
-    )
+    return await extract_identity_principal(request)

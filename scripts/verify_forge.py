@@ -37,6 +37,15 @@ UNIT_PATHS = [
 LANES = ("unit", "tmux", "database", "web", "live-grok", "live-muse")
 
 
+# Warnings raised inside third-party code that this repo cannot fix. Each entry
+# names the upstream release that removes it; delete the entry with that bump.
+TOLERATED_UPSTREAM_WARNINGS = [
+    # starlette <= 1.6.0 (testclient) still reads the alias anyio >= 4.14 deprecates;
+    # fixed on starlette main, unreleased.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]
+
+
 def inspect_junit(path: Path, *, strict_skips: bool = False) -> dict:
     """An absent/empty/all-skipped suite cannot serve as a successful gate."""
     cases = list(ET.parse(path).iter("testcase"))
@@ -75,8 +84,15 @@ def command_for(lane: str, report: Path, *, coverage: bool = False) -> list[str]
             f"--outputFile.junit={report}",
         ]
     command = [sys.executable, "-m", "pytest", "-o", "addopts=", "--strict-markers", "-W", "error"]
+    for warning in TOLERATED_UPSTREAM_WARNINGS:
+        command += ["-W", warning]
     if lane == "unit":
+        # loadfile keeps each module on one worker, matching serial fixture scope.
         command += UNIT_PATHS + [
+            "-n",
+            "auto",
+            "--dist",
+            "loadfile",
             "-m",
             "not integration and not broker and not kind_integration and not live_cli",
         ]

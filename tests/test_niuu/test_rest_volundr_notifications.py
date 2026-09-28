@@ -432,13 +432,15 @@ def test_fleet_stream_owner_scopes_notifications(monkeypatch, roles, expected):
     def event(name: str, **data):
         return SimpleNamespace(type=SimpleNamespace(value=name), data=data)
 
-    async def subscribe():
+    async def subscribe(principal):
         yield event("session_notification", id="mine", owner_id="user-a", tenant_id="tenant-a")
         yield event("session_notification", id="theirs", owner_id="user-b", tenant_id="tenant-a")
         yield event("session_notification", id="alien", owner_id="user-c", tenant_id="tenant-z")
         yield event("session_activity", id="activity", session_id="s")
 
-    embedded.state.broadcaster = SimpleNamespace(subscribe=subscribe)
+    embedded.state.session_event_stream = SimpleNamespace(
+        authorize=lambda principal: None, subscribe=subscribe
+    )
     respx.get("http://remote/api/v1/forge/sessions/stream").mock(
         return_value=Response(
             200,
@@ -450,7 +452,7 @@ def test_fleet_stream_owner_scopes_notifications(monkeypatch, roles, expected):
         )
     )
 
-    async def finite_merge(sources):
+    async def finite_merge(sources, **_kwargs):
         for source in sources.values():
             async for name, data in source():
                 yield f"{name}:{data['id'] if isinstance(data, dict) else data}\n".encode()

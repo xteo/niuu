@@ -31,7 +31,14 @@ data:
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                           log_format:
-                            text_format: "[ENVOY] %REQ(:METHOD)% %REQ(:PATH)% %RESPONSE_CODE% %UPSTREAM_HOST% %RESPONSE_FLAGS%\n"
+                            # Never log the query string: browser WebSocket clients carry
+                            # their bearer as ?token=/?access_token= (no Authorization header).
+                            text_format_source:
+                              inline_string: "[ENVOY] %REQ(:METHOD)% %REQ_WITHOUT_QUERY(:PATH)% %RESPONSE_CODE% %UPSTREAM_HOST% %RESPONSE_FLAGS%\n"
+                            formatters:
+                              - name: envoy.formatter.req_without_query
+                                typed_config:
+                                  "@type": type.googleapis.com/envoy.extensions.formatter.req_without_query.v3.ReqWithoutQuery
                     route_config:
                       name: local_route
                       virtual_hosts:
@@ -131,6 +138,17 @@ data:
                             - match:
                                 prefix: {{ . | quote }}
                             {{- end }}
+                            # Node-originated heartbeat/leave carry no bearer JWT at all — they
+                            # are authenticated by an Ed25519 signature over the request instead
+                            # (niuu.adapters.node_signature.Ed25519NodeVerifier), so Envoy must
+                            # not demand one either. An exact safe_regex match on just these two
+                            # routes, never a prefix: a prefix bypass here would also exempt
+                            # GET/DELETE /api/v1/niuu/guild/nodes(/...), which are admin routes
+                            # that must stay JWT-gated.
+                            - match:
+                                safe_regex:
+                                  google_re2: {}
+                                  regex: "^/api/v1/niuu/guild/nodes/[^/]+/(heartbeat|leave)$"
                             - match:
                                 prefix: "/"
                               requires:

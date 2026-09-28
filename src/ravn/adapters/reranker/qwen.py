@@ -24,13 +24,11 @@ template, it becomes the simpler path and this can be swapped for it.
 
 from __future__ import annotations
 
-import logging
+import math
 
 import httpx
 
 from ravn.ports.reranker import RerankerPort
-
-logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "qwen3-reranker"
 _DEFAULT_BASE_URL = "http://127.0.0.1:8078/v1"
@@ -42,7 +40,7 @@ _INSTRUCTION = "Given a search query, retrieve relevant passages that answer the
 
 
 class QwenRerankerAdapter(RerankerPort):
-    """Rerank with Qwen3-Reranker, or get out of the way."""
+    """Rerank with Qwen3-Reranker; configured failures are explicit."""
 
     def __init__(
         self,
@@ -82,56 +80,39 @@ class QwenRerankerAdapter(RerankerPort):
     async def rerank(
         self, query: str, documents: list[str], *, top_n: int | None = None
     ) -> list[tuple[int, float]]:
-        """Order *documents* by relevance to *query*, best first.
-
-        Returns ``[]`` on any failure. Reranking happens on the turn path, and an agent that
-        cannot answer is a far worse outcome than one whose results are merely in the order
-        retrieval gave them.
-        """
+        """Order documents by relevance; reject failed or incomplete scoring."""
         if not query.strip() or not documents:
             return []
-        try:
-            response = await self._get_client().post(
-                f"{self._base_url}/score",
-                headers=self._headers(),
-                json={
-                    "model": self._model,
-                    "text_1": self._prompt(query, ""),
-                    "text_2": [self._prompt(query, d) for d in documents],
-                },
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning(
-                "rerank: unavailable (%s: %s) — keeping retrieval order", type(exc).__name__, exc
-            )
-            return []
-
-        rows = payload.get("data")
+        response = await self._get_client().post(
+            f"{self._base_url}/score",
+            headers=self._headers(),
+            json={
+                "model": self._model,
+                "text_1": self._prompt(query, ""),
+                "text_2": [self._prompt(query, d) for d in documents],
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
-            logger.warning("rerank: unexpected payload shape — keeping retrieval order")
-            return []
-
-        scored: list[tuple[int, float]] = []
+            raise ValueError("Configured reranker returned no scoring data")
+        scored: dict[int, float] = {}
         for row in rows:
             if not isinstance(row, dict):
-                continue
+                raise ValueError("Configured reranker returned an invalid score row")
             index, score = row.get("index"), row.get("score")
             if (
-                isinstance(index, int)
-                and isinstance(score, int | float)
-                and 0 <= index < len(documents)
+                type(index) is not int
+                or not isinstance(score, int | float)
+                or isinstance(score, bool)
+                or not math.isfinite(score)
+                or not 0 <= index < len(documents)
+                or index in scored
             ):
-                scored.append((index, float(score)))
+                raise ValueError("Configured reranker returned an invalid or duplicate score")
+            scored[index] = float(score)
         if len(scored) != len(documents):
-            # A partial answer would silently drop candidates; the retrieval order is complete.
-            logger.warning(
-                "rerank: scored %d of %d documents — keeping retrieval order",
-                len(scored),
-                len(documents),
-            )
-            return []
-
-        scored.sort(key=lambda pair: pair[1], reverse=True)
-        return scored[:top_n] if top_n else scored
+            raise ValueError("Configured reranker returned incomplete scoring data")
+        ranked = sorted(scored.items(), key=lambda pair: pair[1], reverse=True)
+        return ranked[:top_n] if top_n is not None else ranked

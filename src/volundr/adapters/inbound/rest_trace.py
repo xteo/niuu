@@ -9,6 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Path, Request, status
 from pydantic import BaseModel, Field
 
+from niuu.observability import get_observability
 from volundr.adapters.inbound.auth import check_session_or_resident_access
 from volundr.domain.models import SessionSpan, SessionSpanStatus
 from volundr.domain.ports import SessionSpanRepository
@@ -64,6 +65,12 @@ class SessionSpanResponse(BaseModel):
     actor_label: str | None
     source_service: str
     attributes: dict
+    #: The W3C trace id active when this span was recorded, or ``None`` —
+    #: distinct from ``trace_id`` above (this Forge trace system's own id,
+    #: the session UUID). Lets a Forge span be cross-referenced with the
+    #: OTLP trace it belongs to, without changing what ``trace_id`` means to
+    #: existing API consumers.
+    w3c_trace_id: str | None = None
 
     @classmethod
     def from_span(cls, span: SessionSpan) -> SessionSpanResponse:
@@ -83,6 +90,7 @@ class SessionSpanResponse(BaseModel):
             actor_label=span.actor_label,
             source_service=span.source_service,
             attributes=span.attributes,
+            w3c_trace_id=span.w3c_trace_id,
         )
 
 
@@ -138,18 +146,15 @@ def _sum_durations(spans: Iterable[SessionSpan], predicate) -> int:
 def _trace_bounds(spans: list[SessionSpan]) -> tuple[datetime | None, datetime | None, int | None]:
     if not spans:
         return None, None, None
-    root = next((span for span in spans if span.kind == "session.lifecycle"), None)
-    started_at = root.started_at if root is not None else min(span.started_at for span in spans)
+    # A session retains one lifecycle span per broker start. Its bounds must
+    # include every attempt, including work recorded after an unclean shutdown.
+    started_at = min(span.started_at for span in spans)
     ended_candidates = [span.ended_at for span in spans if span.ended_at is not None]
     ended_at = (
-        root.ended_at
-        if root is not None and root.ended_at is not None
-        else (max(ended_candidates) if ended_candidates else None)
+        max(*ended_candidates, *(span.started_at for span in spans)) if ended_candidates else None
     )
     duration_ms = None
-    if root is not None and root.duration_ms is not None:
-        duration_ms = root.duration_ms
-    elif started_at is not None and ended_at is not None:
+    if ended_at is not None:
         duration_ms = max(0, int((ended_at - started_at).total_seconds() * 1000))
     return started_at, ended_at, duration_ms
 
@@ -229,6 +234,11 @@ def create_trace_router(
             actor_label=data.actor_label,
             source_service=data.source_service,
             attributes=data.attributes,
+            # Read server-side, not accepted from the caller: whichever W3C
+            # trace this POST itself arrived on (via the caller's propagated
+            # traceparent header and this app's own FastAPI instrumentation),
+            # not a value the poster would have to know how to produce.
+            w3c_trace_id=get_observability().trace_id() or None,
         )
         stored = await span_repository.upsert_span(span)
         return SessionSpanResponse.from_span(stored)
@@ -286,6 +296,7 @@ def create_trace_router(
             actor_label=data.actor_label,
             source_service=data.source_service,
             attributes=data.attributes,
+            w3c_trace_id=get_observability().trace_id() or None,
         )
         stored = await span_repository.upsert_span(span)
         return SessionSpanResponse.from_span(stored)

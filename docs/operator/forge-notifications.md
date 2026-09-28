@@ -397,7 +397,7 @@ not in `integration_sinks`.
 
 ## Storage
 
-Migration `000069_forge_notifications` creates four tables:
+Migration `000084_forge_notifications` creates four tables:
 
 - `forge_notifications`, indexed on `(owner_id, seq)`, `(session_id, seq)`,
   `(project_id, seq)` and `(kind, seq)`;
@@ -406,7 +406,7 @@ Migration `000069_forge_notifications` creates four tables:
 - `forge_notification_deliveries`, which cascades from both its notification and its
   rule, and is indexed on `(status, next_attempt_at)`.
 
-Migration `000070_forge_notification_delivery_rate_index` adds a partial index on
+Migration `000085_forge_notification_delivery_rate_index` adds a partial index on
 `(rule_id, delivered_at) WHERE status = 'delivered'` for the per-rule rate limit.
 
 Both migrations ship in `migrations/`, in the Helm migrations configmap, and in the CLI

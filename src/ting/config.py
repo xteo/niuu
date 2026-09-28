@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -25,12 +25,14 @@ from pydantic_settings import (
 )
 
 from bifrost.config import BifrostConfig
+from identity.authz_config import AuthorizationAdapterConfig
 from niuu.config import CorsConfig, HttpAuthAdapterConfig, InstanceRegistryConfig
 from niuu.config_models import (
     SessionDefinitionConfig,
     WorkloadIdentityConfig,
     default_session_definitions,
 )
+from niuu.domain.observability import ObservabilityConfig
 
 
 # Config file search paths (in order of priority).
@@ -47,6 +49,10 @@ def _config_paths() -> list[Path]:
 
 CONFIG_PATHS = _config_paths()
 BUNDLED_FLOCK_FLOWS_PATH = (Path(__file__).parent / "flock_flows.yaml").resolve()
+
+# Default for ``dispatch.workflow_cli_turn_timeout_seconds``; the dispatch service's
+# own config defaults to the same value.
+DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS = 120.0
 
 
 class DatabaseConfig(BaseModel):
@@ -66,11 +72,45 @@ class DatabaseConfig(BaseModel):
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
+class WorkflowRepositoryConfig(BaseModel):
+    """Dynamic workflow definition repository configuration."""
+
+    adapter: str = Field(
+        default="ting.adapters.filesystem_workflows.FilesystemWorkflowRepository",
+        description="Fully qualified WorkflowRepository adapter class.",
+    )
+    kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Plain keyword arguments passed to the configured adapter.",
+    )
+    seed_bundled: bool = Field(
+        default=False,
+        description=(
+            "Seed packaged workflows into the selected repository. Disable for the "
+            "filesystem adapter, which reads packaged workflows directly."
+        ),
+    )
+
+
+class WorkflowImportConfig(BaseModel):
+    """Resource bounds for untrusted workflow bundle imports."""
+
+    max_upload_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    max_expanded_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
+    max_entries: int = Field(default=128, ge=1)
+
+
 class LoggingConfig(BaseModel):
     """Logging configuration."""
 
     level: str = Field(default="info")
     format: str = Field(default="text")
+
+
+class TingObservabilityConfig(ObservabilityConfig):
+    """OpenTelemetry settings with Ting's stable service identity."""
+
+    service_name: str = Field(default="ting")
 
 
 class VolundrConfig(BaseModel):
@@ -108,6 +148,8 @@ class SharedIntegrationsConfig(BaseModel):
     """Configuration for consuming shared integration connections."""
 
     base_url: str = Field(default="")
+    database_name: str = Field(default="")
+    auth: HttpAuthAdapterConfig = Field(default_factory=HttpAuthAdapterConfig)
     timeout_seconds: float = Field(default=30.0)
 
 
@@ -120,20 +162,8 @@ class GuildRegistryConfig(BaseModel):
 
 
 class ReviewConfig(BaseModel):
-    """Run review projection settings.
+    """Run review projection settings."""
 
-    The confidence deltas here feed only the human review audit trail
-    (RunReviewService); the automated confidence gate they once tuned was
-    removed in favour of authoritative workflow outcomes.
-    """
-
-    confidence_delta_approved: float = Field(default=0.15)
-    confidence_delta_rejected: float = Field(default=-0.20)
-    confidence_delta_retry: float = Field(default=-0.05)
-    initial_confidence: float = Field(
-        default=0.5,
-        description="Starting confidence score for newly committed sagas, phases, and runs.",
-    )
     max_retries: int = Field(
         default=3,
         description="Maximum auto-retries before escalation to human review.",
@@ -412,6 +442,19 @@ class DispatchConfig(BaseModel):
             "auto-pick the next ready issue after a phase gate unlocks."
         ),
     )
+    workflow_cli_turn_timeout_seconds: float = Field(
+        default=DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS,
+        ge=0.0,
+        allow_inf_nan=False,
+        description=(
+            "Seconds a workflow persona running on Claude Code (the Agent SDK "
+            "transport) may spend on one turn. A turn is the persona's whole "
+            "agent loop for a task, every model and tool call included, so a "
+            "slow model needs a larger value. A turn that reaches the limit is "
+            "interrupted. 0 turns the limit off. Codex personas get no per-turn "
+            "limit from this setting."
+        ),
+    )
     flock: FlockConfig = Field(default_factory=FlockConfig)
     in_process: InProcessDispatchConfig = Field(default_factory=InProcessDispatchConfig)
     dispatch_prompt_template: str = Field(
@@ -459,15 +502,13 @@ class DispatchConfig(BaseModel):
     )
 
 
-class CerbosConfig(BaseModel):
-    """Cerbos authorization service configuration."""
-
-    url: str = Field(default="http://localhost:3592")
-
-
 class PATConfig(BaseModel):
     """Personal access token configuration (matches Volundr's PATConfig)."""
 
+    service_adapter: str = "niuu.domain.services.pat.PATService"
+    service_kwargs: dict = Field(default_factory=dict)
+    validator_adapter: str = "niuu.domain.services.pat_validator.PATValidator"
+    validator_kwargs: dict = Field(default_factory=dict)
     token_issuer_adapter: str = Field(
         default="niuu.adapters.memory_token_issuer.MemoryTokenIssuer",
         description="Fully-qualified class path for the token issuer adapter.",
@@ -484,6 +525,12 @@ class PATConfig(BaseModel):
         default=300.0,
         description="Seconds to cache valid-token lookups before re-checking the DB.",
     )
+    websocket_check_interval: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds between revocation checks on open WebSockets; expiry is immediate.",
+    )
     revoked_cache_ttl: float = Field(
         default=60.0,
         description="Seconds to cache revoked-token lookups (shorter for fast propagation).",
@@ -493,6 +540,8 @@ class PATConfig(BaseModel):
 class AuthConfig(BaseModel):
     """Authentication configuration."""
 
+    adapter: str = "identity.adapters.identity.EnvoyHeaderAuthenticationAdapter"
+    kwargs: dict = Field(default_factory=dict)
     allow_anonymous_dev: bool = Field(
         default=False,
         description=(
@@ -503,6 +552,10 @@ class AuthConfig(BaseModel):
     default_user_id: str = Field(
         default="dev-user",
         description="User ID for anonymous dev mode fallback.",
+    )
+    default_tenant_id: str = Field(
+        default="",
+        description="Tenant for anonymous dev mode; align with the connected Forge identity.",
     )
 
 
@@ -677,25 +730,57 @@ class WatcherConfig(BaseModel):
         default=False,
         description="If true, CI must pass for completion.",
     )
-    confidence_base: float = Field(
-        default=0.5,
-        description="Base confidence score when completion criteria are met.",
-    )
-    confidence_pr_bonus: float = Field(
-        default=0.2,
-        description="Confidence bonus when a PR exists.",
-    )
-    confidence_ci_bonus: float = Field(
-        default=0.2,
-        description="Confidence bonus when CI has passed.",
-    )
-    confidence_idle_bonus: float = Field(
-        default=0.1,
-        description="Confidence bonus for extended idle beyond threshold.",
-    )
     reconnect_delay: float = Field(
         default=5.0,
-        description="Seconds to wait before reconnecting after SSE subscription failure.",
+        ge=0.0,
+        le=3600.0,
+        description="Seconds to wait before reconnecting after a clean SSE stream close.",
+    )
+    reconnect_initial_delay: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=3600.0,
+        description=(
+            "Initial per-cluster backoff delay in seconds after an SSE subscription "
+            "failure, before the multiplier is applied. 0 means retry immediately."
+        ),
+    )
+    reconnect_max_delay: float = Field(
+        default=120.0,
+        ge=0.0,
+        le=3600.0,
+        description="Ceiling in seconds for a failing cluster's per-cluster backoff delay.",
+    )
+    reconnect_backoff_multiplier: float = Field(
+        default=2.0,
+        ge=1.0,
+        le=10.0,
+        description=(
+            "Multiplier applied to a failing cluster's backoff delay after each "
+            "consecutive failure. 1.0 means retry at a constant reconnect_initial_delay."
+        ),
+    )
+    reconnect_jitter: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction (0-1) randomly subtracted from each computed per-cluster backoff "
+            "delay to avoid synchronized reconnect storms."
+        ),
+    )
+    reconnect_stable_after_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=3600.0,
+        description=(
+            "Seconds an SSE connection must stay open before it counts as healthy "
+            "enough to reset a cluster's backoff — even if it never sees an event "
+            "and then drops. Without this, a cluster that legitimately has no "
+            "sessions right now (so it never gets the 'first event' reset) would "
+            "treat every ordinary periodic reconnect as a failure and grow its "
+            "backoff without bound."
+        ),
     )
 
 
@@ -844,10 +929,6 @@ class NotificationConfig(BaseModel):
         default="http://localhost:8080",
         description="Browser-facing Niuu origin used to build notification links.",
     )
-    confidence_threshold: float = Field(
-        default=0.3,
-        description="Notify when run confidence drops below this value.",
-    )
 
 
 class EventsConfig(BaseModel):
@@ -881,6 +962,11 @@ class A2AConfig(BaseModel):
         default=60,
         ge=0,
         description="Cache-Control max-age for the served agent card.",
+    )
+    launch_lease_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Lease duration for idempotent A2A workflow launch reservations.",
     )
     push_encryption_key: SecretStr = Field(
         default=SecretStr(""),
@@ -980,6 +1066,178 @@ class A2AConfig(BaseModel):
     )
 
 
+class WorkflowExecutionDeliveryConfig(BaseModel):
+    """Code-delivery specialization settings layered over generic workflow execution.
+
+    Everything here — signed reviewer attestation, the Forge evidence and
+    integration policies, and the trusted integration review projector — is
+    meaningless without the delivery extension table and its `forge.*` wait
+    observers. ``enabled`` gates all of it independently of the generic
+    ``workflow_execution.enabled`` flag, which only the reusable fan-out,
+    join, and wait machinery needs.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the code delivery specialization: the delivery router and "
+            "repository, Forge evidence/review wiring, and forge.* wait observers. "
+            "Requires workflow_execution.enabled."
+        ),
+    )
+    review_authenticator_adapter: str = Field(
+        default="",
+        description=(
+            "Dynamic EvidenceAuthenticator adapter used to sign server-derived "
+            "reviewer receipts, required once delivery is enabled."
+        ),
+    )
+    review_authenticator_kwargs: dict[str, Any] = Field(default_factory=dict)
+    review_authenticator_secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
+    review_producers: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Role name to signing-producer identity, required for every role a "
+            "workflow's reviewAttestation declares once delivery is enabled."
+        ),
+    )
+    integration_review_producer: str = Field(
+        default="",
+        description=(
+            "Signing-producer identity for the trusted integration review projector, "
+            "required once delivery is enabled."
+        ),
+    )
+    evidence_policy_id: str = Field(
+        default="",
+        min_length=1,
+        description="Forge evidence policy ID, required once delivery is enabled.",
+    )
+    integration_policy_id: str = Field(
+        default="",
+        min_length=1,
+        description="Forge integration policy ID, required once delivery is enabled.",
+    )
+
+
+class WorkflowExecutionConfig(BaseModel):
+    """Durable, domain-neutral workflow execution: fan-out/join, waits, and the Ravn A2A gateway.
+
+    Every field here serves any workflow that expands into a bounded child
+    DAG and carries no code-delivery vocabulary. The code delivery
+    specialization (its own repository, router, and Forge/review wiring)
+    lives entirely under ``delivery``.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable durable workflow execution: fan-out/join, durable waits, and the "
+            "Ravn A2A gateway. Requires workload identity outside anonymous dev mode."
+        ),
+    )
+    delivery: WorkflowExecutionDeliveryConfig = Field(
+        default_factory=WorkflowExecutionDeliveryConfig
+    )
+    gateway_adapter: str = Field(
+        default="ravn.adapters.child_task_a2a.ConfiguredRavnChildTaskA2AGateway",
+        description="Ravn-owned A2A child gateway adapter.",
+    )
+    gateway_kwargs: dict[str, Any] = Field(default_factory=dict)
+    admission_roles: list[str] = Field(
+        default_factory=lambda: ["volundr:developer"],
+        min_length=1,
+        description=(
+            "Configured gateway admission roles for Ting-issued developer workload "
+            "credentials. These roles are never accepted from execution descriptors."
+        ),
+    )
+    wait_repository_adapter: str = Field(
+        default="ting.adapters.postgres_workflow_waits.PostgresWorkflowWaitRepository",
+        description="Durable repository adapter for workflow waits.",
+    )
+    wait_repository_kwargs: dict[str, Any] = Field(default_factory=dict)
+    wait_observers: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Wait condition observers, each `{condition_type, adapter, ...kwargs}`. "
+            "condition_type is the opaque condition identity a wait node's `conditions` "
+            "list can declare; adapter is the dotted class path implementing "
+            "WaitConditionObserver (ting.ports.workflow_wait). Extra entry keys are "
+            "passed as constructor kwargs; volundr_factory, policy_id, token_issuer, "
+            "admission_roles, and poll_interval_seconds are injected only when the "
+            "adapter's constructor declares them."
+        ),
+    )
+    worker_id: str = Field(default="ting-workflow-execution")
+    launch_claim_limit: int = Field(default=4, ge=1, le=100)
+    reconcile_limit: int = Field(default=100, ge=1, le=1000)
+    lease_seconds: float = Field(default=60.0, gt=0)
+    reconcile_interval_seconds: float = Field(default=5.0, gt=0)
+    default_budget_units: int = Field(default=100, ge=1)
+    default_deadline_seconds: int = Field(default=86400, ge=60)
+    list_page_size: int = Field(default=50, ge=1, le=200)
+    max_child_reconcile_failures: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description=(
+            "Consecutive reconcile failures (gateway/verification exceptions) tolerated for "
+            "one child attempt before it is durably transitioned to a terminal failed state, "
+            "so a single poisoned child cannot starve the reconcile queue forever."
+        ),
+    )
+    max_wait_failures: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description=(
+            "Consecutive reconcile failures tolerated for one wait before it is durably "
+            "transitioned to its terminal failed state."
+        ),
+    )
+    max_parent_stop_failures: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description=(
+            "Consecutive failures tolerated when stopping a canceled parent session before "
+            "the stop intent is recorded as durably failed instead of retried forever."
+        ),
+    )
+
+    @field_validator("admission_roles")
+    @classmethod
+    def _validate_admission_roles(cls, roles: list[str]) -> list[str]:
+        normalized = [role.strip() for role in roles]
+        if any(not role for role in normalized):
+            raise ValueError("developer execution admission roles must be non-empty")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_delivery_wiring(self) -> WorkflowExecutionConfig:
+        if self.delivery.enabled and not self.enabled:
+            raise ValueError(
+                "workflow_execution.delivery.enabled requires workflow_execution.enabled; "
+                "set workflow_execution.enabled: true or disable workflow_execution.delivery"
+            )
+        if not self.delivery.enabled:
+            offending = sorted(
+                {
+                    adapter
+                    for entry in self.wait_observers
+                    if (adapter := str(entry.get("adapter") or "")).startswith("ting.delivery.")
+                }
+            )
+            if offending:
+                raise ValueError(
+                    "workflow_execution.wait_observers configures ting.delivery adapter(s) "
+                    f"({', '.join(offending)}) while workflow_execution.delivery.enabled is "
+                    "false; enable workflow_execution.delivery or remove the observer(s)"
+                )
+        return self
+
+
 class Settings(BaseSettings):
     """Application settings.
 
@@ -998,11 +1256,22 @@ class Settings(BaseSettings):
         yaml_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
+        loc_by_alias=False,
     )
 
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    observability: TingObservabilityConfig = Field(default_factory=TingObservabilityConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    workflow_repository: WorkflowRepositoryConfig = Field(
+        default_factory=lambda: WorkflowRepositoryConfig(
+            kwargs={
+                "catalog_path": "~/.niuu/workflows",
+                "create_directory": True,
+            }
+        )
+    )
+    workflow_import: WorkflowImportConfig = Field(default_factory=WorkflowImportConfig)
     volundr: VolundrConfig = Field(default_factory=VolundrConfig)
     bifrost: BifrostConfig = Field(default_factory=BifrostConfig)
     session_definitions: dict[str, SessionDefinitionConfig] = Field(
@@ -1016,17 +1285,33 @@ class Settings(BaseSettings):
     dispatch: DispatchConfig = Field(default_factory=DispatchConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
     credential_store: CredentialStoreConfig = Field(default_factory=CredentialStoreConfig)
-    shared_integrations: SharedIntegrationsConfig = Field(default_factory=SharedIntegrationsConfig)
+    shared_integrations: SharedIntegrationsConfig = Field(
+        default_factory=SharedIntegrationsConfig,
+        validation_alias=AliasChoices("shared_integrations", "integrations"),
+    )
     guild_registry: GuildRegistryConfig = Field(default_factory=GuildRegistryConfig)
+    authorization: AuthorizationAdapterConfig = Field(default_factory=AuthorizationAdapterConfig)
     pat: PATConfig = Field(default_factory=PATConfig)
     workload_identity: WorkloadIdentityConfig = Field(default_factory=WorkloadIdentityConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
-    cerbos: CerbosConfig = Field(default_factory=CerbosConfig)
+    auth_mode: str = Field(
+        default="envoy",
+        description=(
+            "How this host trusts identity: 'envoy' (default — an Envoy sidecar "
+            "verifies JWTs and forwards trusted x-auth-* headers; unchanged "
+            "Kubernetes behaviour), 'none' (explicit no-auth for a host without "
+            "Envoy), or 'oidc' (in-process JWT verification for a host without "
+            "Envoy). Set by the mini/docker CLI host from host_auth.mode "
+            "(cli.config.AuthConfig) via the AUTH_MODE env var; Kubernetes "
+            "deployments leave this at its default."
+        ),
+    )
     llm: LLMConfig = Field(default_factory=LLMConfig)
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     event_bus: EventBusConfig = Field(default_factory=EventBusConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
     a2a: A2AConfig = Field(default_factory=A2AConfig)
+    workflow_execution: WorkflowExecutionConfig = Field(default_factory=WorkflowExecutionConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     notification: NotificationConfig = Field(default_factory=NotificationConfig)

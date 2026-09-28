@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -192,6 +192,22 @@ async def test_search_priority_order_dedup() -> None:
     assert "technical/b.md" in paths
     # local result should appear first
     assert paths[0] == "technical/a.md"
+
+
+@pytest.mark.asyncio
+async def test_search_attributed_names_the_mount_each_result_came_from() -> None:
+    page_a = _make_page("technical/a.md")
+    page_b = _make_page("technical/b.md")
+    local = _make_mount("local", priority=0, pages=[page_a])
+    shared = _make_mount("shared", priority=1, role="shared", pages=[page_a, page_b])
+
+    adapter = CompositeMimirAdapter(mounts=[local, shared])
+    results = await adapter.search_attributed("technical")
+
+    assert [(mount, page.meta.path) for mount, page in results] == [
+        ("local", "technical/a.md"),
+        ("shared", "technical/b.md"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -428,9 +444,16 @@ async def test_read_source_raises_once_the_retry_budget_is_spent() -> None:
         read_retry_max_backoff_seconds=0.001,
     )
 
-    with pytest.raises(MimirUnavailableError, match="could not read source"):
-        await adapter.read_source("src-1")
-    assert shared.port.read_source.await_count > 1
+    # Advance only the adapter's clock, independently of CI scheduling latency.
+    with (
+        patch("ravn.adapters.mimir.composite.time") as clock,
+        patch("ravn.adapters.mimir.composite.asyncio.sleep", new_callable=AsyncMock) as sleep,
+    ):
+        clock.monotonic.side_effect = [0.0, 0.001, 0.005]
+        with pytest.raises(MimirUnavailableError, match="after 2 attempt\\(s\\)"):
+            await adapter.read_source("src-1")
+    assert shared.port.read_source.await_count == 2
+    sleep.assert_awaited_once_with(0.001)
 
 
 @pytest.mark.asyncio

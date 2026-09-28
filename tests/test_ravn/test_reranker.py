@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+import pytest
 
 from ravn.adapters.reranker.qwen import QwenRerankerAdapter
 
@@ -69,22 +70,25 @@ class TestTheTemplate:
         assert "<Document>: doc one" in sent["text_2"][0]
 
 
-class TestItNeverCostsATurn:
-    async def test_an_unavailable_service_keeps_the_retrieval_order(self) -> None:
+class TestConfiguredFailures:
+    async def test_an_unavailable_service_raises(self) -> None:
         client = _FakeClient(status=503)
 
-        assert await _adapter(client).rerank("q", ["a", "b"]) == []
+        with pytest.raises(httpx.HTTPStatusError):
+            await _adapter(client).rerank("q", ["a", "b"])
 
-    async def test_an_unexpected_payload_keeps_the_retrieval_order(self) -> None:
+    async def test_an_unexpected_payload_raises(self) -> None:
         client = _FakeClient(payload={"unexpected": "shape"})
 
-        assert await _adapter(client).rerank("q", ["a", "b"]) == []
+        with pytest.raises(ValueError):
+            await _adapter(client).rerank("q", ["a", "b"])
 
     async def test_a_partial_answer_is_refused_rather_than_dropping_candidates(self) -> None:
         """Scoring 1 of 2 would silently discard a candidate; the retrieval order is complete."""
         client = _FakeClient(payload={"data": [{"index": 0, "score": 0.9}]})
 
-        assert await _adapter(client).rerank("q", ["a", "b"]) == []
+        with pytest.raises(ValueError):
+            await _adapter(client).rerank("q", ["a", "b"])
 
     async def test_empty_input_asks_nothing(self) -> None:
         client = _FakeClient(scores=[])

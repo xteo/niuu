@@ -162,23 +162,10 @@ class PostgresSearchAdapter(SearchPort):
         If *embedding* is supplied it is stored directly, bypassing
         ``embed_fn``.  This allows callers with pre-computed embeddings to
         avoid redundant model inference.
-        A failure to embed does **not** fail the write — same rule as the sqlite adapter. Indexing
-        runs on the turn path, so an embedding backend that is down or refusing an input would
-        otherwise take the conversation turn with it. The row is written unembedded and logged;
-        ``unembedded()`` finds these and ``backfill_embeddings`` fills them.
         """  # noqa: D401
         resolved_embedding = embedding
         if resolved_embedding is None and self._embed_fn is not None:
-            try:
-                resolved_embedding = await self._embed_fn(content)
-            except Exception as exc:  # noqa: BLE001 — any backend failure, never fatal to the turn
-                logger.warning(
-                    "index %s: embedding failed (%s: %s) — storing unembedded, "
-                    "recoverable with backfill_embeddings",
-                    id,
-                    type(exc).__name__,
-                    exc,
-                )
+            resolved_embedding = await self._embed_fn(content)
 
         if resolved_embedding is not None and self._pgvector_available:
             await self._ensure_vector_column(len(resolved_embedding))

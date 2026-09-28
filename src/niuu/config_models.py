@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DatabaseConfig(BaseModel):
@@ -64,10 +65,13 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldClaude": SessionDefinitionConfig(
             enabled=True,
             display_name="Claude Code",
-            description="Anthropic Claude — full IDE with terminal, tools, and MCP",
+            description=(
+                "Claude Code in the full session workspace: chat, terminal, diffs, "
+                "files and MCP tools. The usual choice for Claude."
+            ),
             labels=["session", "claude"],
-            default_model="claude-opus-5",
-            compatible_providers=["anthropic"],
+            default_model="claude-opus-5-5",
+            compatible_providers=["anthropic", "local"],
             defaults={
                 "broker": {
                     "cliType": "claude",
@@ -81,12 +85,13 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             enabled=True,
             display_name="Claude Code Interactive",
             description=(
-                "Anthropic Claude Code through a tmux-backed interactive terminal "
-                "for subscription sessions, slash commands, and terminal controls"
+                "Claude Code as the plain interactive terminal you know from your own "
+                "machine: slash commands, permission prompts and agent teams. Pick this "
+                "when you want the CLI itself rather than the chat workspace."
             ),
             labels=["session", "claude", "interactive"],
-            default_model="claude-opus-5",
-            compatible_providers=["anthropic"],
+            default_model="claude-opus-5-5",
+            compatible_providers=["anthropic", "local"],
             defaults={
                 "broker": {
                     "cliType": "claude",
@@ -102,14 +107,17 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldCodex": SessionDefinitionConfig(
             enabled=True,
             display_name="OpenAI Codex",
-            description="OpenAI Codex — WebSocket protocol with streaming and tools",
+            description=(
+                "OpenAI's Codex coding agent with streaming chat and tools. "
+                "The usual choice for OpenAI."
+            ),
             labels=["session", "codex"],
             # Astra is the default Codex model (Damien, 2026-09-05). It was empty, which
             # left the choice entirely to whatever the caller happened to pass — the app
             # always sends one, but a REST/tool launch that omitted it got no model at
             # all.
             default_model="gpt-6-astra",
-            compatible_providers=["openai"],
+            compatible_providers=["openai", "local"],
             defaults={
                 "broker": {
                     "cliType": "codex-ws",
@@ -122,7 +130,8 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             enabled=True,
             display_name="OpenAI Codex (Batch)",
             description=(
-                "OpenAI Codex — app-server transport tuned for autonomous workflow execution"
+                "OpenAI Codex set up for unattended runs. Ting workflows use this one; "
+                "for hands-on work pick OpenAI Codex."
             ),
             labels=["session", "codex", "batch"],
             default_model="gpt-6-astra",
@@ -138,7 +147,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldGrok": SessionDefinitionConfig(
             enabled=True,
             display_name="xAI Grok Build",
-            description="xAI Grok Build — Agent Client Protocol (ACP) over stdio (Scaldy pipeline)",
+            description="xAI's Grok Build coding agent, signed in with your Grok account.",
             labels=["session", "grok"],
             default_model="grok-4.7",
             compatible_providers=["xai"],
@@ -154,8 +163,8 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             enabled=True,
             display_name="Meta Muse Code",
             description=(
-                "Meta Muse Code — Muse Session Protocol (MSP) over stdio (Scaldy pipeline); "
-                "native mid-turn steering, durable resumable sessions, real token usage"
+                "Meta's coding agent with streaming chat, tools and resumable sessions. "
+                "Steer its work while it runs."
             ),
             labels=["session", "muse"],
             # Muse Spark 1.3 shipped 2026-09-02 and is what `muse` serves by default in
@@ -173,7 +182,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldPi": SessionDefinitionConfig(
             enabled=True,
             display_name="PI",
-            description="PI coding agent — native RPC, streaming, steering and durable sessions",
+            description="PI coding agent with streaming chat, tools and resumable sessions",
             labels=["session", "pi"],
             default_model="openai-codex/gpt-6-astra",
             compatible_providers=[],
@@ -188,7 +197,10 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldOpenCode": SessionDefinitionConfig(
             enabled=True,
             display_name="OpenCode",
-            description="Model-neutral AI coding agent — Claude, OpenAI, Gemini, local",
+            description=(
+                "OpenCode, an open-source coding agent that works with any connected "
+                "provider or a local model."
+            ),
             labels=["session", "opencode"],
             default_model="",
             compatible_providers=[],
@@ -203,10 +215,7 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
         "skuldDeepSeekHarness": SessionDefinitionConfig(
             enabled=True,
             display_name="DeepSeek Harness",
-            description=(
-                "DeepSeek Harness (dsh) — SDK JSON-RPC stdio protocol with "
-                "streaming, tools, and durable session events"
-            ),
+            description="DeepSeek's Harness coding agent (dsh) with streaming chat and tools.",
             labels=["session", "dsh"],
             default_model="deepseek-v4-flash",
             compatible_providers=["deepseek"],
@@ -222,8 +231,8 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
             enabled=True,
             display_name="Claude Remote Control",
             description=(
-                "Claude Code in Remote Control mode — pair with the Claude app or "
-                "claude.ai/code; the native app drives the session"
+                "Claude Code driven from the Claude app or claude.ai/code: the session "
+                "runs here, you steer it from there."
             ),
             labels=["session", "claude", "remote-control"],
             default_model="",
@@ -274,7 +283,31 @@ class WorkloadIdentityMappingConfig(BaseModel):
     )
     owner_id: str = Field(
         default="",
-        description="User id used as the exchanged token subject and session owner.",
+        description=(
+            "Fixed user id used as the exchanged token subject and session owner. "
+            "Ignored when owner_id_claim is set."
+        ),
+    )
+    owner_id_claim: str = Field(
+        default="",
+        description=(
+            "When set, derive owner_id per-caller from this claim on the verified "
+            "workload proof (dot notation supported) instead of the fixed owner_id "
+            "above — e.g. 'sub' to give each distinct ServiceAccount its own "
+            "identity, so callers sharing one mapping are not conflated into one "
+            "principal. A workload proof missing this claim is rejected, not "
+            "silently mapped to a default."
+        ),
+    )
+    owner_id_claim_pattern: str = Field(
+        default="",
+        description=(
+            "Optional regex with one capture group applied to the owner_id_claim "
+            "value, e.g. '^system:serviceaccount:[^:]+:resident-(.+)$' to pull the "
+            "resident id out of a Kubernetes ServiceAccount subject. Unset uses the "
+            "whole claim value verbatim; a claim value that fails to match a "
+            "configured pattern is rejected, not passed through unstripped."
+        ),
     )
     tenant_id: str = Field(default="default", description="Tenant/org id for isolation.")
     email: str = Field(default="", description="Optional owner/workload email claim.")
@@ -286,6 +319,58 @@ class WorkloadIdentityMappingConfig(BaseModel):
         default_factory=dict,
         description="Non-secret audit metadata embedded as workload_* claims.",
     )
+
+    @model_validator(mode="after")
+    def _validate_owner_id_claim_pattern(self) -> WorkloadIdentityMappingConfig:
+        """A bad pattern here was a 500 at exchange time, not a config-load
+        error — every real caller through this mapping would fail the same
+        way, discoverable only by trying it. Fail at load time instead."""
+        pattern = self.owner_id_claim_pattern.strip()
+        if not pattern:
+            return self
+        if not self.owner_id_claim.strip():
+            raise ValueError(
+                "owner_id_claim_pattern requires owner_id_claim to also be set — a "
+                "pattern with no claim to apply it to can never be reached"
+            )
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"owner_id_claim_pattern {pattern!r} does not compile: {exc}") from exc
+        if compiled.groups != 1:
+            raise ValueError(
+                f"owner_id_claim_pattern {pattern!r} must have exactly one capture "
+                f"group, found {compiled.groups}"
+            )
+        return self
+
+
+class WorkloadIdentityTenantResolverConfig(BaseModel):
+    """Dynamic adapter resolving a per-caller tenant_id for a mapping that
+    also derives owner_id per-caller (``owner_id_claim`` set).
+
+    Every deployed resident's own tenant_id lives in ONE durable record
+    (Völundr's ``resident_runtimes`` table) — a mapping's own static
+    ``tenant_id`` is a single fixed guess that is wrong for any tenant other
+    than the one it names. When this is configured, a mapping using
+    ``owner_id_claim`` derives its tenant from here instead, keyed by the
+    same resolved owner_id (see ``niuu.ports.owner_tenant_resolver
+    .OwnerTenantResolverPort``); the mapping's own ``tenant_id`` is unused
+    for that mapping in that case. Left unset (the default), every mapping
+    falls back to its own static ``tenant_id`` — an explicit,
+    single-tenant-only mode, not a silent guess.
+    """
+
+    adapter: str = Field(
+        default="",
+        description=(
+            "Fully-qualified OwnerTenantResolverPort adapter class path. Empty "
+            "means no resolver is configured — every mapping uses its own static "
+            "tenant_id."
+        ),
+    )
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
 
 
 class WorkloadIdentityConfig(BaseModel):
@@ -312,3 +397,6 @@ class WorkloadIdentityConfig(BaseModel):
     )
     verifiers: list[WorkloadIdentityVerifierConfig] = Field(default_factory=list)
     mappings: list[WorkloadIdentityMappingConfig] = Field(default_factory=list)
+    tenant_resolver: WorkloadIdentityTenantResolverConfig = Field(
+        default_factory=WorkloadIdentityTenantResolverConfig
+    )

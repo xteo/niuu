@@ -11,7 +11,22 @@ from fastapi import FastAPI
 from niuu.domain.model_catalog import ManagedModel
 from volundr.adapters.outbound.pricing import HardcodedPricingProvider
 from volundr.config import Settings
-from volundr.main import _bootstrap_startup_schema, _load_bifrost_catalog, create_app
+from volundr.main import (
+    _bootstrap_startup_schema,
+    _ensure_preview_cache_dir_writable,
+    _load_bifrost_catalog,
+    create_app,
+)
+
+
+@pytest.fixture(autouse=True)
+def user_repository(monkeypatch):
+    """Keep startup identity provisioning behind the mocked persistence port."""
+    repository = AsyncMock()
+    repository.get.return_value = None
+    repository.create.side_effect = lambda user: user
+    monkeypatch.setattr("volundr.main.PostgresUserRepository", lambda _pool: repository)
+    return repository
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +63,35 @@ class TestCreateApp:
         """App has version."""
         app = create_app()
         assert app.version == "0.1.0"
+
+
+class TestEnsurePreviewCacheDirWritable:
+    """Startup must fail loudly, not on the first preview request, when the
+    configured preview_cache_dir cannot be written to (e.g. a Kubernetes pod's
+    read-only root filesystem with the mini-mode ~/.niuu default)."""
+
+    def test_creates_and_accepts_a_writable_directory(self, tmp_path):
+        target = tmp_path / "preview-cache"
+
+        _ensure_preview_cache_dir_writable(target)
+
+        assert target.is_dir()
+
+    def test_raises_with_remedy_when_directory_is_not_writable(self, tmp_path):
+        target = tmp_path / "readonly-preview-cache"
+        target.mkdir()
+        target.chmod(0o555)
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                _ensure_preview_cache_dir_writable(target)
+        finally:
+            target.chmod(0o755)
+
+        message = str(exc_info.value)
+        assert str(target) in message
+        assert "is not writable" in message
+        assert "previewCache.mountPath" in message
+        assert "preview_cache_dir" in message
 
 
 class TestHealthCheck:
@@ -133,8 +177,8 @@ class TestLifespan:
         ]
         mock_conn.close.assert_awaited_once()
 
-    def test_lifespan_bootstraps_schema_before_opening_pool(self) -> None:
-        """Startup bootstrap should run before the app opens its Postgres pool."""
+    def test_lifespan_validates_modules_before_bootstrap_and_opening_pool(self) -> None:
+        """External code must be validated before provider composition can begin."""
         from fastapi.testclient import TestClient
 
         events: list[str] = []
@@ -149,7 +193,15 @@ class TestLifespan:
         async def _bootstrap(_settings: Settings) -> None:
             events.append("bootstrap")
 
+        def _load_external_modules(_paths: list[str]) -> list:
+            events.append("external_modules")
+            return []
+
         with (
+            patch(
+                "volundr.main.load_external_module_manifests",
+                side_effect=_load_external_modules,
+            ),
             patch("volundr.main._bootstrap_startup_schema", side_effect=_bootstrap),
             patch("volundr.main.database_pool", _mock_db_pool),
             patch(
@@ -174,7 +226,72 @@ class TestLifespan:
                 response = client.get("/health")
                 assert response.status_code == 200
 
-        assert events[:2] == ["bootstrap", "database_pool"]
+        assert events[:3] == ["external_modules", "bootstrap", "database_pool"]
+
+    def test_lifespan_rejects_durable_compute_policy_before_health(self) -> None:
+        """A persisted policy cannot make the app healthy with an invalid profile."""
+        from fastapi.testclient import TestClient
+
+        from tests.compute_fakes import LeaseRepository, Provider
+        from volundr.domain.compute import ComputePoolPolicy
+        from volundr.domain.vm_runtime import VmRuntime
+
+        mock_pool = AsyncMock()
+        repository = LeaseRepository()
+        provider = Provider()
+        repository.policies["test-pool"] = ComputePoolPolicy(profile="removed", max_machines=1)
+        runtime = AsyncMock(spec=VmRuntime)
+
+        @asynccontextmanager
+        async def _mock_db_pool(_config):
+            yield mock_pool
+
+        settings = Settings(
+            pod_manager={
+                "adapter": "volundr.adapters.outbound.vm_pod_manager.VmPodManager",
+                "runtime_backend": "vm",
+                "kwargs": {
+                    "profile": "small",
+                    "pool_id": "test-pool",
+                    "max_machines": 1,
+                },
+            },
+            compute={
+                "pool_id": "test-pool",
+                "max_machines": 1,
+                "provider": {"adapter": "tests.Provider"},
+                "runtime": {"adapter": "tests.Runtime"},
+            },
+        )
+
+        with (
+            patch("volundr.main._bootstrap_startup_schema", new=AsyncMock()),
+            patch("volundr.main.database_pool", _mock_db_pool),
+            patch(
+                "volundr.adapters.outbound.bifrost_catalog_http.HttpBifrostCatalogAdapter.list_models",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "volundr.domain.services.tenant.TenantService.ensure_default_tenant",
+                new=AsyncMock(),
+            ),
+            patch(
+                "volundr.compute.main.build_provider",
+                return_value=provider,
+            ),
+            patch(
+                "volundr.adapters.outbound.postgres_compute_leases.PostgresComputeLeaseRepository",
+                return_value=repository,
+            ),
+            patch("volundr.main.import_class", return_value=lambda **_kwargs: runtime),
+        ):
+            app = create_app(settings)
+            with pytest.raises(ValueError, match="configured by the provider"):
+                with TestClient(app) as client:
+                    client.get("/health")
+
+        assert provider.closed
+        runtime.close.assert_awaited_once()
 
     def test_lifespan_initializes_audit_subscriber(self):
         """Lifespan must run startup/shutdown without error when sleipnir is disabled.
@@ -260,7 +377,8 @@ class TestLifespan:
         assert "/api/v1/audit/events" in paths
         assert hasattr(app.state, "pat_service")
 
-    def test_lifespan_mounts_session_proxy_routes_standalone(self):
+    @pytest.mark.parametrize("enforce", [False, True])
+    def test_lifespan_mounts_session_proxy_routes_standalone(self, enforce):
         """Standalone (no CLI root app): the /s/{id} session proxy must exist.
 
         The K8s deployment runs ``uvicorn volundr.main:create_app`` directly.
@@ -300,7 +418,12 @@ class TestLifespan:
             # left the module-global registry set.
             patch("cli.server.get_skuld_registry", return_value=None),
         ):
-            app = create_app()
+            settings = Settings()
+            if enforce:
+                settings.identity.adapter = "identity.adapters.identity.EnvoyHeaderIdentityAdapter"
+                settings.identity.kwargs = {"membership_authority": "local"}
+                settings.authorization.adapter = "identity.adapters.cedar.CedarAuthorizationAdapter"
+            app = create_app(settings)
             with TestClient(app) as client:
                 resp = client.get("/s/00000000-0000-0000-0000-000000000000/health")
                 assert resp.status_code == 404
@@ -309,6 +432,39 @@ class TestLifespan:
                 # Lifespan re-entry must not register the routes twice; the
                 # registry is pinned on app.state and reused.
                 registry = app.state.session_proxy_registry
+                if enforce:
+                    from types import SimpleNamespace
+
+                    from identity.models import Principal
+                    from niuu.ports.identity import InvalidTokenError
+
+                    validate = AsyncMock(
+                        side_effect=[
+                            Principal("alice", "", "acme", ["volundr:viewer"]),
+                            Principal("alice", "", "acme", ["volundr:developer"]),
+                            InvalidTokenError("Membership removed"),
+                        ]
+                    )
+                    with (
+                        patch.object(app.state.identity, "validate_headers", validate),
+                        patch(
+                            "volundr.main.PostgresSessionRepository.get",
+                            new=AsyncMock(
+                                return_value=SimpleNamespace(owner_id="alice", tenant_id="acme")
+                            ),
+                        ),
+                    ):
+                        for allowed in [False, True, False]:
+                            assert (
+                                client.portal.call(
+                                    registry.may_attach,
+                                    "00000000-0000-0000-0000-000000000000",
+                                    "alice",
+                                    "acme",
+                                    ("volundr:admin",),
+                                )
+                                is allowed
+                            )
             with TestClient(app):
                 assert app.state.session_proxy_registry is registry
                 proxy_routes = [
@@ -590,3 +746,63 @@ class TestBifrostCatalogLoading:
             with TestClient(app) as client:
                 response = client.get("/health")
                 assert response.status_code == 200
+
+
+async def test_validation_logging_omits_credentials_and_private_input():
+    from fastapi import Request
+    from fastapi.exceptions import RequestValidationError
+
+    app = create_app()
+    error = RequestValidationError(
+        [
+            {
+                "type": "string_type",
+                "loc": ("body", "api_key"),
+                "msg": "invalid private-test-key",
+                "input": "private-test-key",
+            }
+        ],
+        body={"api_key": "private-test-key"},
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/credentials",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+    with patch("volundr.main.logger.warning") as warning:
+        response = await app.exception_handlers[RequestValidationError](request, error)
+    assert response.status_code == 422
+    warning.assert_called_once()
+    assert "string_type" in str(warning.call_args)
+    assert "private-test-key" not in str(warning.call_args)
+
+
+async def test_periodic_broadcast_sends_a_figure_less_stats_tick_then_a_heartbeat(monkeypatch):
+    """Figures are per subscriber, so the periodic task never computes global stats."""
+    import asyncio
+
+    from volundr.adapters.outbound.broadcaster import InMemoryEventBroadcaster
+    from volundr.domain.models import EventType
+    from volundr.main import _broadcast_periodic_updates
+
+    monkeypatch.setattr("volundr.main.BROADCAST_INTERVAL", 0)
+    broadcaster = InMemoryEventBroadcaster()
+    events = broadcaster.subscribe()
+    first = asyncio.ensure_future(anext(events))
+    await asyncio.sleep(0)  # the subscriber is registered before the first tick
+
+    task = asyncio.create_task(_broadcast_periodic_updates(broadcaster))
+    tick = await asyncio.wait_for(first, timeout=1.0)
+    heartbeat = await asyncio.wait_for(anext(events), timeout=1.0)
+    task.cancel()
+    # The loop handles its own cancellation and returns, so shutdown is clean.
+    assert await asyncio.wait_for(task, timeout=1.0) is None
+    assert not task.cancelled()
+    await events.aclose()
+
+    assert (tick.type, tick.data) == (EventType.STATS_UPDATED, {})
+    assert heartbeat.type is EventType.HEARTBEAT

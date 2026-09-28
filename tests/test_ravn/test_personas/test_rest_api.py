@@ -115,6 +115,19 @@ def test_list_returns_summary_shape(client: TestClient) -> None:
     assert "iteration_budget" in persona
 
 
+def test_list_and_detail_expose_all_outcome_events(client: TestClient) -> None:
+    summaries = client.get("/api/v1/ravn/personas").json()
+    reviewer = next(item for item in summaries if item["name"] == "reviewer")
+    assert reviewer["outcome_events"] == {
+        "pass": "review.passed",
+        "needs_changes": "review.changes_requested",
+        "fail": "review.changes_requested",
+    }
+
+    detail = client.get("/api/v1/ravn/personas/reviewer").json()
+    assert detail["produces"]["event_type_map"] == reviewer["outcome_events"]
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/ravn/personas/validate — validate
 # ---------------------------------------------------------------------------
@@ -140,6 +153,17 @@ def test_validate_invalid_fan_in_strategy(client: TestClient) -> None:
     data = resp.json()
     assert data["valid"] is False
     assert any("fan_in_strategy" in e for e in data["errors"])
+
+
+def test_validate_unknown_permission_mode(client: TestClient) -> None:
+    resp = client.post(
+        "/api/v1/ravn/personas/validate",
+        json={"name": "my-agent", "permission_mode": "superuser"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["valid"] is False
+    assert any("Unknown permission_mode 'superuser'" in e for e in data["errors"])
 
 
 def test_validate_does_not_save(client: TestClient, loader: FilesystemPersonaAdapter) -> None:
@@ -168,6 +192,55 @@ def test_get_builtin_persona(client: TestClient) -> None:
 def test_get_nonexistent_persona_returns_404(client: TestClient) -> None:
     resp = client.get("/api/v1/ravn/personas/no-such-persona")
     assert resp.status_code == 404
+
+
+def test_get_current_portable_persona_returns_raw_source_revision(
+    client_no_builtin: TestClient,
+    tmp_persona_dir: Path,
+) -> None:
+    write_persona(tmp_persona_dir, "test-agent", _CUSTOM_PERSONA)
+
+    resp = client_no_builtin.get("/api/v1/ravn/personas/test-agent/portable")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == "test-agent"
+    assert data["revision"].startswith("content-")
+    assert data["definition"] == _CUSTOM_PERSONA
+
+
+def test_get_exact_portable_revision_returns_same_source(
+    client_no_builtin: TestClient,
+    tmp_persona_dir: Path,
+) -> None:
+    write_persona(tmp_persona_dir, "test-agent", _CUSTOM_PERSONA)
+    current = client_no_builtin.get("/api/v1/ravn/personas/test-agent/portable").json()
+
+    resp = client_no_builtin.get(
+        f"/api/v1/ravn/personas/test-agent/revisions/{current['revision']}"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == current
+
+
+def test_get_portable_persona_reports_nonportable_executor(
+    client_no_builtin: TestClient,
+    tmp_persona_dir: Path,
+) -> None:
+    write_persona(
+        tmp_persona_dir,
+        "bound-agent",
+        {
+            "name": "bound-agent",
+            "executor": {"adapter": "local.Executor", "kwargs": {"token": "secret"}},
+        },
+    )
+
+    resp = client_no_builtin.get("/api/v1/ravn/personas/bound-agent/portable")
+
+    assert resp.status_code == 422
+    assert "local executor binding" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +273,16 @@ def test_create_persona_returns_201(client_no_builtin: TestClient) -> None:
     assert data["permission_mode"] == "read-only"
 
 
+def test_create_persona_rejects_unknown_permission_mode(
+    client_no_builtin: TestClient, loader_no_builtin: FilesystemPersonaAdapter
+) -> None:
+    payload = {**_CREATE_PAYLOAD, "permission_mode": "read-onyl"}
+    resp = client_no_builtin.post("/api/v1/ravn/personas", json=payload)
+    assert resp.status_code == 422
+    assert "Unknown permission_mode 'read-onyl'" in resp.json()["detail"]
+    assert loader_no_builtin.load("test-agent") is None
+
+
 def test_create_persona_conflict_for_duplicate(
     client_no_builtin: TestClient, tmp_persona_dir: Path
 ) -> None:
@@ -229,6 +312,15 @@ def test_replace_custom_persona(
     resp = client_no_builtin.put("/api/v1/ravn/personas/test-agent", json=updated)
     assert resp.status_code == 200
     assert resp.json()["iteration_budget"] == 99
+
+
+def test_replace_rejects_unknown_permission_mode(client_no_builtin: TestClient) -> None:
+    client_no_builtin.post("/api/v1/ravn/personas", json=_CREATE_PAYLOAD)
+
+    updated = {**_CREATE_PAYLOAD, "permission_mode": "superuser"}
+    resp = client_no_builtin.put("/api/v1/ravn/personas/test-agent", json=updated)
+    assert resp.status_code == 422
+    assert "Unknown permission_mode 'superuser'" in resp.json()["detail"]
 
 
 def test_replace_nonexistent_returns_404(client_no_builtin: TestClient) -> None:

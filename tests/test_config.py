@@ -145,6 +145,62 @@ class TestSettings:
             "https://agents.example.test"
         ]
 
+    def test_forge_stream_defaults_match_the_merged_session_stream(self):
+        """Guild's merged /sessions/stream timing is configured, not hardcoded."""
+        settings = Settings()
+
+        assert settings.forge_stream_remote_timeout_seconds == 45.0
+        assert settings.forge_stream_remote_connect_timeout_seconds == 5.0
+        assert settings.forge_stream_retry_seconds == 5.0
+        assert settings.forge_stream_keepalive_seconds == 15.0
+        assert settings.forge_stream_queue_maxsize == 256
+
+    def test_forge_stream_settings_are_configurable(self):
+        settings = Settings(
+            forge_stream_remote_timeout_seconds=60.0,
+            forge_stream_remote_connect_timeout_seconds=2.0,
+            forge_stream_retry_seconds=1.0,
+            forge_stream_keepalive_seconds=10.0,
+            forge_stream_queue_maxsize=64,
+        )
+
+        assert settings.forge_stream_remote_timeout_seconds == 60.0
+        assert settings.forge_stream_remote_connect_timeout_seconds == 2.0
+        assert settings.forge_stream_retry_seconds == 1.0
+        assert settings.forge_stream_keepalive_seconds == 10.0
+        assert settings.forge_stream_queue_maxsize == 64
+
+    def test_guild_transport_timeout_defaults(self):
+        """The pin-handshake ceiling and the owner-probe timeout are
+        configured, not hardcoded — see niuu.adapters.outbound.guild_transport
+        and niuu.adapters.inbound.rest_ravn."""
+        settings = Settings()
+
+        assert settings.guild_transport_connect_timeout_seconds == 5.0
+        assert settings.guild_owner_probe_timeout_seconds == 15.0
+
+    def test_guild_transport_timeout_settings_are_configurable(self):
+        settings = Settings(
+            guild_transport_connect_timeout_seconds=2.0,
+            guild_owner_probe_timeout_seconds=30.0,
+        )
+
+        assert settings.guild_transport_connect_timeout_seconds == 2.0
+        assert settings.guild_owner_probe_timeout_seconds == 30.0
+
+    def test_preview_cache_dir_defaults_to_mini_mode_home(self):
+        """Mini mode's writable HOME keeps working unchanged; Kubernetes must
+        override this (see charts/volundr previewCache.mountPath) because the
+        pod's root filesystem is read-only and HOME=/ there."""
+        settings = Settings()
+
+        assert settings.preview_cache_dir == "~/.niuu/preview-cache"
+
+    def test_preview_cache_dir_is_configurable(self):
+        settings = Settings(preview_cache_dir="/volundr/preview-cache")
+
+        assert settings.preview_cache_dir == "/volundr/preview-cache"
+
 
 class TestGitHubConfig:
     """Tests for GitHubConfig."""
@@ -1060,6 +1116,54 @@ def test_builtin_remote_control_definitions_present():
     assert "skuldCodexRemote" not in defs
 
 
+def test_every_builtin_engine_is_unlocked_by_a_catalog_provider():
+    """Each session definition's compatible vendors must be reachable through at
+    least one AI provider in the built-in catalog, and every AI provider must
+    say which vendor it unlocks; otherwise the launch dialogs could never offer
+    that engine no matter what the person connects."""
+    from niuu.config_models import default_session_definitions
+    from niuu.domain.model_runtime import normalize_model_vendor
+    from volundr.config import _default_integration_definitions
+
+    providers = [
+        entry
+        for entry in _default_integration_definitions()
+        if entry.integration_type == "ai_provider"
+    ]
+    assert providers, "the built-in catalog ships AI providers"
+    for entry in providers:
+        assert entry.model_vendor, f"{entry.slug} does not say which model vendor it unlocks"
+    for entry in _default_integration_definitions():
+        if entry.integration_type != "ai_provider":
+            assert entry.model_vendor == "", f"{entry.slug} is not an AI provider"
+
+    unlocked = {normalize_model_vendor(entry.model_vendor) for entry in providers}
+    for key, definition in default_session_definitions().items():
+        for vendor in definition.compatible_providers:
+            assert normalize_model_vendor(vendor) in unlocked, (
+                f"{key} accepts {vendor!r} but no catalog provider unlocks it"
+            )
+
+
+def test_builtin_engine_descriptions_read_as_plain_language():
+    """The engine picker shows these to people choosing what to launch; they
+    must say what the engine is for rather than which transport it speaks."""
+    from niuu.config_models import default_session_definitions
+
+    jargon = ("transport", "protocol", "stdio", "WebSocket", "JSON-RPC", "tmux-backed")
+    for key, definition in default_session_definitions().items():
+        assert definition.description, f"{key} has no description"
+        for word in jargon:
+            assert word not in definition.description, f"{key} description mentions {word!r}"
+
+
+def test_preview_cache_dir_env_alias(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PREVIEW_CACHE_DIR", "/volundr/preview-cache")
+    settings = Settings()
+    assert settings.preview_cache_dir == "/volundr/preview-cache"
+
+
 def test_runtime_routing_legacy_aliases(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NIUU_SERVER_HOST", "10.0.0.8")
@@ -1080,3 +1184,125 @@ def test_runtime_routing_rejects_invalid_port(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError):
         Settings()
+
+
+def test_model_server_is_a_local_provider_configured_from_runtime_settings():
+    """The seeded "Model server" unlocks the local vendor and hands sessions the
+    gateway URL from its (non-secret) config rather than from a credential."""
+    from volundr.config import (
+        MODEL_GATEWAY_URL_ENV,
+        MODEL_SERVER_SLUG,
+        _default_integration_definitions,
+    )
+    from volundr.domain.model_gateway import MODEL_GATEWAY_TOKEN_ENV
+
+    entry = next(e for e in _default_integration_definitions() if e.slug == MODEL_SERVER_SLUG)
+    assert entry.integration_type == "ai_provider"
+    assert entry.model_vendor == "local"
+    assert entry.auth_type == "none"
+    assert entry.env_from_credentials == {}
+    assert entry.env_from_config == {
+        MODEL_GATEWAY_URL_ENV: "gateway_url",
+        MODEL_GATEWAY_TOKEN_ENV: "token",
+    }
+    assert "Settings → Runtime" in entry.description
+
+
+def test_local_models_unlock_the_claude_and_codex_engines():
+    from niuu.config_models import default_session_definitions
+
+    definitions = default_session_definitions()
+    for key in ("skuldClaude", "skuldClaudeInteractive", "skuldCodex"):
+        assert "local" in definitions[key].compatible_providers, key
+
+
+def test_env_from_config_reaches_the_registry():
+    """Definitions loaded from config keep env_from_config for the contributor."""
+    from volundr.config import (
+        MODEL_GATEWAY_URL_ENV,
+        MODEL_SERVER_SLUG,
+        _default_integration_definitions,
+    )
+    from volundr.domain.model_gateway import MODEL_GATEWAY_TOKEN_ENV
+    from volundr.domain.services.integration_registry import definitions_from_config
+
+    loaded = definitions_from_config(
+        [entry.model_dump() for entry in _default_integration_definitions()]
+    )
+    entry = next(d for d in loaded if d.slug == MODEL_SERVER_SLUG)
+    assert entry.env_from_config == {
+        MODEL_GATEWAY_URL_ENV: "gateway_url",
+        MODEL_GATEWAY_TOKEN_ENV: "token",
+    }
+
+
+def test_git_hosts_sign_the_cli_tools_in():
+    """Sessions carry gh and glab; the connected account's token reaches them."""
+    from volundr.config import _default_integration_definitions
+
+    by_slug = {entry.slug: entry for entry in _default_integration_definitions()}
+    assert by_slug["github"].env_from_credentials == {"GH_TOKEN": "token"}
+    assert by_slug["gitlab"].env_from_credentials == {"GITLAB_TOKEN": "token"}
+
+
+def test_jira_catalog_supports_api_tokens_and_oauth_authorization_code():
+    from volundr.config import _default_integration_definitions
+
+    jira = next(entry for entry in _default_integration_definitions() if entry.slug == "jira")
+    assert jira.credential_schema["required"] == ["email", "api_token"]
+    assert jira.config_schema["required"] == ["site_url"]
+    assert "cloud_id" in jira.config_schema["properties"]
+    assert jira.config_schema["properties"]["project_keys"]["type"] == "string[]"
+    assert jira.config_schema["properties"]["labels"]["type"] == "string[]"
+    assert jira.credential_enrollment == {
+        "method": "oauth_authorization_code",
+        "credential_field": "access_token",
+        "default_credential_name": "jira-signin",
+    }
+    assert jira.oauth is not None
+    assert jira.oauth.token_request_format == "json"
+    assert jira.oauth.client_secret_required is True
+    assert "offline_access" in jira.oauth.scopes
+
+
+def test_ravn_flock_llm_config_loads_from_the_shared_config_file(monkeypatch, tmp_path):
+    """Mini mode: Volundr reads its own key from the file Ting also reads."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        """
+dispatch:
+  flock:
+    llm_config:
+      model: ting/dispatch-model
+ravn_flock_llm_config:
+  model: Qwen/Qwen3.8-27B
+  max_tokens: 8192
+  provider:
+    adapter: ravn.adapters.llm.openai.OpenAICompatibleAdapter
+    kwargs:
+      base_url: https://vllm.example.test
+"""
+    )
+    _clear_settings_env(monkeypatch)
+    monkeypatch.setenv("NIUU_CONFIG", str(config_file))
+
+    settings = Settings()
+
+    assert settings.ravn_flock_llm_config["model"] == "Qwen/Qwen3.8-27B"
+    assert settings.ravn_flock_llm_config["provider"]["kwargs"] == {
+        "base_url": "https://vllm.example.test"
+    }
+
+
+def test_ravn_flock_llm_config_defaults_to_no_forge_default(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _clear_settings_env(monkeypatch)
+
+    assert Settings().ravn_flock_llm_config == {}
+
+
+def test_ravn_flock_llm_config_rejects_a_block_ravn_cannot_load():
+    import pytest
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        Settings(ravn_flock_llm_config={"model": "Qwen/Qwen3.8-27B", "max_tokens": "lots"})

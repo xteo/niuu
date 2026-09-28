@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from niuu.adapters.inbound.rest_integration_models import IntegrationResponse
 from niuu.domain.models import SecretType
+from niuu.domain.oauth_credentials import OAUTH_ENGINE, OAuthCredentialUnavailableError
 from niuu.http_compat import LegacyRouteNotice, warn_on_legacy_route
 from volundr.adapters.inbound.auth import extract_principal
+from volundr.adapters.outbound.mcp_oauth import MCPOAuthDiscovery
 from volundr.domain.models import (
     CredentialEnrollment,
     IntegrationConnection,
@@ -28,6 +32,12 @@ from volundr.domain.services.credential_enrollment import (
     CredentialEnrollmentService,
 )
 from volundr.domain.services.integration_registry import IntegrationRegistry
+from volundr.domain.services.oauth_clients import (
+    OAuthClient,
+    OAuthClientError,
+    OAuthClientRegistry,
+    app_key,
+)
 from volundr.domain.services.tracker_factory import TrackerFactory
 
 logger = logging.getLogger(__name__)
@@ -122,6 +132,11 @@ def _validate_required_fields(schema: dict[str, Any], values: dict[str, Any]) ->
 class IntegrationUpdateRequest(BaseModel):
     """Request model for updating an integration connection."""
 
+    credential: dict[str, str] | None = Field(
+        default=None,
+        description="Replacement static credential for this account",
+    )
+
     model_config = ConfigDict(populate_by_name=True)
 
     credential_name: str | None = Field(
@@ -153,6 +168,24 @@ class MCPServerSpecResponse(BaseModel):
         description="Map of env var name to credential field name",
         examples=[{"LINEAR_API_KEY": "token"}],
     )
+
+
+class OAuthClientResponse(BaseModel):
+    """An OAuth application this install signs in through (never the secret)."""
+
+    slug: str
+    app: str = Field(description="Which of the provider's applications; 'default' unless named")
+    client_id: str
+    has_secret: bool
+    base_url: str = ""
+    source: str = Field(description="configured (oauth.clients) or registered (from the wizard)")
+
+
+class OAuthClientRegisterRequest(BaseModel):
+    app: str = Field(default="", max_length=64, description="A name; empty means 'default'")
+    client_id: str = Field(min_length=1, max_length=512)
+    client_secret: str = Field(default="", max_length=1024)
+    base_url: str = Field(default="", max_length=2048)
 
 
 class CatalogEntryResponse(BaseModel):
@@ -192,9 +225,33 @@ class CatalogEntryResponse(BaseModel):
         description="OAuth scopes if auth_type is OAuth",
         examples=[["read", "write"]],
     )
+    oauth_client_secret_required: bool = Field(
+        default=False,
+        description="Whether interactive OAuth sign-in requires an application client secret",
+    )
     credential_enrollment: dict[str, str] | None = Field(
         default=None,
         description="Interactive credential enrollment metadata when supported",
+    )
+    sign_in_available: bool = Field(
+        default=False,
+        description="Whether the interactive sign-in can actually run on this install",
+    )
+    sign_in_needs_app: bool = Field(
+        default=False,
+        description=(
+            "The sign-in works through an OAuth application the install owns and none is "
+            "registered yet; PUT /oauth-clients/{slug} registers one"
+        ),
+    )
+    model_vendor: str = Field(
+        default="",
+        description=(
+            "Model vendor a connection of this AI provider unlocks (anthropic, openai, "
+            "xai, deepseek); session definitions list the vendors they accept in "
+            "compatible_providers. Empty for non-AI integrations."
+        ),
+        examples=["anthropic"],
     )
 
     @classmethod
@@ -227,6 +284,9 @@ class CatalogEntryResponse(BaseModel):
             mcp_server=mcp,
             auth_type=defn.auth_type,
             oauth_scopes=oauth_scopes,
+            oauth_client_secret_required=(
+                defn.oauth.client_secret_required if defn.oauth is not None else False
+            ),
             credential_enrollment=(
                 {
                     "method": defn.credential_enrollment.method,
@@ -236,6 +296,7 @@ class CatalogEntryResponse(BaseModel):
                 if defn.credential_enrollment is not None
                 else None
             ),
+            model_vendor=defn.model_vendor,
         )
 
 
@@ -250,11 +311,21 @@ class CredentialEnrollmentStartRequest(BaseModel):
         validation_alias=AliasChoices("credential_name", "credentialName"),
         max_length=253,
     )
+    oauth_app: str = Field(
+        default="",
+        validation_alias=AliasChoices("oauth_app", "oauthApp"),
+        max_length=64,
+        description="Which of the provider's OAuth applications this account signs in through",
+    )
     connection_id: str = Field(
         default="",
         validation_alias=AliasChoices("connection_id", "connectionId"),
         max_length=100,
     )
+
+
+class CredentialEnrollmentCodeRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=4096, repr=False)
 
 
 class CredentialEnrollmentResponse(BaseModel):
@@ -271,6 +342,7 @@ class CredentialEnrollmentResponse(BaseModel):
     user_code: str = Field(serialization_alias="userCode")
     expires_at: datetime = Field(serialization_alias="expiresAt")
     error_code: str = Field(serialization_alias="errorCode")
+    input_required: bool = Field(default=False, serialization_alias="inputRequired")
 
     @classmethod
     def from_domain(cls, enrollment: CredentialEnrollment) -> CredentialEnrollmentResponse:
@@ -284,7 +356,124 @@ class CredentialEnrollmentResponse(BaseModel):
             user_code=enrollment.user_code,
             expires_at=enrollment.expires_at,
             error_code=enrollment.error_code,
+            input_required=enrollment.method == "claude_setup",
         )
+
+
+SOURCE_CONTROL_PROBE_LIMIT = 100
+PROBE_TIMEOUT_SECONDS = 15.0
+
+
+async def probe_source_control(
+    connection: IntegrationConnection, credential: dict[str, str]
+) -> IntegrationTestResult:
+    """Prove the token works by listing what it can see, not by checking it exists."""
+    provider_name = connection.adapter.rsplit(".", 1)[-1]
+    token = credential.get("token", "")
+    if not token:
+        return IntegrationTestResult(
+            success=False, provider=provider_name, error="Credential has no token field"
+        )
+    config = connection.config or {}
+    if connection.slug == "gitlab":
+        base = str(config.get("base_url") or "https://gitlab.com").rstrip("/")
+        headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
+        user_url = f"{base}/api/v4/user"
+        repos_url = (
+            f"{base}/api/v4/projects?membership=true&simple=true"
+            f"&order_by=last_activity_at&per_page={SOURCE_CONTROL_PROBE_LIMIT}"
+        )
+        name_key, login_key = "path_with_namespace", "username"
+    else:
+        base = str(config.get("base_url") or "https://api.github.com").rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        user_url = f"{base}/user"
+        repos_url = f"{base}/user/repos?sort=updated&per_page={SOURCE_CONTROL_PROBE_LIMIT}"
+        name_key, login_key = "full_name", "login"
+    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, headers=headers) as client:
+        user_response = await client.get(user_url)
+        if user_response.status_code != 200:
+            return IntegrationTestResult(
+                success=False,
+                provider=provider_name,
+                error=(
+                    f"The token was rejected (HTTP {user_response.status_code}). "
+                    "Check it is valid and has repository access."
+                ),
+            )
+        user = str((user_response.json() or {}).get(login_key) or "")
+        repos_response = await client.get(repos_url)
+    if repos_response.status_code != 200:
+        return IntegrationTestResult(
+            success=False,
+            provider=provider_name,
+            user=user or None,
+            error=f"Signed in as {user}, but listing repositories failed "
+            f"(HTTP {repos_response.status_code}).",
+        )
+    rows = repos_response.json() or []
+    names = [str(row.get(name_key) or "") for row in rows if isinstance(row, dict)]
+    names = [name for name in names if name]
+    more = 'rel="next"' in repos_response.headers.get("link", "")
+    count = f"{len(names)}+" if more else str(len(names))
+    return IntegrationTestResult(
+        success=True,
+        provider=provider_name,
+        user=user or None,
+        detail=f"{count} repositories reachable",
+        repositories=names,
+    )
+
+
+async def probe_ai_provider(
+    connection: IntegrationConnection,
+    definition: IntegrationDefinition | None,
+    credential: dict[str, str],
+) -> IntegrationTestResult:
+    """Call the provider's cheapest authenticated endpoint with the stored key."""
+    provider_name = connection.adapter.rsplit(".", 1)[-1] or connection.slug
+    probe = dict(definition.key_probe) if definition is not None else {}
+    if not probe:
+        # Sign-in credentials (subscriptions) and providers without a probe
+        # are proven when a session uses them; existence is all we can say.
+        return IntegrationTestResult(
+            success=True, provider=provider_name, detail="Credential stored"
+        )
+    key = credential.get("api_key", "")
+    if not key:
+        return IntegrationTestResult(
+            success=False, provider=provider_name, error="Credential has no api_key field"
+        )
+    headers = dict(probe.get("headers") or {})
+    auth = str(probe.get("auth") or "bearer")
+    if auth == "bearer":
+        headers["Authorization"] = f"Bearer {key}"
+    else:
+        headers[auth] = key
+    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS) as client:
+        response = await client.get(str(probe["url"]), headers=headers)
+    if response.status_code in (401, 403):
+        return IntegrationTestResult(
+            success=False,
+            provider=provider_name,
+            error=f"The provider rejected this key (HTTP {response.status_code}).",
+        )
+    if response.status_code != 200:
+        return IntegrationTestResult(
+            success=False,
+            provider=provider_name,
+            error=f"The provider answered HTTP {response.status_code} to the key check.",
+        )
+    payload = response.json() if "json" in response.headers.get("content-type", "") else {}
+    models = payload.get("data") if isinstance(payload, dict) else None
+    detail = (
+        f"Key works · {len(models)} models available" if isinstance(models, list) else "Key works"
+    )
+    return IntegrationTestResult(success=True, provider=provider_name, detail=detail)
 
 
 class IntegrationTestResult(BaseModel):
@@ -301,6 +490,14 @@ class IntegrationTestResult(BaseModel):
         default=None,
         description="Authenticated user if connected",
         examples=["user@example.com"],
+    )
+    detail: str | None = Field(
+        default=None,
+        description="What the check proved, e.g. '42 repositories' or '31 models'",
+    )
+    repositories: list[str] = Field(
+        default_factory=list,
+        description="Repositories the credential can see (first page), for source control",
     )
     error: str | None = Field(
         default=None,
@@ -322,6 +519,8 @@ def _build_integrations_router(
     registry: IntegrationRegistry | None = None,
     credential_store: CredentialStorePort | None = None,
     credential_enrollment_service: CredentialEnrollmentService | None = None,
+    oauth_clients: OAuthClientRegistry | None = None,
+    mcp_internal_hosts: Sequence[str] = (),
 ) -> APIRouter:
     """Create FastAPI router for integration management endpoints."""
     router = APIRouter(
@@ -343,12 +542,28 @@ def _build_integrations_router(
                 credential_status="missing",
             )
         metadata = credential.metadata
+        expires_at = metadata.get("auth_expires_at")
+        auth_state = str(metadata.get("auth_state") or "configured")
+        error_code = metadata.get("auth_error_code")
+        if metadata.get("renewal_owner") == OAUTH_ENGINE:
+            # Check on demand, under the existing authorized connection request.
+            # A vault outage must not be reported as a revoked user grant.
+            expires_at = None
+            try:
+                current = await credential_store.get_value(
+                    "user", connection.owner_id, connection.credential_name
+                )
+                expires_at = (current or {}).get("expires_at")
+            except OAuthCredentialUnavailableError as exc:
+                auth_state = "auth_required" if exc.reconnect else "unavailable"
+                error_code = "oauth_reconnect_required" if exc.reconnect else "oauth_unavailable"
+        if expires_at and datetime.fromisoformat(str(expires_at)) <= datetime.now(UTC):
+            auth_state = "auth_required"
         return IntegrationResponse.from_connection(
             connection,
-            credential_status=str(metadata.get("auth_state") or "configured"),
-            credential_error_code=(
-                str(metadata["auth_error_code"]) if metadata.get("auth_error_code") else None
-            ),
+            credential_status=auth_state,
+            credential_expires_at=str(expires_at) if expires_at else None,
+            credential_error_code=str(error_code) if error_code else None,
             credential_status_updated_at=(
                 str(metadata["auth_state_updated_at"])
                 if metadata.get("auth_state_updated_at")
@@ -377,7 +592,89 @@ def _build_integrations_router(
         if registry is None:
             return []
         definitions = registry.list_definitions()
-        return [CatalogEntryResponse.from_definition(d) for d in definitions]
+        entries = []
+        for definition in definitions:
+            entry = CatalogEntryResponse.from_definition(definition)
+            enrollment_method = (
+                definition.credential_enrollment.method
+                if definition.credential_enrollment is not None
+                else ""
+            )
+            if enrollment_method == "oauth_authorization_code" and oauth_clients is not None:
+                entry.sign_in_available = oauth_clients.has_usable(definition.slug)
+            elif credential_enrollment_service is not None:
+                entry.sign_in_available = credential_enrollment_service.available(definition.slug)
+            if oauth_clients is not None and not entry.sign_in_available:
+                entry.sign_in_needs_app = oauth_clients.supports(
+                    definition.slug
+                ) and not oauth_clients.has_usable(definition.slug)
+            entries.append(entry)
+        return entries
+
+    def _require_oauth_clients() -> OAuthClientRegistry:
+        if oauth_clients is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth applications cannot be registered on this install",
+            )
+        return oauth_clients
+
+    def _client_response(client: OAuthClient) -> OAuthClientResponse:
+        return OAuthClientResponse(
+            slug=client.slug,
+            app=client.app,
+            client_id=client.client_id,
+            has_secret=bool(client.client_secret),
+            base_url=client.base_url,
+            source=client.source,
+        )
+
+    @router.get("/oauth-clients", response_model=list[OAuthClientResponse])
+    async def list_oauth_clients(
+        principal: Principal = Depends(extract_principal),
+    ) -> list[OAuthClientResponse]:
+        """The OAuth applications this install signs in through."""
+        del principal
+        return [_client_response(client) for client in _require_oauth_clients().list()]
+
+    @router.put("/oauth-clients/{slug}", response_model=OAuthClientResponse)
+    async def register_oauth_client(
+        data: OAuthClientRegisterRequest,
+        slug: str = Path(description="Integration slug, e.g. github"),
+        principal: Principal = Depends(extract_principal),
+    ) -> OAuthClientResponse:
+        """Register the application (client id, optional secret) this install signs in through."""
+        clients = _require_oauth_clients()
+        try:
+            client = await clients.register(
+                slug,
+                data.client_id,
+                data.client_secret,
+                app=app_key(data.app),
+                base_url=data.base_url,
+            )
+        except OAuthClientError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        logger.info(
+            "OAuth application %r for %s registered by %s", client.app, slug, principal.user_id
+        )
+        return _client_response(client)
+
+    @router.delete("/oauth-clients/{slug}", status_code=status.HTTP_204_NO_CONTENT)
+    async def remove_oauth_client(
+        slug: str = Path(description="Integration slug, e.g. github"),
+        app: str = "",
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Forget a registered application; a configured one cannot be removed here."""
+        del principal
+        try:
+            await _require_oauth_clients().remove(slug, app_key(app))
+        except OAuthClientError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.post(
         "/enrollments",
@@ -399,6 +696,7 @@ def _build_integrations_router(
                 slug=data.slug,
                 credential_name=data.credential_name,
                 connection_id=data.connection_id,
+                oauth_app=app_key(data.oauth_app) if data.oauth_app else "",
             )
         except CredentialEnrollmentError as exc:
             raise HTTPException(
@@ -443,6 +741,22 @@ def _build_integrations_router(
             enrollment = await credential_enrollment_service.cancel(enrollment_id, principal)
         except CredentialEnrollmentError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return CredentialEnrollmentResponse.from_domain(enrollment)
+
+    @router.post("/enrollments/{enrollment_id}/code", response_model=CredentialEnrollmentResponse)
+    async def submit_enrollment_code(
+        enrollment_id: UUID,
+        data: CredentialEnrollmentCodeRequest,
+        principal: Principal = Depends(extract_principal),
+    ) -> CredentialEnrollmentResponse:
+        if credential_enrollment_service is None:
+            raise HTTPException(status_code=503, detail="Interactive enrollment is unavailable")
+        try:
+            enrollment = await credential_enrollment_service.submit_code(
+                enrollment_id, principal, data.code
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return CredentialEnrollmentResponse.from_domain(enrollment)
 
     @router.get(
@@ -516,6 +830,8 @@ def _build_integrations_router(
                     canonical_path=canonical_prefix,
                 ),
             )
+        if data.slug == "mcp":
+            raise HTTPException(422, "Connect MCP servers through the MCP connection endpoint")
         definition = (
             registry.get_definition(data.slug) if registry is not None and data.slug else None
         )
@@ -563,11 +879,23 @@ def _build_integrations_router(
                 definition.credential_schema,
                 credential_data,
             )
-            if credential_errors:
+            config_errors = _validate_required_fields(definition.config_schema, data.config)
+            if credential_errors or config_errors:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=credential_errors,
+                    detail=credential_errors + config_errors,
                 )
+            # Storing under a name another connection of the same provider
+            # already uses would silently overwrite that account's secret.
+            for existing in await integration_repo.list_connections(principal.user_id):
+                if existing.slug == definition.slug and existing.credential_name == credential_name:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"{definition.name} is already connected as {credential_name!r}; "
+                            "give this account another name"
+                        ),
+                    )
 
             await credential_store.store(
                 owner_type="user",
@@ -576,15 +904,31 @@ def _build_integrations_router(
                 secret_type=_secret_type_for_definition(definition),
                 data={str(key): str(value) for key, value in credential_data.items()},
                 metadata={
+                    **(
+                        credential_metadata
+                        if isinstance(credential_metadata, dict)
+                        else {"metadata": str(credential_metadata)}
+                    ),
                     "source": "integration",
                     "integration": definition.slug,
                     "integration_type": str(definition.integration_type),
                     "auth_type": definition.auth_type,
                     "auth_state": "active",
-                    **(
-                        credential_metadata
-                        if isinstance(credential_metadata, dict)
-                        else {"metadata": str(credential_metadata)}
+                    "tenant_id": principal.tenant_id,
+                    "oauth_app": str(data.config.get("oauth_app") or "default"),
+                    "oauth_token_field": (
+                        definition.credential_enrollment.credential_field
+                        if definition.credential_enrollment
+                        else next(
+                            (
+                                k
+                                for k, v in definition.oauth.token_field_mapping.items()
+                                if v == "access_token"
+                            ),
+                            "access_token",
+                        )
+                        if definition.oauth
+                        else "token"
                     ),
                 },
             )
@@ -652,6 +996,54 @@ def _build_integrations_router(
                 detail=f"Integration not found: {connection_id}",
             )
 
+        if existing.slug == "mcp" and (
+            data.credential_name is not None
+            or (data.config is not None and data.config != existing.config)
+        ):
+            raise HTTPException(422, "Reconnect the MCP server to change its authentication")
+        if data.credential is not None:
+            definition = registry.get_definition(existing.slug) if registry else None
+            if (
+                existing.owner_id != principal.user_id
+                or existing.slug == "mcp"
+                or definition is None
+                or not definition.credential_schema.get("properties")
+            ):
+                raise HTTPException(422, "Reconnect this account through its provider sign-in flow")
+            if data.credential_name is not None:
+                raise HTTPException(422, "Cannot rename a credential while replacing it")
+            if credential_store is None:
+                raise HTTPException(503, "Credential storage is not available")
+            current_credential = await credential_store.get(
+                "user", existing.owner_id, existing.credential_name
+            )
+            if (
+                current_credential
+                and current_credential.metadata.get("renewal_owner") == OAUTH_ENGINE
+            ):
+                raise HTTPException(422, "Reconnect this OAuth account through provider sign-in")
+            errors = _validate_required_fields(definition.credential_schema, data.credential)
+            errors += _validate_required_fields(
+                definition.config_schema,
+                data.config if data.config is not None else existing.config,
+            )
+            if not data.credential or errors:
+                raise HTTPException(422, errors or "Credential data is required")
+            await credential_store.store(
+                owner_type="user",
+                owner_id=existing.owner_id,
+                name=existing.credential_name,
+                secret_type=_secret_type_for_definition(definition),
+                data=data.credential,
+                metadata={
+                    "source": "integration",
+                    "integration": definition.slug,
+                    "integration_type": str(definition.integration_type),
+                    "auth_type": definition.auth_type,
+                    "auth_state": "active",
+                    "tenant_id": principal.tenant_id,
+                },
+            )
         now = datetime.now(UTC)
         updated = IntegrationConnection(
             id=existing.id,
@@ -698,6 +1090,10 @@ def _build_integrations_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Integration not found: {connection_id}",
             )
+        if existing.slug == "mcp":
+            if credential_store is None:
+                raise HTTPException(503, "Credential store unavailable")
+            await credential_store.delete("user", existing.owner_id, existing.credential_name)
         await integration_repo.delete_connection(connection_id)
 
     @router.post(
@@ -726,6 +1122,38 @@ def _build_integrations_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Integration not found: {connection_id}",
             )
+
+        if existing.slug == "mcp":
+            try:
+                if credential_store is None or registry is None:
+                    raise ValueError("MCP credential store unavailable")
+                credential = await credential_store.get(
+                    "user", existing.owner_id, existing.credential_name
+                )
+                spec = registry.mcp_spec(existing)
+                if (
+                    credential is None
+                    or spec is None
+                    or credential.metadata.get("mcp_url") != spec.url
+                    or credential.metadata.get("tenant_id") != principal.tenant_id
+                ):
+                    raise ValueError("MCP credential binding mismatch")
+                values = await credential_store.get_value(
+                    "user", existing.owner_id, existing.credential_name
+                )
+                token = (values or {}).get(spec.token_field)
+                if not token:
+                    raise ValueError("MCP access token missing")
+                await MCPOAuthDiscovery(
+                    request_timeout=PROBE_TIMEOUT_SECONDS, internal_hosts=mcp_internal_hosts
+                ).initialize(spec.url, {spec.auth_header: spec.auth_prefix + token})
+            except Exception:
+                return IntegrationTestResult(
+                    success=False,
+                    provider="MCP",
+                    error="MCP initialization failed; check the endpoint or reconnect",
+                )
+            return IntegrationTestResult(success=True, provider="MCP", detail="MCP initialized")
 
         try:
             if existing.integration_type == IntegrationType.ISSUE_TRACKER:
@@ -766,10 +1194,10 @@ def _build_integrations_router(
                         provider=existing.adapter.rsplit(".", 1)[-1],
                         error="Credential not found",
                     )
-                return IntegrationTestResult(
-                    success=True,
-                    provider=existing.adapter.rsplit(".", 1)[-1],
-                )
+                definition = registry.get_definition(existing.slug) if registry else None
+                if existing.integration_type == IntegrationType.SOURCE_CONTROL:
+                    return await probe_source_control(existing, cred_value)
+                return await probe_ai_provider(existing, definition, cred_value)
 
             return IntegrationTestResult(
                 success=False,
@@ -794,6 +1222,8 @@ def create_integrations_router(
     registry: IntegrationRegistry | None = None,
     credential_store: CredentialStorePort | None = None,
     credential_enrollment_service: CredentialEnrollmentService | None = None,
+    oauth_clients: OAuthClientRegistry | None = None,
+    mcp_internal_hosts: Sequence[str] = (),
 ) -> APIRouter:
     """Create the canonical shared integrations router."""
     return _build_integrations_router(
@@ -803,6 +1233,8 @@ def create_integrations_router(
         registry=registry,
         credential_store=credential_store,
         credential_enrollment_service=credential_enrollment_service,
+        oauth_clients=oauth_clients,
+        mcp_internal_hosts=mcp_internal_hosts,
     )
 
 
@@ -813,6 +1245,8 @@ def create_canonical_integrations_router(
     registry: IntegrationRegistry | None = None,
     credential_store: CredentialStorePort | None = None,
     credential_enrollment_service: CredentialEnrollmentService | None = None,
+    oauth_clients: OAuthClientRegistry | None = None,
+    mcp_internal_hosts: Sequence[str] = (),
 ) -> APIRouter:
     """Backward-compatible alias for the canonical shared integrations router."""
     return create_integrations_router(
@@ -822,4 +1256,6 @@ def create_canonical_integrations_router(
         registry=registry,
         credential_store=credential_store,
         credential_enrollment_service=credential_enrollment_service,
+        oauth_clients=oauth_clients,
+        mcp_internal_hosts=mcp_internal_hosts,
     )

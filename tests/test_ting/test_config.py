@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from ting.config import DatabaseConfig, LoggingConfig, Settings
+from ting.config import (
+    DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS,
+    DatabaseConfig,
+    DispatchConfig,
+    LoggingConfig,
+    Settings,
+    WorkflowExecutionConfig,
+)
 
 
 class TestDatabaseConfig:
@@ -45,6 +52,15 @@ class TestSettings:
         settings = Settings(database=DatabaseConfig(host="custom-host"))
         assert settings.database.host == "custom-host"
 
+    def test_shared_integrations_accepts_platform_env_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INTEGRATIONS__DATABASE_NAME", "niuu_shared")
+
+        settings = Settings()
+
+        assert settings.shared_integrations.database_name == "niuu_shared"
+
     def test_server_and_platform_legacy_aliases(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOST", "127.0.0.2")
         monkeypatch.setenv("PORT", "8181")
@@ -80,3 +96,93 @@ class TestSettings:
 
         with pytest.raises(ValueError, match=field):
             Settings()
+
+
+class TestWorkflowCliTurnTimeout:
+    """``dispatch.workflow_cli_turn_timeout_seconds`` bounds a Claude Code persona's turn."""
+
+    def test_defaults_to_120_seconds(self) -> None:
+        assert DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS == 120.0
+        assert DispatchConfig().workflow_cli_turn_timeout_seconds == 120.0
+        assert Settings().dispatch.workflow_cli_turn_timeout_seconds == 120.0
+
+    def test_config_file_shape_sets_it(self) -> None:
+        settings = Settings(dispatch={"workflow_cli_turn_timeout_seconds": 900})
+
+        assert settings.dispatch.workflow_cli_turn_timeout_seconds == 900.0
+
+    def test_environment_sets_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DISPATCH__WORKFLOW_CLI_TURN_TIMEOUT_SECONDS", "1800")
+
+        assert Settings().dispatch.workflow_cli_turn_timeout_seconds == 1800.0
+
+    def test_zero_turns_the_limit_off_and_is_accepted(self) -> None:
+        assert (
+            DispatchConfig(workflow_cli_turn_timeout_seconds=0).workflow_cli_turn_timeout_seconds
+            == 0.0
+        )
+
+    @pytest.mark.parametrize("value", [-1, -0.5, "nan", "inf", "-inf", "ten minutes"])
+    def test_negative_non_finite_or_non_numeric_values_fail_loudly(self, value: object) -> None:
+        with pytest.raises(ValueError, match="workflow_cli_turn_timeout_seconds"):
+            DispatchConfig(workflow_cli_turn_timeout_seconds=value)
+
+
+class TestWorkflowExecutionConfig:
+    """The generic pack and its code-delivery specialization gate independently."""
+
+    def test_defaults_are_generic_only(self) -> None:
+        config = WorkflowExecutionConfig()
+        assert config.enabled is False
+        assert config.delivery.enabled is False
+        # Delivery-only settings moved off the top-level model entirely.
+        assert not hasattr(config, "evidence_policy_id")
+        assert not hasattr(config, "integration_policy_id")
+        assert not hasattr(config, "review_producers")
+
+    def test_delivery_enabled_requires_workflow_execution_enabled(self) -> None:
+        with pytest.raises(ValueError, match="requires workflow_execution.enabled"):
+            WorkflowExecutionConfig(enabled=False, delivery={"enabled": True})
+
+    def test_delivery_enabled_with_workflow_execution_enabled_is_accepted(self) -> None:
+        config = WorkflowExecutionConfig(enabled=True, delivery={"enabled": True})
+        assert config.delivery.enabled is True
+
+    def test_rejects_ting_delivery_wait_observer_while_delivery_is_disabled(self) -> None:
+        with pytest.raises(ValueError, match="ting.delivery"):
+            WorkflowExecutionConfig(
+                enabled=True,
+                delivery={"enabled": False},
+                wait_observers=[
+                    {
+                        "condition_type": "forge.checks",
+                        "adapter": "ting.delivery.wait_observers.ForgeChecksWaitObserver",
+                    }
+                ],
+            )
+
+    def test_accepts_ting_delivery_wait_observer_once_delivery_is_enabled(self) -> None:
+        config = WorkflowExecutionConfig(
+            enabled=True,
+            delivery={"enabled": True},
+            wait_observers=[
+                {
+                    "condition_type": "forge.checks",
+                    "adapter": "ting.delivery.wait_observers.ForgeChecksWaitObserver",
+                }
+            ],
+        )
+        assert config.wait_observers[0]["adapter"].endswith("ForgeChecksWaitObserver")
+
+    def test_generic_only_wait_observer_is_unaffected_by_delivery_state(self) -> None:
+        config = WorkflowExecutionConfig(
+            enabled=True,
+            delivery={"enabled": False},
+            wait_observers=[
+                {
+                    "condition_type": "timer",
+                    "adapter": "ting.adapters.timer_wait_observer.TimerWaitObserver",
+                }
+            ],
+        )
+        assert config.wait_observers[0]["condition_type"] == "timer"

@@ -1,5 +1,5 @@
 import { useMemo, useState, type FormEvent } from 'react';
-import { useNavigate } from '@tanstack/react-router';
+import { useNavigate, useSearch } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useService } from '@niuulabs/plugin-sdk';
 import { BranchSelect, RepoSelect, type RepoRecord } from '@niuulabs/ui';
@@ -9,6 +9,7 @@ import { useWorkflows } from './useWorkflows';
 
 type RepoCatalogService = {
   getRepos(): Promise<RepoRecord[]>;
+  getBranches(repoUrl: string): Promise<string[]>;
 };
 
 function hasResearchTag(tags: string[] | undefined): boolean {
@@ -17,6 +18,7 @@ function hasResearchTag(tags: string[] | undefined): boolean {
 
 export function ResearchNewPage() {
   const navigate = useNavigate();
+  const routeSearch = useSearch({ strict: false }) as { returnTo?: string };
   const repoCatalog = useService<RepoCatalogService>('niuu.repos');
   const dispatchBus = useService<IDispatchBus>('ting.dispatch');
   const createCampaign = useCreateResearchCampaign();
@@ -88,6 +90,13 @@ export function ResearchNewPage() {
       branch,
       connectionId: effectiveConnectionId || undefined,
     });
+    if (routeSearch.returnTo === '/ting/work') {
+      void navigate({
+        to: '/ting/work/$workId' as never,
+        params: { workId: `campaign:${campaign.id}` } as never,
+      });
+      return;
+    }
     void navigate({ to: '/ting/research/$slug', params: { slug: campaign.slug } });
   }
 
@@ -362,6 +371,7 @@ export function ResearchNewPage() {
               <span className="niuu:text-sm niuu:font-medium niuu:text-text-primary">Branch</span>
               {repo && repos.length > 0 ? (
                 <BranchSelect
+                  loadBranches={repoCatalog.getBranches}
                   repos={repos}
                   selectedRepos={repo}
                   value={branch}

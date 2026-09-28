@@ -55,6 +55,18 @@ def test_shared_db_does_not_embed_volundr_session_migrations() -> None:
         assert "ALTER TABLE sessions" not in block
 
 
+def test_shared_db_does_not_embed_resident_runtimes_migrations() -> None:
+    # resident_runtimes (000055) is a volundr-only table; 000079 ALTERs it and
+    # would fail against a standalone niuu-shared database that never created it.
+    template = (CHART_DIR / "templates" / "migrations-configmap.yaml").read_text()
+    blocks = _migration_blocks(template)
+
+    assert "000055_resident_runtimes.up.sql" not in blocks
+    assert "000079_resident_realm_binding.up.sql" not in blocks
+    for block in blocks.values():
+        assert "resident_runtimes" not in block
+
+
 def _rendered_documents(*extra_args: str) -> list[dict]:
     result = subprocess.run(
         ["helm", "template", "test", str(CHART_DIR), *extra_args],
@@ -78,6 +90,29 @@ def test_credential_enrollment_runner_renders_unsupported_by_default() -> None:
     runner = config["credential_enrollment_runner"]
     assert runner["adapter"].endswith("UnsupportedCredentialEnrollmentRunner")
     assert runner["secret_kwargs_env"] == {}
+
+
+def test_native_login_runner_has_dedicated_namespace_and_scoped_rbac():
+    documents = _rendered_documents(
+        "--set",
+        "credentialEnrollmentRunner.adapter="
+        "volundr.adapters.outbound.k8s_login_runner.KubernetesLoginRunner",
+        "--set",
+        "credentialEnrollmentRunner.kwargs.image=test-only/skuld:pinned",
+        "--set",
+        "credentialEnrollmentRunner.kwargs.namespace=test-logins",
+    )
+    namespace = next(doc for doc in documents if doc["kind"] == "Namespace")
+    assert namespace["metadata"]["name"] == "test-logins"
+    role = next(doc for doc in documents if doc["kind"] == "Role")
+    assert role["metadata"]["namespace"] == "test-logins"
+    assert {resource for rule in role["rules"] for resource in rule["resources"]} == {
+        "jobs",
+        "pods",
+        "pods/exec",
+    }
+    binding = next(doc for doc in documents if doc["kind"] == "RoleBinding")
+    assert binding["subjects"][0]["namespace"] == "default"
 
 
 def test_credential_enrollment_runner_secret_kwargs_reach_the_deployment() -> None:

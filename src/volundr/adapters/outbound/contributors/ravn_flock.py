@@ -3,7 +3,7 @@
 When workload_type == "ravn_flock", this contributor replaces the default
 single-CLI layout with:
   - Skuld container with mesh.enabled=true + nng ports + Sleipnir webhook
-  - N ravn daemon sidecar containers (one per persona in workload_config.personas)
+  - N regular ravn daemon containers (one per persona in workload_config.personas)
   - Per-sidecar initContainer that writes YAML config to an emptyDir volume
     mounted read-only at /etc/ravn/config.yaml (RAVN_CONFIG env var points here)
   - nng mesh ports allocated via the same scheme as ravn flock init
@@ -25,7 +25,7 @@ from typing import Any
 
 import yaml
 
-from niuu.domain.llm_merge import _SECURITY_KEYS, merge_llm
+from niuu.domain.llm_merge import _SECURITY_KEYS, is_empty, merge_llm
 from niuu.mesh import nng_gateway_port_for as _gateway_port_for
 from niuu.mesh import nng_ports_for as _ports_for
 from volundr.domain.models import (
@@ -58,7 +58,8 @@ _RAVN_COMMAND = [
     (
         "import os, pathlib, subprocess, sys\n"
         "persona = os.environ.get('RAVN_PERSONA') or 'ravn'\n"
-        "log = pathlib.Path('/workspace/.flock/logs') / f'{persona}.log'\n"
+        "log = pathlib.Path(os.environ.get('RAVN_LOG_PATH', "
+        "f'/workspace/.flock/logs/{persona}.log'))\n"
         "log.parent.mkdir(parents=True, exist_ok=True)\n"
         "proc = subprocess.Popen(\n"
         "    [\n"
@@ -274,7 +275,16 @@ def _resolve_mimir_runtime(
         }
         url = str(raw_ref.get("url") or "").strip()
         path = str(raw_ref.get("path") or "").strip()
-        if url:
+        if raw_ref.get("adapter"):
+            instance["adapter"] = str(raw_ref["adapter"])
+            instance["kwargs"] = dict(raw_ref.get("kwargs") or {})
+            instance["secret_kwargs_env"] = dict(raw_ref.get("secret_kwargs_env") or {})
+            auth_ref = raw_ref.get("auth_ref") or raw_ref.get("authRef")
+            if instance["adapter"] == "ravn.adapters.mimir.gbrain.GBrainMimirAdapter" and auth_ref:
+                instance["kwargs"].pop("api_token", None)
+                instance["secret_kwargs_env"].pop("api_token", None)
+                instance["kwargs"]["api_token_file"] = _mimir_token_file(str(auth_ref))
+        elif url:
             instance["url"] = url
         elif path:
             instance["path"] = path
@@ -286,6 +296,10 @@ def _resolve_mimir_runtime(
         if auth := _mimir_auth_from_ref(raw_ref.get("auth_ref") or raw_ref.get("authRef")):
             instance["auth"] = auth
 
+        if "default_read_priority" in raw_ref or "defaultReadPriority" in raw_ref:
+            instance["read_priority"] = int(
+                raw_ref.get("default_read_priority", raw_ref.get("defaultReadPriority"))
+            )
         categories = _string_list(raw_ref.get("categories"))
         if categories:
             instance["categories"] = categories
@@ -402,13 +416,19 @@ def _normalize_instance(raw_instance: dict[str, Any]) -> dict[str, Any] | None:
     }
     url = str(raw_instance.get("url") or "").strip()
     path = str(raw_instance.get("path") or "").strip()
-    if url:
+    if raw_instance.get("adapter"):
+        instance["adapter"] = str(raw_instance["adapter"])
+        instance["kwargs"] = dict(raw_instance.get("kwargs") or {})
+        instance["secret_kwargs_env"] = dict(raw_instance.get("secret_kwargs_env") or {})
+    elif url:
         instance["url"] = url
     elif path:
         instance["path"] = path
     else:
         return None
 
+    if "read_priority" in raw_instance:
+        instance["read_priority"] = int(raw_instance["read_priority"])
     categories = _string_list(raw_instance.get("categories"))
     if categories:
         instance["categories"] = categories
@@ -491,6 +511,7 @@ def _build_ravn_config(
     persona_source_http_base_url: str = "",
     workflow: dict[str, Any] | None = None,
     extra_ravn_config: dict[str, Any] | None = None,
+    workspace_root: str = _WORKSPACE_MOUNT_PATH,
 ) -> str:
     """Generate the ravn daemon YAML config for a single flock node.
 
@@ -515,8 +536,10 @@ def _build_ravn_config(
 
     max_tasks = persona_override.get("max_concurrent_tasks") or global_max_concurrent_tasks
 
+    state_root = f"{workspace_root}/.ravn/{persona}"
     config: dict[str, Any] = {
         "persona": persona,
+        "memory": {"path": f"{state_root}/memory.db"},
         "mesh": {
             "enabled": True,
             "adapter": "nng",
@@ -547,10 +570,8 @@ def _build_ravn_config(
         "initiative": {
             "enabled": True,
             "max_concurrent_tasks": max_tasks,
-            # All personas share /workspace, but each daemon owns its queue.
-            # Sharing the default journal makes every sidecar restore the same
-            # interrupted task after a pod restart.
-            "queue_journal_path": f"{_WORKSPACE_MOUNT_PATH}/.ravn/daemon/{persona}-queue.json",
+            # Each daemon owns its queue, cron store and local memory.
+            "queue_journal_path": f"{state_root}/daemon/queue.json",
         },
         "mimir": {
             "enabled": True,
@@ -558,7 +579,7 @@ def _build_ravn_config(
             "write_routing": mimir_write_routing,
         },
         "permission": {
-            "workspace_root": _WORKSPACE_MOUNT_PATH,
+            "workspace_root": workspace_root,
         },
         "logging": {"level": "INFO"},
     }
@@ -581,6 +602,19 @@ def _build_ravn_config(
     # iteration_budget is also mirrored to initiative for future initiative-level use.
     po: dict = {}
     system_prompt_extra = persona_override.get("system_prompt_extra") or ""
+    if mimir_instances:
+        wells = ", ".join(instance["name"] for instance in mimir_instances)
+        system_prompt_extra += (
+            f"\n\nAttached memory wells: {wells}. Use mimir_search before writing; "
+            "use mimir_read to inspect results, mimir_write to save durable findings, "
+            "and use the mimir parameter on writes to target a named well. Read operations "
+            "search across configured mounts in priority order. Respect the configured "
+            "write routing and preserve source attribution. These tools use the actual "
+            "backend attached to each well. gbrain wells support search, read, write, "
+            "query and ingestion; they do not support Mimir raw-source retrieval or "
+            "Mimir lint. Native dream cycles run on the gbrain service; do not attach "
+            "a warden or pretend unsupported operations succeeded."
+        )
     if system_prompt_extra.strip():
         po["system_prompt_extra"] = system_prompt_extra
     budget = persona_override.get("iteration_budget") or 0
@@ -603,7 +637,13 @@ def _build_ravn_config(
     if po:
         config["persona_overrides"] = po
 
-    if persona_source_mode == _PERSONA_SOURCE_MOUNTED_VOLUME:
+    portable_definition = persona_override.get("portable_definition")
+    if isinstance(portable_definition, dict):
+        config["persona_source"] = {
+            "adapter": "ravn.adapters.personas.inline.InlinePersonaAdapter",
+            "kwargs": {"definitions": {persona: portable_definition}},
+        }
+    elif persona_source_mode == _PERSONA_SOURCE_MOUNTED_VOLUME:
         config["persona_source"] = {
             "adapter": "ravn.adapters.personas.mounted_volume.MountedVolumePersonaAdapter",
             "kwargs": {"mount_path": persona_source_mount_path},
@@ -626,6 +666,11 @@ def _build_ravn_config(
 
     if extra_ravn_config:
         config = _deep_merge_config(config, extra_ravn_config)
+    if workflow and workflow.get("result_schema"):
+        runtime_workflow = config.get("workflow")
+        if not isinstance(runtime_workflow, dict):
+            raise ValueError("Ravn workflow override must remain an object")
+        runtime_workflow["result_schema"] = dict(workflow["result_schema"])
 
     return yaml.safe_dump(config, default_flow_style=False, sort_keys=False)
 
@@ -645,6 +690,7 @@ def _normalize_workflow_config(
     workflow: dict[str, Any] | None,
     initiative_context: str,
     trace_context: dict[str, str] | None = None,
+    result_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(workflow, dict):
         return None
@@ -659,6 +705,7 @@ def _normalize_workflow_config(
         "version": str(workflow.get("version") or ""),
         "scope": str(workflow.get("scope") or ""),
         "initial_context": initiative_context,
+        "result_schema": dict(result_schema or {}),
         "graph": graph,
         "trace_context": dict(trace_context or {}),
     }
@@ -734,16 +781,71 @@ def _default_flock_trigger_config(
     }
 
 
+def _resolve_flock_llm(*, default_llm: dict[str, Any], workload_llm: object) -> dict[str, Any]:
+    """Return the flock-wide LLM config every node starts from.
+
+    ``workload_config.llm_config`` is merged over the Forge default
+    (``ravn_flock_llm_config``), last wins per key; per-persona ``llm``
+    overrides are merged over the result for each node.
+
+    The session ``model`` is deliberately not a layer: in a flock it is the
+    Skuld broker's own CLI model, and Ting fills it with its dispatch default,
+    so reading it here would hand a Ravn a model meant for another agent.
+    """
+    if workload_llm is not None and not isinstance(workload_llm, dict):
+        raise ValueError(
+            "workload_config.llm_config must be a mapping in Ravn's llm: shape "
+            f"(model, max_tokens, provider), got {type(workload_llm).__name__}"
+        )
+    return merge_llm(defaults=default_llm, global_override=workload_llm)
+
+
+def _persona_model(persona_dict: dict[str, Any]) -> object:
+    persona_llm = persona_dict.get("llm")
+    return persona_llm.get("model") if isinstance(persona_llm, dict) else None
+
+
+def _require_node_models(
+    persona_dicts: list[dict[str, Any]],
+    global_llm: dict[str, Any],
+    extra_ravn_config: dict[str, Any] | None,
+) -> None:
+    """Refuse to launch a flock whose nodes would start without a named model.
+
+    A node config without ``llm.model`` runs on Ravn's built-in default — a
+    model nobody chose for this flock, discovered only when every reply fails.
+    """
+    if not is_empty(global_llm.get("model")):
+        return
+    ravn_config_llm = (extra_ravn_config or {}).get("llm")
+    if isinstance(ravn_config_llm, dict) and not is_empty(ravn_config_llm.get("model")):
+        return
+    missing = [pd["name"] for pd in persona_dicts if is_empty(_persona_model(pd))]
+    if not missing:
+        return
+    raise ValueError(
+        f"ravn_flock: no LLM model configured for persona(s) {', '.join(missing)}. "
+        "Name one with workload_config.llm_config.model or a per-persona llm.model, "
+        "or configure the Forge default ravn_flock_llm_config "
+        "(Helm value ravnFlockLlmConfig)."
+    )
+
+
 class RavnFlockContributor(SessionContributor):
     """Contributes flock pod spec when workload_type == 'ravn_flock'.
 
     Resolves the launch spec from the session context, reads
     workload_config.personas + mesh/mimir/sleipnir settings, then:
       - Emits Skuld mesh env vars (SKULD__MESH__*, nng addresses)
-      - Emits one ravn sidecar container per persona with RAVN_CONFIG env
+      - Emits one regular ravn container per persona with RAVN_CONFIG env
       - Emits per-sidecar initContainer + emptyDir volume for mounted config
       - Emits a Mimir emptyDir volume
       - Emits Sleipnir webhook env vars for both skuld and ravn containers
+
+    Each node's LLM is layered from *default_llm_config* (the Forge default),
+    ``workload_config.llm_config`` and per-persona ``llm`` overrides. A launch
+    that leaves any node without a model raises instead of starting nodes on
+    Ravn's built-in default.
 
     No-ops silently when workload_type != 'ravn_flock'.
     """
@@ -763,9 +865,12 @@ class RavnFlockContributor(SessionContributor):
         workload_identity_volume_name: str = "niuu-workload-identity",
         workload_identity_mount_path: str = _DEFAULT_WORKLOAD_IDENTITY_MOUNT_PATH,
         workload_identity_token_file_env: str = "NIUU_WORKLOAD_IDENTITY_TOKEN_FILE",
+        execution_credential_service: object | None = None,
+        default_llm_config: dict[str, Any] | None = None,
         **_extra: object,
     ) -> None:
         self._launch_spec_provider = launch_spec_provider
+        self._default_llm_config = dict(default_llm_config or {})
         self._ravn_image = ravn_image
         self._base_port = base_port
         self._mesh_host = mesh_host
@@ -777,6 +882,7 @@ class RavnFlockContributor(SessionContributor):
         self._workload_identity_volume_name = workload_identity_volume_name
         self._workload_identity_mount_path = workload_identity_mount_path.rstrip("/")
         self._workload_identity_token_file_env = workload_identity_token_file_env
+        self._execution_credential_service = execution_credential_service
 
     @property
     def name(self) -> str:
@@ -822,9 +928,38 @@ class RavnFlockContributor(SessionContributor):
         global_max_concurrent_tasks: int = wc.get(
             "max_concurrent_tasks", _DEFAULT_MAX_CONCURRENT_TASKS
         )
-        global_llm: dict | None = wc.get("llm_config") or None
+        global_llm = _resolve_flock_llm(
+            default_llm=self._default_llm_config,
+            workload_llm=wc.get("llm_config") or None,
+        )
+        provenance = wc.get("provenance")
+        provenance = provenance if isinstance(provenance, dict) else {}
         extra_ravn_config = wc.get("ravn_config")
         extra_ravn_config = extra_ravn_config if isinstance(extra_ravn_config, dict) else None
+        execution_provenance = (
+            provenance.get("workflow_execution") if isinstance(provenance, dict) else None
+        )
+        execution_credential_mounts: tuple[dict, ...] = ()
+        if isinstance(execution_provenance, dict):
+            anonymous = bool(
+                ((extra_ravn_config or {}).get("gateway") or {})
+                .get("platform", {})
+                .get("anonymous_dev_mode", False)
+            )
+            if self._execution_credential_service is None and not anonymous:
+                raise RuntimeError(
+                    "authenticated developer coordinator launch requires "
+                    "workflow_execution_credentials.enabled=true"
+                )
+            scrubbed_ravn_config = dict(extra_ravn_config or {})
+            execution_config = dict(scrubbed_ravn_config.get("workflow_execution") or {})
+            execution_config.pop("auth_token", None)
+            if self._execution_credential_service is not None:
+                projection = self._execution_credential_service.projection(session.id)
+                execution_config["auth_token_file"] = projection.token_file
+                execution_credential_mounts = projection.pod_spec.volume_mounts
+            scrubbed_ravn_config["workflow_execution"] = execution_config
+            extra_ravn_config = scrubbed_ravn_config
         observability_config = wc.get("observability")
         observability_config = (
             {
@@ -851,8 +986,6 @@ class RavnFlockContributor(SessionContributor):
         except (TypeError, ValueError):
             daily_budget_usd = None
         initiative_context = str(wc.get("initiative_context") or "")
-        provenance = wc.get("provenance")
-        provenance = provenance if isinstance(provenance, dict) else {}
         raw_trace_context = provenance.get("trace_context")
         trace_context = (
             {
@@ -867,6 +1000,14 @@ class RavnFlockContributor(SessionContributor):
             wc.get("workflow"),
             initiative_context,
             trace_context,
+            wc.get("workflow_result_schema"),
+        )
+
+        _require_node_models(persona_dicts, global_llm, extra_ravn_config)
+        logger.info(
+            "ravn_flock: session=%s llm model=%s",
+            str(session.id)[:8],
+            global_llm.get("model") or "(set per node)",
         )
 
         values, pod_spec = self._build_flock_spec(
@@ -887,6 +1028,7 @@ class RavnFlockContributor(SessionContributor):
             extra_ravn_config=extra_ravn_config,
             observability_config=observability_config,
             runtime_backend=context.runtime_backend,
+            execution_credential_mounts=execution_credential_mounts,
         )
 
         return SessionContribution(values=values, pod_spec=pod_spec)
@@ -921,6 +1063,7 @@ class RavnFlockContributor(SessionContributor):
         extra_ravn_config: dict[str, Any] | None = None,
         observability_config: dict[str, Any] | None = None,
         runtime_backend: str = "",
+        execution_credential_mounts: tuple[dict, ...] = (),
     ) -> tuple[dict[str, Any], PodSpecAdditions]:
         session_id = str(session.id)
         base_port = self._base_port
@@ -929,7 +1072,10 @@ class RavnFlockContributor(SessionContributor):
         requires_local_mimir_mount = _requires_local_mimir_mount(mimir_instances)
         ravn_container_names = [f"ravn-{pd['name']}" for pd in persona_dicts]
         requires_secret_mount = any(
-            isinstance(instance.get("auth"), dict)
+            str((instance.get("kwargs") or {}).get("api_token_file") or "").startswith(
+                f"{_OPENBAO_SECRET_VOLUME_PATH}/"
+            )
+            or isinstance(instance.get("auth"), dict)
             and str(instance["auth"].get("token_file") or "").startswith(
                 f"{_OPENBAO_SECRET_VOLUME_PATH}/"
             )
@@ -1119,7 +1265,8 @@ class RavnFlockContributor(SessionContributor):
         extra_containers: list[dict] = []
         config_volumes: list[dict] = []
         init_containers: list[dict] = []
-        openshell_processes: list[dict[str, Any]] = []
+        openshell_workloads: list[dict[str, Any]] = []
+        openshell_files: dict[str, str] = {}
 
         for i, persona_dict in enumerate(persona_dicts):
             persona = persona_dict["name"]
@@ -1129,6 +1276,11 @@ class RavnFlockContributor(SessionContributor):
             gw = _ravn_gateway_port_for(ravn_index, base_port)
 
             config_yaml = _build_ravn_config(
+                workspace_root=(
+                    "/sandbox/workspace"
+                    if runtime_backend == "openshell"
+                    else _WORKSPACE_MOUNT_PATH
+                ),
                 persona=persona,
                 persona_override=persona_dict,
                 global_llm=global_llm,
@@ -1175,7 +1327,7 @@ class RavnFlockContributor(SessionContributor):
                 {"name": "RAVN_PEER_ID", "value": peer_id},
                 {"name": "RAVN_CONFIG", "value": _RAVN_CONFIG_MOUNT_PATH},
                 {"name": "HOME", "value": _WORKSPACE_MOUNT_PATH},
-                {"name": "RAVN_STATE_DIR", "value": f"{_WORKSPACE_MOUNT_PATH}/.ravn"},
+                {"name": "RAVN_STATE_DIR", "value": f"{_WORKSPACE_MOUNT_PATH}/.ravn/{persona}"},
                 {"name": "HOST", "value": self._mesh_host},
                 {"name": "PORT", "value": str(gw)},
                 {
@@ -1216,6 +1368,7 @@ class RavnFlockContributor(SessionContributor):
                     {"name": _MIMIR_VOLUME_NAME, "mountPath": _MIMIR_MOUNT_PATH},
                 )
             volume_mounts.extend(persona_source_volume_mounts)
+            volume_mounts.extend(dict(mount) for mount in execution_credential_mounts)
 
             container: dict[str, Any] = {
                 "name": f"ravn-{persona}",
@@ -1233,7 +1386,8 @@ class RavnFlockContributor(SessionContributor):
             }
             extra_containers.append(container)
             if runtime_backend == "openshell":
-                config_path = f"/sandbox/.volundr/flock/{persona}.yaml"
+                config_path = f"/sandbox/workspace/.flock/config/{persona}.yaml"
+                openshell_files[config_path] = config_yaml
                 process_env = {
                     str(entry["name"]): str(entry.get("value") or "")
                     for entry in ravn_env
@@ -1243,26 +1397,35 @@ class RavnFlockContributor(SessionContributor):
                     {
                         "HOME": "/sandbox/workspace",
                         "RAVN_CONFIG": config_path,
-                        "RAVN_STATE_DIR": "/sandbox/workspace/.ravn",
+                        "RAVN_STATE_DIR": f"/sandbox/workspace/.ravn/{persona}",
+                        "RAVN_LOG_PATH": f"/sandbox/workspace/.flock/logs/{persona}.log",
                     }
                 )
                 process_env.pop(self._workload_identity_token_file_env, None)
-                openshell_processes.append(
+                openshell_workloads.append(
                     {
                         "name": f"ravn-{persona}",
-                        "command": [
-                            "/opt/niuu/bin/python",
-                            "-m",
-                            "ravn",
-                            "daemon",
-                            "--config",
-                            config_path,
-                            "--persona",
-                            persona,
+                        "image": self._ravn_image,
+                        "command": list(_RAVN_COMMAND),
+                        "environment": process_env,
+                        "volume_mounts": [
+                            {
+                                "name": "flock-ipc",
+                                "mount_path": "/tmp/niuu-mesh",
+                                "read_only": False,
+                            },
+                            *(
+                                [
+                                    {
+                                        "name": _MIMIR_VOLUME_NAME,
+                                        "mount_path": _MIMIR_MOUNT_PATH,
+                                        "read_only": False,
+                                    },
+                                ]
+                                if requires_local_mimir_mount
+                                else []
+                            ),
                         ],
-                        "env": process_env,
-                        "files": {config_path: config_yaml},
-                        "logPath": f"/sandbox/.volundr/flock/{persona}.log",
                     }
                 )
 
@@ -1300,10 +1463,41 @@ class RavnFlockContributor(SessionContributor):
         }
         if daily_budget_usd and daily_budget_usd > 0:
             values["flock"]["daily_budget_usd"] = float(daily_budget_usd)
+        if extra_ravn_config:
+            # LocalProcess and its Docker subclass regenerate node configs with
+            # ``ravn flock init``.  Retain the workload-scoped runtime overlay
+            # so that regeneration can apply the same config as pod sidecars.
+            values["flock"]["ravn_config"] = _deep_merge_config({}, extra_ravn_config)
         if workflow:
             values["workflow"] = workflow
-        if openshell_processes:
-            values["openshell"] = {"processes": openshell_processes}
+        if openshell_workloads:
+            if persona_source_mode == _PERSONA_SOURCE_MOUNTED_VOLUME:
+                raise ValueError(
+                    "OpenShell flock personas require filesystem or HTTP sources, not ConfigMaps"
+                )
+            if requires_secret_mount:
+                raise ValueError(
+                    "OpenShell flock credentials require dynamic providers, "
+                    "not injected secret files"
+                )
+            volumes = [{"name": "flock-ipc", "empty_dir": {}}]
+            mounts = [{"name": "flock-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": False}]
+            if requires_local_mimir_mount:
+                volumes.append({"name": _MIMIR_VOLUME_NAME, "empty_dir": {}})
+                mounts.append(
+                    {
+                        "name": _MIMIR_VOLUME_NAME,
+                        "mount_path": _MIMIR_MOUNT_PATH,
+                        "read_only": False,
+                    }
+                )
+            values["openshell"] = {
+                "workloads": openshell_workloads,
+                "files": openshell_files,
+                "volumes": volumes,
+                "volumeMounts": mounts,
+            }
+            pod_spec = PodSpecAdditions(env=tuple(skuld_env))
 
         if mimir_config:
             values["mimir"] = {

@@ -19,6 +19,7 @@ from niuu.domain.workflow_kickoff import (
     WORKFLOW_KICKOFF_ID_KEY,
     WORKFLOW_KICKOFF_REDELIVERY_KEY,
 )
+from niuu.mesh.transport_builder import TransportBuildError
 from ravn.feedback import EnvironmentFeedbackRecorder
 from skuld.broker import (
     Broker,
@@ -67,6 +68,95 @@ def _kickoff_ack_frame(
     }
 
 
+def _attested_review_id(session_id: str, peer_id: str, source_event_id: str) -> str:
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"niuulabs:attested-review:{session_id}:{peer_id}:event:{source_event_id}",
+        )
+    )
+
+
+# A workflow graph declaring an explicit review attestation for the three
+# candidate reviewer roles, the joinMode-all stage their personas must belong
+# to for that binding to validate, and the end node whose completion event
+# the broker attaches those attested reviews to.
+_WORKSTREAM_REVIEW_GRAPH = {
+    "executionContract": "developer-workstream/v1",
+    "reviewAttestation": {
+        "version": 1,
+        "scope": "workstream",
+        "eventType": "developer.review.completed",
+        "roles": {
+            "code": "developer-code-reviewer",
+            "security": "developer-security-reviewer",
+            "adversarial": "developer-adversarial-reviewer",
+        },
+    },
+    "nodes": [
+        {
+            "id": "workstream-reviews",
+            "kind": "stage",
+            "joinMode": "all",
+            "stageMembers": [
+                {"personaId": "developer-code-reviewer"},
+                {"personaId": "developer-security-reviewer"},
+                {"personaId": "developer-adversarial-reviewer"},
+            ],
+        },
+        {
+            "id": "workstream-complete",
+            "kind": "end",
+            "joinMode": "all",
+            "completionEvent": "developer.workstream.completed",
+        },
+    ],
+    "edges": [
+        {
+            "id": "workstream-reviews-complete",
+            "source": "workstream-reviews",
+            "target": "workstream-complete",
+            "label": "developer.workstream.completed -> developer.workstream.completed",
+        },
+    ],
+}
+
+# A second graph reusing none of _WORKSTREAM_REVIEW_GRAPH's event names, to
+# prove the broker's attested-terminal-delivery branch is driven by the
+# graph's own reviewAttestation and terminal node rather than a literal
+# event name.
+_RENAMED_ATTESTED_GRAPH = {
+    "reviewAttestation": {
+        "version": 1,
+        "scope": "workstream",
+        "eventType": "acme.review.completed",
+        "roles": {"code": "developer-code-reviewer"},
+    },
+    "nodes": [
+        {
+            "id": "acme-review",
+            "kind": "stage",
+            "joinMode": "all",
+            "stageMembers": [{"personaId": "developer-code-reviewer"}],
+        },
+        {
+            "id": "acme-complete",
+            "kind": "end",
+            "joinMode": "all",
+            "completionEvent": "acme.workflow.completed",
+        },
+    ],
+    "edges": [
+        {
+            "id": "acme-review-complete",
+            "source": "acme-review",
+            "target": "acme-complete",
+            "label": "acme.workflow.completed -> acme.workflow.completed",
+        },
+    ],
+}
+
+
 def _ack_kickoff(
     broker_instance: Broker,
     peer_id: str,
@@ -109,6 +199,36 @@ class TestBroker:
         # Ensure workspace_dir points to tmp_path
         settings.session.workspace_dir = str(tmp_path)
         return Broker(settings=settings)
+
+    async def test_background_resume_and_channel_start_join_one_handshake(self, test_broker):
+        entered, finish = asyncio.Event(), asyncio.Event()
+        transport = MagicMock(is_alive=False)
+
+        async def start():
+            entered.set()
+            # Codex becomes alive before its thread resume handshake completes.
+            transport.is_alive = True
+            await finish.wait()
+
+        transport.start = AsyncMock(side_effect=start)
+        test_broker._transport = transport
+        background = asyncio.create_task(test_broker._auto_start_transport())
+        await entered.wait()
+        channel = asyncio.create_task(test_broker._ensure_transport_started())
+        await asyncio.sleep(0)
+        assert not channel.done()
+        finish.set()
+        await asyncio.gather(background, channel)
+        transport.start.assert_awaited_once()
+
+    async def test_transport_start_failure_does_not_hold_start_lock(self, test_broker):
+        transport = MagicMock(is_alive=False)
+        transport.start = AsyncMock(side_effect=[RuntimeError("startup failed"), None])
+        test_broker._transport = transport
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await test_broker._ensure_transport_started()
+        await test_broker._ensure_transport_started()
+        assert transport.start.await_count == 2
 
     def test_init_from_settings(self, test_broker, tmp_path):
         assert test_broker.session_id == "test-session-123"
@@ -477,8 +597,9 @@ class TestBroker:
         assert test_broker._transport is not None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("room_enabled", [False, True])
     async def test_startup_dispatches_workflow_trigger_instead_of_auto_starting_transport(
-        self, tmp_path
+        self, tmp_path, room_enabled
     ):
         settings = SkuldSettings(
             session={
@@ -486,6 +607,7 @@ class TestBroker:
                 "workspace_dir": str(tmp_path),
                 "initial_prompt": "Implement the requested change",
             },
+            room={"enabled": room_enabled},
             mesh={"enabled": True, "peer_id": "skuld-wf"},
             workflow_trigger={
                 "enabled": True,
@@ -515,6 +637,8 @@ class TestBroker:
         broker._channels.add(mock_channel)
 
         with (
+            patch.object(broker, "_wait_for_event_consumers", return_value=True),
+            patch.object(broker, "_wait_for_workflow_kickoff_acks", return_value=True),
             patch.object(broker, "_create_transport", return_value=mock_transport),
             patch("skuld.broker.ServiceManager") as mock_service_manager_cls,
             patch.object(
@@ -528,6 +652,16 @@ class TestBroker:
             mock_service_manager = AsyncMock()
             mock_service_manager_cls.return_value = mock_service_manager
             await broker.startup()
+            assert broker._workflow_trigger_task is not None
+            await broker._workflow_trigger_task
+
+        if broker._room_bridge is not None:
+            await broker._room_bridge.stop_presence_sweep()
+        if broker._peer_watchdog_task is not None:
+            broker._peer_watchdog_task.cancel()
+        replay_broker = Broker(settings=settings)
+        replay_broker._load_conversation_history()
+        assert replay_broker._conversation_turns[0].content == settings.session.initial_prompt
 
         mock_transport.start.assert_not_called()
         mock_adapter.publish.assert_awaited_once()
@@ -546,7 +680,9 @@ class TestBroker:
         )
 
     @pytest.mark.asyncio
-    async def test_startup_propagates_workflow_trigger_failure(self, tmp_path):
+    async def test_startup_exposes_workflow_trigger_failure_without_blocking_listener(
+        self, tmp_path
+    ):
         settings = SkuldSettings(
             session={
                 "id": "wf-session-failed",
@@ -564,11 +700,16 @@ class TestBroker:
         broker = Broker(settings=settings)
         mock_transport = AsyncMock()
         mock_transport.on_event = MagicMock()
+        mock_adapter = MagicMock(peer_id="skuld-wf")
 
         with (
             patch.object(broker, "_create_transport", return_value=mock_transport),
             patch("skuld.broker.ServiceManager") as mock_service_manager_cls,
-            patch.object(broker, "_start_mesh_adapter", new=AsyncMock()),
+            patch.object(
+                broker,
+                "_start_mesh_adapter",
+                new=AsyncMock(side_effect=lambda: setattr(broker, "_mesh_adapter", mock_adapter)),
+            ),
             patch.object(
                 broker,
                 "_run_workflow_trigger_task",
@@ -576,8 +717,124 @@ class TestBroker:
             ),
         ):
             mock_service_manager_cls.return_value = AsyncMock()
-            with pytest.raises(RuntimeError, match="never acknowledged"):
-                await broker.startup()
+            await broker.startup()
+            assert broker._workflow_trigger_task is not None
+            await broker._workflow_trigger_task
+
+        status = broker.startup_status()
+        assert status["ready"] is False
+        assert status["startup_state"] == "failed"
+        assert "never acknowledged" in status["error"]
+        assert broker._activity_state == "error"
+
+    @pytest.mark.asyncio
+    async def test_startup_returns_while_workflow_ack_waits_then_becomes_ready(self, tmp_path):
+        settings = SkuldSettings(
+            session={
+                "id": "wf-session-listener-first",
+                "workspace_dir": str(tmp_path),
+                "initial_prompt": "Implement the requested change",
+            },
+            mesh={"enabled": True, "peer_id": "skuld-wf"},
+            workflow_trigger={"enabled": True, "event_type": "code.requested"},
+            chronicle_watcher_enabled=False,
+        )
+        broker = Broker(settings=settings)
+        mock_transport = AsyncMock()
+        mock_transport.on_event = MagicMock()
+        mock_adapter = MagicMock(peer_id="skuld-wf")
+        kickoff_started = asyncio.Event()
+        acknowledge = asyncio.Event()
+
+        async def wait_for_ack():
+            kickoff_started.set()
+            await acknowledge.wait()
+
+        with (
+            patch.object(broker, "_create_transport", return_value=mock_transport),
+            patch("skuld.broker.ServiceManager") as mock_service_manager_cls,
+            patch.object(
+                broker,
+                "_start_mesh_adapter",
+                new=AsyncMock(side_effect=lambda: setattr(broker, "_mesh_adapter", mock_adapter)),
+            ),
+            patch.object(broker, "_run_workflow_trigger_task", new=wait_for_ack),
+        ):
+            mock_service_manager_cls.return_value = AsyncMock()
+            await asyncio.wait_for(broker.startup(), timeout=0.5)
+            await asyncio.wait_for(kickoff_started.wait(), timeout=0.5)
+
+            assert broker.startup_status() == {
+                "ready": False,
+                "startup_state": "workflow_kickoff_pending",
+            }
+            assert broker._workflow_trigger_task is not None
+            assert not broker._workflow_trigger_task.done()
+
+            acknowledge.set()
+            await asyncio.wait_for(broker._workflow_trigger_task, timeout=0.5)
+
+        assert broker.startup_status() == {"ready": True, "startup_state": "ready"}
+
+    @pytest.mark.asyncio
+    async def test_configured_mesh_transport_failure_does_not_fallback_in_process(self, tmp_path):
+        broker = Broker(
+            settings=SkuldSettings(
+                session={"id": "mesh-build-failed", "workspace_dir": str(tmp_path)},
+                mesh={"enabled": True, "transport": "nng", "peer_id": "skuld-wf"},
+            )
+        )
+
+        with (
+            patch.dict(
+                "niuu.mesh.transport_builder.TRANSPORT_ALIASES",
+                {"nng": "sleipnir.adapters.missing_nng.NngTransport"},
+            ),
+            patch("niuu.mesh.build_in_process_mesh") as in_process,
+            pytest.raises(TransportBuildError, match="mesh transport 'nng' could not be imported"),
+        ):
+            await broker._start_mesh_adapter()
+
+        in_process.assert_not_called()
+        assert broker._mesh_adapter is None
+
+    @pytest.mark.asyncio
+    async def test_mesh_startup_failure_stays_observable_without_background_tasks(self, tmp_path):
+        settings = SkuldSettings(
+            session={"id": "mesh-start-failed", "workspace_dir": str(tmp_path)},
+            mesh={"enabled": True, "transport": "nng", "peer_id": "skuld-wf"},
+            room={"enabled": True},
+            peer_watchdog={"enabled": True},
+            activity_heartbeat={"enabled": True},
+            chronicle_watcher_enabled=False,
+        )
+        broker = Broker(settings=settings)
+        mock_transport = AsyncMock()
+        mock_transport.on_event = MagicMock()
+
+        with (
+            patch.object(broker, "_create_transport", return_value=mock_transport),
+            patch("skuld.broker.ServiceManager") as mock_service_manager_cls,
+            patch.object(
+                broker,
+                "_start_mesh_adapter",
+                new=AsyncMock(side_effect=RuntimeError("mesh bind failed")),
+            ),
+        ):
+            mock_service_manager_cls.return_value = AsyncMock()
+            await broker.startup()
+
+        assert broker.startup_status() == {
+            "ready": False,
+            "startup_state": "failed",
+            "error": "RuntimeError: mesh bind failed",
+        }
+        assert broker._activity_state == "error"
+        assert broker._workflow_trigger_task is None
+        assert broker._peer_watchdog_task is None
+        assert broker._activity_heartbeat_task is None
+        assert broker._room_bridge is not None
+        await broker._room_bridge.stop_presence_sweep()
 
     @pytest.mark.asyncio
     async def test_acknowledged_workflow_kickoff_is_not_repeated_after_restart(self, tmp_path):
@@ -607,6 +864,75 @@ class TestBroker:
 
         first_publish.assert_awaited_once()
         restarted_publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ["not valid JSON", "directory"])
+    async def test_unreadable_workflow_acknowledgment_does_not_repeat_kickoff(
+        self, tmp_path, marker
+    ):
+        settings = SkuldSettings(
+            session={"id": "wf-unreadable", "workspace_dir": str(tmp_path)},
+            workflow_trigger={
+                "enabled": True,
+                "node_id": "trigger-1",
+                "event_type": "code.requested",
+            },
+        )
+        broker = Broker(settings=settings)
+        marker_path = tmp_path / ".skuld" / "workflow_kickoff_wf-unreadable.json"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        if marker == "directory":
+            marker_path.mkdir()
+            expected = OSError
+        else:
+            marker_path.write_text(marker)
+            expected = ValueError
+        with patch.object(broker, "_publish_workflow_trigger", new=AsyncMock()) as publish:
+            with pytest.raises(expected):
+                await broker._run_workflow_trigger_task()
+        publish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_restored_terminal_outcome_skips_workflow_prompt_and_kickoff(self, tmp_path):
+        settings = SkuldSettings(
+            session={
+                "id": "wf-terminal-restarted",
+                "workspace_dir": str(tmp_path),
+                "initial_prompt": "Implement the requested change",
+            },
+            room={"enabled": True},
+            mesh={"enabled": True, "peer_id": "skuld-wf"},
+            workflow_trigger={
+                "enabled": True,
+                "node_id": "trigger-1",
+                "event_type": "developer.workstream.requested",
+            },
+            chronicle_watcher_enabled=False,
+        )
+        broker = Broker(settings=settings)
+        broker._restored_workflow_terminal_completion = (
+            "workflow-stop:workstream-complete",
+            {"metadata": {"event_type": "developer.workstream.completed"}, "data": {}},
+        )
+        transport = AsyncMock()
+        transport.on_event = MagicMock()
+
+        with (
+            patch.object(broker, "_hydrate_conversation_history", new=AsyncMock()),
+            patch.object(broker, "_create_transport", return_value=transport),
+            patch("skuld.broker.ServiceManager") as service_manager_cls,
+            patch.object(broker, "_start_mesh_adapter", new=AsyncMock()),
+            patch.object(broker, "_ensure_workflow_prompt_turn", new=AsyncMock()) as prompt,
+            patch.object(broker, "_run_supervised_workflow_trigger", new=AsyncMock()) as kickoff,
+        ):
+            service_manager_cls.return_value = AsyncMock()
+            await broker.startup()
+
+        prompt.assert_not_awaited()
+        kickoff.assert_not_awaited()
+        assert broker._workflow_trigger_task is None
+        assert broker.startup_status() == {"ready": True, "startup_state": "ready"}
+        await broker._room_bridge.stop_presence_sweep()
 
     @pytest.mark.asyncio
     async def test_publish_workflow_trigger_waits_for_connected_consumers(self, tmp_path):
@@ -901,7 +1227,8 @@ class TestBroker:
         broker._mesh_adapter.publish.assert_awaited_once()
         event, topic = broker._mesh_adapter.publish.await_args.args
         assert topic == "code.changed"
-        assert event.correlation_id == event_id
+        assert event.event_id == "request-1"
+        assert event.correlation_id == event_id == "request-1"
         assert event.root_correlation_id == "flock-session"
         assert event.payload == {
             "commit": "abc123",
@@ -1491,6 +1818,46 @@ class TestBroker:
         )
 
     @pytest.mark.asyncio
+    async def test_peer_error_failure_names_the_failing_workflow_node(self, test_broker):
+        """A peer that dies during setup reports its node, so Ting can fail that stage."""
+        test_broker._room_bridge = MagicMock()
+        test_broker._room_bridge.participants = {}
+        test_broker._report_activity_state = AsyncMock(return_value=True)
+        test_broker._finish_trace_span = AsyncMock()
+        test_broker._is_room_only_workflow_session = MagicMock(return_value=True)
+
+        error = (
+            "RuntimeError: Persona requires durable workflow execution tools, but an "
+            "owner-bound workflow_execution runtime context is not configured"
+        )
+        await test_broker._observe_room_peer_event(
+            "flock-kvm-research-coordinator",
+            "error",
+            {
+                "task_id": "event_research_coordinate_fe4ae2efb1c879c7",
+                "data": error,
+                "metadata": {
+                    "workflow_node_id": "research-coordinate",
+                    "persona": "kvm-research-coordinator",
+                    "failure_kind": "RuntimeError",
+                },
+            },
+        )
+
+        test_broker._report_activity_state.assert_awaited_once_with(
+            "error",
+            extra_metadata={
+                "failure_source": "ravn_flock",
+                "failure_peer_id": "flock-kvm-research-coordinator",
+                "failure_persona": "kvm-research-coordinator",
+                "error": error,
+                "failure_workflow_node_id": "research-coordinate",
+                "failure_kind": "RuntimeError",
+                "failure_task_id": "event_research_coordinate_fe4ae2efb1c879c7",
+            },
+        )
+
+    @pytest.mark.asyncio
     async def test_peer_git_checkpoint_signals_increment_artifacts(self, test_broker):
         test_broker._room_bridge = MagicMock()
 
@@ -1997,6 +2364,618 @@ class TestBroker:
         broker_under_test._room_bridge.handle_collaboration_frame.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_workflow_child_completion_retains_authenticated_review_envelope(self, tmp_path):
+        settings = SkuldSettings(
+            session={"id": "child-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": _WORKSTREAM_REVIEW_GRAPH},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "review-peer": MagicMock(persona="developer-code-reviewer"),
+            "workflow-stop:workstream-complete": MagicMock(persona="workflow-runtime"),
+        }
+        broker_under_test._emit_pipeline_event = AsyncMock()
+        broker_under_test._maybe_activate_workflow_gate = AsyncMock()
+        broker_under_test._maybe_emit_workflow_terminal_outcome = AsyncMock()
+        broker_under_test._report_activity_state = AsyncMock()
+        broker_under_test._is_room_only_workflow_session = MagicMock(return_value=True)
+
+        await broker_under_test._emit_peer_outcome_pipeline_event(
+            "review-peer",
+            {
+                "metadata": {
+                    "event_type": "developer.review.completed",
+                    "task_id": "review-event-1",
+                },
+                "data": {
+                    "event_type": "developer.review.completed",
+                    "valid": True,
+                    "fields": {
+                        "attempt_id": "attempt-1",
+                        "candidate_sha": "a" * 40,
+                        "candidate_tree": "b" * 40,
+                        "verdict": "pass",
+                        "summary": "Reviewed immutable candidate",
+                        "findings": [],
+                    },
+                },
+            },
+        )
+        await broker_under_test._emit_peer_outcome_pipeline_event(
+            "review-peer",
+            {
+                "metadata": {
+                    "event_type": "developer.review.completed",
+                    "task_id": "review-event-1",
+                },
+                "data": {
+                    "event_type": "developer.review.completed",
+                    "valid": True,
+                    "fields": {
+                        "attempt_id": "attempt-1",
+                        "candidate_sha": "c" * 40,
+                        "candidate_tree": "d" * 40,
+                        "verdict": "pass",
+                        "summary": "Conflicting reuse of the authenticated event id",
+                        "findings": [],
+                    },
+                },
+            },
+        )
+        await broker_under_test._maybe_report_flock_completion(
+            "workflow-stop:workstream-complete",
+            {
+                "metadata": {"event_type": "developer.workstream.completed"},
+                "data": {
+                    "valid": True,
+                    "fields": {
+                        "result": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": "a" * 40,
+                            "candidateTree": "b" * 40,
+                        }
+                    },
+                },
+            },
+        )
+
+        live_review = broker_under_test._report_activity_state.await_args_list[0]
+        assert live_review.args[0] == "active"
+        assert live_review.kwargs["extra_metadata"]["attested_review"]["reviewerId"] == (
+            "review-peer"
+        )
+        assert broker_under_test._report_activity_state.await_count == 2
+
+        metadata = broker_under_test._report_activity_state.await_args.kwargs["extra_metadata"]
+        envelope = metadata["delivery"]
+        assert envelope["result"]["attemptId"] == "attempt-1"
+        assert envelope["reviews"] == [
+            {
+                "eventId": _attested_review_id("child-session", "review-peer", "review-event-1"),
+                "sessionId": "child-session",
+                "role": "code",
+                "scope": "workstream",
+                "reviewerId": "review-peer",
+                "personaId": "developer-code-reviewer",
+                "attemptId": "attempt-1",
+                "candidateSha": "a" * 40,
+                "candidateTree": "b" * 40,
+                "verdict": "pass",
+                "summary": "Reviewed immutable candidate",
+                "findings": [],
+                "valid": True,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_attested_terminal_envelope_follows_graph_declared_event_names(self, tmp_path):
+        """The delivery envelope is attached by graph structure, not a literal.
+
+        Nothing here is named `developer.workstream.completed` or
+        `developer.review.completed`: the review-attestation event type and
+        the terminal completion event are both declared under different
+        names, and the broker must still recognize its own graph's terminal
+        completion and attach the attested review to it.
+        """
+        settings = SkuldSettings(
+            session={"id": "acme-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": _RENAMED_ATTESTED_GRAPH},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "review-peer": MagicMock(persona="developer-code-reviewer"),
+            "workflow-stop:acme-complete": MagicMock(persona="workflow-runtime"),
+        }
+        broker_under_test._emit_pipeline_event = AsyncMock()
+        broker_under_test._maybe_activate_workflow_gate = AsyncMock()
+        broker_under_test._maybe_emit_workflow_terminal_outcome = AsyncMock()
+        broker_under_test._report_activity_state = AsyncMock()
+        broker_under_test._is_room_only_workflow_session = MagicMock(return_value=True)
+
+        await broker_under_test._emit_peer_outcome_pipeline_event(
+            "review-peer",
+            {
+                "metadata": {
+                    "event_type": "acme.review.completed",
+                    "task_id": "acme-review-event-1",
+                },
+                "data": {
+                    "event_type": "acme.review.completed",
+                    "valid": True,
+                    "fields": {
+                        "attempt_id": "attempt-1",
+                        "candidate_sha": "a" * 40,
+                        "candidate_tree": "b" * 40,
+                        "verdict": "pass",
+                        "summary": "Reviewed immutable candidate",
+                        "findings": [],
+                    },
+                },
+            },
+        )
+        await broker_under_test._maybe_report_flock_completion(
+            "workflow-stop:acme-complete",
+            {
+                "metadata": {"event_type": "acme.workflow.completed"},
+                "data": {
+                    "valid": True,
+                    "fields": {
+                        "result": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": "a" * 40,
+                            "candidateTree": "b" * 40,
+                        }
+                    },
+                },
+            },
+        )
+
+        metadata = broker_under_test._report_activity_state.await_args.kwargs["extra_metadata"]
+        assert metadata["completion_event_type"] == "acme.workflow.completed"
+        envelope = metadata["delivery"]
+        assert envelope["result"]["attemptId"] == "attempt-1"
+        assert [review["role"] for review in envelope["reviews"]] == ["code"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_outcome_without_review_attestation_has_no_delivery_envelope(
+        self, tmp_path
+    ):
+        """A graph with no `reviewAttestation` never gets a `delivery` envelope.
+
+        `self._review_attestation` is `None` for a graph that declares none,
+        so the attested-terminal check must not fire purely because the
+        outcome carries a `result` object.
+        """
+        graph = {
+            "nodes": [
+                {
+                    "id": "plain-complete",
+                    "kind": "end",
+                    "joinMode": "all",
+                    "completionEvent": "plain.workflow.completed",
+                },
+            ],
+            "edges": [
+                {
+                    "id": "plain-start-complete",
+                    "source": "plain-start",
+                    "target": "plain-complete",
+                    "label": "plain.workflow.completed -> plain.workflow.completed",
+                },
+            ],
+        }
+        settings = SkuldSettings(
+            session={"id": "plain-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": graph},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "workflow-stop:plain-complete": MagicMock(persona="workflow-runtime"),
+        }
+        broker_under_test._report_activity_state = AsyncMock()
+        broker_under_test._is_room_only_workflow_session = MagicMock(return_value=True)
+        assert broker_under_test._review_attestation is None
+
+        await broker_under_test._maybe_report_flock_completion(
+            "workflow-stop:plain-complete",
+            {
+                "metadata": {"event_type": "plain.workflow.completed"},
+                "data": {
+                    "valid": True,
+                    "fields": {
+                        "result": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": "a" * 40,
+                            "candidateTree": "b" * 40,
+                        }
+                    },
+                },
+            },
+        )
+
+        metadata = broker_under_test._report_activity_state.await_args.kwargs["extra_metadata"]
+        assert "delivery" not in metadata
+
+    @pytest.mark.asyncio
+    async def test_repaired_child_terminal_envelope_selects_current_candidate_reviews(
+        self, tmp_path
+    ):
+        settings = SkuldSettings(
+            session={"id": "child-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": _WORKSTREAM_REVIEW_GRAPH},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "workflow-stop:workstream-complete": MagicMock(persona="workflow-runtime"),
+        }
+        broker_under_test._report_activity_state = AsyncMock()
+        broker_under_test._is_room_only_workflow_session = MagicMock(return_value=True)
+
+        def review(
+            event_id: str,
+            role: str,
+            candidate_sha: str,
+            candidate_tree: str,
+            *,
+            valid: object = True,
+            scope: str = "workstream",
+        ) -> dict:
+            return {
+                "eventId": event_id,
+                "sessionId": "child-session",
+                "role": role,
+                "scope": scope,
+                "reviewerId": f"{role}-peer",
+                "personaId": f"developer-{role}-reviewer",
+                "attemptId": "attempt-1",
+                "candidateSha": candidate_sha,
+                "candidateTree": candidate_tree,
+                "verdict": "pass",
+                "summary": event_id,
+                "findings": [],
+                "valid": valid,
+            }
+
+        old_sha, old_tree = "a" * 40, "b" * 40
+        current_sha, current_tree = "c" * 40, "d" * 40
+        history = [
+            review("old-code", "code", old_sha, old_tree),
+            review("old-security", "security", old_sha, old_tree),
+            review("old-adversarial", "adversarial", old_sha, old_tree),
+            review("current-code-first", "code", current_sha, current_tree),
+            review("current-security", "security", current_sha, current_tree),
+            review("current-adversarial", "adversarial", current_sha, current_tree),
+            review("current-code-latest", "code", current_sha, current_tree),
+            review(
+                "current-code-invalid",
+                "code",
+                current_sha,
+                current_tree,
+                valid="true",
+            ),
+            review(
+                "current-integration-scope",
+                "code",
+                current_sha,
+                current_tree,
+                scope="integration",
+            ),
+        ]
+        broker_under_test._attested_review_outcomes = {item["eventId"]: item for item in history}
+
+        await broker_under_test._maybe_report_flock_completion(
+            "workflow-stop:workstream-complete",
+            {
+                "metadata": {"event_type": "developer.workstream.completed"},
+                "data": {
+                    "valid": True,
+                    "fields": {
+                        "result": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": current_sha,
+                            "candidateTree": current_tree,
+                        }
+                    },
+                },
+            },
+        )
+
+        metadata = broker_under_test._report_activity_state.await_args.kwargs["extra_metadata"]
+        assert [item["eventId"] for item in metadata["delivery"]["reviews"]] == [
+            "current-adversarial",
+            "current-code-latest",
+            "current-security",
+        ]
+        assert len(broker_under_test._attested_review_outcomes) == len(history)
+
+    @pytest.mark.asyncio
+    async def test_restarted_child_restores_authenticated_current_candidate_reviews(self, tmp_path):
+        settings = SkuldSettings(
+            session={"id": "child-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            volundr_api_url="http://volundr.test",
+            workflow={"graph": _WORKSTREAM_REVIEW_GRAPH},
+        )
+        source = Broker(settings=settings)
+        assert source._room_bridge is not None
+        source._room_bridge._observe_peer_event = AsyncMock()
+
+        personas = {
+            "code-peer": "developer-code-reviewer",
+            "security-peer": "developer-security-reviewer",
+            "adversarial-peer": "developer-adversarial-reviewer",
+        }
+        for peer_id, persona in personas.items():
+            await source._room_bridge.register_mesh_peer(
+                peer_id,
+                persona,
+                participant_kind="mesh",
+            )
+
+        old_sha, old_tree = "a" * 40, "b" * 40
+        current_sha, current_tree = "c" * 40, "d" * 40
+
+        async def persist_review(
+            peer_id: str,
+            task_id: str,
+            candidate_sha: str,
+            candidate_tree: str,
+            *,
+            valid: object = True,
+            include_valid: bool = True,
+            claimed_persona: str = "",
+        ) -> None:
+            event = {
+                "kind": "outcome",
+                "sourceEventId": f"{task_id}:{peer_id}",
+                "taskId": task_id,
+                "eventType": "developer.review.completed",
+                "persona": claimed_persona,
+                "fields": {
+                    "attemptId": "attempt-1",
+                    "candidateSha": candidate_sha,
+                    "candidateTree": candidate_tree,
+                    "verdict": "pass",
+                    "summary": task_id,
+                    "findings": [],
+                },
+            }
+            if include_valid:
+                event["valid"] = valid
+            await source._room_bridge.handle_collaboration_frame(
+                peer_id,
+                event,
+            )
+
+        await persist_review("code-peer", "old-code", old_sha, old_tree)
+        await persist_review(
+            "code-peer",
+            "shared-review-task",
+            current_sha,
+            current_tree,
+            claimed_persona="developer-security-reviewer",
+        )
+        await persist_review("security-peer", "shared-review-task", current_sha, current_tree)
+        await persist_review("adversarial-peer", "shared-review-task", current_sha, current_tree)
+        await persist_review(
+            "security-peer",
+            "invalid-security",
+            current_sha,
+            current_tree,
+            valid="true",
+        )
+        await persist_review(
+            "security-peer",
+            "missing-bindings",
+            "",
+            current_tree,
+        )
+        await persist_review(
+            "adversarial-peer",
+            "missing-validity",
+            current_sha,
+            current_tree,
+            include_valid=False,
+        )
+
+        durable_frames = [
+            SimpleNamespace(kind=entry["kind"], payload=entry["payload"])
+            for entry in source._event_log_buffer
+        ]
+        missing_validity = next(
+            frame.payload
+            for frame in durable_frames
+            if frame.payload.get("taskId") == "missing-validity"
+        )
+        assert missing_validity["valid"] is None
+        durable_frames.extend(
+            [
+                SimpleNamespace(
+                    kind="assistant",
+                    payload={
+                        "type": "assistant",
+                        "content": "room_outcome developer.review.completed valid=true",
+                    },
+                ),
+                SimpleNamespace(
+                    kind="room_outcome",
+                    payload={
+                        "type": "room_outcome",
+                        "participantId": "forged-peer",
+                        "participant": {
+                            "peer_id": "different-peer",
+                            "persona": "developer-code-reviewer",
+                        },
+                        "eventType": "developer.review.completed",
+                        "taskId": "forged-review",
+                        "valid": True,
+                        "fields": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": current_sha,
+                            "candidateTree": current_tree,
+                            "verdict": "pass",
+                            "summary": "forged",
+                            "findings": [],
+                        },
+                    },
+                ),
+            ]
+        )
+
+        restarted = Broker(settings=settings)
+        restarted._restore_durable_runtime_state(durable_frames)
+        restarted._restore_durable_runtime_state(durable_frames)
+
+        old_code_id = _attested_review_id("child-session", "code-peer", "old-code")
+        current_ids = {
+            role: _attested_review_id("child-session", f"{role}-peer", "shared-review-task")
+            for role in ("adversarial", "code", "security")
+        }
+        assert list(restarted._attested_review_outcomes) == [
+            old_code_id,
+            current_ids["code"],
+            current_ids["security"],
+            current_ids["adversarial"],
+        ]
+        assert restarted._attested_review_outcomes[current_ids["code"]]["personaId"] == (
+            "developer-code-reviewer"
+        )
+        assert len(restarted._attested_review_outcomes) == 4
+
+        restarted._room_bridge = MagicMock()
+        restarted._room_bridge.participants = {
+            "workflow-stop:workstream-complete": MagicMock(persona="workflow-runtime"),
+        }
+        restarted._report_activity_state = AsyncMock()
+        restarted._is_room_only_workflow_session = MagicMock(return_value=True)
+        await restarted._maybe_report_flock_completion(
+            "workflow-stop:workstream-complete",
+            {
+                "metadata": {"event_type": "developer.workstream.completed"},
+                "data": {
+                    "valid": True,
+                    "fields": {
+                        "result": {
+                            "attemptId": "attempt-1",
+                            "candidateSha": current_sha,
+                            "candidateTree": current_tree,
+                        }
+                    },
+                },
+            },
+        )
+
+        metadata = restarted._report_activity_state.await_args.kwargs["extra_metadata"]
+        reviews = metadata["delivery"]["reviews"]
+        assert [review["eventId"] for review in reviews] == [
+            current_ids["adversarial"],
+            current_ids["code"],
+            current_ids["security"],
+        ]
+        assert all(review["candidateSha"] == current_sha for review in reviews)
+        assert all(review["candidateTree"] == current_tree for review in reviews)
+
+    @pytest.mark.asyncio
+    async def test_malformed_attested_review_is_not_projected_as_evidence(self, tmp_path):
+        settings = SkuldSettings(
+            session={"id": "child-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": _WORKSTREAM_REVIEW_GRAPH},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "review-peer": MagicMock(persona="developer-code-reviewer"),
+        }
+        broker_under_test._emit_pipeline_event = AsyncMock()
+        broker_under_test._maybe_activate_workflow_gate = AsyncMock()
+        broker_under_test._maybe_emit_workflow_terminal_outcome = AsyncMock()
+        broker_under_test._report_activity_state = AsyncMock()
+
+        await broker_under_test._emit_peer_outcome_pipeline_event(
+            "review-peer",
+            {
+                "metadata": {
+                    "event_type": "developer.review.completed",
+                    "task_id": "review-event-malformed",
+                },
+                "data": {
+                    "event_type": "developer.review.completed",
+                    "valid": True,
+                    "fields": {
+                        "attempt_id": "attempt-1",
+                        "candidate_sha": "a" * 40,
+                        "candidate_tree": "b" * 40,
+                        "verdict": "pass",
+                        "summary": "Stopped before producing structured findings",
+                        "findings": "stop response",
+                    },
+                },
+            },
+        )
+
+        broker_under_test._emit_pipeline_event.assert_awaited_once()
+        assert broker_under_test._attested_review_outcomes == {}
+        broker_under_test._report_activity_state.assert_not_awaited()
+        broker_under_test._maybe_activate_workflow_gate.assert_not_awaited()
+        broker_under_test._maybe_emit_workflow_terminal_outcome.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("valid", ["true", "false", 1])
+    async def test_attested_review_requires_literal_true_validity(self, tmp_path, valid):
+        settings = SkuldSettings(
+            session={"id": "child-session", "workspace_dir": str(tmp_path)},
+            room={"enabled": True},
+            workflow={"graph": _WORKSTREAM_REVIEW_GRAPH},
+        )
+        broker_under_test = Broker(settings=settings)
+        broker_under_test._room_bridge = MagicMock()
+        broker_under_test._room_bridge.participants = {
+            "review-peer": MagicMock(persona="developer-code-reviewer"),
+        }
+        broker_under_test._emit_pipeline_event = AsyncMock()
+        broker_under_test._maybe_activate_workflow_gate = AsyncMock()
+        broker_under_test._maybe_emit_workflow_terminal_outcome = AsyncMock()
+        broker_under_test._report_activity_state = AsyncMock()
+
+        await broker_under_test._emit_peer_outcome_pipeline_event(
+            "review-peer",
+            {
+                "metadata": {
+                    "event_type": "developer.review.completed",
+                    "task_id": "review-event-non-boolean-validity",
+                },
+                "data": {
+                    "event_type": "developer.review.completed",
+                    "valid": valid,
+                    "fields": {
+                        "attempt_id": "attempt-1",
+                        "candidate_sha": "a" * 40,
+                        "candidate_tree": "b" * 40,
+                        "verdict": "pass",
+                        "summary": "Review validity was not canonical JSON true",
+                        "findings": [],
+                    },
+                },
+            },
+        )
+
+        broker_under_test._emit_pipeline_event.assert_awaited_once()
+        assert broker_under_test._emit_pipeline_event.await_args.args[1]["valid"] is False
+        assert broker_under_test._attested_review_outcomes == {}
+        broker_under_test._report_activity_state.assert_not_awaited()
+        broker_under_test._maybe_activate_workflow_gate.assert_not_awaited()
+        broker_under_test._maybe_emit_workflow_terminal_outcome.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_parallel_terminal_node_waits_for_git_push_when_required(self, tmp_path):
         settings = SkuldSettings(
             session={"id": "sess-1", "workspace_dir": str(tmp_path)},
@@ -2212,9 +3191,12 @@ class TestBroker:
             approval_policy="untrusted",
             sandbox="workspace-write",
             agent_teams=True,
+            model_gateway={"url": "http://niuu:8080/api/v1/bifrost", "token": "t"},
         )
         b = Broker(settings=settings)
         kwargs = b._build_transport_kwargs()
+        assert kwargs["model_gateway_url"] == "http://niuu:8080/api/v1/bifrost"
+        assert kwargs["model_gateway_token"] == "t"
         assert kwargs["workspace_dir"] == str(tmp_path)
         assert kwargs["model"] == "opus"
         assert kwargs["sdk_port"] == 9999
@@ -2579,7 +3561,12 @@ class TestDispatchBrowserMessage:
 
     @pytest.mark.asyncio
     async def test_dispatch_publish_event_injects_through_mesh(self, test_broker):
+        from skuld.channels import WebSocketChannel
+
         sender_ws = AsyncMock()
+        # publish_event is owner-only; register this connection as owner so
+        # the room-role gate doesn't preempt the behavior under test here.
+        test_broker._channels.add(WebSocketChannel(sender_ws, room_role="owner"))
         test_broker.handle_publish_mesh_event = AsyncMock(return_value="event-1")
 
         await test_broker._dispatch_browser_message(
@@ -2817,8 +3804,13 @@ class TestDispatchBrowserMessage:
     @pytest.mark.asyncio
     async def test_dispatch_guard_blocks_unsupported_control(self, test_broker):
         """Unsupported control messages are rejected with an error to sender_ws."""
+        from skuld.channels import WebSocketChannel
+
         test_broker._transport.capabilities = TransportCapabilities()  # all False
         sender_ws = AsyncMock()
+        # interrupt is owner-only; register this connection as owner so the
+        # room-role gate doesn't preempt the capability guard under test here.
+        test_broker._channels.add(WebSocketChannel(sender_ws, room_role="owner"))
 
         await test_broker._dispatch_browser_message({"type": "interrupt"}, sender_ws=sender_ws)
 
@@ -3131,7 +4123,12 @@ class TestFastAPIEndpoints:
     def client(self):
         from fastapi.testclient import TestClient
 
-        client = TestClient(app)
+        # These tests exercise routes/behavior unrelated to room-role
+        # gating (logs, CORS, service management); simulate a trusted
+        # proxy-stamped owner connection so _enforce_room_role doesn't
+        # block them (see tests/test_skuld/test_broker_api_gate_room_role.py
+        # and test_room_role_message_gating.py for the gate's own coverage).
+        client = TestClient(app, headers={"x-niuu-room-role": "owner"})
         yield client
         client.close()
 
@@ -3149,18 +4146,50 @@ class TestFastAPIEndpoints:
 
     def test_ready_endpoint_not_ready(self, client):
         broker._transport = None
+        broker._startup_ready = False
+        broker._startup_state = "starting"
+        broker._startup_failure = ""
         response = client.get("/ready")
-        assert response.status_code == 200
+        assert response.status_code == 503
         data = response.json()
         assert data["ready"] is False
+        assert data["startup_state"] == "starting"
 
     def test_ready_endpoint_ready(self, client):
         broker._transport = MagicMock()
+        broker._startup_ready = True
+        broker._startup_state = "ready"
+        broker._startup_failure = ""
         response = client.get("/ready")
         assert response.status_code == 200
         data = response.json()
         assert data["ready"] is True
         broker._transport = None
+        broker._startup_ready = False
+
+    def test_health_and_readiness_expose_terminal_startup_failure(self, client):
+        broker._transport = MagicMock()
+        broker._startup_ready = False
+        broker._startup_state = "failed"
+        broker._startup_failure = "RuntimeError: kickoff was never acknowledged"
+
+        health_response = client.get("/health")
+        ready_response = client.get("/ready")
+
+        assert health_response.status_code == 200
+        assert health_response.json()["status"] == "unhealthy"
+        assert health_response.json()["startup_state"] == "failed"
+        assert "never acknowledged" in health_response.json()["error"]
+        assert ready_response.status_code == 503
+        assert ready_response.json() == {
+            "session_id": broker.session_id,
+            "ready": False,
+            "startup_state": "failed",
+            "error": "RuntimeError: kickoff was never acknowledged",
+        }
+        broker._transport = None
+        broker._startup_state = "created"
+        broker._startup_failure = ""
 
     def test_logs_endpoint(self, client):
         _log_buffer.clear()
@@ -3318,7 +4347,12 @@ class TestCORSMiddleware:
     def client(self):
         from fastapi.testclient import TestClient
 
-        client = TestClient(app)
+        # These tests exercise routes/behavior unrelated to room-role
+        # gating (logs, CORS, service management); simulate a trusted
+        # proxy-stamped owner connection so _enforce_room_role doesn't
+        # block them (see tests/test_skuld/test_broker_api_gate_room_role.py
+        # and test_room_role_message_gating.py for the gate's own coverage).
+        client = TestClient(app, headers={"x-niuu-room-role": "owner"})
         yield client
         client.close()
 
@@ -4293,6 +5327,7 @@ class TestHandleWebSocket:
     async def test_handle_websocket_no_transport(self, test_broker):
         """Returns error JSON when transport is not initialized."""
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         test_broker._transport = None
 
@@ -4305,6 +5340,58 @@ class TestHandleWebSocket:
         assert "not initialized" in sent["content"]
 
     @pytest.mark.asyncio
+    async def test_handle_websocket_viewer_connection_does_not_overwrite_user_jwt(
+        self, test_broker
+    ):
+        """A viewer/approver connecting after the owner must not swap the
+        broker's single stored _user_jwt/_user_claims — those are read later
+        for actions taken "as the user" (e.g. the chronicle watcher's auth
+        headers), and must keep reflecting the actual owner."""
+        mock_transport = AsyncMock()
+        mock_transport.is_alive = True
+        mock_transport.capabilities = TransportCapabilities()
+        test_broker._transport = mock_transport
+        test_broker._user_jwt = "owners-original-token"
+        # room_role_source="proxy": the process-backend topology, where a
+        # missing header means viewer. The Kubernetes "deployment" default
+        # (a missing header means owner, unconditionally) is covered by
+        # test_handle_websocket_owner_connection_updates_user_jwt's header
+        # case and by test_enforce_room_role_middleware.py.
+        test_broker._settings.ws_auth.room_role_source = "proxy"
+
+        mock_ws = AsyncMock()
+        # No x-niuu-room-role header, not loopback -> _resolve_room_role
+        # resolves "viewer" for this connection under room_role_source=proxy.
+        mock_ws.headers = {"authorization": "Bearer a-viewers-token"}
+        mock_ws.client = SimpleNamespace(host="203.0.113.9")
+        mock_ws.query_params = {}
+        mock_ws.receive_json = AsyncMock(side_effect=[WebSocketDisconnect()])
+
+        await test_broker.handle_websocket(mock_ws)
+
+        assert test_broker._user_jwt == "owners-original-token"
+
+    @pytest.mark.asyncio
+    async def test_handle_websocket_owner_connection_updates_user_jwt(self, test_broker):
+        mock_transport = AsyncMock()
+        mock_transport.is_alive = True
+        mock_transport.capabilities = TransportCapabilities()
+        test_broker._transport = mock_transport
+        test_broker._user_jwt = "stale-token"
+
+        mock_ws = AsyncMock()
+        mock_ws.headers = {
+            "authorization": "Bearer the-owners-fresh-token",
+            "x-niuu-room-role": "owner",
+        }
+        mock_ws.query_params = {}
+        mock_ws.receive_json = AsyncMock(side_effect=[WebSocketDisconnect()])
+
+        await test_broker.handle_websocket(mock_ws)
+
+        assert test_broker._user_jwt == "the-owners-fresh-token"
+
+    @pytest.mark.asyncio
     async def test_handle_websocket_normal_flow(self, test_broker):
         """Browser connects, receives welcome, sends message, then disconnects."""
         mock_transport = AsyncMock()
@@ -4313,6 +5400,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         # First receive_json returns a message, second raises disconnect
         mock_ws.receive_json = AsyncMock(side_effect=[{"content": "hello"}, WebSocketDisconnect()])
@@ -4336,6 +5424,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -4373,6 +5462,7 @@ class TestHandleWebSocket:
         test_broker._event_log_seq = 42
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -4402,6 +5492,7 @@ class TestHandleWebSocket:
         test_broker._pending_permission_requests["perm-replay"] = pending
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -4421,6 +5512,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         # Bad frame (non-JSON) -> valid message -> disconnect. The valid message after
         # the bad one MUST still be dispatched.
@@ -4457,6 +5549,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(
             side_effect=RuntimeError('WebSocket is not connected. Need to call "accept" first.')
@@ -4479,6 +5572,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.send_json = AsyncMock(
             side_effect=RuntimeError('Cannot call "send" once a close message has been sent.')
@@ -4498,6 +5592,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -4532,6 +5627,7 @@ class TestHandleWebSocket:
         broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -4560,6 +5656,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=[{"content": "hello"}, WebSocketDisconnect()])
 
@@ -4588,6 +5685,7 @@ class TestHandleWebSocket:
         test_broker._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=RuntimeError("boom"))
 
@@ -4603,6 +5701,7 @@ class TestHandleWebSocket:
         mock_transport.capabilities = TransportCapabilities(session_resume=True)
         test_broker._transport = mock_transport
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await test_broker.handle_cli_websocket(mock_ws, "ws-session")
 
@@ -4616,6 +5715,7 @@ class TestHandleWebSocket:
         mock_transport.capabilities = TransportCapabilities()
         test_broker._transport = mock_transport
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await test_broker.handle_cli_websocket(mock_ws, "ws-session")
 
@@ -4629,6 +5729,7 @@ class TestHandleWebSocket:
         mock_transport.capabilities = TransportCapabilities(cli_websocket=True)
         test_broker._transport = mock_transport
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await test_broker.handle_cli_websocket(mock_ws, "wrong-session")
 
@@ -4642,6 +5743,7 @@ class TestHandleWebSocket:
         mock_transport.capabilities = TransportCapabilities(cli_websocket=True)
         test_broker._transport = mock_transport
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await test_broker.handle_cli_websocket(mock_ws, "ws-session")
 
@@ -4656,7 +5758,12 @@ class TestServiceAPIEndpoints:
     def client(self):
         from fastapi.testclient import TestClient
 
-        client = TestClient(app)
+        # These tests exercise routes/behavior unrelated to room-role
+        # gating (logs, CORS, service management); simulate a trusted
+        # proxy-stamped owner connection so _enforce_room_role doesn't
+        # block them (see tests/test_skuld/test_broker_api_gate_room_role.py
+        # and test_room_role_message_gating.py for the gate's own coverage).
+        client = TestClient(app, headers={"x-niuu-room-role": "owner"})
         yield client
         client.close()
 
@@ -5714,6 +6821,7 @@ class TestBrokerRoomAdapter:
         b = Broker(settings=no_room_settings)
         b._transport = AsyncMock()
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await b._dispatch_browser_message(
             {"type": "directed_message", "targetPeerId": "p1", "content": "Hi!"},
@@ -6208,6 +7316,7 @@ class TestBrokerRoomAdapter:
         b._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -6227,6 +7336,7 @@ class TestBrokerRoomAdapter:
         b._transport = mock_transport
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.query_params = {}
         mock_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
 
@@ -6244,6 +7354,7 @@ class TestBrokerRoomAdapter:
     async def test_handle_ravn_websocket_rejects_when_room_disabled(self, no_room_settings):
         b = Broker(settings=no_room_settings)
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")
 
@@ -6260,6 +7371,7 @@ class TestBrokerRoomAdapter:
         b._room_bridge = mock_bridge
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.receive_text = AsyncMock(side_effect=WebSocketDisconnect())
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")
@@ -6296,6 +7408,7 @@ class TestBrokerRoomAdapter:
             + "\n"
         )
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.receive_text = AsyncMock(side_effect=[frame, WebSocketDisconnect()])
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")
@@ -6324,6 +7437,7 @@ class TestBrokerRoomAdapter:
         }
         frame = _json.dumps({"events": [{"kind": "usage", "usage": usage}]}) + "\n"
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.receive_text = AsyncMock(side_effect=[frame, WebSocketDisconnect()])
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")
@@ -6342,6 +7456,7 @@ class TestBrokerRoomAdapter:
         b._room_bridge = mock_bridge
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.receive_text = AsyncMock(side_effect=["not valid json\n", WebSocketDisconnect()])
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")
@@ -6359,6 +7474,7 @@ class TestBrokerRoomAdapter:
         b._room_bridge = mock_bridge
 
         mock_ws = AsyncMock()
+        mock_ws.headers = {}
         mock_ws.receive_text = AsyncMock(side_effect=RuntimeError("unexpected"))
 
         await b.handle_ravn_websocket(mock_ws, "agent-1")

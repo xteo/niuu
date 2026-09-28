@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from identity.adapters.authorization import AllowAllAuthorizationAdapter
 from ting.domain.models import (
     TrackerIssue,
     TrackerMilestone,
@@ -138,14 +139,6 @@ class StubTracker(TrackerPort):
 
     async def get_run_by_id(self, run_id: Any) -> Any:
         return None
-
-    # -- Confidence events ------------------------------------------------
-
-    async def add_confidence_event(self, tracker_id: str, event: Any) -> None:
-        pass
-
-    async def get_confidence_events(self, tracker_id: str) -> list:
-        return []
 
     # -- Phase gates ------------------------------------------------------
 
@@ -301,6 +294,7 @@ def create_ting_test_app(
 
     # Expose on app.state for test assertions
     app.state.settings = settings
+    app.state.authorization = AllowAllAuthorizationAdapter()
     app.state.pool = pool
     app.state.stub_tracker = stub_tracker
 

@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
 from niuu.domain.notifications import NotificationDraft, build_notification_turn
 from tests.conftest import InMemorySessionRepository, MockEventBroadcaster, MockPodManager
 from tests.support.notifications import InMemoryNotificationStore
@@ -47,7 +48,7 @@ def _app(*, reply_ready: bool = True, with_notifications: bool = True):
         sinks=[],
     )
     app = FastAPI()
-    app.state.identity = object()
+    app.state.identity = EnvoyHeaderAuthenticationAdapter()
     app.include_router(
         create_session_log_router(
             log,
@@ -173,7 +174,7 @@ async def test_reply_ready_disabled_skips_final_outputs():
     assert store.notifications == {} and log.read_back == []
 
 
-async def test_orphan_log_has_no_owner_to_project_into():
+async def test_orphan_log_is_refused_before_anything_is_projected():
     client, log, store, _, _ = _app()
     sid = uuid4()
     response = client.post(
@@ -181,7 +182,7 @@ async def test_orphan_log_has_no_owner_to_project_into():
         json={"entries": [_notification_frame(sid, 1, "nt_o", "Orphan")]},
         headers=HEADERS,
     )
-    assert response.status_code == 201
+    assert response.status_code == 404
     assert store.notifications == {} and log.read_back == []
 
 

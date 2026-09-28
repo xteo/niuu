@@ -1,9 +1,12 @@
+import { createElement } from 'react';
 import { createRoute, redirect } from '@tanstack/react-router';
+import { SquareTerminal } from 'lucide-react';
 import { definePlugin } from '@niuulabs/plugin-sdk';
+import { readUiMode } from '@niuulabs/shell';
 import { ForgePage } from './ui/ForgePage';
 import { VolundrPage } from './ui/VolundrPage';
-import { SessionsPage } from './ui/SessionsPage';
-import { VolundrSessionRoute, VolundrArchivedRoute } from './ui/routes';
+import { SimpleLaunchPage } from './ui/SimpleLaunchPage';
+import { VolundrSessionsRoute, VolundrSessionRoute, VolundrArchivedRoute } from './ui/routes';
 import { LaunchCatalogPage } from './ui/LaunchCatalogPage';
 import { HistoryPage } from './ui/HistoryPage';
 import { NotificationsPage } from './ui/notifications/NotificationsPage';
@@ -14,6 +17,13 @@ export const volundrPlugin = definePlugin({
   rune: 'V',
   title: 'Völundr',
   subtitle: '',
+  simple: {
+    tabs: ['sessions'],
+    title: 'Sessions',
+    subtitle: 'coding agents in sandboxes',
+    // Coding sessions: a terminal an agent works in.
+    icon: createElement(SquareTerminal, { size: 17, 'aria-hidden': true }),
+  },
   tabs: [
     { id: 'forge', label: 'Forge', path: '/volundr/forge' },
     { id: 'sessions', label: 'Sessions', path: '/volundr/sessions' },
@@ -31,7 +41,7 @@ export const volundrPlugin = definePlugin({
       path: '/volundr',
       beforeLoad: ({ location }) => {
         throw redirect({
-          to: '/volundr/forge' as never,
+          to: (readUiMode() === 'simple' ? '/volundr/sessions' : '/volundr/forge') as never,
           search: location.search as never,
         });
       },
@@ -50,12 +60,17 @@ export const volundrPlugin = definePlugin({
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/volundr/sessions',
-      component: SessionsPage,
+      component: VolundrSessionsRoute,
+    }),
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: '/volundr/sessions/new',
+      component: SimpleLaunchPage,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: '/volundr/sessions/$sessionId',
-      component: SessionsPage,
+      component: VolundrSessionsRoute,
     }),
     createRoute({
       getParentRoute: () => rootRoute,
@@ -129,9 +144,9 @@ export {
 export type { VolundrHttpAdapter } from './adapters/http';
 
 // Port types
-export type { IVolundrService } from './ports/IVolundrService';
+export type { IVolundrService, SessionReadOptions } from './ports/IVolundrService';
 export type { IClusterAdapter } from './ports/IClusterAdapter';
-export type { ISessionStore, SessionFilters } from './ports/ISessionStore';
+export type { ISessionStore, SessionFilters, SessionLookupOptions } from './ports/ISessionStore';
 export type { IPtyStream } from './ports/IPtyStream';
 export type { IMetricsStream, MetricPoint } from './ports/IMetricsStream';
 export type { IFileSystemPort, FileTreeNode } from './ports/IFileSystemPort';
@@ -171,10 +186,31 @@ export {
   useNotificationReadState,
   useUnreadNotificationCount,
 } from './ui/hooks/useNotifications';
+export { SimpleSessionsPage } from './ui/SimpleSessionsPage';
+export { SimpleLaunchPage } from './ui/SimpleLaunchPage';
+export { useSessionList, useSessionDetail } from './ui/hooks/useSessionStore';
+export { sessionActivityTs, compareSessionsByActivity } from './ui/sessions/sessionLabels';
+export {
+  useQuickLaunch,
+  quickLaunchName,
+  quickLaunchSource,
+  defaultTargetId,
+  type QuickLaunchRequest,
+  type QuickLaunchOptions,
+} from './ui/hooks/useQuickLaunch';
 export { ForgePage } from './ui/ForgePage';
 export { StructuredLogViewer } from './ui/components/StructuredLogViewer';
 export { useSkuldChat } from './ui/hooks/useSkuldChat';
-export { WizardSelect } from './ui/LaunchWizardPrimitives';
+export {
+  WizardSelect,
+  StepIndicator,
+  SectionCard,
+  RuntimePanel,
+} from './ui/LaunchWizardPrimitives';
+export { ConfirmRow, BootingStep } from './ui/LaunchWizardSteps';
+export { LaunchWizard } from './ui/LaunchWizard';
+export { QuickLaunch } from './ui/QuickLaunch';
+export { useFeatures } from './ui/useFeatures';
 export { formatModelOption, type RuntimeModelDescriptor } from './ui/launchWizardModel';
 
 // Atoms
@@ -232,5 +268,7 @@ export type {
   ExternalSession,
   ExternalSessionHarness,
 } from './models/volundr.model';
+
+export { UserStorageSettings } from './ui/UserStorageSettings';
 
 export { ForgeSessionSettings } from './ui/ForgeSessionSettings';

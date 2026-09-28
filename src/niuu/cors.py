@@ -5,7 +5,13 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from niuu.adapters.inbound.source_health import SOURCE_FAILURES_HEADER
 from niuu.config import CorsConfig
+
+
+def _exposed_headers(cors: CorsConfig) -> list[str]:
+    """The configured exposed headers plus the source-failures header, once each."""
+    return list(dict.fromkeys([*cors.expose_headers, SOURCE_FAILURES_HEADER]))
 
 
 def apply_cors_middleware(app: FastAPI, cors: CorsConfig) -> None:
@@ -19,5 +25,9 @@ def apply_cors_middleware(app: FastAPI, cors: CorsConfig) -> None:
         allow_credentials=cors.allow_credentials,
         allow_methods=cors.allow_methods,
         allow_headers=cors.allow_headers,
-        expose_headers=cors.expose_headers,
+        # Browsers hide all custom response headers from cross-origin JS by
+        # default — without this, X-Niuu-Source-Failures (and the configured
+        # headers, e.g. X-Forge-Unavailable-Instances) are silently unreadable
+        # from a browser client even though the server sent them.
+        expose_headers=_exposed_headers(cors),
     )

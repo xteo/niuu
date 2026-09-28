@@ -18,6 +18,7 @@ from skuld.transports.codex_ws import (
     _pick_free_port,
     _rpc_notification,
     _rpc_request,
+    codex_gateway_overrides,
 )
 
 # ---------------------------------------------------------------------------
@@ -234,6 +235,7 @@ class TestConstruction:
                     "args": ["-m", "ravn", "tool-mcp"],
                     "startup_timeout_sec": 30,
                     "tool_timeout_sec": 3600,
+                    "required": True,
                 }
             ],
         )
@@ -246,6 +248,54 @@ class TestConstruction:
             "mcp_servers.ravn-tools.tool_timeout_sec",
             "3600.0",
         ) in t._mcp_overrides
+        assert ("mcp_servers.ravn-tools.required", "true") in t._mcp_overrides
+
+    def test_init_with_mcp_tool_policy_uses_codex_overrides(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            mcp_servers=[
+                {
+                    "name": "ravn-tools",
+                    "command": "python3",
+                    "args": ["-m", "ravn", "tool-mcp"],
+                    "default_tools_approval_mode": "approve",
+                    "enabled_tools": ["delivery_evidence", "workflow_execution_create"],
+                }
+            ],
+        )
+
+        assert (
+            "mcp_servers.ravn-tools.default_tools_approval_mode",
+            '"approve"',
+        ) in t._mcp_overrides
+        assert (
+            "mcp_servers.ravn-tools.enabled_tools",
+            '["delivery_evidence", "workflow_execution_create"]',
+        ) in t._mcp_overrides
+
+    def test_mcp_startup_timeout_is_configurable(self, tmp_path):
+        t = _make_transport(tmp_path, mcp_startup_timeout_seconds=17.0)
+
+        assert t._mcp_startup_timeout_seconds == 17.0
+
+    def test_mcp_startup_timeout_must_be_positive(self, tmp_path):
+        with pytest.raises(ValueError, match="mcp_startup_timeout_seconds must be positive"):
+            _make_transport(tmp_path, mcp_startup_timeout_seconds=0)
+
+    @pytest.mark.asyncio
+    async def test_mcp_catalog_failure_does_not_echo_codex_stderr(self, tmp_path):
+        t = _make_transport(tmp_path)
+        process = MagicMock(returncode=2)
+        process.communicate = AsyncMock(return_value=(b"", b"Authorization: Bearer must-not-leak"))
+        with patch(
+            "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ):
+            with pytest.raises(RuntimeError, match="exited with status 2") as raised:
+                await t._resolved_mcp_catalog("/bin/codex", env={}, overrides=[])
+
+        assert "must-not-leak" not in str(raised.value)
 
     @pytest.mark.asyncio
     async def test_connect_ws_uses_configured_large_message_limit(self, tmp_path):
@@ -429,6 +479,38 @@ class TestHandshake:
         assert thread_params["sandbox"] == "workspace-write"
 
     @pytest.mark.asyncio
+    async def test_handshake_read_only_never_requests_approval(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            skip_permissions=False,
+            approval_policy="never",
+            sandbox="read-only",
+            shell_tool_enabled=False,
+        )
+        t._ws = FakeWebSocket()
+        t._alive = True
+
+        params_captured = []
+
+        async def fake_send_rpc(method, params=None):
+            params_captured.append((method, params))
+            if method == "initialize":
+                return {"userAgent": "codex"}
+            if method == "thread/start":
+                return {"thread": {"id": "t-1"}}
+            return {}
+
+        t._send_rpc = fake_send_rpc
+        t._send_notification = AsyncMock()
+        _collect_emits(t)
+
+        await t._handshake()
+
+        thread_params = params_captured[1][1]
+        assert thread_params["approvalPolicy"] == "never"
+        assert thread_params["sandbox"] == "read-only"
+
+    @pytest.mark.asyncio
     async def test_handshake_without_overrides_defers_to_codex_config(self, tmp_path):
         t = _make_transport(tmp_path, skip_permissions=False)
         t._ws = FakeWebSocket()
@@ -456,6 +538,28 @@ class TestHandshake:
 
 
 class TestSpawnAppServer:
+    @pytest.mark.asyncio
+    async def test_spawn_app_server_disables_native_shell_and_agents_when_configured(
+        self, tmp_path
+    ):
+        t = _make_transport(
+            tmp_path,
+            shell_tool_enabled=False,
+            multi_agent_enabled=False,
+        )
+        t._codex_socket_path = str(tmp_path / "app-server.sock")
+
+        process = MagicMock()
+        process.pid = 123
+        process.stdout = None
+        process.stderr = None
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)) as spawn:
+            await t._spawn_app_server()
+
+        call_args = spawn.call_args.args
+        assert "features.shell_tool=false" in call_args
+        assert "features.multi_agent=false" in call_args
+
     @pytest.mark.asyncio
     async def test_spawn_app_server_passes_mcp_overrides(self, tmp_path):
         t = _make_transport(
@@ -567,19 +671,60 @@ class TestSpawnAppServer:
 
 class TestStartupFailure:
     @pytest.mark.asyncio
+    async def test_required_mcp_failure_prevents_initial_prompt(self, tmp_path):
+        t = _make_transport(tmp_path, initial_prompt="Coordinate delivery")
+        t._spawn_app_server = AsyncMock()
+        t._connect_ws = AsyncMock()
+        t._handshake = AsyncMock(
+            side_effect=RuntimeError("required MCP server ravn-tools failed to initialize")
+        )
+        t.stop = AsyncMock()
+        t.send_message = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="Codex app-server startup failed"):
+            await t.start()
+
+        t.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_start_rejects_app_server_failure_without_substitution(self, tmp_path):
         t = _make_transport(tmp_path, initial_prompt="Investigate this")
         emit = AsyncMock()
         t.on_event(emit)
         t._spawn_app_server = AsyncMock()
-        t._connect_ws = AsyncMock(side_effect=RuntimeError("uds handshake failed"))
+        t._connect_ws = AsyncMock(side_effect=RuntimeError("Codex app-server exited with code 1"))
         t._handshake = AsyncMock()
+        t.stop = AsyncMock()
 
         t.send_message = AsyncMock()
         with pytest.raises(RuntimeError, match="Codex app-server startup failed"):
             await t.start()
         t.send_message.assert_not_awaited()
         assert not t.is_alive
+
+    @pytest.mark.asyncio
+    async def test_spawn_app_server_creates_codex_home(self, tmp_path, monkeypatch):
+        """The Codex CLI refuses a CODEX_HOME that does not exist; a fresh
+        sandbox has none, so the transport creates it."""
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+        t = _make_transport(tmp_path)
+        proc = MagicMock()
+        proc.pid = 4242
+        proc.stdout = None
+        proc.stderr = None
+        with (
+            patch("skuld.transports.codex_ws.resolve_codex_cli", return_value="codex"),
+            patch(
+                "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=proc),
+            ),
+            patch("skuld.transports.codex_ws._drain_stream", new=AsyncMock()),
+        ):
+            await t._spawn_app_server()
+        assert (home / ".codex").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -3121,6 +3266,58 @@ class TestServerMessageWithId:
 
 class TestThreadStartedNotification:
     @pytest.mark.asyncio
+    async def test_nested_agent_cannot_complete_parent_turn(self, tmp_path):
+        t = _make_transport(tmp_path)
+        t._alive = True
+        emit = _collect_emits(t)
+        await t._handle_server_message(
+            {"method": "thread/started", "params": {"thread": {"id": "parent"}}}
+        )
+        await t._handle_server_message(
+            {
+                "method": "turn/started",
+                "params": {"threadId": "parent", "turn": {"id": "parent-turn"}},
+            }
+        )
+        emit.reset_mock()
+
+        for method, params in (
+            ("thread/started", {"thread": {"id": "child"}}),
+            ("turn/started", {"turn": {"id": "child-turn"}}),
+            ("item/agentMessage/delta", {"delta": "Child final answer"}),
+            ("turn/completed", {"turn": {"id": "child-turn"}}),
+            ("thread/closed", {}),
+        ):
+            await t._handle_server_message(
+                {"method": method, "params": {"threadId": "child", **params}}
+            )
+
+        assert t._thread_id == "parent"
+        assert t._current_turn_id == "parent-turn"
+        assert t._alive
+        assert all(call.args[0]["type"] == "agent_event" for call in emit.call_args_list)
+        assert all(call.args[0]["agent_id"] == "child" for call in emit.call_args_list)
+
+        t._handle_server_request = AsyncMock()
+        request = {
+            "id": 42,
+            "method": "item/tool/call",
+            "params": {"threadId": "child"},
+        }
+        await t._handle_server_message(request)
+        t._handle_server_request.assert_awaited_once_with(request)
+
+        await t._handle_server_message(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "parent", "turn": {"id": "parent-turn"}},
+            }
+        )
+        assert t._current_turn_id is None
+        assert len(_events_of_type(emit, "result")) == 1
+        assert _events_of_type(emit, "result")[0]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
     async def test_thread_started_sets_thread_id(self, tmp_path):
         t = _make_transport(tmp_path)
         _collect_emits(t)
@@ -3464,6 +3661,19 @@ class TestReasoningEffort:
         assert _model_supports_ultra("GPT-6-Astra") is True
         assert _codex_effort_for_model("gpt-6-astra") == "ultra"
 
+    def test_effort_helpers_recognize_gpt_6_sol_not_luna(self) -> None:
+        # Codex 0.157.0 lists ultra for GPT-6 Sol; GPT-6 Luna tops out at max.
+        assert _model_supports_ultra("gpt-6-sol") is True
+        assert _codex_effort_for_model("gpt-6-sol") == "ultra"
+        assert _model_supports_ultra("gpt-6-luna") is False
+        assert _codex_effort_for_model("gpt-6-luna") == "high"
+
+    @pytest.mark.asyncio
+    async def test_gpt_6_sol_handshake_sends_ultra_effort(self, tmp_path) -> None:
+        t = _make_transport(tmp_path, model="gpt-6-sol")
+        params = await _capture_thread_start_params(t)
+        assert params["config"]["model_reasoning_effort"] == "ultra"
+
     def test_sol_defaults_to_ultra(self, tmp_path) -> None:
         t = _make_transport(tmp_path, model="gpt-5.6-sol")
         assert t._reasoning_effort == "ultra"
@@ -3512,3 +3722,237 @@ class TestReasoningEffort:
         t = _make_transport(tmp_path, model="gpt-5.5", reasoning_effort="high")
         params = await _capture_thread_start_params(t)
         assert params["config"]["model_reasoning_effort"] == "high"
+
+
+class TestModelGateway:
+    """Sessions on a self-hosted model: Codex talks to the platform's gateway."""
+
+    def test_overrides_select_a_chat_provider_keyed_by_env(self):
+        overrides = dict(codex_gateway_overrides("http://niuu:8080/api/v1/bifrost/"))
+        assert overrides == {
+            "model_provider": '"niuu"',
+            "model_providers.niuu.name": '"Niuu model gateway"',
+            "model_providers.niuu.base_url": '"http://niuu:8080/api/v1/bifrost/v1"',
+            "model_providers.niuu.env_key": '"NIUU_MODEL_GATEWAY_TOKEN"',
+            "model_providers.niuu.wire_api": '"responses"',
+        }
+        assert codex_gateway_overrides("  ") == []
+
+    @pytest.mark.asyncio
+    async def test_spawn_passes_the_overrides_and_the_token(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            model_gateway_url="http://niuu:8080/api/v1/bifrost",
+            model_gateway_token="niuu-gateway",
+        )
+        mock_process = MagicMock()
+        mock_process.stdout = None
+        mock_process.stderr = None
+        mock_process.pid = 12345
+        with (
+            patch(
+                "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as mock_exec,
+            patch("skuld.transports.codex_ws.resolve_codex_cli", return_value="/bin/codex"),
+            patch(
+                "skuld.transports.codex_ws.ensure_codex_tool_shims",
+                return_value=(tmp_path / ".skuld-tools" / "bin", {}),
+            ),
+        ):
+            mock_exec.return_value = mock_process
+            await t._spawn_app_server()
+        args = mock_exec.call_args[0]
+        assert 'model_provider="niuu"' in args
+        assert 'model_providers.niuu.base_url="http://niuu:8080/api/v1/bifrost/v1"' in args
+        assert 'model_providers.niuu.wire_api="responses"' in args
+        assert mock_exec.call_args.kwargs["env"]["NIUU_MODEL_GATEWAY_TOKEN"] == "niuu-gateway"
+
+    @pytest.mark.asyncio
+    async def test_blank_token_with_a_gateway_url_raises(self, tmp_path):
+        """Codex reads NIUU_MODEL_GATEWAY_TOKEN as its provider key and
+
+        refuses an empty value — never a silent, unauthenticated session.
+        """
+        t = _make_transport(
+            tmp_path,
+            model_gateway_url="http://niuu:8080/api/v1/bifrost",
+            model_gateway_token="",
+        )
+        with (
+            patch(
+                "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ),
+            patch("skuld.transports.codex_ws.resolve_codex_cli", return_value="/bin/codex"),
+            patch(
+                "skuld.transports.codex_ws.ensure_codex_tool_shims",
+                return_value=(tmp_path / ".skuld-tools" / "bin", {}),
+            ),
+            pytest.raises(ValueError, match="model_gateway_token is blank"),
+        ):
+            await t._spawn_app_server()
+
+    @pytest.mark.asyncio
+    async def test_read_only_mcp_spawn_disables_other_native_capability_sources(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            read_only_mcp_only=True,
+            shell_tool_enabled=False,
+            multi_agent_enabled=False,
+            mcp_servers=[
+                {
+                    "name": "ravn-tools",
+                    "command": "ravn-tool-mcp",
+                    "default_tools_approval_mode": "approve",
+                    "enabled_tools": ["delivery_evidence"],
+                }
+            ],
+        )
+        t._resolved_mcp_catalog = AsyncMock(
+            return_value=[
+                {"name": "ravn-tools", "enabled": True},
+                {"name": "seeded-rogue", "enabled": True},
+            ]
+        )
+        mock_process = MagicMock(stdout=None, stderr=None, pid=12345)
+        with (
+            patch(
+                "skuld.transports.codex_ws.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as mock_exec,
+            patch("skuld.transports.codex_ws.resolve_codex_cli", return_value="/bin/codex"),
+            patch(
+                "skuld.transports.codex_ws.ensure_codex_tool_shims",
+                return_value=(tmp_path / ".skuld-tools" / "bin", {}),
+            ),
+        ):
+            mock_exec.return_value = mock_process
+            await t._spawn_app_server()
+
+        args = mock_exec.call_args.args
+        assert "features.shell_tool=false" in args
+        assert "features.multi_agent=false" in args
+        assert "features.apps=false" in args
+        assert "features.plugins=false" in args
+        assert "features.tool_suggest=false" in args
+        assert 'mcp_servers.ravn-tools.default_tools_approval_mode="approve"' in args
+        assert 'mcp_servers.ravn-tools.enabled_tools=["delivery_evidence"]' in args
+        assert "mcp_servers.ravn-tools.enabled=true" in args
+        assert "mcp_servers.seeded-rogue.enabled=false" in args
+
+    @pytest.mark.asyncio
+    async def test_read_only_mcp_status_rejects_unexpected_initialized_server(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            read_only_mcp_only=True,
+            mcp_servers=[{"name": "ravn-tools", "command": "ravn-tool-mcp"}],
+        )
+        t._send_rpc = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "name": "ravn-tools",
+                        "serverInfo": {"name": "ravn-tools"},
+                        "tools": {},
+                        "resources": [],
+                        "resourceTemplates": [],
+                    },
+                    {
+                        "name": "seeded-rogue",
+                        "serverInfo": {"name": "seeded-rogue"},
+                        "tools": {"write": {}},
+                        "resources": [],
+                        "resourceTemplates": [],
+                    },
+                ],
+                "nextCursor": None,
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="isolation failed"):
+            await t._verify_read_only_mcp_servers()
+
+    @pytest.mark.asyncio
+    async def test_read_only_mcp_status_accepts_only_generated_server(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            read_only_mcp_only=True,
+            mcp_servers=[{"name": "ravn-tools", "command": "ravn-tool-mcp"}],
+        )
+        t._send_rpc = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "name": "ravn-tools",
+                        "serverInfo": {"name": "ravn-tools"},
+                        "tools": {},
+                        "resources": [],
+                        "resourceTemplates": [],
+                    },
+                    {
+                        "name": "seeded-rogue",
+                        "serverInfo": None,
+                        "tools": {},
+                        "resources": [],
+                        "resourceTemplates": [],
+                    },
+                ],
+                "nextCursor": None,
+            }
+        )
+
+        await t._verify_read_only_mcp_servers()
+
+    @pytest.mark.asyncio
+    async def test_read_only_mcp_status_rejects_disconnected_allowed_server(self, tmp_path):
+        t = _make_transport(
+            tmp_path,
+            read_only_mcp_only=True,
+            mcp_servers=[{"name": "ravn-tools", "command": "ravn-tool-mcp"}],
+        )
+        t._send_rpc = AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "name": "ravn-tools",
+                        "serverInfo": None,
+                        "tools": {},
+                        "resources": [],
+                        "resourceTemplates": [],
+                    }
+                ],
+                "nextCursor": None,
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="disconnected allowed"):
+            await t._verify_read_only_mcp_servers()
+
+    @pytest.mark.asyncio
+    async def test_no_chatgpt_login_when_routed_through_the_gateway(self, tmp_path):
+        provider = MagicMock()
+        provider.get_tokens = AsyncMock(return_value=None)
+        t = _make_transport(
+            tmp_path,
+            codex_auth_provider=provider,
+            model_gateway_url="http://niuu:8080/api/v1/bifrost",
+        )
+        t._send_rpc = AsyncMock()
+        await t._authenticate_codex()
+        provider.get_tokens.assert_not_awaited()
+        t._send_rpc.assert_not_awaited()
+
+
+class TestGatewayReasoningEffort:
+    def test_no_default_effort_behind_the_gateway(self, tmp_path):
+        """Codex asks OpenAI models for high reasoning by default; a served
+        model gets no reasoning request unless the session sets one."""
+        routed = _make_transport(tmp_path, model="llama3.1:8b", model_gateway_url="http://gw")
+        assert routed._reasoning_effort == ""
+        direct = _make_transport(tmp_path, model="gpt-5.6-sol")
+        assert direct._reasoning_effort == "ultra"
+        explicit = _make_transport(
+            tmp_path, model="deepseek-r1", model_gateway_url="http://gw", reasoning_effort="medium"
+        )
+        assert explicit._reasoning_effort == "medium"

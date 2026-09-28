@@ -44,6 +44,9 @@ _PRINCIPAL = Principal(
 
 def _client(service: Mock) -> TestClient:
     app = FastAPI()
+    from identity.adapters.identity import EnvoyHeaderAuthenticationAdapter
+
+    app.state.identity = EnvoyHeaderAuthenticationAdapter()
     app.include_router(create_resident_runtimes_router(service))
     app.dependency_overrides[extract_principal] = lambda: _PRINCIPAL
     return TestClient(app)
@@ -230,6 +233,7 @@ def test_native_resident_session_crud_uses_authenticated_service() -> None:
 def test_create_and_lifecycle_routes_use_authenticated_service() -> None:
     flock_id = uuid4()
     member_id = uuid4()
+    realm_id = uuid4()
     runtime = ResidentRuntime(
         id=uuid4(),
         owner_id="user-a",
@@ -257,6 +261,7 @@ def test_create_and_lifecycle_routes_use_authenticated_service() -> None:
             "flockMemberId": str(member_id),
             "flockRole": "coordinator",
             "flockPeerId": f"ravn-{member_id}",
+            "realmId": str(realm_id),
         },
     )
     restarted = client.post(f"/api/v1/forge/resident-runtimes/{runtime.id}/restart")
@@ -277,6 +282,7 @@ def test_create_and_lifecycle_routes_use_authenticated_service() -> None:
         flock_member_id=member_id,
         flock_role="coordinator",
         flock_peer_id=f"ravn-{member_id}",
+        realm_id=realm_id,
     )
     service.delete.assert_awaited_once_with(_PRINCIPAL, runtime.id)
 
@@ -321,7 +327,7 @@ def test_create_maps_domain_failures(error, expected_status) -> None:
         ("record_usage", "post", "/usage", {"tokens": 1}),
         ("list_sessions", "get", "/sessions", None),
         ("create_session", "post", "/sessions", {"title": "Work"}),
-        ("delete_session", "delete", f"/sessions/{uuid4()}", None),
+        ("delete_session", "delete", "/sessions/3f2b8c1e-6d4a-4e9b-9c57-1a2b3c4d5e6f", None),
         ("set_desired_state", "post", "/suspend", None),
         ("set_desired_state", "post", "/resume", None),
         ("delete", "delete", "", None),

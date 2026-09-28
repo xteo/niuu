@@ -8,6 +8,7 @@ from uuid import UUID
 
 import asyncpg
 
+from identity.ports import AuthorizationDeniedError
 from ting.domain.models import CampaignStageState, WorkflowCampaign, WorkflowCampaignStatus
 from ting.ports.workflow_campaign_repository import WorkflowCampaignRepository
 
@@ -57,21 +58,26 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
         *,
         owner_id: str,
         session_id: str,
+        connection_id: str | None = None,
     ) -> WorkflowCampaign | None:
-        row = await self._pool.fetchrow(
+        rows = await self._pool.fetch(
             """
             SELECT *
             FROM workflow_campaigns
             WHERE owner_id = $1
               AND session_id = $2
+              AND ($3::text IS NULL OR connection_id = $3)
               AND status IN ('pending', 'running', 'blocked')
             ORDER BY updated_at DESC
-            LIMIT 1
+            LIMIT 2
             """,
             owner_id,
             session_id,
+            connection_id,
         )
-        return self._row_to_campaign(row) if row is not None else None
+        if len(rows) != 1:
+            return None
+        return self._row_to_campaign(rows[0])
 
     async def get_campaign(self, campaign_id: UUID) -> WorkflowCampaign | None:
         row = await self._pool.fetchrow(
@@ -109,7 +115,7 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
         return self._row_to_campaign(row)
 
     async def save_campaign(self, campaign: WorkflowCampaign) -> WorkflowCampaign:
-        await self._pool.execute(
+        result = await self._pool.execute(
             """
             INSERT INTO workflow_campaigns (
                 id,
@@ -130,11 +136,12 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
                 updated_at,
                 last_activity_at,
                 completed_at,
-                connection_id
+                connection_id,
+                tenant_id
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14::jsonb,
-                $15, $16, $17, $18, $19
+                $15, $16, $17, $18, $19, $20
             )
             ON CONFLICT (id) DO UPDATE SET
                 slug = EXCLUDED.slug,
@@ -154,6 +161,8 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
                 last_activity_at = EXCLUDED.last_activity_at,
                 completed_at = EXCLUDED.completed_at,
                 connection_id = EXCLUDED.connection_id
+                WHERE workflow_campaigns.tenant_id = EXCLUDED.tenant_id
+                  AND workflow_campaigns.owner_id IS NOT DISTINCT FROM EXCLUDED.owner_id
             """,
             campaign.id,
             campaign.slug,
@@ -174,7 +183,10 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
             campaign.last_activity_at,
             campaign.completed_at,
             campaign.connection_id,
+            campaign.tenant_id,
         )
+        if result == "INSERT 0 0":
+            raise AuthorizationDeniedError("Resource ownership is immutable")
         return campaign
 
     async def delete_campaign(self, campaign_id: UUID) -> bool:
@@ -202,6 +214,7 @@ class PostgresWorkflowCampaignRepository(WorkflowCampaignRepository):
         ]
         return WorkflowCampaign(
             id=row["id"],
+            tenant_id=row["tenant_id"],
             slug=row["slug"],
             name=row["name"],
             owner_id=row["owner_id"],

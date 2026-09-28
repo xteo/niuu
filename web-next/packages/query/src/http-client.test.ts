@@ -19,6 +19,7 @@ function makeFetch(status: number, body: unknown, ok = status >= 200 && status <
     status,
     ok,
     json: vi.fn().mockResolvedValue(body),
+    text: vi.fn().mockResolvedValue(JSON.stringify(body)),
   });
 }
 
@@ -254,7 +255,10 @@ describe('createApiClient', () => {
       vi.fn().mockResolvedValue(
         new Response(JSON.stringify({ items: [] }), {
           status: 200,
-          headers: { 'X-Forge-Unavailable-Instances': 'horde-1' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forge-Unavailable-Instances': 'horde-1',
+          },
         }),
       ),
     );
@@ -284,6 +288,17 @@ describe('createApiClient', () => {
     const [, opts] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(opts.method).toBe('POST');
     expect(opts.body).toBe(JSON.stringify({ name: 'x' }));
+  });
+
+  it('POST merges caller headers with authentication headers', async () => {
+    setTokenProvider(() => 'bearer-xyz');
+    const client = createApiClient(BASE);
+    await client.post('/items', { name: 'x' }, { headers: { 'Idempotency-Key': 'launch-key' } });
+    const [, opts] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = opts.headers as Headers;
+    expect(headers.get('Idempotency-Key')).toBe('launch-key');
+    expect(headers.get('Authorization')).toBe('Bearer bearer-xyz');
+    expect(headers.get('Content-Type')).toBe('application/json');
   });
 
   it('POST without a payload omits the request body', async () => {
@@ -364,6 +379,36 @@ describe('createApiClient', () => {
     expect(result).toBeUndefined();
   });
 
+  it('returns the body text when the server declares a non-JSON document', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('name: reviewer\nrole: review\n', {
+          status: 200,
+          headers: { 'content-type': 'text/yaml; charset=utf-8' },
+        }),
+      ),
+    );
+    const client = createApiClient(BASE);
+    await expect(client.get<string>('/personas/reviewer/yaml')).resolves.toBe(
+      'name: reviewer\nrole: review\n',
+    );
+  });
+
+  it('parses JSON when the server declares JSON', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('{"name":"reviewer"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+    const client = createApiClient(BASE);
+    await expect(client.get('/personas/reviewer')).resolves.toEqual({ name: 'reviewer' });
+  });
+
   it('throws ApiClientError on non-ok response', async () => {
     vi.stubGlobal('fetch', makeFetch(404, { detail: 'not found' }, false));
     const client = createApiClient(BASE);
@@ -391,6 +436,18 @@ describe('createApiClient', () => {
       expect((err as ApiClientError).detail).toBe('Unknown error');
     }
   });
+
+  it.each(['Internal Server Error', '<html>Bad gateway</html>', ''])(
+    'preserves HTTP errors for a non-JSON body: %s',
+    async (body) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 500 })));
+      await expect(createApiClient(BASE).get('/dreams')).rejects.toMatchObject({
+        name: 'ApiClientError',
+        status: 500,
+        detail: body || 'Unknown error',
+      });
+    },
+  );
 });
 
 it('passes an inventory read AbortSignal to fetch without dropping authentication', async () => {

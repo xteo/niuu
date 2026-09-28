@@ -258,6 +258,66 @@ class TestSubprocessTransport:
         assert payload["mcpServers"]["mimir-local"]["command"] == "python3"
 
     @pytest.mark.asyncio
+    async def test_read_only_mcp_boundary_uses_only_explicit_mcp_tools(self, tmp_path):
+        transport = SubprocessTransport(
+            str(tmp_path),
+            skip_permissions=True,
+            agent_teams=True,
+            mcp_servers=[{"name": "ravn-tools", "command": "ravn-tool-mcp"}],
+            read_only_mcp_only=True,
+            allowed_mcp_tools=["mcp__ravn-tools__*"],
+        )
+        mock_subprocess = self._mock_process(
+            stdout_lines=[
+                (
+                    b'{"type": "system", "subtype": "init", "mcp_servers": '
+                    b'[{"name": "ravn-tools", "status": "connected"}]}\n'
+                ),
+                b'{"type": "result", "result": "Done"}\n',
+            ]
+        )
+        transport.on_event(AsyncMock())
+
+        with patch(
+            "skuld.transports.subprocess.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as mock_exec:
+            mock_exec.return_value = mock_subprocess
+            await transport.send_message("coordinate")
+
+        call_args = mock_exec.call_args.args
+        assert call_args[call_args.index("--tools") + 1] == ""
+        assert "--strict-mcp-config" in call_args
+        assert call_args[call_args.index("--permission-mode") + 1] == "dontAsk"
+        assert call_args[call_args.index("--allowedTools") + 1] == "mcp__ravn-tools__*"
+        assert "bypassPermissions" not in call_args
+        assert transport._agent_teams is False
+
+    @pytest.mark.asyncio
+    async def test_read_only_mcp_boundary_fails_when_required_server_did_not_start(self, tmp_path):
+        transport = SubprocessTransport(
+            str(tmp_path),
+            mcp_servers=[{"name": "ravn-tools", "command": "ravn-tool-mcp"}],
+            read_only_mcp_only=True,
+            allowed_mcp_tools=["mcp__ravn-tools__*"],
+        )
+        mock_subprocess = self._mock_process(
+            stdout_lines=[
+                b'{"type": "system", "subtype": "init", "mcp_servers": '
+                b'[{"name": "ravn-tools", "status": "failed", '
+                b'"error": "process exited"}]}\n',
+            ]
+        )
+
+        with patch(
+            "skuld.transports.subprocess.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as mock_exec:
+            mock_exec.return_value = mock_subprocess
+            with pytest.raises(RuntimeError, match=r"ravn-tools: failed \(process exited\)"):
+                await transport.send_message("coordinate")
+
+    @pytest.mark.asyncio
     async def test_start_with_initial_prompt_sends_message(self, tmp_path):
         transport = SubprocessTransport(str(tmp_path), initial_prompt="bootstrap prompt")
 
@@ -2130,3 +2190,32 @@ class TestStopProcess:
 
         proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
+
+
+def test_persistent_subprocess_routes_through_the_model_gateway():
+    """A configured gateway must reach the spawned CLI, not just the config.
+
+    PersistentSubprocessTransport is the transport Claude sessions actually use,
+    and it was the only one that never received the model_gateway plumbing that
+    sdk.py and tmux_interactive.py have — so a session pointed at a self-hosted
+    model silently went to the vendor API instead.
+    """
+    from skuld.transports.persistent_subprocess import PersistentSubprocessTransport
+
+    transport = PersistentSubprocessTransport(
+        workspace_dir="/tmp",
+        model_gateway_url="http://gateway.invalid/api/v1/bifrost",
+        model_gateway_token="unused",
+    )
+    env = transport._spawn_env() if hasattr(transport, "_spawn_env") else None
+    if env is None:
+        from skuld.transports.claude_env import claude_spawn_env
+
+        env = claude_spawn_env(
+            gateway_url=transport._model_gateway_url,
+            gateway_token=transport._model_gateway_token,
+        )
+
+    assert env["ANTHROPIC_BASE_URL"] == "http://gateway.invalid/api/v1/bifrost"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "unused"
+    assert "ANTHROPIC_API_KEY" not in env

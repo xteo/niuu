@@ -9,13 +9,15 @@ import {
   type IFeatureCatalogService,
   niuuConfigSchema,
   type NiuuConfig,
+  type PluginDescriptor,
   useConfig,
 } from '@niuulabs/plugin-sdk';
 import { createQueryClient } from '@niuulabs/query';
 import { AuthProvider, useAuth } from '@niuulabs/auth';
 import { Shell } from '@niuulabs/shell';
 import { LogoKnot } from '@niuulabs/plugin-login';
-import { plugins } from './plugins';
+import { SetupGate, ConnectionRecoveryProvider } from '@niuulabs/plugin-setup';
+import { loadEnabledPlugins } from './plugins';
 import { buildServiceBackendStatus, buildServices, isUnavailableService } from './services';
 
 const DEFAULT_CONFIG_ENDPOINT = '/config.json';
@@ -51,7 +53,7 @@ export function publishServiceBackends(
   target.__NIUU_SERVICE_BACKENDS__ = backends;
 }
 
-function AppInner() {
+function AppInner({ plugins }: { plugins: PluginDescriptor[] }) {
   const config = useConfig();
   const serviceState = useMemo(() => {
     try {
@@ -88,20 +90,24 @@ function AppInner() {
       <AuthGate>
         <ServicesProvider services={services}>
           <FeatureCatalogProvider service={featureCatalogService}>
-            <div className="niuu:flex niuu:h-full niuu:min-h-0 niuu:flex-col">
-              {unavailableServices.length > 0 ? (
-                <div
-                  role="status"
-                  title={unavailableServices.join(', ')}
-                  className="niuu:border-b niuu:border-amber-400/30 niuu:bg-amber-400/10 niuu:px-3 niuu:py-1.5 niuu:text-xs niuu:text-amber-200"
-                >
-                  {unavailableServices.length} optional service backend
-                  {unavailableServices.length === 1 ? ' is' : 's are'} unavailable. Features without
-                  a live backend will report unavailable instead of showing demo data.
+            <SetupGate>
+              <ConnectionRecoveryProvider>
+                <div className="niuu:flex niuu:h-full niuu:min-h-0 niuu:flex-col">
+                  {unavailableServices.length > 0 ? (
+                    <div
+                      role="status"
+                      title={unavailableServices.join(', ')}
+                      className="niuu:border-b niuu:border-amber-400/30 niuu:bg-amber-400/10 niuu:px-3 niuu:py-1.5 niuu:text-xs niuu:text-amber-200"
+                    >
+                      {unavailableServices.length} optional service backend
+                      {unavailableServices.length === 1 ? ' is' : 's are'} unavailable. Features
+                      without a live backend will report unavailable instead of showing demo data.
+                    </div>
+                  ) : null}
+                  <ApplicationShell plugins={plugins} />
                 </div>
-              ) : null}
-              <ApplicationShell />
-            </div>
+              </ConnectionRecoveryProvider>
+            </SetupGate>
           </FeatureCatalogProvider>
         </ServicesProvider>
       </AuthGate>
@@ -137,7 +143,7 @@ export function App() {
   const configEndpoint = resolveConfigEndpoint();
   const [state, setState] = useState<
     | { status: 'loading' }
-    | { status: 'ready'; config: NiuuConfig }
+    | { status: 'ready'; config: NiuuConfig; plugins: PluginDescriptor[] }
     | { status: 'error'; error: Error }
   >({ status: 'loading' });
 
@@ -153,9 +159,10 @@ export function App() {
         }
         return niuuConfigSchema.parse(await response.json());
       })
-      .then((config) => {
+      .then(async (config) => {
+        const plugins = await loadEnabledPlugins(config);
         if (!cancelled) {
-          setState({ status: 'ready', config });
+          setState({ status: 'ready', config, plugins });
         }
       })
       .catch((error: unknown) => {
@@ -182,7 +189,7 @@ export function App() {
   return (
     <ConfigProvider value={state.config}>
       <QueryClientProvider client={queryClient}>
-        <AppInner />
+        <AppInner plugins={state.plugins} />
         <ReactQueryDevtools initialIsOpen={false} />
       </QueryClientProvider>
     </ConfigProvider>
@@ -228,7 +235,7 @@ function AuthGate({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-function ApplicationShell() {
+function ApplicationShell({ plugins }: { plugins: PluginDescriptor[] }) {
   const { enabled, logout } = useAuth();
   const [disconnected, setDisconnected] = useState(false);
   if (disconnected)

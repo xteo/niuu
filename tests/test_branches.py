@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, ConnectError
 
+from tests.conftest import make_session_participant_service
 from volundr.adapters.inbound.rest import create_router
 from volundr.domain.models import GitProviderType
 from volundr.domain.ports import (
@@ -165,6 +166,7 @@ def _make_app(provider: _StubProvider | None = None, *, repo_service=...):
         chronicle_service=None,
         broadcaster=None,
         repo_service=repo_service,
+        session_participant_service=make_session_participant_service(None),
     )
     app = FastAPI()
     app.include_router(router)
@@ -173,6 +175,15 @@ def _make_app(provider: _StubProvider | None = None, *, repo_service=...):
 
 class TestBranchesEndpoint:
     """Tests for GET /repos/branches."""
+
+    async def test_provider_outage_returns_502(self):
+        app = _make_app(provider=_StubProvider(error=ConnectError("unavailable")))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/api/v1/forge/repos/branches", params={"repo_url": "https://github.com/org/repo"}
+            )
+        assert response.status_code == 502
+        assert "Could not fetch branches" in response.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_list_branches_ok(self):

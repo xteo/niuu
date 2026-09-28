@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -52,8 +53,27 @@ class InMemoryWorkflowRepository(WorkflowRepository):
         self._workflows[workflow.id] = workflow
         return workflow
 
+    async def list_workflow_versions(self, workflow_id):
+        return []
+
+    async def get_workflow_version(self, workflow_id, *, version=None, document_revision=None):
+        workflow = await self.get_workflow(workflow_id)
+        return workflow if workflow is not None and workflow.version == version else None
+
+    async def save_workflow_version(self, workflow, **kwargs):
+        raise NotImplementedError
+
     async def delete_workflow(self, workflow_id: UUID) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
+
+    async def has_recorded_version_history(self, workflow_id: UUID) -> bool:
+        return True
+
+    async def adopt_legacy_bundled(self, seed):
+        return await self.save_workflow(seed)
+
+    async def reclassify_orphaned_bundled_as_authored(self, workflow_id):
+        return await self.get_workflow(workflow_id)
 
 
 def _workflow(
@@ -139,6 +159,21 @@ class TestAgentCard:
         card = parse_agent_card(client.get(CARD_PATH).json())
 
         assert card.capabilities.push_notifications is True
+
+    def test_skill_description_notes_placement_when_the_workflow_declares_one(self) -> None:
+        base = _workflow()
+        workflow = replace(
+            base,
+            schema_version=2,
+            graph={**base.graph, "placement": {"tags": ["dgx-spark"]}},
+        )
+        client = _client(InMemoryWorkflowRepository([workflow]))
+
+        response = client.get(CARD_PATH)
+
+        card = parse_agent_card(response.json())
+        assert "graph.placement" in card.skills[0].description
+        assert "422" in card.skills[0].description
 
     def test_workflow_without_declared_tags_gets_protocol_tag(self) -> None:
         workflow = _workflow()

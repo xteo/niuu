@@ -74,6 +74,21 @@ class TestExtractPrincipalWithHeaders:
         assert data["tenant_id"] == "tenant-1"
         assert data["roles"] == ["volundr:admin", "volundr:developer"]
 
+    def test_explicit_dev_tenant_aligns_cross_service_identity(self, dev_app):
+        dev_app.state.settings.auth.default_tenant_id = "local-tenant"
+        with TestClient(dev_app) as client:
+            assert client.get("/whoami").json()["tenant_id"] == "local-tenant"
+            # Real supplied identity retains its own tenant; the default applies
+            # only to the explicitly anonymous development identity.
+            response = client.get(
+                "/whoami",
+                headers={
+                    "x-auth-user-id": "other-user",
+                    "x-auth-tenant": "other-tenant",
+                },
+            )
+            assert response.json()["tenant_id"] == "other-tenant"
+
     def test_single_role(self, client: TestClient):
         resp = client.get(
             "/whoami",
@@ -96,7 +111,7 @@ class TestExtractPrincipalWithHeaders:
         assert data["user_id"] == "user-99"
         assert data["email"] == ""
         assert data["tenant_id"] == ""
-        assert data["roles"] == ["volundr:developer"]
+        assert data["roles"] == []
 
 
 class TestExtractPrincipalProduction:
@@ -134,3 +149,12 @@ class TestExtractPrincipalDevFallback:
         assert resp.status_code == 200
         data = resp.json()
         assert data["user_id"] == "dev-user"
+
+
+def test_envoy_base64_roles_are_decoded(client):
+    import base64
+    import json
+
+    roles = base64.b64encode(json.dumps(["volundr:viewer"]).encode()).decode()
+    response = client.get("/whoami", headers={"x-auth-user-id": "alice", "x-auth-roles": roles})
+    assert response.json()["roles"] == ["volundr:viewer"]

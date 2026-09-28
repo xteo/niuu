@@ -8,7 +8,8 @@
  * @niuulabs/query (get / post / put / patch / delete methods).
  */
 
-import type { ApiClient } from '@niuulabs/query';
+import { ApiClientError, getAuthHeaders, type ApiClient } from '@niuulabs/query';
+import { WorkflowRevisionConflictError } from '../ports';
 import type {
   ITingService,
   IDispatcherService,
@@ -49,12 +50,18 @@ import type {
   AuditEntry,
   AuditFilter,
   ImportProjectOptions,
+  WorkflowExportFormat,
+  WorkflowExport,
+  WorkflowImportSource,
+  WorkflowImportPreview,
 } from '../ports';
 import type { Saga, Phase, Run } from '../domain/saga';
 import type { DispatcherState } from '../domain/dispatcher';
 import type { SessionInfo } from '../domain/session';
 import type { TrackerProject, TrackerMilestone, TrackerIssue } from '../domain/tracker';
 import type { Workflow } from '../domain/workflow';
+import { layoutWorkflow } from '../domain/workflowLayout';
+import { estimateWorkflowNodeSize } from '../domain/workflowGeometry';
 
 // ---------------------------------------------------------------------------
 // Raw server types (snake_case)
@@ -64,6 +71,7 @@ interface RawSaga {
   id: string;
   tracker_id: string;
   tracker_type?: string;
+  tracker_connection_id?: string;
   slug?: string;
   name: string;
   repos: string[];
@@ -71,7 +79,6 @@ interface RawSaga {
   base_branch?: string;
   status: string;
   url?: string;
-  confidence?: number;
   created_at: string;
   workflow_id?: string | null;
   workflow?: string | null;
@@ -102,7 +109,6 @@ interface RawRun {
   declared_files: string[];
   estimate_hours: number | null;
   status: string;
-  confidence: number;
   session_id: string | null;
   reviewer_session_id: string | null;
   review_round: number;
@@ -120,14 +126,12 @@ interface RawPhase {
   number: number;
   name: string;
   status: string;
-  confidence: number;
   runs: RawRun[];
 }
 
 interface RawDispatcherState {
   id: string;
   running: boolean;
-  threshold: number;
   max_concurrent_runs: number;
   auto_continue: boolean;
   updated_at: string;
@@ -151,7 +155,6 @@ interface RawSessionInfo {
   status: string;
   chronicle_lines: string[];
   branch: string | null;
-  confidence: number;
   run_name: string;
   saga_name: string;
   cluster_name: string;
@@ -195,6 +198,9 @@ interface RawTrackerProject {
   milestone_count: number;
   issue_count: number;
   slug?: string;
+  tracker_connection_id?: string;
+  tracker_type?: string;
+  tracker_name?: string;
 }
 
 interface RawTrackerMilestone {
@@ -204,6 +210,9 @@ interface RawTrackerMilestone {
   description: string;
   sort_order: number;
   progress: number;
+  tracker_connection_id?: string;
+  tracker_type?: string;
+  tracker_name?: string;
 }
 
 interface RawTrackerIssue {
@@ -217,6 +226,9 @@ interface RawTrackerIssue {
   priority: number;
   url: string;
   milestone_id: string | null;
+  tracker_connection_id?: string;
+  tracker_type?: string;
+  tracker_name?: string;
 }
 
 interface RawDispatchQueueItem {
@@ -261,6 +273,8 @@ interface RawDispatchCluster {
 }
 
 interface RawWorkflow {
+  schema_version?: 1 | 2;
+  workflow_dependencies?: Workflow['workflowDependencies'];
   id: string;
   name: string;
   description: string;
@@ -272,6 +286,40 @@ interface RawWorkflow {
   edges: Workflow['edges'];
   resourceBindings?: Workflow['resourceBindings'];
   resource_bindings?: Workflow['resourceBindings'];
+  graph?: Record<string, unknown>;
+  personaDependencies?: Workflow['personaDependencies'];
+  persona_dependencies?: Workflow['personaDependencies'];
+  revision?: string | null;
+  document_revision?: string | null;
+  is_head?: boolean;
+  origin?: 'bundled' | 'authored';
+  can_edit?: boolean;
+  readOnly?: boolean;
+  read_only?: boolean;
+  canonicalYaml?: string;
+  canonical_yaml?: string;
+  requirements?: Workflow['requirements'];
+}
+
+interface RawWorkflowVersionSummary {
+  version: string;
+  document_revision: string;
+  created_at: string;
+  is_head: boolean;
+  based_on_revision?: string | null;
+  origin?: 'bundled' | 'authored';
+}
+
+interface RawWorkflowImportPreview {
+  workflows?: WorkflowImportPreview['workflows'];
+  workflow: WorkflowImportPreview['workflow'];
+  personas: WorkflowImportPreview['personas'];
+  requirements?: WorkflowImportPreview['requirements'];
+  errors?: string[];
+  canApply?: boolean;
+  can_apply?: boolean;
+  previewDigest?: string;
+  preview_digest?: string;
 }
 
 interface RawWorkflowLaunchResult {
@@ -287,6 +335,12 @@ interface RawWorkflowLaunchResult {
   status: string;
   clusterName?: string;
   cluster_name?: string;
+  chatEndpoint?: string | null;
+  chat_endpoint?: string | null;
+  workflowVersion?: string;
+  workflow_version?: string;
+  documentRevision?: string;
+  document_revision?: string;
 }
 
 interface RawCampaignStageState {
@@ -435,7 +489,6 @@ function toRun(raw: RawRun): Run {
     declaredFiles: raw.declared_files,
     estimateHours: raw.estimate_hours,
     status: raw.status as Run['status'],
-    confidence: raw.confidence,
     sessionId: raw.session_id,
     reviewerSessionId: raw.reviewer_session_id,
     reviewRound: raw.review_round,
@@ -455,7 +508,6 @@ function toPhase(raw: RawPhase): Phase {
     number: raw.number,
     name: raw.name,
     status: raw.status as Phase['status'],
-    confidence: raw.confidence,
     runs: raw.runs.map(toRun),
   };
 }
@@ -475,6 +527,7 @@ function toSaga(raw: RawSaga): Saga {
     id: raw.id,
     trackerId: raw.tracker_id,
     trackerType: raw.tracker_type ?? 'linear',
+    trackerConnectionId: raw.tracker_connection_id ?? '',
     url: raw.url || undefined,
     slug:
       raw.slug ??
@@ -488,7 +541,6 @@ function toSaga(raw: RawSaga): Saga {
     featureBranch: raw.feature_branch,
     baseBranch: raw.base_branch ?? 'main',
     status: raw.status as Saga['status'],
-    confidence: raw.confidence ?? 0,
     createdAt: raw.created_at,
     workflowId: raw.workflow_id ?? undefined,
     workflow: raw.workflow ?? undefined,
@@ -508,7 +560,6 @@ function toDispatcherState(raw: RawDispatcherState): DispatcherState {
   return {
     id: raw.id,
     running: raw.running,
-    threshold: raw.threshold,
     maxConcurrentRuns: raw.max_concurrent_runs,
     autoContinue: raw.auto_continue,
     updatedAt: raw.updated_at,
@@ -521,7 +572,6 @@ function toSessionInfo(raw: RawSessionInfo): SessionInfo {
     status: raw.status as SessionInfo['status'],
     chronicleLines: raw.chronicle_lines,
     branch: raw.branch,
-    confidence: raw.confidence,
     runName: raw.run_name,
     sagaName: raw.saga_name,
     clusterName: raw.cluster_name,
@@ -572,6 +622,9 @@ function toTrackerProject(raw: RawTrackerProject): TrackerProject {
     milestoneCount: raw.milestone_count,
     issueCount: raw.issue_count,
     slug: raw.slug ?? '',
+    trackerConnectionId: raw.tracker_connection_id ?? '',
+    trackerType: raw.tracker_type ?? '',
+    trackerName: raw.tracker_name ?? '',
   };
 }
 
@@ -583,6 +636,9 @@ function toTrackerMilestone(raw: RawTrackerMilestone): TrackerMilestone {
     description: raw.description,
     sortOrder: raw.sort_order,
     progress: raw.progress,
+    trackerConnectionId: raw.tracker_connection_id ?? '',
+    trackerType: raw.tracker_type ?? '',
+    trackerName: raw.tracker_name ?? '',
   };
 }
 
@@ -598,6 +654,9 @@ function toTrackerIssue(raw: RawTrackerIssue): TrackerIssue {
     priority: raw.priority,
     url: raw.url,
     milestoneId: raw.milestone_id,
+    trackerConnectionId: raw.tracker_connection_id ?? '',
+    trackerType: raw.tracker_type ?? '',
+    trackerName: raw.tracker_name ?? '',
   };
 }
 
@@ -667,13 +726,24 @@ function toCommitRequestBody(req: CommitSagaRequest): Record<string, unknown> {
       })),
     })),
     transcript: req.transcript,
+    tracker_connection_id: req.trackerConnectionId,
   };
 }
 
 function toWorkflow(raw: RawWorkflow): Workflow {
+  const nodeSizes = new Map(
+    raw.nodes.map((node) => [node.id, estimateWorkflowNodeSize(node, { edges: raw.edges })]),
+  );
+  const initialLayout = layoutWorkflow(
+    raw.nodes.map((node) => node.id),
+    raw.edges,
+    // The canvas routes feedback below cards; reserve no empty lanes above them.
+    { originX: 96, originY: 64, nodeSizes, columnGap: 72, rowGap: 36, feedbackLaneSpacing: 0 },
+  );
   const nodes = raw.nodes.map((node, index) => ({
     ...node,
-    position: node.position ?? { x: 96 + index * 240, y: 144 },
+    position: node.position ??
+      initialLayout.positions.get(node.id) ?? { x: 96, y: 144 + index * 160 },
   }));
 
   const positions = new Map(nodes.map((node) => [node.id, node.position]));
@@ -695,6 +765,8 @@ function toWorkflow(raw: RawWorkflow): Workflow {
   });
 
   return {
+    schemaVersion: raw.schema_version,
+    workflowDependencies: raw.workflow_dependencies ?? {},
     id: raw.id,
     name: raw.name,
     description: raw.description || undefined,
@@ -705,6 +777,16 @@ function toWorkflow(raw: RawWorkflow): Workflow {
     nodes,
     edges,
     resourceBindings: raw.resourceBindings ?? raw.resource_bindings ?? [],
+    graph: raw.graph,
+    personaDependencies: raw.personaDependencies ?? raw.persona_dependencies ?? {},
+    revision: raw.revision ?? null,
+    documentRevision: raw.document_revision ?? null,
+    isHead: raw.is_head ?? true,
+    origin: raw.origin ?? (raw.scope === 'system' ? 'bundled' : 'authored'),
+    canEdit: raw.can_edit ?? !(raw.readOnly ?? raw.read_only ?? false),
+    readOnly: raw.readOnly ?? raw.read_only ?? false,
+    canonicalYaml: raw.canonicalYaml ?? raw.canonical_yaml,
+    requirements: raw.requirements ?? [],
   };
 }
 
@@ -712,12 +794,89 @@ function toWorkflowBody(workflow: Workflow): Record<string, unknown> {
   return {
     name: workflow.name,
     description: workflow.description ?? '',
-    version: workflow.version ?? 'draft',
     scope: workflow.scope ?? 'user',
     tags: workflow.tags ?? [],
     nodes: workflow.nodes,
     edges: workflow.edges,
     resourceBindings: workflow.resourceBindings ?? [],
+    graph: {
+      ...(workflow.graph ?? {}),
+      tags: workflow.tags ?? [],
+      nodes: workflow.nodes,
+      edges: workflow.edges,
+      resourceBindings: workflow.resourceBindings ?? [],
+    },
+    persona_dependencies: workflow.personaDependencies ?? {},
+    schema_version: workflow.schemaVersion ?? 1,
+    workflow_dependencies: workflow.workflowDependencies ?? {},
+    expected_revision: workflow.revision ?? undefined,
+    base_revision: workflow.documentRevision ?? undefined,
+    refresh_personas: workflow.refreshPersonas ?? [],
+  };
+}
+
+function toWorkflowImportBody(request: WorkflowImportSource): Record<string, unknown> {
+  return {
+    content: request.content,
+    filename: request.filename,
+    mappings: request.mappings ?? {},
+    bindings: request.bindings ?? {},
+    mode: request.mode ?? 'copy',
+    workflow_id: request.workflowId,
+    expected_revision: request.expectedRevision,
+    preview_digest: request.previewDigest,
+  };
+}
+
+function toWorkflowImportPreview(raw: RawWorkflowImportPreview): WorkflowImportPreview {
+  return {
+    ...(raw.workflows ? { workflows: raw.workflows } : {}),
+    workflow: raw.workflow,
+    personas: raw.personas,
+    requirements: raw.requirements ?? [],
+    errors: raw.errors ?? [],
+    canApply: raw.canApply ?? raw.can_apply ?? false,
+    previewDigest: raw.previewDigest ?? raw.preview_digest ?? '',
+  };
+}
+
+function exportFilename(
+  disposition: string | null,
+  workflowId: string,
+  format: WorkflowExportFormat,
+) {
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition ?? '')?.[1];
+  if (encoded) return decodeURIComponent(encoded);
+  const plain = /filename="?([^";]+)"?/i.exec(disposition ?? '')?.[1];
+  if (plain) return plain;
+  return `${workflowId}.${format === 'bundle' ? 'zip' : 'yaml'}`;
+}
+
+async function exportWorkflowFile(
+  client: ApiClient,
+  id: string,
+  format: WorkflowExportFormat,
+  version?: string,
+): Promise<WorkflowExport> {
+  if (!client.basePath) {
+    throw new Error('Workflow export requires an HTTP client with a basePath.');
+  }
+  const response = await fetch(
+    `${client.basePath}/workflows/${encodeURIComponent(id)}/export?${new URLSearchParams({
+      format,
+      ...(version ? { version } : {}),
+    }).toString()}`,
+    { headers: getAuthHeaders() },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).trim() || response.statusText;
+    throw new ApiClientError(`API request failed: ${response.status}`, response.status, detail);
+  }
+  const data = await response.blob();
+  return {
+    data,
+    filename: exportFilename(response.headers.get('Content-Disposition'), id, format),
+    mediaType: response.headers.get('Content-Type') ?? data.type,
   };
 }
 
@@ -728,6 +887,7 @@ function toWorkflowLaunchBody(request: WorkflowLaunchRequest): Record<string, un
     repo: request.repo,
     branch: request.branch,
     connectionId: request.connectionId,
+    workflow_version: request.workflowVersion,
   };
 }
 
@@ -740,6 +900,9 @@ function toWorkflowLaunchResult(raw: RawWorkflowLaunchResult): WorkflowLaunchRes
     sessionName: raw.sessionName ?? raw.session_name ?? '',
     status: raw.status,
     clusterName: raw.clusterName ?? raw.cluster_name ?? '',
+    chatEndpoint: raw.chatEndpoint ?? raw.chat_endpoint ?? null,
+    workflowVersion: raw.workflowVersion ?? raw.workflow_version ?? '',
+    documentRevision: raw.documentRevision ?? raw.document_revision ?? '',
   };
 }
 
@@ -872,6 +1035,7 @@ function toResearchCampaignCreateBody(
     question: request.question,
     name: request.name,
     workflowId: request.workflowId,
+    workflowVersion: request.workflowVersion,
     repo: request.repo,
     branch: request.branch,
     mode: request.mode,
@@ -899,6 +1063,7 @@ function toSpecCampaignCreateBody(request: CreateSpecCampaignRequest): Record<st
     prompt: request.prompt,
     name: request.name,
     workflowId: request.workflowId,
+    workflowVersion: request.workflowVersion,
     repo: request.repo,
     repos: request.repos,
     branch: request.branch,
@@ -1080,10 +1245,6 @@ export function buildDispatcherHttpAdapter(client: ApiClient): IDispatcherServic
       await client.patch<void>('/dispatcher', { running });
     },
 
-    async setThreshold(threshold: number) {
-      await client.patch<void>('/dispatcher', { threshold });
-    },
-
     async setAutoContinue(autoContinue: boolean) {
       await client.patch<void>('/dispatcher', { auto_continue: autoContinue });
     },
@@ -1138,22 +1299,31 @@ export function buildTrackerHttpAdapter(client: ApiClient): ITrackerBrowserServi
       return raw.map(toTrackerProject);
     },
 
-    async getProject(projectId: string) {
+    async getProject(projectId: string, trackerConnectionId?: string) {
+      const query = trackerConnectionId
+        ? `?tracker_connection_id=${encodeURIComponent(trackerConnectionId)}`
+        : '';
       const raw = await client.get<RawTrackerProject>(
-        `/tracker/projects/${encodeURIComponent(projectId)}`,
+        `/tracker/projects/${encodeURIComponent(projectId)}${query}`,
       );
       return toTrackerProject(raw);
     },
 
-    async listMilestones(projectId: string) {
+    async listMilestones(projectId: string, trackerConnectionId?: string) {
+      const query = trackerConnectionId
+        ? `?tracker_connection_id=${encodeURIComponent(trackerConnectionId)}`
+        : '';
       const raw = await client.get<RawTrackerMilestone[]>(
-        `/tracker/projects/${encodeURIComponent(projectId)}/milestones`,
+        `/tracker/projects/${encodeURIComponent(projectId)}/milestones${query}`,
       );
       return raw.map(toTrackerMilestone);
     },
 
-    async listIssues(projectId: string, milestoneId?: string) {
-      const query = milestoneId ? `?milestone_id=${encodeURIComponent(milestoneId)}` : '';
+    async listIssues(projectId: string, milestoneId?: string, trackerConnectionId?: string) {
+      const params = new URLSearchParams();
+      if (milestoneId) params.set('milestone_id', milestoneId);
+      if (trackerConnectionId) params.set('tracker_connection_id', trackerConnectionId);
+      const query = params.size > 0 ? `?${params.toString()}` : '';
       const raw = await client.get<RawTrackerIssue[]>(
         `/tracker/projects/${encodeURIComponent(projectId)}/issues${query}`,
       );
@@ -1170,6 +1340,7 @@ export function buildTrackerHttpAdapter(client: ApiClient): ITrackerBrowserServi
       const target = options?.target;
       const raw = await client.post<RawSaga>('/tracker/import', {
         project_id: projectId,
+        tracker_connection_id: options?.trackerConnectionId,
         repos: options?.repoRefs?.map((ref) => ref.repo) ?? repos,
         base_branch: options?.repoRefs?.[0]?.branch ?? baseBranch,
         repo_refs: options?.repoRefs,
@@ -1181,6 +1352,9 @@ export function buildTrackerHttpAdapter(client: ApiClient): ITrackerBrowserServi
               : (instanceId ?? null),
         target_tags: target?.mode === 'tags' ? target.tags : [],
         target_match: target?.mode === 'tags' ? (target.match ?? 'all') : 'all',
+        workflow_id: options?.workflowId,
+        workflowVersion: options?.workflowVersion,
+        start_immediately: false,
       });
       return toSaga(raw);
     },
@@ -1251,39 +1425,96 @@ export function buildWorkflowHttpAdapter(client: ApiClient): IWorkflowService {
       try {
         const raw = await client.get<RawWorkflow>(`/workflows/${encodeURIComponent(id)}`);
         return toWorkflow(raw);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
+      }
+    },
+
+    async listWorkflowVersions(id: string) {
+      const raw = await client.get<RawWorkflowVersionSummary[]>(
+        `/workflows/${encodeURIComponent(id)}/versions`,
+      );
+      return raw.map((item) => ({
+        version: item.version,
+        documentRevision: item.document_revision,
+        createdAt: item.created_at,
+        isHead: item.is_head,
+        basedOnRevision: item.based_on_revision ?? null,
+        origin: item.origin,
+      }));
+    },
+
+    async getWorkflowVersion(id: string, version: string) {
+      try {
+        const raw = await client.get<RawWorkflow>(
+          `/workflows/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+        );
+        return toWorkflow(raw);
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
       }
     },
 
     async saveWorkflow(workflow: Workflow) {
+      if (workflow.canEdit === false) {
+        throw new Error('You do not have permission to create a new workflow version.');
+      }
       const body = toWorkflowBody(workflow);
       let existing: RawWorkflow | null;
       try {
         existing = await client.get<RawWorkflow>(`/workflows/${encodeURIComponent(workflow.id)}`);
-      } catch {
-        existing = null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) {
+          existing = null;
+        } else {
+          throw error;
+        }
       }
 
       if (existing) {
         try {
-          const raw = await client.put<RawWorkflow>(
-            `/workflows/${encodeURIComponent(workflow.id)}`,
+          const raw = await client.post<RawWorkflow>(
+            `/workflows/${encodeURIComponent(workflow.id)}/versions`,
             body,
           );
           return toWorkflow(raw);
         } catch (error) {
-          if (existing.scope !== 'system') throw error;
+          if (error instanceof ApiClientError && error.status === 409) {
+            throw new WorkflowRevisionConflictError(error.detail);
+          }
+          throw error;
         }
       }
 
-      const createBody = existing?.scope === 'system' ? { ...body, scope: 'user' } : body;
+      const createBody = workflow.copyFrom ? { ...body, copy_from: workflow.copyFrom } : body;
       const raw = await client.post<RawWorkflow>('/workflows', createBody);
       return toWorkflow(raw);
     },
 
     async deleteWorkflow(id: string) {
       await client.delete<void>(`/workflows/${encodeURIComponent(id)}`);
+    },
+
+    exportWorkflow(id: string, format: WorkflowExportFormat, version?: string) {
+      return exportWorkflowFile(client, id, format, version);
+    },
+
+    async previewWorkflowImport(request: WorkflowImportSource) {
+      const raw = await client.post<RawWorkflowImportPreview>(
+        '/workflows/imports/preview',
+        toWorkflowImportBody(request),
+      );
+      return toWorkflowImportPreview(raw);
+    },
+
+    async applyWorkflowImport(request: WorkflowImportSource) {
+      const raw = await client.post<RawWorkflow>(
+        '/workflows/imports/apply',
+        toWorkflowImportBody(request),
+      );
+      return toWorkflow(raw);
     },
 
     async launchWorkflow(workflowId: string, request: WorkflowLaunchRequest) {
@@ -1309,8 +1540,9 @@ export function buildResearchHttpAdapter(client: ApiClient): IResearchService {
           `/research/campaigns/${encodeURIComponent(slug)}`,
         );
         return toResearchCampaignDetail(raw);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
       }
     },
 
@@ -1340,8 +1572,9 @@ export function buildResearchHttpAdapter(client: ApiClient): IResearchService {
           `/research/campaigns/${encodeURIComponent(slug)}/artifact?path=${encodeURIComponent(path)}`,
         );
         return toCampaignArtifactDetail(raw);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
       }
     },
   };
@@ -1360,8 +1593,9 @@ export function buildSpecsHttpAdapter(client: ApiClient): ISpecsService {
           `/specs/campaigns/${encodeURIComponent(slug)}`,
         );
         return toResearchCampaignDetail(raw);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
       }
     },
 
@@ -1383,8 +1617,9 @@ export function buildSpecsHttpAdapter(client: ApiClient): ISpecsService {
           `/specs/campaigns/${encodeURIComponent(slug)}/artifact?path=${encodeURIComponent(path)}`,
         );
         return toCampaignArtifactDetail(raw);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ApiClientError && error.status === 404) return null;
+        throw error;
       }
     },
 
@@ -1419,7 +1654,6 @@ interface RawFlockConfig {
 }
 
 interface RawDispatchDefaults {
-  confidence_threshold: number;
   max_concurrent_runs: number;
   auto_continue: boolean;
   batch_size: number;
@@ -1467,7 +1701,6 @@ function toFlockConfig(raw: RawFlockConfig): FlockConfig {
 
 function toDispatchDefaults(raw: RawDispatchDefaults): DispatchDefaults {
   return {
-    confidenceThreshold: raw.confidence_threshold,
     maxConcurrentRuns: raw.max_concurrent_runs,
     autoContinue: raw.auto_continue,
     batchSize: raw.batch_size,
@@ -1538,8 +1771,6 @@ export function buildTingSettingsHttpAdapter(client: ApiClient): ITingSettingsSe
 
     async updateDispatchDefaults(patch) {
       const body: Record<string, unknown> = {};
-      if (patch.confidenceThreshold !== undefined)
-        body['confidence_threshold'] = patch.confidenceThreshold;
       if (patch.maxConcurrentRuns !== undefined)
         body['max_concurrent_runs'] = patch.maxConcurrentRuns;
       if (patch.autoContinue !== undefined) body['auto_continue'] = patch.autoContinue;

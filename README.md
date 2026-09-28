@@ -1,297 +1,174 @@
-# niuu
+# Niuu
 
-[![CI](https://github.com/niuulabs/volundr/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/niuulabs/volundr/actions/workflows/ci.yaml)
-[![Release](https://github.com/niuulabs/volundr/actions/workflows/release.yaml/badge.svg)](https://github.com/niuulabs/volundr/actions/workflows/release.yaml)
-[![Secret Scan](https://github.com/niuulabs/volundr/actions/workflows/secrets.yaml/badge.svg?branch=main)](https://github.com/niuulabs/volundr/actions/workflows/secrets.yaml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/niuulabs/volundr/badge)](https://scorecard.dev/viewer/?uri=github.com/niuulabs/volundr)
-[![Coverage](https://codecov.io/gh/niuulabs/volundr/branch/main/graph/badge.svg)](https://codecov.io/gh/niuulabs/volundr)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+**Where AI agents work, collaborate, and evolve.**
 
-The self-hosted platform for AI workspaces, custom AI teams, always-on assistants, shared knowledge, and local or cloud AI.
+Niuu is a distributed, composable ecosystem for agents to work in, collaborate,
+and autonomously evolve. It brings together independent agents with ongoing
+mandates, coordinated teams, interconnected workflows, and shared memory.
+Agents can use the system themselves: discover peers, commission work, build
+new tools, and share what they learn across environments.
 
-<p align="center">
-  <img src="docs/site/images/ui-ting-workflows.png" alt="Ting workflow builder in Niuu" width="960">
-</p>
+We are building toward an **operating system for agents**: a distributed
+computing environment organized around goals, agents, capabilities, and
+resources. The services in this repository are its building blocks.
 
-<p align="center">
-  <img src="docs/site/images/ui-guild-instances.png" alt="Guild instance registry" width="49%">
-  <img src="docs/site/images/ui-niuu-home.png" alt="Volundr forge dashboard" width="49%">
-</p>
+[Documentation](https://docs.niuu.cloud/) ·
+[Architecture](https://docs.niuu.cloud/concepts/platform-model/) ·
+[Get started](https://docs.niuu.cloud/get-started/install/)
 
-## What Niuu Is
+## An environment agents can inhabit
 
-Niuu brings four operating modes into one platform you can run on your own machine, on Kubernetes, or inside your own infrastructure:
+A resident has a mandate: an ongoing responsibility within an environment.
+It observes what happens, judges what needs attention, and decides whether to
+act, investigate, collaborate, or ask for help. Its work and understanding
+continue beyond any one conversation.
 
-- **AI workspaces** for hands-on work with one assistant or several assistants working together in a live coding environment
-- **Custom AI teams** you can design, launch, and steer for coding, research, operations, approvals, and your own multi-step flows
-- **Always-on assistants** that monitor sources, revisit knowledge, refresh documents, and stay available for live operator guidance
-- **Local and cloud AI** managed in one place, including what models are available, where they run, and when they are used
+Residents can draw on specialist agents and multi-agent workflows. A capability
+gap can become a task for a team: research a problem, build a tool, verify it,
+and return it for use. Knowledge and capabilities can then pass between agents,
+so progress in one environment can benefit another.
 
-The result is a self-hosted system where you can move smoothly between direct operator work, autonomous execution, durable memory, and local or third-party models without handing control to an external vendor platform.
+One demonstrated example: a cluster resident encountered a storage warning,
+found that it lacked a suitable diagnostic tool, and commissioned a team to
+build one. The resulting tool was installed and propagated to residents in two
+other clusters. Observation led to new capability, shared across the system.
 
-## Platform Map
+Niuu supports that cycle through:
 
-```
-                         Users
-                    ┌───────────┐
-                    │ Niuu Web  │  React/Vite, OIDC auth
-                    │ (browser) │
-                    └─────┬─────┘
-                          │
-              ┌───────────┴───────────┐
-              │                       │
-         REST/SSE                 WebSocket
-         (sessions,               (chat)
-          chronicles,
-          git, etc.)
-              │                       │
-    ┌─────────▼──────────┐            │
-    │ Volundr / Shared   │            │
-    │ platform APIs      │            │
-    └────────┬───────────┘            │
-             │                        │
-    ┌────────┴──────────────────────┐ │
-    │ Kubernetes                    │ │
-    │  ┌──────────────────────────┐ │ │
-    │  │      Session Pod         │ │ │
-    │  │  ┌────────┐ ┌─────────┐  │◄┘ │
-    │  │  │ Skuld  │ │VS Code  │  │   │
-    │  │  │(broker)│ │ Server  │  │   │
-    │  │  └───┬────┘ └─────────┘  │   │
-    │  │      │  Claude Code CLI  │   │
-    │  │      │  / Codex CLI      │   │
-    │  │  ┌───▼──────────────┐    │   │
-    │  │  │  Workspace PVC   │    │   │
-    │  └──┴──────────────────┴────┘   │
-    └───────────────────────────────┘ │
-                                       │
-    ┌──────────────────────────────────┘
-    │  Coordination & Runtime
-    │  ┌──────┐  ┌──────┐  ┌──────┐
-    │  │ Ting │  │ Ravn │  │Guild │
-    │  │flows │  │agents│  │regis.│
-    │  └──────┘  └──────┘  └──────┘
-    │
-    │  Supporting Services
-    │  ┌──────────┐ ┌────────┐ ┌────────────┐ ┌─────────────┐
-    │  │ Bifröst  │ │ Mimir  │ │ Observatory│ │  Sleipnir   │
-    │  │(LLM gw)  │ │(memory)│ │ (ops view) │ │ (transport) │
-    └──┴──────────┴─┴────────┴─┴────────────┴─┴─────────────┘
-```
+- **Independent agents with mandates.** Residents maintain context and pursue
+  ongoing responsibilities within their configured authority.
+- **Teams and interconnected workflows.** Agents delegate work, coordinate
+  specialists, and involve people in decisions and review.
+- **Shared memory and learning.** Working context, durable knowledge, and
+  reusable tools let agents carry experience forward and learn from each other.
+- **Communication across environments.** Collaboration rooms provide shared
+  conversations; flock meshes provide direct communication between members;
+  A2A connects agents to external agents and workflows. An event bus connects
+  activity across services.
 
-| Component | Role |
-|-----------|------|
-| **Niuu Web** | Operator interface for sessions, workflows, registered instances, memory, assistants, and platform settings |
-| **Volundr** | Live AI workspaces, session lifecycle, workspace provisioning, chronicles, git workflows, and direct operator pairing |
-| **Skuld** | Live broker inside session pods connecting the browser to coding agents, tools, terminals, and workflow runtime events |
-| **Ting** | Workflow and coordination layer for teams, review loops, staged execution, and launchable flows |
-| **Ravn** | Assistant runtime and persona harness for one assistant or a connected team, with tools, wakefulness, and long-lived behaviors |
-| **Guild** | Shared registry for platform instances and targets, so Niuu can discover and use Volundr, Ting, Mimir, and other services across environments |
-| **Mimir** | Shared knowledge and memory system for durable documentation, ingest, research artifacts, curation, and assistant recall |
-| **Bifröst** | Local and cloud model gateway that decides what models are available, where they run, and how callers route between them |
-| **Observatory** | Platform topology and operations view for health, discovery, and event visibility across the running system |
-| **Sleipnir** | Transport abstraction for events and messaging across NATS, NNG, RabbitMQ, subprocesses, and other backbones |
-| **niuu CLI** | Unified CLI and TUI for managing local and remote services |
+## Compose your own system
 
-Chat traffic flows directly from the browser to Skuld inside the session pod — Volundr is never in the chat data path.
+Niuu is built around APIs, independent services, shared contracts, and plugins.
+Use the pieces you need, extend them with adapters, or build your own workflows
+and interfaces on top. The web application is one way to participate; agents,
+mobile clients, command-line tools, and external systems can use the same services.
 
-## What Niuu Lets You Build
+The architecture separates the choice of agent harness, runtime, model, and
+execution environment. Sessions support runtimes including Claude Code, Codex,
+OpenCode, and Ravn. Model access can use local or cloud providers. Services can
+run together locally or across Kubernetes deployments, with sandboxed execution
+available through configured runtime adapters.
 
-- **Live AI workspaces** with repos, terminals, diffs, and direct conversation with one assistant or several assistants working together
-- **Custom AI teams** for coding, review, security, research, approvals, retries, and your own staged workflows
-- **Shared knowledge systems** where research, chronicles, postmortems, curated memory, and Warden-maintained docs accumulate
-- **Long-lived assistants** that continue working after the interactive session ends by watching sources, refreshing documents, and staying reachable for operator guidance
-- **Local and cloud model operations** where you decide what models are available, whether work stays local or uses third-party providers, and how the rest of the platform can use them
+The moving parts have distinct responsibilities:
 
-## Features
+| Part | Role in the system |
+| --- | --- |
+| **Agent runtimes** | Reasoning, tool use, learning, and capability evolution |
+| **Workflows and teams** | Coordinated execution, dispatch, stages, and review gates |
+| **Workspaces** | Execution environments, session lifecycle, git workflows, and history |
+| **Session gateway** | Runtime processes, transcripts, and channel connections |
+| **Shared memory** | Durable knowledge, retrieval, and curation |
+| **Model gateway** | Local and cloud model access, routing, and usage |
+| **Service discovery** | Instance registration and routing across environments |
+| **Event bus** | Events and transport between services |
+| **Observability** | Visibility into the distributed system and its activity |
 
-### Sessions & Workspaces
+Agent runtimes own judgment and learning; shared services supply collaboration
+and infrastructure. See the [architecture guide](https://docs.niuu.cloud/concepts/platform-model/)
+for the system diagram, service boundaries, and implementation names.
 
-- **Sessions** — create, start, stop, and archive AI coding sessions with model selection and preset configuration
-- **Workspaces** — per-session PVC provisioning with user home volumes and storage quotas
-- **Templates** — config-driven workspace blueprints (repos, setup scripts, runtime settings)
-- **Presets** — portable runtime configs (model, MCP servers, resources, env vars) stored in the database
-- **Profiles** — read-only workload configurations loaded from YAML or Kubernetes CRDs
-- **Chronicles** — session history snapshots with timelines, file diffs, commit summaries, and reforge chains
+## Toward an operating system for agents
 
-### AI Agents
+The long-term unit of computing is the whole Niuu environment. Machines,
+models, services, and devices contribute resources to it. Agents and people
+work through capabilities exposed by that environment, while interfaces provide
+ways to observe, direct, and participate in the running system.
 
-- **Ting saga dispatch** — decomposes issues from GitHub or Linear into typed tasks (feat, fix, refactor, test) and spawns coding agents for each
-- **Run planning** — multi-agent coordination where sub-agents work on decomposed tasks in parallel
-- **Ravn personas** — configurable agent identities with tone, expertise, and behaviour profiles
-- **Dream cycles** — background reflection and knowledge consolidation for long-running Ravn agents
-- **Wakefulness triggers** — schedule or event-driven agent activation
+In that model, a goal survives the particular agent or session working on it.
+The system connects intent to execution, coordinates access to resources under
+policy, preserves outcomes, and makes improvements available for subsequent
+work. Learning and evolution become part of how the environment develops over
+time.
 
-### LLM Routing (Bifröst)
+Today's platform provides the execution, coordination, communication, memory,
+and discovery services, alongside agent learning and capability-building
+mechanisms. Bringing these together under a common model of goals, actors,
+resources, authority, evaluation, and lineage is the direction of the OS work.
 
-- OpenAI-compatible API (`POST /v1/chat/completions`, `GET /v1/models`) across Anthropic, OpenAI, and Ollama
-- Routing strategies: failover, cost-optimised, round-robin, latency-optimised
-- Model aliases (`fast`, `balanced`, `best`) resolved from config
-- Usage logging to SQLite; optional authentication via PAT or open mode
-- Pi mode: run fully offline via Ollama on a Raspberry Pi or any low-power device
+## Get started
 
-### Git & Issue Tracking
+Start with [Install Niuu](https://docs.niuu.cloud/get-started/install/), then
+follow [Your first working session](https://docs.niuu.cloud/get-started/first-local-stack/).
+The walkthrough runs Claude Code locally and verifies a file it creates.
+You will need Git and an authenticated Claude Code installation; a Kubernetes
+cluster is not required.
 
-- **Git workflows** — branch creation, PR management, CI status checks, merge confidence scoring
-- **GitHub and GitLab** — pluggable provider adapters via dynamic loading
-- **Issue tracking** — Jira and Linear integration with repo-to-project mappings
+### From a source checkout
 
-### Platform
-
-- **Multi-tenancy** — hierarchical tenant tree with roles (admin, developer, viewer) and quota enforcement
-- **Identity** — IDP-agnostic OIDC authentication (Keycloak, Entra ID, Okta) with JIT user provisioning via Envoy
-- **Authorization** — pluggable policy engine (Cerbos, simple role-based, or allow-all for dev)
-- **Secret injection** — CSI-based mounting via Infisical, OpenBao/Vault; Volundr never reads secret values
-- **Credential management** — pluggable credential stores (Vault, Infisical, memory) for API keys, OAuth tokens, SSH keys
-- **Event pipeline** — session events dispatched to PostgreSQL, RabbitMQ, and/or OpenTelemetry sinks
-- **MCP servers** — configurable Model Context Protocol servers injected into sessions
-- **Saved prompts** — reusable prompts scoped globally or per-project
-- **SSE streaming** — real-time session state and stats updates
-
-## Quick Start
+Install Git, curl, make, a C compiler, pkg-config, OpenSSL development headers,
+uv, Node.js (20.11 or newer), and pnpm (the version pinned in
+[`web-next/package.json`](web-next/package.json)). Then, from the repository root:
 
 ```bash
-# Install Python 3.12 dependencies
 uv sync --python 3.12 --extra dev
-
-# Install the pnpm-pinned web workspace
-corepack enable
-cd web-next && pnpm install --frozen-lockfile && cd ..
-
-# Start the local platform stack
 ./start-dev
+```
 
-# Stop it again
+The script installs workspace dependencies, builds PostgreSQL and the web
+assets, and starts the platform in the background. Open the URL it prints
+(port 8080 by default). The first build takes longer; subsequent starts reuse
+the built assets. Local sessions run under your OS account and use its runtime
+credentials.
+
+Stop the development stack with:
+
+```bash
 ./stop-dev
 ```
 
-The local Niuu stack serves at `http://localhost:8080`. Interactive API docs are available under `/docs` for the relevant services.
+See [Local development](https://docs.niuu.cloud/operations/local-development/)
+for configuration and troubleshooting.
 
-If you want to run pieces manually instead of the dev stack, you can still start the individual services directly from their config files, but `./start-dev` and `./stop-dev` are the normal way to bring the platform up locally.
+## Development
 
-### Cached and offline bootstrap
-
-The lockfiles are the source of truth. Warm a connected development cache once with `uv sync --frozen --python 3.12 --extra dev` and `cd web-next && pnpm fetch`. A machine with those caches can then reproduce the environment without registry access:
-
-```bash
-uv sync --frozen --offline --python 3.12 --extra dev
-cd web-next
-pnpm install --frozen-lockfile --offline
-```
-
-Offline installation fails explicitly when a locked artifact is absent from the cache; it never substitutes an unpinned package.
-
-### Local and Deployment Modes
-
-`./start-dev` runs the full local platform host in one process. In this local embedded Forge mode, Guild owns the public `/api/v1/forge` route and registers a system `Local Forge` instance backed by the in-process Volundr app. Guild dispatches to that local target through `httpx.ASGITransport`, so requests keep normal HTTP semantics but do not cross the network or call `localhost`.
-
-Standalone Forge means the Volundr service is running without Guild as the front-door aggregator. In that shape, the Volundr app itself serves `/api/v1/forge`; this is what the standalone `charts/volundr` deployment does. In the umbrella `charts/niuu` deployment, the logical `forge-api` ingress backend resolves to Guild when `guild.enabled=true`, and to Volundr when `guild.enabled=false`.
-
-The route ownership rule is: Guild owns `/api/v1/forge` in aggregate or local embedded mode; Volundr owns `/api/v1/forge` only when it is the standalone Forge service.
-
-## Configuration
-
-Each service loads config from YAML with environment variable overrides using `__` for nesting:
-
-| Service | Config file |
-|---------|------------|
-| Volundr | `config.yaml` or `/etc/volundr/config.yaml` |
-| Bifröst | `bifrost.yaml` |
-| Ting | `ting.yaml` |
-| Ravn | `ravn.yaml` |
+The backend uses Python, FastAPI, and PostgreSQL. The web interface uses React,
+TypeScript, and Tailwind CSS. Services follow hexagonal architecture: domain
+logic depends on ports, adapters implement them, and each service's `main.py`
+wires the implementation together.
 
 ```bash
-# Volundr environment overrides
-DATABASE__HOST=postgres.local
-DATABASE__PASSWORD=secret
-GIT__GITHUB__TOKEN=ghp_xxxx
-EVENT_PIPELINE__OTEL__ENABLED=true
-```
-
-See the [configuration reference](https://niuulabs.github.io/volundr/reference/configuration/) for all options.
-
-## Testing
-
-```bash
-# Backend lint, format, tests, and 85% coverage
+# Backend lint and tests, with coverage
 make verify
 
-# Web UI typecheck, lint, format, tests, and 85% coverage
+# Web typecheck, lint, formatting, and tests, with coverage
 cd web-next
 pnpm typecheck
 pnpm lint
 pnpm format:check
 pnpm test
-
-# Forge contracts and real-tmux acceptance
-make test-forge
-make test-forge-tmux
-
-# Informational module-size and dependency-coupling review
-cd ..
-make review-modules
 ```
 
-See the [Forge stability review](docs/testing/forge-stability-review-2026-09-07.md)
-for findings and the [test workflow](docs/testing/forge-stability-workflow.md) for
-database, Chromium, repeated tmux, and explicit live-provider checks.
+For workspace execution checks, see the [Forge test workflow](docs/testing/forge-stability-workflow.md) and the
+[live agentic acceptance plan](docs/testing/forge-live-agentic-acceptance.md).
+From the repository root, `make test-forge` runs contract checks and
+`make test-forge-tmux` runs real-tmux acceptance. Use `make test-forge-live`
+with a configured local platform, or `make forge-trace-lab` to replay reviewed
+traces without provider calls.
 
-## Deployment
-
-The main install surface is the `niuu` umbrella chart under `charts/`, which deploys the platform components together:
-
-```bash
-# Full Niuu platform
-helm install niuu ./charts/niuu -n niuu \
-  --set database.external.host=postgres.svc.cluster.local \
-  --set ingress.enabled=true \
-  --set ingress.hosts[0].host=niuu.example.com
-
-# Or upgrade an existing release
-helm upgrade niuu ./charts/niuu -n niuu
-```
-
-You can still deploy individual component charts when you need to, but the default platform deployment path should be the `niuu` chart.
-
-See the [deployment guide](https://niuulabs.github.io/volundr/operations/kubernetes-deployment/) for Helm values, migrations, and production setup.
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| API | FastAPI, Uvicorn, Pydantic |
-| Database | PostgreSQL via asyncpg (raw SQL, no ORM) |
-| Web UI | React 19, Vite, Tailwind CSS 4, shared design tokens, TanStack Query |
-| Broker | FastAPI WebSockets |
-| Transport | NNG (pynng), NATS, RabbitMQ via Sleipnir |
-| Orchestration | Kubernetes, Helm |
-| Auth | OIDC/OAuth2, Envoy, Cerbos |
-| Secrets | OpenBao/Vault, Infisical, CSI driver |
-| Observability | OpenTelemetry (traces + metrics) |
-| Events | RabbitMQ (optional), SSE |
-| Git | GitHub API, GitLab API |
-| LLM | Anthropic, OpenAI, Ollama (via Bifröst) |
-
-## Optional Dependencies
-
-```bash
-uv sync --extra rabbitmq   # RabbitMQ event sink
-uv sync --extra k8s        # Kubernetes client
-uv sync --extra otel       # OpenTelemetry export
-uv sync --extra nats       # NATS transport
-uv sync --extra tui        # Terminal UI (niuu CLI)
-```
+Read [`CLAUDE.md`](CLAUDE.md) and [the repository rules](.claude/rules/) before
+changing code.
 
 ## Documentation
 
-Full documentation at [niuulabs.github.io/volundr](https://niuulabs.github.io/volundr/).
+| Guide | Covers |
+| --- | --- |
+| [First session](https://docs.niuu.cloud/get-started/first-local-stack/) | Launch an agent and verify its work |
+| [Architecture](https://docs.niuu.cloud/concepts/platform-model/) | Components, ownership, and collaboration |
+| [Configuration](https://docs.niuu.cloud/reference/configuration/) | Service configuration and environment overrides |
+| [OpenShell](https://docs.niuu.cloud/operations/openshell-runtime/) | Sandboxed runtime execution |
+| [Kubernetes deployment](https://docs.niuu.cloud/operations/kubernetes-deployment/) | Platform deployment with the Niuu Helm chart |
+| [Local development](https://docs.niuu.cloud/operations/local-development/) | Develop and run from source |
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
-
-Forge's [live agentic acceptance plan](docs/testing/forge-live-agentic-acceptance.md)
-drives real Claude/tmux and Codex sessions through tool use, search, workers,
-questions, reconnects, and background capture. Run `make test-forge-live` against
-a configured local platform; use `make forge-trace-lab` to replay reviewed traces
-without provider calls. Legacy Claude SDK modes remain compatibility coverage.
+[Apache 2.0](LICENSE).

@@ -198,6 +198,51 @@ async def test_native_other_waits_for_editor_paste_and_exact_consumption(native_
     ) < events.index(receipts(events)[0])
 
 
+async def test_turn_end_race_during_menu_render_wait_does_not_lose_the_answer(native_bridge):
+    """Deterministic reproduction of a CI-only flake: ``ValueError: The native Claude question
+    ended while its menu was rendering`` (see ``_answer_tty_prompt_locked`` in
+    ``tmux_interactive.py``).
+
+    In production this fires whenever a turn-end signal (the ``Stop`` hook, or the
+    synthetic-turn idle watchdog) clears ``_pending_tty_prompts[request_id]`` while
+    ``_wait_question_screen`` is still bound-polling for the live menu to render — a real
+    concurrent path, not a test artefact: the poll is a genuine ``await`` loop, and nothing
+    serializes it against hook delivery or the watchdog task. Rather than relying on real
+    timers/xdist scheduling luck to hit that window (as CI did once), this test forces the
+    exact interleaving deterministically: a one-shot wrapper around
+    ``_capture_question_screen`` fires the clear on the very call ``_wait_question_screen``
+    uses to observe the (already-matching) menu, so the race lands on every run.
+    """
+    transport, events = native_bridge
+    transport.capture_stdout = "☐ Label\nWhich label should be written?\n❯ 1. Blue\n  2. Amber\n"
+    rid = await transport.surface()
+    transport.steps.append(("2", "❯\n"))
+    transport.consumed = {"answers": {SINGLE[0]["question"]: "Amber"}}
+
+    original_capture = transport._capture_question_screen
+    cleared = False
+
+    async def capture_then_race_clear(*, pane_id=None):
+        nonlocal cleared
+        screen_text = await original_capture(pane_id=pane_id)
+        if not cleared:
+            cleared = True
+            # Simulate a concurrent turn-end signal (Stop hook / synthetic-turn watchdog)
+            # landing while the menu render wait is still polling — exactly the CI race.
+            await transport._clear_pending_tty_prompts("terminal_idle")
+        return screen_text
+
+    transport._capture_question_screen = capture_then_race_clear
+
+    await transport.send_control("ask_user_answer", request_id=rid, answers=[{"answer": "Amber"}])
+
+    assert cleared, "the injected race never ran — the test stopped proving anything"
+    assert _send_keys(transport) == ["2"]
+    resolved = [e for e in events if e.get("type") == "ask_user_resolved"]
+    assert [(e["request_id"], e["decision"]) for e in resolved] == [(rid, "Amber")]
+    assert rid not in transport._pending_tty_prompts
+
+
 async def test_native_two_pages_review_every_answer_before_submit(native_bridge):
     transport, events = native_bridge
     transport.capture_stdout = screen("multi-00-initial")
@@ -526,6 +571,52 @@ async def test_delayed_first_native_page_is_waited_for_before_keys(native_bridge
     transport.consumed = {"answers": {SINGLE[0]["question"]: "Amber"}}
     await transport.send_control("ask_user_answer", request_id=rid, answers=[{"answer": "Amber"}])
     assert _send_keys(transport) == ["2"] and receipts(events)[0]["accepted"] is True
+
+
+async def test_v2_1_panel_border_first_page_is_recognized(native_bridge):
+    """Claude Code v2.1.282 prefixes the active tab's question text with a dim '│ '
+    left-gutter in a multi-question AskUserQuestion (tabs across the top, one per
+    question, plus a Submit tab) — see the sanitised capture from niuulabs/niuu session
+    d8210020-fad6-4459-b55a-91a0d4a355f9 (request tty-1-03824702). Before the
+    `_strip_question_border` fix in tmux_interactive.py, that stray glyph defeated
+    `_question_page_matches`'s exact-text comparison, so `_wait_question_screen` never
+    saw the first page as ready and answering failed forever with 'The live Claude
+    menu does not match the pending question state'."""
+    transport, events = native_bridge
+    transport.capture_stdout = (
+        "←  ☐ Label  ✔ Submit  →\n\n│ Which label should be written?\n\n❯ 1. Blue\n  2. Amber\n"
+    )
+    rid = await transport.surface()
+    transport.steps.append(("1", "❯\n"))
+    transport.consumed = {"answers": {SINGLE[0]["question"]: "Blue"}}
+    await transport.send_control("ask_user_answer", request_id=rid, answers=[{"answer": "Blue"}])
+    assert _send_keys(transport) == ["1"] and receipts(events)[0]["accepted"] is True
+
+
+async def test_first_page_mismatch_keeps_question_pending_with_retryable_error(native_bridge):
+    """A first-page mismatch before any keys are pressed is a *read* failure, not proof
+    Claude rejected the answer — the question must stay open so the exact same answer
+    can be retried (e.g. once a display-parsing bug like the one above is fixed).
+    Escalating to `ControlRecoveryError` (the 'go inspect the native session' signal)
+    is reserved for once keys have actually been pressed; see
+    `_answer_tty_prompt_locked` in tmux_interactive.py. Real incident: niuulabs/niuu
+    session d8210020-fad6-4459-b55a-91a0d4a355f9, request tty-1-03824702 — the same
+    answer was replayed twice (23:55:18 and 23:55:52 UTC) and failed both times with
+    the bare, non-actionable 'does not match the pending question state' error."""
+    transport, events = native_bridge
+    transport.capture_stdout = (
+        "☐ Label\nSomething the parser never recognizes\n❯ 1. Blue\n  2. Amber\n"
+    )
+    rid = await transport.surface()
+
+    with pytest.raises(ValueError, match="still pending and this same answer can be retried"):
+        await transport.send_control(
+            "ask_user_answer", request_id=rid, answers=[{"answer": "Blue"}]
+        )
+    assert rid in transport._pending_tty_prompts
+    assert not transport._pending_tty_prompts[rid].get("answer_uncertain")
+    assert not transport.steps and not transport.loaded_buffers  # no keys were ever pressed
+    assert not receipts(events)
 
 
 @pytest.mark.parametrize(

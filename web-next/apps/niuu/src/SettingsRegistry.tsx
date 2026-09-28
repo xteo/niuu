@@ -1,5 +1,6 @@
+import { ForgeSessionSettings, UserStorageSettings } from '@niuulabs/plugin-volundr';
+import { UiModeSwitch } from '@niuulabs/shell';
 import { createElement, useMemo } from 'react';
-import { ForgeSessionSettings } from '@niuulabs/plugin-volundr';
 import {
   useConfig,
   type MountedSettingsProviderDescriptor,
@@ -65,12 +66,26 @@ export interface RemoteSettingsIntegrationsResource {
   enrollmentStartPath?: string;
   enrollmentStatusPath?: string;
   enrollmentCancelPath?: string;
+  enrollmentCodePath?: string;
+}
+
+export interface RemoteSettingsExternalIntegrationsResource {
+  id: string;
+  type: 'external_integrations';
+  label: string;
+  description?: string;
+  writable?: boolean;
+  listPath: string;
+  createPath: string;
+  deletePath: string;
+  validatePath: string;
 }
 
 export type RemoteSettingsResource =
   | RemoteSettingsTokensResource
   | RemoteSettingsCredentialsResource
-  | RemoteSettingsIntegrationsResource;
+  | RemoteSettingsIntegrationsResource
+  | RemoteSettingsExternalIntegrationsResource;
 
 export interface RemoteSettingsSectionSchema {
   id: string;
@@ -103,6 +118,53 @@ export type MountedSettingsProvider =
     };
 
 const LOCAL_PROVIDERS: MountedSettingsProviderDescriptor[] = [
+  {
+    id: 'interface',
+    pluginId: 'settings',
+    title: 'Interface',
+    subtitle: 'appearance and navigation',
+    scope: 'user',
+    defaultSectionId: 'mode',
+    sections: [
+      {
+        id: 'mode',
+        label: 'Display mode',
+        description: 'Choose how much of the navigation and product surface is shown.',
+        render: () => (
+          <section className="settings-interface" aria-labelledby="settings-interface-heading">
+            <p className="settings-shell__kicker">Appearance</p>
+            <h1 className="settings-shell__panel-heading" id="settings-interface-heading">
+              Interface mode
+            </h1>
+            <p className="settings-shell__panel-copy">
+              Simple shows the essential navigation. Advanced shows every available tool and
+              setting.
+            </p>
+            <div className="settings-interface__control">
+              <span>Mode</span>
+              <UiModeSwitch />
+            </div>
+          </section>
+        ),
+      },
+    ],
+  },
+  {
+    id: 'storage',
+    pluginId: 'volundr',
+    title: 'Storage',
+    subtitle: 'your files across clusters',
+    scope: 'user',
+    defaultSectionId: 'home',
+    sections: [
+      {
+        id: 'home',
+        label: 'Home & temporary files',
+        description: 'Manage your own home, retained temporary files and caches on each cluster.',
+        render: () => <UserStorageSettings />,
+      },
+    ],
+  },
   {
     id: 'session-view',
     pluginId: 'volundr',
@@ -145,6 +207,14 @@ const REMOTE_PROVIDER_DEFS = [
     subtitle: 'connected services and providers',
     scope: 'user' as const,
     resolver: (config: NiuuConfig) => resolveSettingsServiceBase(config, 'integrations'),
+  },
+  {
+    id: 'runtime',
+    pluginId: 'setup',
+    title: 'Runtime',
+    subtitle: 'this host: sessions at once, access, local model',
+    scope: 'admin' as const,
+    resolver: (config: NiuuConfig) => resolveSettingsServiceBase(config, 'runtime'),
   },
   {
     id: 'volundr',

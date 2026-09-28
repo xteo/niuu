@@ -1,5 +1,6 @@
 """Tests for Volundr Helm chart templates."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -480,6 +481,64 @@ class TestRbacTemplate:
         """Test template has cluster-wide conditional."""
         assert ".Values.rbac.clusterWide" in template_yaml
 
+    @staticmethod
+    def _render_rbac(*overrides: str) -> list[dict]:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--namespace",
+                "forge",
+                "--set",
+                "rbac.clusterWide=true",
+                *overrides,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+    @staticmethod
+    def _secret_verbs(document: dict) -> list[list[str]]:
+        return [
+            rule["verbs"] for rule in document.get("rules", []) if "secrets" in rule["resources"]
+        ]
+
+    @pytest.mark.parametrize("enabled", ["true", "false"])
+    def test_cluster_role_never_grants_secrets_for_execution_credentials(self, enabled):
+        """Per-session bearer Secrets live in the release namespace only, so a
+        cluster-wide Secret write grant would be pure excess privilege."""
+        documents = self._render_rbac("--set", f"workflowExecutionCredentials.enabled={enabled}")
+        cluster_roles = [doc for doc in documents if doc.get("kind") == "ClusterRole"]
+
+        assert cluster_roles
+        for cluster_role in cluster_roles:
+            assert self._secret_verbs(cluster_role) == []
+
+    def test_namespaced_role_grants_secret_writes_for_execution_credentials(self):
+        documents = self._render_rbac("--set", "workflowExecutionCredentials.enabled=true")
+        role = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "Role" and doc["metadata"]["name"] == "test-volundr"
+        )
+
+        assert role["metadata"].get("namespace", "forge") == "forge"
+        assert self._secret_verbs(role) == [["get", "list", "watch", "create", "patch", "delete"]]
+
+    def test_namespaced_role_is_read_only_on_secrets_without_execution_credentials(self):
+        documents = self._render_rbac()
+        role = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "Role" and doc["metadata"]["name"] == "test-volundr"
+        )
+
+        assert self._secret_verbs(role) == [["get", "list", "watch"]]
+
 
 class TestConfigMapTemplate:
     """Tests for configmap.yaml template."""
@@ -599,7 +658,145 @@ class TestConfigMapTemplate:
         assert parsed.session_tokens.ttl_seconds == 604800
         assert parsed.http.allowed_origins == ["https://forge.example.com"]
 
-    def test_ci_values_run_resident_runtime_migrations(self):
+    def test_observability_is_absent_by_default(self):
+        """config.observability: {} (the default) must not render a block
+        that would validate as enabled: false with no endpoints — Helm's
+        `with` treats an empty map as falsy, so the key should be omitted
+        entirely, matching ObservabilityConfig's own "unset, not disabled"
+        default."""
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "observability" not in config
+
+    def test_observability_block_renders_from_values(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "config.observability.enabled=true",
+                "--set",
+                "config.observability.trace_endpoint=http://otel-collector:4317",
+                "--set",
+                "config.observability.metric_endpoint=http://otel-collector:4318/v1/metrics",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert config["observability"]["enabled"] is True
+        assert config["observability"]["trace_endpoint"] == "http://otel-collector:4317"
+        assert config["observability"]["metric_endpoint"] == "http://otel-collector:4318/v1/metrics"
+
+    @staticmethod
+    def _execution_credentials_config(*overrides: str) -> dict:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--namespace",
+                "forge",
+                "--set",
+                "workflowExecutionCredentials.enabled=true",
+                *overrides,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        assert configmap["data"]["config.yaml"].count("projection_kwargs:") == 1
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+        return config["workflow_execution_credentials"]
+
+    def test_execution_credential_projection_defaults_to_release_namespace(self):
+        config = self._execution_credentials_config()
+
+        assert config["projection_kwargs"] == {"namespace": "forge"}
+
+    def test_execution_credential_projection_namespace_override_is_single_key(self):
+        result_config = self._execution_credentials_config(
+            "--set",
+            "workflowExecutionCredentials.projectionKwargs.namespace=sessions",
+            "--set",
+            "workflowExecutionCredentials.projectionKwargs.label=x",
+        )
+
+        assert result_config["projection_kwargs"] == {"namespace": "sessions", "label": "x"}
+
+    def test_execution_credential_projection_namespace_is_not_duplicated(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "workflowExecutionCredentials.projectionKwargs.namespace=sessions",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        configmap = next(
+            doc
+            for doc in yaml.safe_load_all(result.stdout)
+            if doc
+            and doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        rendered = configmap["data"]["config.yaml"]
+        start = rendered.index("projection_kwargs:")
+        end = rendered.index("projection_secret_kwargs_env:")
+
+        assert rendered[start:end].count("namespace:") == 1
+
+    @pytest.mark.parametrize(
+        "overrides,expected_image",
+        [
+            (["--set", "image.tag=pr-993"], "ghcr.io/niuulabs/niuu:pr-993"),
+            (
+                [
+                    "--set",
+                    "global.image.registry=registry.example,global.image.repository=niuu,global.image.tag=release",
+                ],
+                "registry.example/niuu:release",
+            ),
+        ],
+    )
+    def test_ci_values_run_resident_runtime_migrations(self, overrides, expected_image):
         result = subprocess.run(
             [
                 "helm",
@@ -608,6 +805,7 @@ class TestConfigMapTemplate:
                 str(CHART_DIR),
                 "-f",
                 str(CHART_DIR / "ci-values.yaml"),
+                *overrides,
             ],
             check=True,
             capture_output=True,
@@ -616,6 +814,9 @@ class TestConfigMapTemplate:
         documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
         deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
         init_containers = deployment["spec"]["template"]["spec"].get("initContainers", [])
+        lineage = next(c for c in init_containers if c["name"] == "migration-lineage")
+        app = deployment["spec"]["template"]["spec"]["containers"][0]
+        assert lineage["image"] == app["image"] == expected_image
         migrations = next(
             container for container in init_containers if container["name"] == "migrate"
         )
@@ -677,6 +878,70 @@ class TestConfigMapTemplate:
                 "secret_kwargs_env": {},
             }
         ]
+
+
+class TestPreviewCacheStorage:
+    """Tests for the tool-result image preview cache mount.
+
+    The volundr container's root filesystem is read-only
+    (securityContext.readOnlyRootFilesystem), so config.preview_cache_dir must
+    always resolve to a writable emptyDir mount, never Settings.preview_cache_dir's
+    ~/.niuu mini-mode default (that resolves to /.niuu under the pod's HOME=/).
+    """
+
+    @staticmethod
+    def _render(*overrides: str) -> tuple[dict, dict]:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), *overrides],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
+        return configmap, deployment
+
+    def test_configmap_renders_preview_cache_dir_default(self):
+        configmap, _ = self._render()
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert config["preview_cache_dir"] == "/volundr/preview-cache"
+
+    def test_configmap_renders_preview_cache_dir_override(self):
+        configmap, _ = self._render("--set", "previewCache.mountPath=/custom/preview")
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert config["preview_cache_dir"] == "/custom/preview"
+
+    def test_deployment_mounts_preview_cache_emptydir_at_configured_path(self):
+        _, deployment = self._render()
+        containers = deployment["spec"]["template"]["spec"]["containers"]
+        volundr_container = next(c for c in containers if c["name"] == "volundr")
+        mount = next(m for m in volundr_container["volumeMounts"] if m["name"] == "preview-cache")
+        assert mount["mountPath"] == "/volundr/preview-cache"
+
+        volumes = deployment["spec"]["template"]["spec"]["volumes"]
+        volume = next(v for v in volumes if v["name"] == "preview-cache")
+        assert volume["emptyDir"]["sizeLimit"] == "1Gi"
+
+    def test_deployment_preview_cache_mount_path_follows_override(self):
+        _, deployment = self._render("--set", "previewCache.mountPath=/custom/preview")
+        containers = deployment["spec"]["template"]["spec"]["containers"]
+        volundr_container = next(c for c in containers if c["name"] == "volundr")
+        mount = next(m for m in volundr_container["volumeMounts"] if m["name"] == "preview-cache")
+        assert mount["mountPath"] == "/custom/preview"
+
+    def test_deployment_preview_cache_emptydir_has_no_size_limit_when_unset(self):
+        _, deployment = self._render("--set-string", "previewCache.sizeLimit=")
+        volumes = deployment["spec"]["template"]["spec"]["volumes"]
+        volume = next(v for v in volumes if v["name"] == "preview-cache")
+        assert volume["emptyDir"] == {}
 
 
 class TestHpaTemplate:
@@ -848,3 +1113,281 @@ class TestNewValuesDefaults:
         """Test network policy is configured."""
         np = values_yaml["networkPolicy"]
         assert np["enabled"] is False
+
+
+def _rendered_configmap(*extra_args: str) -> dict:
+    command = ["helm", "template", "test", str(CHART_DIR), *extra_args]
+    docs = list(yaml.safe_load_all(subprocess.check_output(command)))
+    return next(
+        yaml.safe_load(d["data"]["config.yaml"])
+        for d in docs
+        if d and d["kind"] == "ConfigMap" and "config.yaml" in d.get("data", {})
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+class TestPodManagerRoomRoleSource:
+    """pod_manager.room_role_source — the single setting the 409 gate and
+    RoomRoleSourceContributor both read (see rest_session_participants.py)."""
+
+    def test_defaults_to_deployment(self):
+        config = _rendered_configmap()
+        assert config["pod_manager"]["room_role_source"] == "deployment"
+        assert config["pod_manager"]["room_role_cache_ttl_seconds"] == 5.0
+
+    def test_renders_remote_and_a_custom_cache_ttl(self):
+        config = _rendered_configmap(
+            "--set",
+            "podManager.roomRoleSource=remote",
+            "--set",
+            "podManager.roomRoleCacheTtlSeconds=12",
+        )
+        assert config["pod_manager"]["room_role_source"] == "remote"
+        assert config["pod_manager"]["room_role_cache_ttl_seconds"] == 12
+
+    def test_config_parses_as_settings(self):
+        from volundr.config import PodManagerConfig
+
+        config = _rendered_configmap(
+            "--set",
+            "podManager.roomRoleSource=remote",
+        )
+        pm = PodManagerConfig(**config["pod_manager"])
+        assert pm.room_role_source == "remote"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is required")
+def test_forge_envoy_authorization_route_for_room_role_endpoint_is_valid():
+    """Without this route, Forge's own ext_authz sidecar denies the scoped
+    workload token before it ever reaches the FastAPI-level scope check —
+    see identity/policies/authorization.cedar's gateway-scoped-credential rule."""
+    from identity.authz_config import AuthorizationGatewayConfig, JWTMetadataProvider
+
+    with open(CHART_DIR / "values.yaml") as fh:
+        values = yaml.safe_load(fh)
+    routes = values["envoy"]["authorization"]["routes"]
+    role_route = next(
+        r for r in routes if r["path"] == "/api/v1/forge/sessions/{session_id}/participants/role"
+    )
+    assert role_route["required_scope"] == "forge:session:room-role"
+    assert role_route["methods"] == ["GET"]
+    assert role_route.get("path_template") is True
+
+    config = AuthorizationGatewayConfig(
+        routes=routes,
+        providers=[JWTMetadataProvider(issuer="https://issuer.test", audiences=["volundr"])],
+    )
+    matched = next(
+        r
+        for r in config.routes
+        if "GET" in r.methods and r.matches("/api/v1/forge/sessions/abc-123/participants/role")
+    )
+    assert matched.required_scope == "forge:session:room-role"
+
+
+class TestResidentWorkloadIdentityMapping:
+    """workloadIdentity.residentMapping — admits resident ServiceAccounts and
+    derives ravn_id per-caller from the verified subject, instead of every
+    resident matching one static, shared owner_id."""
+
+    @staticmethod
+    def _config(*extra_args: str) -> dict:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), *extra_args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        return yaml.safe_load(configmap["data"]["config.yaml"])
+
+    def test_disabled_by_default_renders_no_resident_mapping(self):
+        config = self._config()
+        assert config["workload_identity"]["mappings"] == []
+
+    def test_enabled_renders_a_subject_prefix_scoped_mapping(self):
+        config = self._config(
+            "--set",
+            "workloadIdentity.residentMapping.enabled=true",
+            "--set",
+            "workloadIdentity.residentMapping.namespace=residents",
+        )
+        mappings = config["workload_identity"]["mappings"]
+        assert len(mappings) == 1
+        mapping = mappings[0]
+        assert mapping["subject_prefix"] == "system:serviceaccount:residents:resident-"
+        assert mapping["owner_id_claim"] == "sub"
+        assert (
+            mapping["owner_id_claim_pattern"]
+            == "^system:serviceaccount:[^:]+:resident-([0-9a-f-]{36})$"
+        )
+        assert mapping["tenant_id"] == "default"
+
+    def test_enabled_without_namespace_fails_the_render(self):
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "workloadIdentity.residentMapping.enabled=true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "workloadIdentity.residentMapping.namespace is required" in result.stderr
+
+    def test_operator_supplied_mappings_are_preserved_alongside_the_resident_one(self):
+        config = self._config(
+            "--set",
+            "workloadIdentity.residentMapping.enabled=true",
+            "--set",
+            "workloadIdentity.residentMapping.namespace=residents",
+            "--set",
+            "workloadIdentity.mappings[0].name=other-mapping",
+            "--set",
+            "workloadIdentity.mappings[0].owner_id=fixed-owner",
+        )
+        mappings = config["workload_identity"]["mappings"]
+        names = {m["name"] for m in mappings}
+        assert names == {"other-mapping", "ravn-resident"}
+
+    def test_resident_mapping_is_tried_before_operator_mappings(self):
+        """WorkloadIdentityService.exchange() returns on the FIRST match —
+        residentMapping must come first, or a broader operator mapping
+        (e.g. a catch-all "system:serviceaccount:<ns>:" with no
+        "resident-" requirement) ordered ahead of it would silently win,
+        giving every resident that operator mapping's shared owner_id
+        instead of its own."""
+        config = self._config(
+            "--set",
+            "workloadIdentity.residentMapping.enabled=true",
+            "--set",
+            "workloadIdentity.residentMapping.namespace=residents",
+            "--set",
+            "workloadIdentity.mappings[0].name=catch-all",
+            "--set",
+            "workloadIdentity.mappings[0].owner_id=shared-owner",
+        )
+        mappings = config["workload_identity"]["mappings"]
+        assert mappings[0]["name"] == "ravn-resident"
+        assert mappings[1]["name"] == "catch-all"
+
+    def test_owner_id_pattern_extracts_only_the_runtime_uuid(self):
+        """Regression: the subject a resident pod's projected token carries
+        is system:serviceaccount:<namespace>:resident-<uuid> — the pattern
+        must capture just the uuid, not the whole subject or the namespace."""
+        import re
+
+        config = self._config(
+            "--set",
+            "workloadIdentity.residentMapping.enabled=true",
+            "--set",
+            "workloadIdentity.residentMapping.namespace=residents",
+        )
+        pattern = config["workload_identity"]["mappings"][0]["owner_id_claim_pattern"]
+        subject = "system:serviceaccount:residents:resident-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        match = re.match(pattern, subject)
+        assert match is not None
+        assert match.group(1) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def test_owner_id_pattern_does_not_match_a_non_uuid_resident_name(self):
+        """A non-UUID-named ServiceAccount (e.g. valhalla's Fleet-managed
+        "resident-muninn" or "resident-ravn", shared by several releases and
+        never created by FluxPodManager's per-runtime naming) must not match
+        this broad prefix mapping's owner_id_claim_pattern — that would let
+        it shadow the specific mapping that actually owns that name. See
+        WorkloadIdentityService._matches, which treats a pattern non-match as
+        "this mapping does not apply" and falls through instead of raising."""
+        import re
+
+        config = self._config(
+            "--set",
+            "workloadIdentity.residentMapping.enabled=true",
+            "--set",
+            "workloadIdentity.residentMapping.namespace=valhalla",
+        )
+        pattern = config["workload_identity"]["mappings"][0]["owner_id_claim_pattern"]
+        subject = "system:serviceaccount:valhalla:resident-muninn"
+        assert re.fullmatch(pattern, subject) is None
+
+
+class TestWorkloadIdentityTenantResolver:
+    """workloadIdentity.tenantResolver — derives a resident's real tenant_id
+    from resident_runtimes.tenant_id instead of residentMapping's one
+    static, shared tenantId."""
+
+    @staticmethod
+    def _config(*extra_args: str) -> dict:
+        result = subprocess.run(
+            ["helm", "template", "test", str(CHART_DIR), *extra_args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        return yaml.safe_load(configmap["data"]["config.yaml"])
+
+    def test_disabled_by_default(self):
+        config = self._config()
+        resolver = config["workload_identity"]["tenant_resolver"]
+        assert resolver["adapter"] == ""
+        assert resolver["secret_kwargs_env"] == {}
+
+    def test_configured_adapter_and_secret_kwargs_render(self):
+        config = self._config(
+            "--set",
+            "workloadIdentity.tenantResolver.adapter="
+            "volundr.adapters.outbound.resident_tenant_resolver."
+            "LazyPostgresResidentTenantResolver",
+            "--set",
+            "workloadIdentity.tenantResolver.secretKwargs[0].kwarg=dsn",
+            "--set",
+            "workloadIdentity.tenantResolver.secretKwargs[0].secretName=volundr-postgres-app",
+            "--set",
+            "workloadIdentity.tenantResolver.secretKwargs[0].secretKey=dsn",
+        )
+        resolver = config["workload_identity"]["tenant_resolver"]
+        assert resolver["adapter"] == (
+            "volundr.adapters.outbound.resident_tenant_resolver.LazyPostgresResidentTenantResolver"
+        )
+        assert resolver["secret_kwargs_env"] == {"dsn": "WORKLOAD_TENANT_RESOLVER_SK_DSN"}
+
+    def test_secret_kwargs_env_var_is_sourced_from_the_named_secret(self):
+        docs_result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "workloadIdentity.tenantResolver.secretKwargs[0].kwarg=dsn",
+                "--set",
+                "workloadIdentity.tenantResolver.secretKwargs[0].secretName=volundr-postgres-app",
+                "--set",
+                "workloadIdentity.tenantResolver.secretKwargs[0].secretKey=dsn",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(docs_result.stdout) if doc]
+        deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        env = {item["name"]: item for item in container["env"]}
+        secret_ref = env["WORKLOAD_TENANT_RESOLVER_SK_DSN"]["valueFrom"]["secretKeyRef"]
+        assert secret_ref == {"name": "volundr-postgres-app", "key": "dsn"}

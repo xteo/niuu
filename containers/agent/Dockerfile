@@ -1,4 +1,10 @@
-FROM python:3.14-slim-bookworm@sha256:86f975aca15cf04a40b399eebede9aea7c82eae084d1f1a0a6ef6bcaae871a30 AS builder
+# Security fixes awaiting stable CPython releases; no interpreter ABI changes.
+FROM --platform=$BUILDPLATFORM python:3.14-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS python-security
+COPY containers/python-security/ /security/
+RUN apt-get update && apt-get install -y --no-install-recommends patch \
+    && python /security/build.py /patched-stdlib
+
+FROM python:3.14-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f AS builder
 
 ARG TARGETARCH
 
@@ -8,10 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    UV_VERSION="0.11.10"; \
+    UV_VERSION="0.12.13"; \
     case "${TARGETARCH}" in \
-      amd64) UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"; UV_SHA256="077e1a0777bcf516e02f4ef245e269c8d1baa780438e4c50e09c5c997f85538a" ;; \
-      arm64) UV_ARCHIVE="uv-aarch64-unknown-linux-gnu.tar.gz"; UV_SHA256="91d5f4583539640765662ef86edcf3bf4db07439b622c7bed50c961240162046" ;; \
+      amd64) UV_ARCHIVE="uv-x86_64-unknown-linux-gnu.tar.gz"; UV_SHA256="745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd" ;; \
+      arm64) UV_ARCHIVE="uv-aarch64-unknown-linux-gnu.tar.gz"; UV_SHA256="2eaa5d94f5db7b3a1a092156b9420459e42ab0217d917fe74a876309cef9b5e9" ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}" -o "/tmp/${UV_ARCHIVE}"; \
@@ -24,9 +30,22 @@ WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock README.md /app/
 COPY src/ /app/src/
+# vendor/envoy_authz_protos/ is one of the wheel's registered package roots
+# (see pyproject.toml); the build fails without it even though this image
+# does not run identity.authz_main.
+COPY vendor/ /app/vendor/
 RUN uv sync --frozen --no-dev --no-editable --extra k8s --extra nats
 
-FROM python:3.14-slim-bookworm@sha256:86f975aca15cf04a40b399eebede9aea7c82eae084d1f1a0a6ef6bcaae871a30
+FROM python:3.14-slim-bookworm@sha256:9ab8d9c8514b44f90cf0029dd42fdd7e9e211e639c8b995304cc04568dee900f
+
+RUN --mount=type=bind,from=python-security,source=/patched-stdlib,target=/patched-stdlib \
+    --mount=type=bind,source=containers/python-security,target=/security \
+    python /security/install.py /patched-stdlib && python /security/verify.py
+
+# CI passes the UTC date, so the registry layer cache cannot keep this upgrade
+# (and the security fixes it pulls) for more than a day.
+ARG OS_PACKAGES_REFRESH=
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.title="agent"
 LABEL org.opencontainers.image.description="Niuu Agent - Ravn CLI and daemon runtime"

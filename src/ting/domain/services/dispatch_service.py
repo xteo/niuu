@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import logging
+import random
 import re
 import string
 import uuid
@@ -26,15 +27,18 @@ try:
 except ImportError:
     _catalog_saga_completed = None  # type: ignore[assignment]
 
-from mimir.registry import MimirRegistryStore
+from mimir.connections import normalize_mimir_workload_config, resolve_mimir_registry_refs
 from niuu.config_models import default_session_definitions
 from niuu.domain.model_runtime import (
+    is_self_hosted_model,
     session_definition_for_model,
     transport_adapter_for_session_definition,
     validate_session_definition_for_models,
 )
 from niuu.domain.models import Principal
 from niuu.domain.tags import matches_tags
+from ravn.domain.persona_document import PortablePersonaSource
+from ting.config import DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS
 from ting.domain.flock_merge import build_flock_workload_config
 from ting.domain.models import (
     DispatcherState,
@@ -49,11 +53,13 @@ from ting.domain.models import (
     WorkflowScope,
 )
 from ting.domain.templates import BUNDLED_TEMPLATES_DIR, TemplatePhase, load_template
+from ting.domain.tracker_routing import select_tracker_for_saga
 from ting.domain.utils import _slugify
 from ting.domain.workflow_snapshot import (
     workflow_mimir_from_snapshot,
     workflow_name_from_snapshot,
     workflow_personas_from_snapshot,
+    workflow_runtime_personas_from_snapshot,
     workflow_stage_models_from_snapshot,
 )
 from ting.ports.dispatcher_repository import DispatcherRepository
@@ -67,7 +73,6 @@ from ting.ports.workflow_repository import WorkflowRepository
 logger = logging.getLogger(__name__)
 
 _DEFAULT_WORKFLOW_SESSION_DEFINITION = "skuldCodex"
-_WORKFLOW_CLI_TURN_TIMEOUT_S = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +84,16 @@ _READY_STATUS_TYPES = {"unstarted"}
 _ACTIVE_SESSION_STATUSES = {"running", "starting", "creating"}
 _COMPLETED_LINEAR_STATES = {"completed", "cancelled"}
 _CLI_TRANSPORT_EXECUTOR = "ravn.adapters.executors.cli.CliTransportExecutor"
+# CLI transports that call their vendor's API unless pointed at the session's
+# model gateway, which is then how they serve a self-hosted model. OpenCode and
+# PI reach such a model through their own provider configuration instead.
+_MODEL_GATEWAY_TRANSPORTS = frozenset(
+    {
+        "skuld.transports.sdk.SDKTransport",
+        "skuld.transports.tmux_interactive.TmuxInteractiveTransport",
+        "skuld.transports.codex_ws.CodexWebSocketTransport",
+    }
+)
 
 
 def _sanitize_log(value: object) -> str:
@@ -86,9 +101,9 @@ def _sanitize_log(value: object) -> str:
     return str(value).replace("\n", "\\n").replace("\r", "\\r")
 
 
-def _supports_principal_kwarg(method: object) -> bool:
+def _supports_keyword_arg(method: object, keyword: str) -> bool:
     try:
-        return "principal" in inspect.signature(method).parameters
+        return keyword in inspect.signature(method).parameters
     except (TypeError, ValueError):
         return False
 
@@ -124,6 +139,7 @@ def _resolve_workflow_execution(
     fallback_model: str,
     requested_definition: str | None,
     session_definitions: dict[str, Any],
+    workflow_cli_turn_timeout_seconds: float,
     configured_models: list[Any] | None = None,
 ) -> tuple[str, str | None, list[dict[str, Any]]]:
     if not workflow_snapshot:
@@ -166,7 +182,7 @@ def _resolve_workflow_execution(
         if requested_definition
         else None
     )
-    for persona in workflow_personas_from_snapshot(workflow_snapshot):
+    for persona in workflow_runtime_personas_from_snapshot(workflow_snapshot):
         if not isinstance(persona, dict):
             continue
         runtime_persona = dict(persona)
@@ -198,10 +214,17 @@ def _resolve_workflow_execution(
                 executor_kwargs: dict[str, Any] = {"transport_adapter": transport_adapter}
                 if transport_adapter == "skuld.transports.sdk.SDKTransport":
                     executor_kwargs["transport_kwargs"] = {
-                        "turn_timeout_s": _WORKFLOW_CLI_TURN_TIMEOUT_S
+                        "turn_timeout_s": workflow_cli_turn_timeout_seconds
                     }
                 elif transport_adapter == "skuld.transports.codex_ws.CodexWebSocketTransport":
                     executor_kwargs["transport_kwargs"] = {"skip_permissions": True}
+                if transport_adapter in _MODEL_GATEWAY_TRANSPORTS and is_self_hosted_model(
+                    model, configured_models=configured_models
+                ):
+                    # Only the persona can say its model is self-hosted: the
+                    # session carries the gateway address whatever its personas
+                    # run, and a cloud persona must keep its vendor's API.
+                    executor_kwargs["model_gateway"] = True
                 runtime_persona["executor"] = {
                     "adapter": _CLI_TRANSPORT_EXECUTOR,
                     "kwargs": executor_kwargs,
@@ -220,80 +243,6 @@ def _resolve_workflow_execution(
         session_definition = None
 
     return stage_models[0], session_definition, personas
-
-
-def _normalize_mimir_workload_config(
-    raw: dict[str, Any] | None = None,
-    *,
-    hosted_url: str = "",
-) -> dict[str, Any]:
-    if not raw and not hosted_url:
-        return {}
-
-    normalized = copy.deepcopy(raw) if isinstance(raw, dict) else {}
-    if hosted_url and not normalized.get("hosted_url"):
-        normalized["hosted_url"] = hosted_url
-    return normalized
-
-
-def _resolve_mimir_registry_refs(
-    raw: dict[str, Any] | None = None,
-    *,
-    registry_path: str = "",
-) -> dict[str, Any]:
-    """Hydrate registry-backed Mimir refs with concrete path/url metadata.
-
-    Workflow snapshots currently preserve registry IDs, mount names, and binding
-    metadata. Before dispatching a flock, resolve those IDs against the local
-    Mimir registry so Volundr can materialize real mount instances.
-    """
-    normalized = copy.deepcopy(raw) if isinstance(raw, dict) else {}
-    registry_refs = normalized.get("registry_refs")
-    if not isinstance(registry_refs, list) or not registry_refs or not registry_path.strip():
-        return normalized
-
-    registry_file = Path(registry_path).expanduser()
-    store = MimirRegistryStore(registry_file)
-    entries = store.list_entries()
-    if not entries:
-        return normalized
-
-    by_id = {entry.id: entry for entry in entries}
-    by_name = {entry.name: entry for entry in entries}
-
-    resolved_refs: list[dict[str, Any]] = []
-    for raw_ref in registry_refs:
-        if not isinstance(raw_ref, dict):
-            continue
-        resolved = dict(raw_ref)
-        lookup_key = str(
-            raw_ref.get("registry_entry_id")
-            or raw_ref.get("registryEntryId")
-            or raw_ref.get("mount_name")
-            or raw_ref.get("mountName")
-            or ""
-        ).strip()
-        entry = by_id.get(lookup_key) or by_name.get(lookup_key)
-        if entry is None:
-            resolved_refs.append(resolved)
-            continue
-
-        if entry.path and not str(resolved.get("path") or "").strip():
-            resolved["path"] = entry.path
-        if entry.url and not str(resolved.get("url") or "").strip():
-            resolved["url"] = entry.url
-        if entry.role and not str(resolved.get("role") or "").strip():
-            resolved["role"] = entry.role
-        if entry.categories and not resolved.get("categories"):
-            resolved["categories"] = list(entry.categories)
-        if entry.auth_ref and not str(resolved.get("auth_ref") or "").strip():
-            resolved["auth_ref"] = entry.auth_ref
-        resolved.setdefault("default_read_priority", entry.default_read_priority)
-        resolved.setdefault("enabled", entry.enabled)
-        resolved_refs.append(resolved)
-
-    normalized["registry_refs"] = resolved_refs
-    return normalized
 
 
 @dataclass(frozen=True)
@@ -482,41 +431,38 @@ def _promote_default_ting_run_personas(personas: list[dict]) -> list[dict]:
     return upgraded
 
 
-def resolve_target_adapter(
-    connection_id: str | None,
-    adapter_by_target: dict[str, VolundrPort],
-    fallback: VolundrPort,
-) -> VolundrPort:
-    """Resolve the target Volundr adapter for a dispatch item."""
-    if not connection_id:
-        return fallback
-    adapter = adapter_by_target.get(connection_id)
-    if adapter is not None:
-        return adapter
-    return fallback
-
-
 class TargetSelectionError(Exception):
-    """Raised when a tag selector matches no available Volundr backend."""
+    """Raised when no available Volundr backend satisfies the requested target."""
 
 
 def select_adapter_by_tags(
     adapters: list[VolundrPort],
-    tags: list[str] | tuple[str, ...],
+    tags: list[str] | tuple[str, ...] = (),
     match: str = "all",
+    *,
+    connection_id: str | None = None,
 ) -> VolundrPort:
-    """Select a Volundr adapter whose registered instance carries the given tags.
+    """Place new work uniformly across eligible targets, or honor an explicit pin.
 
-    ``match="all"`` (default) requires every tag; ``match="any"`` requires one.
-    Fails loud — raises ``TargetSelectionError`` if nothing matches rather than
-    silently dispatching to an unintended backend.
+    ``match="all"`` requires every tag; ``match="any"`` requires one.
+    Selection never retries another target after a failure.
     """
-    for adapter in adapters:
-        if matches_tags(getattr(adapter, "tags", []) or [], tags, match):
-            return adapter
-    raise TargetSelectionError(
-        f"No Volundr backend matches tags {sorted(set(tags))} (match={match})"
-    )
+    eligible = [
+        adapter
+        for adapter in adapters
+        if not tags or matches_tags(getattr(adapter, "tags", []) or [], tags, match)
+    ]
+    if connection_id:
+        for adapter in eligible:
+            if connection_id in {adapter.target_id, adapter.name}:
+                return adapter
+        raise TargetSelectionError(f"Volundr target not found or ineligible: {connection_id}")
+    if not eligible:
+        raise TargetSelectionError(
+            f"No Volundr backend matches tags {sorted(set(tags))} (match={match})"
+        )
+    # ponytail: uniform placement; use capacity-aware scheduling when targets expose capacity.
+    return random.choice(eligible)
 
 
 def base_branch_for_repo(saga: Saga, repo: str) -> str:
@@ -545,7 +491,6 @@ class DispatchConfig:
     dispatch_prompt_template: str = ""
     max_cached_issues: int = 10_000
     templates_dir: Path = BUNDLED_TEMPLATES_DIR
-    initial_confidence: float = 0.5
     flock_enabled: bool = False
     flock_default_personas: list[dict] = field(
         default_factory=lambda: [
@@ -563,6 +508,7 @@ class DispatchConfig:
     live_flock: object | None = field(default=None, repr=False)
     session_definitions: dict[str, Any] = field(default_factory=default_session_definitions)
     configured_models: list[Any] = field(default_factory=list)
+    workflow_cli_turn_timeout_seconds: float = DEFAULT_WORKFLOW_CLI_TURN_TIMEOUT_SECONDS
 
     def __getattribute__(self, name: str) -> object:
         live = super().__getattribute__("live_flock")
@@ -605,6 +551,7 @@ class DispatchService:
         event_bus: EventBusPort | None = None,
         flow_provider: FlockFlowProvider | None = None,
         workflow_repo: WorkflowRepository | None = None,
+        persona_source: PortablePersonaSource | None = None,
     ) -> None:
         self._tracker_factory = tracker_factory
         self._volundr_factory = volundr_factory
@@ -616,12 +563,13 @@ class DispatchService:
         self._event_bus = event_bus
         self._flow_provider = flow_provider
         self._workflow_repo = workflow_repo
+        self._persona_source = persona_source
 
     async def _dispatch_capacity_snapshot(
         self,
         owner_id: str,
         *,
-        volundr: VolundrPort,
+        volundrs: list[VolundrPort],
         trackers: list[TrackerPort] | None = None,
         auth_token: str | None = None,
     ) -> tuple[DispatcherState, int, int, int]:
@@ -634,30 +582,31 @@ class DispatchService:
         """
         state = await self._dispatcher_repo.get_or_create(owner_id)
 
-        active_sessions = 0
-        try:
-            sessions = await volundr.list_sessions(auth_token=auth_token)
-            active_sessions = sum(
-                1 for session in sessions if session.status in _ACTIVE_SESSION_STATUSES
-            )
-        except Exception:
-            logger.warning(
-                "Failed to list active Volundr sessions for owner %s while checking capacity",
-                owner_id[:8],
-                exc_info=True,
-            )
+        session_groups = await asyncio.gather(
+            *(adapter.list_sessions(auth_token=auth_token) for adapter in volundrs)
+        )
+        active_sessions = sum(
+            session.status in _ACTIVE_SESSION_STATUSES
+            for sessions in session_groups
+            for session in sessions
+        )
 
         running_runs = 0
         if trackers:
-            try:
-                running = await trackers[0].list_runs_by_status(RunStatus.RUNNING)
-                running_runs = len(running)
-            except Exception:
-                logger.warning(
-                    "Failed to list tracker RUNNING runs for owner %s while checking capacity",
-                    owner_id[:8],
-                    exc_info=True,
-                )
+            results = await asyncio.gather(
+                *(tracker.list_runs_by_status(RunStatus.RUNNING) for tracker in trackers),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "Failed to list tracker RUNNING runs for owner %s "
+                        "while checking capacity: %s",
+                        owner_id[:8],
+                        result,
+                    )
+                else:
+                    running_runs += len(result)
 
         occupied_slots = max(active_sessions, running_runs)
         available_slots = max(state.max_concurrent_runs - occupied_slots, 0)
@@ -670,29 +619,40 @@ class DispatchService:
         principal: Principal | None = None,
         auth_token: str | None = None,
         saga_tracker_id: str | None = None,
+        tracker_connection_id: str | None = None,
     ) -> list[QueueItem]:
         """Find all dispatchable issues, optionally scoped to one saga."""
         adapters = await self._tracker_factory.for_owner(owner_id)
-        if principal is not None and hasattr(self._volundr_factory, "primary_for_principal"):
-            volundr = await self._volundr_factory.primary_for_principal(principal)
+        if principal is not None and hasattr(self._volundr_factory, "for_principal"):
+            all_volundr = await self._volundr_factory.for_principal(principal)
         else:
-            volundr = await self._volundr_factory.primary_for_owner(owner_id)
-        if volundr is None:
+            all_volundr = await self._volundr_factory.for_owner(owner_id)
+        if not all_volundr:
             logger.warning("No Volundr adapter for owner %s, returning empty queue", owner_id)
             return []
 
         sagas = await self._saga_repo.list_sagas(owner_id=owner_id)
         if saga_tracker_id:
-            sagas = [s for s in sagas if s.tracker_id == saga_tracker_id]
+            sagas = [
+                saga
+                for saga in sagas
+                if saga.tracker_id == saga_tracker_id
+                and (
+                    not tracker_connection_id or saga.tracker_connection_id == tracker_connection_id
+                )
+            ]
         # Only process active sagas — completed/failed ones have no dispatchable work
         active_sagas = [s for s in sagas if s.status == SagaStatus.ACTIVE]
         if not active_sagas:
             return []
 
         # Get active sessions to exclude already-running issues
-        sessions = await volundr.list_sessions(auth_token=auth_token)
+        session_groups = await asyncio.gather(
+            *(adapter.list_sessions(auth_token=auth_token) for adapter in all_volundr)
+        )
         active_issue_ids = {
             s.tracker_issue_id
+            for sessions in session_groups
             for s in sessions
             if s.tracker_issue_id and s.status in _ACTIVE_SESSION_STATUSES
         }
@@ -760,11 +720,11 @@ class DispatchService:
         )
 
         adapters = await self._tracker_factory.for_owner(owner_id)
-        if principal is not None and hasattr(self._volundr_factory, "primary_for_principal"):
-            volundr = await self._volundr_factory.primary_for_principal(principal)
+        if principal is not None and hasattr(self._volundr_factory, "for_principal"):
+            all_volundr = await self._volundr_factory.for_principal(principal)
         else:
-            volundr = await self._volundr_factory.primary_for_owner(owner_id)
-        if volundr is None:
+            all_volundr = await self._volundr_factory.for_owner(owner_id)
+        if not all_volundr:
             logger.error("No Volundr adapter for owner %s, cannot dispatch", owner_id)
             return [
                 DispatchResult(
@@ -775,18 +735,6 @@ class DispatchService:
                 )
                 for item in items
             ]
-
-        # Pre-resolve all Volundr adapters for connection_id targeting
-        if principal is not None and hasattr(self._volundr_factory, "for_principal"):
-            all_volundr = await self._volundr_factory.for_principal(principal)
-        else:
-            all_volundr = await self._volundr_factory.for_owner(owner_id)
-        adapter_by_target: dict[str, VolundrPort] = {}
-        for a in all_volundr:
-            if a.target_id:
-                adapter_by_target[a.target_id] = a
-            if a.name:
-                adapter_by_target[a.name] = a
 
         integration_ids_by_target: dict[int, list[str]] = {}
 
@@ -802,36 +750,33 @@ class DispatchService:
                 logger.warning("Saga not found: %s", item.saga_id)
                 continue
 
-            issue = item.issue or issue_cache.get(item.issue_id)
+            issue = item.issue or issue_cache.get((str(saga.id), item.issue_id))
             if issue is None:
                 logger.warning("Issue not found: %s", item.issue_id)
                 continue
 
-            if item.target_tags:
-                # Label-based targeting: pick a backend whose tags match. Fail loud —
-                # never silently fall back to an unintended backend.
-                try:
-                    target_volundr = select_adapter_by_tags(
-                        all_volundr, item.target_tags, item.target_match
-                    )
-                except TargetSelectionError as exc:
-                    logger.warning("Tag targeting failed for issue %s: %s", item.issue_id, exc)
-                    results.append(
-                        DispatchResult(
-                            issue_id=item.issue_id,
-                            session_id="",
-                            session_name="",
-                            status="failed",
-                        )
-                    )
-                    continue
-            else:
-                target_connection = item.connection_id or connection_id or saga.instance_id
-                target_volundr = resolve_target_adapter(
-                    target_connection,
-                    adapter_by_target,
-                    volundr,
+            target_connection = item.connection_id or connection_id
+            # Saga tags replace its default instance; an explicit request pin still applies.
+            if not target_connection and not item.target_tags:
+                target_connection = saga.instance_id
+            try:
+                target_volundr = select_adapter_by_tags(
+                    all_volundr,
+                    item.target_tags,
+                    item.target_match,
+                    connection_id=target_connection,
                 )
+            except TargetSelectionError as exc:
+                logger.warning("Target selection failed for issue %s: %s", item.issue_id, exc)
+                results.append(
+                    DispatchResult(
+                        issue_id=item.issue_id,
+                        session_id="",
+                        session_name="",
+                        status="failed",
+                    )
+                )
+                continue
             integration_cache_key = id(target_volundr)
             integration_ids = integration_ids_by_target.get(integration_cache_key)
             if integration_ids is None:
@@ -864,7 +809,7 @@ class DispatchService:
                 item=item,
                 saga=saga,
                 issue=issue,
-                adapters=adapters,
+                adapter=select_tracker_for_saga(adapters, saga),
                 effective_model=effective_model,
                 effective_prompt=effective_prompt,
                 integration_ids=integration_ids,
@@ -883,6 +828,7 @@ class DispatchService:
         self,
         owner_id: str,
         saga_tracker_id: str,
+        tracker_connection_id: str | None = None,
     ) -> list[DispatchResult]:
         """Dispatch newly unblocked issues if auto_continue is enabled.
 
@@ -907,8 +853,8 @@ class DispatchService:
                 return []
             if self._volundr_factory is None:
                 return []
-            volundr = await self._volundr_factory.primary_for_owner(owner_id)
-            if volundr is None:
+            all_volundr = await self._volundr_factory.for_owner(owner_id)
+            if not all_volundr:
                 logger.info("Auto-continue skipped for owner %s: no Volundr adapter", owner_id[:8])
                 return []
 
@@ -919,7 +865,7 @@ class DispatchService:
                 available_slots,
             ) = await self._dispatch_capacity_snapshot(
                 owner_id,
-                volundr=volundr,
+                volundrs=all_volundr,
                 trackers=adapters,
             )
             if available_slots <= 0:
@@ -933,7 +879,11 @@ class DispatchService:
                 )
                 return []
 
-            ready = await self.find_ready_issues(owner_id, saga_tracker_id=saga_tracker_id)
+            ready = await self.find_ready_issues(
+                owner_id,
+                saga_tracker_id=saga_tracker_id,
+                tracker_connection_id=tracker_connection_id,
+            )
             if not ready:
                 logger.info(
                     "Auto-continue skipped for owner %s: no ready issues (saga=%s)",
@@ -1014,13 +964,13 @@ class DispatchService:
             id=saga_id,
             tracker_id=str(saga_id),
             tracker_type="native",
+            tracker_connection_id="native",
             slug=slug,
             name=template.name,
             repos=template.repos,
             feature_branch=template.feature_branch,
             base_branch=template.base_branch,
             status=SagaStatus.ACTIVE,
-            confidence=self._config.initial_confidence,
             created_at=now,
             owner_id=owner_id,
         )
@@ -1037,7 +987,6 @@ class DispatchService:
                 number=phase_num,
                 name=tpl_phase.name,
                 status=phase_status,
-                confidence=self._config.initial_confidence,
             )
             await self._saga_repo.save_phase(phase)
 
@@ -1054,7 +1003,6 @@ class DispatchService:
                     declared_files=tpl_run.declared_files,
                     estimate_hours=tpl_run.estimate_hours,
                     status=RunStatus.PENDING,
-                    confidence=self._config.initial_confidence,
                     session_id=None,
                     branch=None,
                     chronicle_summary=None,
@@ -1120,8 +1068,8 @@ class DispatchService:
         Per-run ``persona_overrides`` from the template YAML are merged onto
         the matching flow persona before dispatch.
         """
-        volundr = await self._volundr_factory.primary_for_owner(owner_id)
-        if volundr is None:
+        all_volundr = await self._volundr_factory.for_owner(owner_id)
+        if not all_volundr:
             logger.error(
                 "DispatchService: no Volundr adapter for owner %s, cannot dispatch phase '%s'",
                 owner_id,
@@ -1129,11 +1077,7 @@ class DispatchService:
             )
             return
 
-        integration_ids = await self._fetch_integration_ids(
-            volundr,
-            None,
-            owner_id,
-        )
+        integration_ids_by_target: dict[int, list[str]] = {}
         trackers = await self._tracker_factory.for_owner(owner_id)
         (
             state,
@@ -1142,7 +1086,7 @@ class DispatchService:
             available_slots,
         ) = await self._dispatch_capacity_snapshot(
             owner_id,
-            volundr=volundr,
+            volundrs=all_volundr,
             trackers=trackers,
         )
         if available_slots < len(runs):
@@ -1172,7 +1116,6 @@ class DispatchService:
                     declared_files=run.declared_files,
                     estimate_hours=run.estimate_hours,
                     status=RunStatus.QUEUED,
-                    confidence=run.confidence,
                     session_id=None,
                     branch=run.branch,
                     chronicle_summary=run.chronicle_summary,
@@ -1189,6 +1132,17 @@ class DispatchService:
                     phase.name,
                 )
                 continue
+            volundr = select_adapter_by_tags(
+                all_volundr,
+                saga.target_tags,
+                saga.target_match,
+                connection_id=saga.instance_id if not saga.target_tags else None,
+            )
+            if id(volundr) not in integration_ids_by_target:
+                integration_ids_by_target[id(volundr)] = await self._fetch_integration_ids(
+                    volundr, None, owner_id
+                )
+            integration_ids = integration_ids_by_target[id(volundr)]
             session_name = re.sub(r"[^a-z0-9]+", "-", run.name.lower()).strip("-")[:48]
             workload_config = build_flock_workload_config(
                 flock_flow_name,
@@ -1196,6 +1150,10 @@ class DispatchService:
                 self._flow_provider,
                 tpl_run.prompt,
             )
+            if workload_config and workload_config.get("mimir"):
+                workload_config["mimir"] = resolve_mimir_registry_refs(
+                    workload_config["mimir"], registry_path=self._config.flock_mimir_registry_path
+                )
             request = SpawnRequest(
                 name=session_name,
                 repo=repo,
@@ -1223,7 +1181,6 @@ class DispatchService:
                     declared_files=run.declared_files,
                     estimate_hours=run.estimate_hours,
                     status=RunStatus.RUNNING,
-                    confidence=run.confidence,
                     session_id=session.id,
                     branch=run.branch,
                     chronicle_summary=run.chronicle_summary,
@@ -1281,58 +1238,58 @@ class DispatchService:
         }
         has_persisted_phases = bool(phases)
 
-        for adapter in adapters:
-            try:
-                project, milestones, issues = await self._fetch_saga_data(adapter, saga)
+        adapter = select_tracker_for_saga(adapters, saga)
+        try:
+            project, milestones, issues = await self._fetch_saga_data(adapter, saga)
 
-                if project is not None and project.status in _COMPLETED_LINEAR_STATES:
-                    return [], True
+            if project is not None and project.status in _COMPLETED_LINEAR_STATES:
+                return [], True
 
-                milestone_names = {m.id: m.name for m in milestones}
-                blocked_identifiers = await self._get_blocked_safe(adapter, saga)
+            milestone_names = {m.id: m.name for m in milestones}
+            blocked_identifiers = await self._get_blocked_safe(adapter, saga)
 
-                items: list[QueueItem] = []
-                for issue in issues:
-                    if has_persisted_phases and issue.milestone_id not in active_phase_tracker_ids:
-                        continue
-                    if not is_ready(issue, active_issue_ids, blocked_identifiers):
-                        continue
-                    items.append(
-                        QueueItem(
-                            saga_id=str(saga.id),
-                            saga_name=saga.name,
-                            saga_slug=saga.slug,
-                            repos=saga.repos,
-                            feature_branch=saga.feature_branch,
-                            phase_name=milestone_names.get(issue.milestone_id or "", "Unassigned"),
-                            issue_id=issue.id,
-                            identifier=issue.identifier,
-                            title=issue.title,
-                            description=issue.description,
-                            status=issue.status,
-                            status_type=issue.status_type,
-                            priority=issue.priority,
-                            priority_label=issue.priority_label,
-                            estimate=issue.estimate,
-                            url=issue.url,
-                            milestone_id=issue.milestone_id,
-                            workflow_id=str(saga.workflow_id) if saga.workflow_id else None,
-                            workflow=workflow_name_from_snapshot(saga.workflow_snapshot),
-                            workflow_version=(
-                                str(saga.workflow_snapshot.get("version"))
-                                if saga.workflow_snapshot
-                                and saga.workflow_snapshot.get("version") is not None
-                                else None
-                            ),
-                            instance_id=saga.instance_id,
-                            target_tags=tuple(saga.target_tags),
-                            target_match=saga.target_match,
-                        )
+            items: list[QueueItem] = []
+            for issue in issues:
+                if has_persisted_phases and issue.milestone_id not in active_phase_tracker_ids:
+                    continue
+                if not is_ready(issue, active_issue_ids, blocked_identifiers):
+                    continue
+                items.append(
+                    QueueItem(
+                        saga_id=str(saga.id),
+                        saga_name=saga.name,
+                        saga_slug=saga.slug,
+                        repos=saga.repos,
+                        feature_branch=saga.feature_branch,
+                        phase_name=milestone_names.get(issue.milestone_id or "", "Unassigned"),
+                        issue_id=issue.id,
+                        identifier=issue.identifier,
+                        title=issue.title,
+                        description=issue.description,
+                        status=issue.status,
+                        status_type=issue.status_type,
+                        priority=issue.priority,
+                        priority_label=issue.priority_label,
+                        estimate=issue.estimate,
+                        url=issue.url,
+                        milestone_id=issue.milestone_id,
+                        workflow_id=str(saga.workflow_id) if saga.workflow_id else None,
+                        workflow=workflow_name_from_snapshot(saga.workflow_snapshot),
+                        workflow_version=(
+                            str(saga.workflow_snapshot.get("version"))
+                            if saga.workflow_snapshot
+                            and saga.workflow_snapshot.get("version") is not None
+                            else None
+                        ),
+                        instance_id=saga.instance_id,
+                        target_tags=tuple(saga.target_tags),
+                        target_match=saga.target_match,
                     )
-                return items, False
-            except Exception:
-                logger.error("Failed to fetch issues for saga %s", saga.id, exc_info=True)
-        return [], False
+                )
+            return items, False
+        except Exception:
+            logger.error("Failed to fetch issues for saga %s", saga.id, exc_info=True)
+            return [], False
 
     @staticmethod
     async def _get_blocked_safe(adapter: TrackerPort, saga: Saga) -> set[str]:
@@ -1357,7 +1314,9 @@ class DispatchService:
         """Fetch integration IDs from Volundr, returning empty on failure."""
         try:
             kwargs: dict[str, Any] = {"auth_token": auth_token}
-            if principal is not None and _supports_principal_kwarg(volundr.list_integration_ids):
+            if principal is not None and _supports_keyword_arg(
+                volundr.list_integration_ids, "principal"
+            ):
                 kwargs["principal"] = principal
             ids = await volundr.list_integration_ids(**kwargs)
             logger.info("Fetched %d Volundr integration IDs: %s", len(ids), ids)
@@ -1373,25 +1332,23 @@ class DispatchService:
     @staticmethod
     async def _build_issue_cache(
         adapters: list[TrackerPort], sagas: list[Saga], max_cached_issues: int
-    ) -> dict[str, TrackerIssue]:
+    ) -> dict[tuple[str, str], TrackerIssue]:
         """Build a lookup of issue details for prompt generation."""
-        issue_cache: dict[str, TrackerIssue] = {}
+        issue_cache: dict[tuple[str, str], TrackerIssue] = {}
         for saga in sagas:
-            for adapter in adapters:
-                try:
-                    issues = await adapter.list_issues(saga.tracker_id)
-                    for issue in issues:
-                        if len(issue_cache) >= max_cached_issues:
-                            logger.warning(
-                                "Issue cache limit reached (%d), skipping remaining issues",
-                                max_cached_issues,
-                            )
-                            break
-                        issue_cache[issue.id] = issue
-                    break
-                except Exception:
-                    logger.warning("Failed to fetch issues for saga %s", saga.id, exc_info=True)
-                    continue
+            adapter = select_tracker_for_saga(adapters, saga)
+            try:
+                issues = await adapter.list_issues(saga.tracker_id)
+                for issue in issues:
+                    if len(issue_cache) >= max_cached_issues:
+                        logger.warning(
+                            "Issue cache limit reached (%d), skipping remaining issues",
+                            max_cached_issues,
+                        )
+                        break
+                    issue_cache[(str(saga.id), issue.id)] = issue
+            except Exception:
+                logger.warning("Failed to fetch issues for saga %s", saga.id, exc_info=True)
         return issue_cache
 
     def _build_spawn_request(
@@ -1448,7 +1405,7 @@ class DispatchService:
         mimir_url = self._config.flock_mimir_hosted_url
         mimir_registry_path = self._config.flock_mimir_registry_path
         sleipnir_urls = list(self._config.flock_sleipnir_publish_urls)
-        mimir_cfg = _normalize_mimir_workload_config(hosted_url=mimir_url)
+        mimir_cfg = normalize_mimir_workload_config(hosted_url=mimir_url)
         mesh_transport = "nng"
 
         if use_workflow_flock:
@@ -1470,12 +1427,13 @@ class DispatchService:
                 fallback_model=effective_model,
                 requested_definition=workflow_definition,
                 session_definitions=self._config.session_definitions,
+                workflow_cli_turn_timeout_seconds=self._config.workflow_cli_turn_timeout_seconds,
                 configured_models=self._config.configured_models,
             )
             personas = copy.deepcopy(workflow_persona_overrides)
             flow_name_for_log = str(workflow_snapshot.get("name") or "")
-            mimir_cfg = _resolve_mimir_registry_refs(
-                _normalize_mimir_workload_config(workflow_mimir_from_snapshot(workflow_snapshot)),
+            mimir_cfg = resolve_mimir_registry_refs(
+                normalize_mimir_workload_config(workflow_mimir_from_snapshot(workflow_snapshot)),
                 registry_path=mimir_registry_path,
             )
         else:
@@ -1488,8 +1446,8 @@ class DispatchService:
                 flow_name_for_log = flow.name
                 personas = [p.to_dict() for p in flow.personas]
                 mimir_url = flow.mimir_hosted_url or mimir_url
-                mimir_cfg = _resolve_mimir_registry_refs(
-                    _normalize_mimir_workload_config(flow.mimir, hosted_url=mimir_url),
+                mimir_cfg = resolve_mimir_registry_refs(
+                    normalize_mimir_workload_config(flow.mimir, hosted_url=mimir_url),
                     registry_path=mimir_registry_path,
                 )
                 mesh_transport = flow.mesh_transport or mesh_transport
@@ -1580,7 +1538,7 @@ class DispatchService:
         item: DispatchItem,
         saga: Saga,
         issue: TrackerIssue,
-        adapters: list[TrackerPort],
+        adapter: TrackerPort,
         effective_model: str,
         effective_prompt: str,
         integration_ids: list[str],
@@ -1608,45 +1566,46 @@ class DispatchService:
                 "request": request,
                 "auth_token": auth_token,
             }
-            if principal is not None and _supports_principal_kwarg(target_volundr.spawn_session):
+            if principal is not None and _supports_keyword_arg(
+                target_volundr.spawn_session, "principal"
+            ):
                 spawn_kwargs["principal"] = principal
             session = await target_volundr.spawn_session(**spawn_kwargs)
 
             # Record run progress and set tracker issue to In Progress
+            adapter_name = type(adapter).__name__
+            # Older external adapters may not yet accept tenant attribution.
+            progress_scope = {}
+            if _supports_keyword_arg(adapter.update_run_progress, "tenant_id"):
+                progress_scope["tenant_id"] = principal.tenant_id if principal is not None else ""
+            await adapter.update_run_progress(
+                issue.id,
+                status=RunStatus.RUNNING,
+                session_id=session.id,
+                owner_id=owner_id,
+                **progress_scope,
+                phase_tracker_id=issue.milestone_id,
+                saga_tracker_id=saga.tracker_id,
+            )
             logger.info(
-                "Dispatch: updating %d tracker adapters for issue %s",
-                len(adapters),
+                "Dispatch: %s.update_run_progress OK for %s",
+                adapter_name,
                 issue.id,
             )
-            for adapter in adapters:
-                adapter_name = type(adapter).__name__
-                await adapter.update_run_progress(
-                    issue.id,
-                    status=RunStatus.RUNNING,
-                    session_id=session.id,
-                    owner_id=owner_id,
-                    phase_tracker_id=issue.milestone_id,
-                    saga_tracker_id=saga.tracker_id,
-                )
+            try:
+                await adapter.update_run_state(issue.id, RunStatus.RUNNING)
                 logger.info(
-                    "Dispatch: %s.update_run_progress OK for %s",
+                    "Dispatch: %s.update_run_state OK for %s → In Progress",
                     adapter_name,
                     issue.id,
                 )
-                try:
-                    await adapter.update_run_state(issue.id, RunStatus.RUNNING)
-                    logger.info(
-                        "Dispatch: %s.update_run_state OK for %s → In Progress",
-                        adapter_name,
-                        issue.id,
-                    )
-                except Exception:
-                    logger.error(
-                        "FAILED: %s.update_run_state for %s",
-                        adapter_name,
-                        issue.id,
-                        exc_info=True,
-                    )
+            except Exception:
+                logger.error(
+                    "FAILED: %s.update_run_state for %s",
+                    adapter_name,
+                    issue.id,
+                    exc_info=True,
+                )
 
             logger.info("Dispatched %s → session %s", issue.identifier, session.id)
             if self._event_bus is not None:
@@ -1706,7 +1665,11 @@ class DispatchService:
             return None, f"workflow {item.workflow_id!r} is not visible to this saga owner"
         from ting.domain.workflow_snapshot import build_workflow_snapshot  # noqa: PLC0415
 
-        return build_workflow_snapshot(workflow), None
+        try:
+            snapshot = build_workflow_snapshot(workflow, persona_source=self._persona_source)
+        except ValueError as exc:
+            return None, str(exc)
+        return snapshot, None
 
     async def _resolve_default_workflow_snapshot(
         self,
@@ -1729,7 +1692,10 @@ class DispatchService:
 
         from ting.domain.workflow_snapshot import build_workflow_snapshot  # noqa: PLC0415
 
-        snapshot = build_workflow_snapshot(workflow)
+        try:
+            snapshot = build_workflow_snapshot(workflow, persona_source=self._persona_source)
+        except ValueError as exc:
+            return None, str(exc)
         await self._saga_repo.update_saga_workflow(
             saga.id,
             workflow_id=workflow.id,

@@ -1657,18 +1657,139 @@ data:
     -- as stale with a last-seen time rather than vanishing from the graph.
     CREATE INDEX IF NOT EXISTS observatory_fragments_received_at_idx
         ON observatory_fragments (received_at DESC);
-  000062_session_turn_started_at.down.sql: |
+  000062_pat_authority.down.sql: |
+    -- Revoke scoped credentials before older code can treat them as unrestricted.
+    -- Preserve the audit record; token_hash no longer matches any presented JWT.
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'personal_access_tokens' AND column_name = 'scopes'
+        ) THEN
+            UPDATE personal_access_tokens
+            SET token_hash = 'revoked:' || token_hash
+            WHERE scopes IS NOT NULL AND token_hash NOT LIKE 'revoked:%';
+        END IF;
+    END $$;
+    DROP INDEX IF EXISTS idx_pats_tenant_owner;
+    ALTER TABLE personal_access_tokens DROP COLUMN IF EXISTS scopes;
+    ALTER TABLE personal_access_tokens DROP COLUMN IF EXISTS tenant_id;
+  000062_pat_authority.up.sql: |
+    -- Existing unattributed PATs remain recorded but are not valid credentials.
+    -- Rotate them through the authenticated issuance path to establish tenant/scope metadata.
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS scopes TEXT[];
+    ALTER TABLE personal_access_tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_pats_tenant_owner ON personal_access_tokens(tenant_id, owner_id);
+  000063_topology_source_authority.down.sql: |
+    DROP INDEX IF EXISTS idx_observatory_fragments_tenant;
+    ALTER TABLE observatory_fragments DROP COLUMN IF EXISTS owner_id;
+    ALTER TABLE observatory_fragments DROP COLUMN IF EXISTS tenant_id;
+  000063_topology_source_authority.up.sql: |
+    -- Legacy fragments remain quarantined until ownership is audited.
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE observatory_fragments ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_observatory_fragments_tenant ON observatory_fragments(tenant_id);
+  000064_instance_tenant_attribution.down.sql: |
+    -- Preserve recorded tenant attribution on rollback; older code may ignore it.
+    -- The relaxed constraint is additive and also accepts the old user-row shape.
+    SELECT 1;
+  000064_instance_tenant_attribution.up.sql: |
+    ALTER TABLE niuu_instances DROP CONSTRAINT IF EXISTS niuu_instances_scope_check;
+    ALTER TABLE niuu_instances ADD CONSTRAINT niuu_instances_scope_check CHECK (
+        (visibility = 'system' AND owner_id IS NULL)
+        OR (visibility = 'tenant' AND owner_id IS NULL AND tenant_id IS NOT NULL)
+        OR (visibility = 'user' AND owner_id IS NOT NULL)
+    );
+  000065_admin_settings.down.sql: |
+    DROP TABLE IF EXISTS admin_settings;
+  000065_admin_settings.up.sql: |
+    -- Admin settings edited on the Settings page (Forge → Storage) persist across
+    -- restarts instead of living in process memory. One row per settings section.
+    CREATE TABLE IF NOT EXISTS admin_settings (
+        section     TEXT PRIMARY KEY,
+        data        JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  000066_compute_leases.down.sql: |
+    DROP TABLE IF EXISTS compute_leases;
+  000066_compute_leases.up.sql: |
+    -- Durable VM allocations. Failed and draining machines still consume pool capacity.
+    CREATE TABLE IF NOT EXISTS compute_leases (
+        id UUID PRIMARY KEY,
+        pool_id TEXT NOT NULL,
+        session_id UUID NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'provisioning', 'ready', 'busy', 'draining', 'released', 'failed'
+        )),
+        data JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (data->>'id' = id::text),
+        CHECK (data->>'pool_id' = pool_id),
+        CHECK (data->>'session_id' = session_id::text),
+        CHECK (data->>'state' = state)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_compute_leases_live_session
+        ON compute_leases (pool_id, session_id) WHERE state != 'released';
+    CREATE INDEX IF NOT EXISTS idx_compute_leases_pool_state ON compute_leases (pool_id, state);
+  000067_compute_pools.down.sql: |
+    -- Rollback is safe only after admission is paused and every allocation is released.
+    DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM compute_leases WHERE state != 'released') THEN
+            RAISE EXCEPTION 'Drain and release all compute allocations before downgrading';
+        END IF;
+    END $$;
+    DELETE FROM compute_leases WHERE session_id IS NULL;
+    UPDATE compute_leases SET data = data - ARRAY[
+        'session_bootstrap_ref', 'created_at', 'provision_deadline', 'idle_since',
+        'retry_after', 'failures', 'stop_requested', 'bootstrap_owner'
+    ];
+    ALTER TABLE compute_leases ALTER COLUMN session_id SET NOT NULL;
+    ALTER TABLE compute_leases DROP CONSTRAINT IF EXISTS compute_leases_state_check;
+    ALTER TABLE compute_leases ADD CONSTRAINT compute_leases_state_check CHECK (state IN (
+        'provisioning', 'ready', 'busy', 'draining', 'released', 'failed'
+    ));
+    DROP TABLE IF EXISTS compute_pools;
+  000067_compute_pools.up.sql: |
+    -- Standby guests have no session or user binding. Keep capacity until confirmed deletion.
+    ALTER TABLE compute_leases ALTER COLUMN session_id DROP NOT NULL;
+    ALTER TABLE compute_leases DROP CONSTRAINT IF EXISTS compute_leases_state_check;
+    ALTER TABLE compute_leases ADD CONSTRAINT compute_leases_state_check CHECK (state IN (
+        'provisioning', 'idle', 'quarantined', 'ready', 'busy', 'draining', 'released', 'failed'
+    ));
+    CREATE TABLE IF NOT EXISTS compute_pools (
+        pool_id TEXT PRIMARY KEY,
+        data JSONB NOT NULL
+    );
+    UPDATE compute_leases SET data = data || jsonb_build_object('created_at', created_at)
+    WHERE NOT data ? 'created_at';
+  000068_compute_profile_revision.down.sql: |
+    -- Older controllers cannot parse the additional payload field.
+    DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM compute_leases WHERE state != 'released') THEN
+            RAISE EXCEPTION 'Drain and release all compute allocations before downgrading';
+        END IF;
+    END $$;
+    UPDATE compute_leases SET data = data - 'profile_revision';
+  000068_compute_profile_revision.up.sql: |
+    -- Profile revisions are stored in the existing JSONB lease payload.
+    -- Empty revisions on older leases remain readable and cannot enter the warm pool.
+    UPDATE compute_leases SET data = data || '{"profile_revision": ""}'::jsonb
+    WHERE NOT data ? 'profile_revision';
+  000069_session_turn_started_at.down.sql: |
     ALTER TABLE sessions DROP COLUMN IF EXISTS turn_started_at;
-  000062_session_turn_started_at.up.sql: |
+  000069_session_turn_started_at.up.sql: |
     -- Timestamp (UTC) of when a session's CURRENT turn started (the user's prompt
     -- landing). Stable across intra-turn active/tool_executing flips (unlike
     -- activity_state_since, which re-stamps on coarse-bucket changes). NULL when no
     -- turn is in flight, or when an older broker doesn't report it. Clients anchor
     -- the RUNNING elapsed to this, falling back to activity_state_since when NULL.
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS turn_started_at TIMESTAMPTZ;
-  000063_message_delivery_claims.down.sql: |
+  000070_message_delivery_claims.down.sql: |
     DROP TABLE IF EXISTS session_message_deliveries;
-  000063_message_delivery_claims.up.sql: |
+  000070_message_delivery_claims.up.sql: |
     -- Durable dispatch identities: pending claims are never silently re-executed.
     CREATE TABLE IF NOT EXISTS session_message_deliveries (
         session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -1682,22 +1803,28 @@ data:
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (session_id, request_id)
     );
-  000064_remove_duplicate_event_log_index.down.sql: |
+  000071_remove_duplicate_event_log_index.down.sql: |
     CREATE INDEX IF NOT EXISTS idx_session_event_log_session_seq
         ON session_event_log (session_id, seq);
-  000064_remove_duplicate_event_log_index.up.sql: |
+  000071_remove_duplicate_event_log_index.up.sql: |
     -- The primary key already provides this exact ordered index.
     DROP INDEX IF EXISTS idx_session_event_log_session_seq;
-  000065_startup_schema_history.down.sql: |
+  000072_startup_schema_history.down.sql: |
     DROP TABLE IF EXISTS volundr_schema_history;
-  000065_startup_schema_history.up.sql: |
+  000072_startup_schema_history.up.sql: |
     -- Standalone bootstrap uses this same table before applying the numbered set.
     CREATE TABLE IF NOT EXISTS volundr_schema_history (
         filename TEXT PRIMARY KEY,
         sha256 CHAR(64) NOT NULL,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-  000066_forge_projects.up.sql: |
+  000073_forge_projects.down.sql: |
+    DROP TABLE IF EXISTS forge_project_receipts;
+    DROP TABLE IF EXISTS forge_project_dispatches;
+    DROP INDEX IF EXISTS idx_sessions_project;
+    ALTER TABLE sessions DROP COLUMN IF EXISTS coordination;
+    DROP TABLE IF EXISTS forge_projects;
+  000073_forge_projects.up.sql: |
     -- Additive project coordination. Existing sessions retain NULL coordination.
     CREATE TABLE IF NOT EXISTS forge_projects (
         id UUID PRIMARY KEY,
@@ -1728,13 +1855,14 @@ data:
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_forge_receipts_cursor ON forge_project_receipts(project_id, seq);
-  000066_forge_projects.down.sql: |
-    DROP TABLE IF EXISTS forge_project_receipts;
-    DROP TABLE IF EXISTS forge_project_dispatches;
-    DROP INDEX IF EXISTS idx_sessions_project;
-    ALTER TABLE sessions DROP COLUMN IF EXISTS coordination;
-    DROP TABLE IF EXISTS forge_projects;
-  000067_session_read_state.up.sql: |
+
+  000074_session_coordination_revision.up.sql: |
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS coordination_revision BIGINT NOT NULL DEFAULT 0;
+
+  000074_session_coordination_revision.down.sql: |
+    ALTER TABLE sessions DROP COLUMN IF EXISTS coordination_revision;
+
+  000075_session_read_state.up.sql: |
     -- Inbox attention is independent of lifecycle, and is scoped to the authenticated reader.
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS latest_final_seq BIGINT NOT NULL DEFAULT 0;
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS latest_final_turn_id TEXT;
@@ -1748,70 +1876,320 @@ data:
         PRIMARY KEY (session_id, user_id)
     );
 
-  000067_session_read_state.down.sql: |
+  000075_session_read_state.down.sql: |
     DROP TABLE IF EXISTS session_read_states;
     ALTER TABLE sessions DROP COLUMN IF EXISTS latest_final_at;
     ALTER TABLE sessions DROP COLUMN IF EXISTS latest_final_turn_id;
     ALTER TABLE sessions DROP COLUMN IF EXISTS latest_final_seq;
-  lineage-aliases.json: |
-    {
-      "000050_session_definition.up.sql": [
-        {
-          "filename": "000049_session_definition.up.sql",
-          "sha256": "445459e6efb424224c25d3e04dde7ba84aa19765f444261969df7c271c6f172b"
-        }
-      ],
-      "000051_device_tokens.up.sql": [
-        {
-          "filename": "000050_device_tokens.up.sql",
-          "sha256": "8300e019b70f71d38e4258071a4e7a794a401001ffe9b2f0838d374fdbcc0f1d"
-        }
-      ],
-      "000052_session_activity_state_since.up.sql": [
-        {
-          "filename": "000051_session_activity_state_since.up.sql",
-          "sha256": "be4f049338d0892efcdda16ee40138e6015491f562f27fcc2b4cc3b0c856c031"
-        }
-      ],
-      "000062_session_turn_started_at.up.sql": [
-        {
-          "filename": "000052_session_turn_started_at.up.sql",
-          "sha256": "cb98b1e1cd325b8c3b30f674ff8da711586b13ea665ae26d31b632de7b1bf919"
-        }
-      ],
-      "000063_message_delivery_claims.up.sql": [
-        {
-          "filename": "000053_message_delivery_claims.up.sql",
-          "sha256": "1a5bb4da1acaf2c174668ebefc7eba81cee8771213d81dc91b9ae274400ed1a0"
-        }
-      ],
-      "000064_remove_duplicate_event_log_index.up.sql": [
-        {
-          "filename": "000054_remove_duplicate_event_log_index.up.sql",
-          "sha256": "d247d1ea35c013bb3aac35afcab76d017d729b276cd9bc6f3cb13ef2c92f9505"
-        }
-      ],
-      "000065_startup_schema_history.up.sql": [
-        {
-          "filename": "000055_startup_schema_history.up.sql",
-          "sha256": "d691bdc83fa0257005ff511431ddd78ea4ec1e828a1fa1cbe3565146306cf3e7"
-        }
-      ],
-      "000068_session_coordination_revision.up.sql": [
-        {
-          "filename": "000067_session_coordination_revision.up.sql",
-          "sha256": "2e82f5a71bf5f14422d775f2a65b907bb58c863ea677c60bb7a5b2b0d6531e36"
-        }
-      ]
-    }
+  000076_chronicle_attribution.up.sql: |
+    -- Chronicles outlive their session, so they carry the session's owner and tenant
+    -- themselves: history that survives a session delete is still scoped to the
+    -- principals who could list that session. No foreign keys, for the same reason
+    -- 000038 dropped the session one: history must survive what it references.
+    ALTER TABLE chronicles ADD COLUMN IF NOT EXISTS owner_id TEXT;
+    ALTER TABLE chronicles ADD COLUMN IF NOT EXISTS tenant_id TEXT;
 
-  000068_session_coordination_revision.up.sql: |
-    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS coordination_revision BIGINT NOT NULL DEFAULT 0;
+    UPDATE chronicles c
+    SET owner_id = s.owner_id, tenant_id = s.tenant_id
+    FROM sessions s
+    WHERE c.session_id = s.id AND c.owner_id IS NULL AND c.tenant_id IS NULL;
 
-  000068_session_coordination_revision.down.sql: |
-    ALTER TABLE sessions DROP COLUMN IF EXISTS coordination_revision;
+    CREATE INDEX IF NOT EXISTS idx_chronicles_tenant_owner ON chronicles(tenant_id, owner_id);
 
-  000069_forge_notifications.up.sql: |
+  000076_chronicle_attribution.down.sql: |
+    DROP INDEX IF EXISTS idx_chronicles_tenant_owner;
+    ALTER TABLE chronicles DROP COLUMN IF EXISTS tenant_id;
+    ALTER TABLE chronicles DROP COLUMN IF EXISTS owner_id;
+  000077_instance_health.up.sql: |
+    -- Server-side reachability tracking for registered runtime instances. Guild
+    -- probes each instance on register and on a periodic loop, and records the
+    -- result here so an offline node is reported as such instead of looking like
+    -- an idle one that simply has no sessions.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS health TEXT NOT NULL DEFAULT 'unknown';
+    -- last_seen_at: the last time a probe SUCCEEDED — "when did it last work".
+    -- last_checked_at: the last time a probe was ATTEMPTED, success or not —
+    -- "when did we last look". A never-reachable instance has a last_checked_at
+    -- but no last_seen_at; conflating the two would let the UI invent a "just
+    -- now" last-seen time for a node that has never actually answered.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'niuu_instances_health_check'
+        ) THEN
+            ALTER TABLE niuu_instances
+                ADD CONSTRAINT niuu_instances_health_check
+                CHECK (health IN ('unknown', 'ok', 'unreachable'));
+        END IF;
+    END $$;
+  000077_instance_health.down.sql: |
+    ALTER TABLE niuu_instances DROP CONSTRAINT IF EXISTS niuu_instances_health_check;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_error;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_checked_at;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS last_seen_at;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS health;
+  000078_session_span_w3c_trace_id.up.sql: |
+    -- Forge session spans key on trace_id = the session UUID, a stable per-session
+    -- correlation id predating OTel adoption here. It is not a W3C trace id and
+    -- cannot become one without breaking every existing consumer of
+    -- GET /sessions/{id}/trace. Store the W3C trace id (32 lowercase hex chars)
+    -- alongside instead, when the span was recorded while a real OTel trace was
+    -- active, so a Forge span can be cross-referenced with the OTLP trace it
+    -- belongs to.
+    ALTER TABLE session_spans ADD COLUMN IF NOT EXISTS w3c_trace_id VARCHAR(32);
+
+    CREATE INDEX IF NOT EXISTS idx_session_spans_w3c_trace_id
+        ON session_spans(w3c_trace_id)
+        WHERE w3c_trace_id IS NOT NULL;
+  000078_session_span_w3c_trace_id.down.sql: |
+    DROP INDEX IF EXISTS idx_session_spans_w3c_trace_id;
+    ALTER TABLE session_spans DROP COLUMN IF EXISTS w3c_trace_id;
+  000079_resident_realm_binding.up.sql: |
+    -- Explicit realm<->resident link, by id, instead of the naming convention
+    -- the web join previously relied on (resident named after the realm slug).
+    --
+    -- ON DELETE RESTRICT, not SET NULL: the realms REST route's own contract
+    -- says the resident must be torn down first ("The realm's resident is a
+    -- Ravn fleet object and is removed through DELETE /api/v1/ravn/ravens/{id}"
+    -- in rest_realms.py), but nothing enforced it. SET NULL would silently
+    -- unbind an still-live resident from its realm on delete -- a fallback, not
+    -- an answer. RESTRICT makes an out-of-order delete fail loudly instead.
+    ALTER TABLE resident_runtimes
+        ADD COLUMN IF NOT EXISTS realm_id UUID REFERENCES realms(id) ON DELETE RESTRICT;
+
+    CREATE INDEX IF NOT EXISTS idx_resident_runtimes_realm
+        ON resident_runtimes (realm_id)
+        WHERE realm_id IS NOT NULL;
+
+    -- Backfill the explicit link for existing residents that were only ever
+    -- matched by the (now-secondary) naming convention: a resident's name
+    -- equals its realm's slug (web-next's residentNameFor). Only backfill an
+    -- UNAMBIGUOUS match -- one resident, one realm, same name/slug, resident
+    -- not already bound to some other realm -- so we never guess.
+    UPDATE resident_runtimes rr
+    SET realm_id = r.id
+    FROM realms r
+    WHERE rr.realm_id IS NULL
+      AND rr.name = r.slug
+      AND (SELECT COUNT(*) FROM resident_runtimes rr2 WHERE rr2.name = r.slug) = 1
+      AND (SELECT COUNT(*) FROM realms r2 WHERE r2.slug = rr.name) = 1;
+  000079_resident_realm_binding.down.sql: |
+    DROP INDEX IF EXISTS idx_resident_runtimes_realm;
+    ALTER TABLE resident_runtimes DROP COLUMN IF EXISTS realm_id;
+  000080_session_participants.up.sql: |
+    -- Durable per-session collaboration grants: several participants share one
+    -- agent room in the browser through DURABLE grants exposed as Cedar
+    -- attributes (room_viewers/room_approvers), computed from the
+    -- ACTIVE, unexpired rows here. Cascades with the session it grants access
+    -- to, unlike chronicles (000076), which are deliberately kept alive after
+    -- their session is gone.
+    CREATE TABLE IF NOT EXISTS session_participants (
+        id UUID NOT NULL DEFAULT gen_random_uuid(),
+        session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'invited',
+        expires_at TIMESTAMPTZ,
+        invited_by TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (id),
+        UNIQUE (session_id, user_id)
+    );
+
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'session_participants_role_check'
+        ) THEN
+            ALTER TABLE session_participants
+                ADD CONSTRAINT session_participants_role_check
+                CHECK (role IN ('observer', 'teacher', 'debugger', 'approver'));
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'session_participants_status_check'
+        ) THEN
+            ALTER TABLE session_participants
+                ADD CONSTRAINT session_participants_status_check
+                CHECK (status IN ('invited', 'active', 'revoked'));
+        END IF;
+    END $$;
+
+    CREATE INDEX IF NOT EXISTS idx_session_participants_session ON session_participants(session_id);
+    CREATE INDEX IF NOT EXISTS idx_session_participants_user ON session_participants(user_id);
+  000080_session_participants.down.sql: |
+    DROP TABLE IF EXISTS session_participants;
+  000081_ravn_trigger_store.up.sql: |
+    -- Durable storage for the Ravn API's /triggers routes (POST /ravn/triggers
+    -- was returning 503 because no store was wired). trigger_store is a dynamic
+    -- adapter (trigger_store.adapter); only used when it is set to
+    -- ravn.adapters.trigger_store.postgres_store.LazyPostgresTriggerStore — the
+    -- default (ravn.adapters.trigger_store.FileTriggerStore) is a local file.
+    -- Scoped by owner_id/tenant_id so one tenant cannot list or delete another
+    -- tenant's triggers. repo scopes an event-kind trigger to one repository's
+    -- events (ravn.adapters.triggers.api_source filters on it before
+    -- enqueueing) so a QA resident does not fire on every tenant's pull
+    -- requests; empty for cron-kind triggers, which have no event payload.
+    CREATE TABLE IF NOT EXISTS ravn_triggers (
+        id           UUID        PRIMARY KEY,
+        kind         TEXT        NOT NULL,
+        persona_name TEXT        NOT NULL,
+        spec         TEXT        NOT NULL,
+        repo         TEXT        NOT NULL DEFAULT '',
+        enabled      BOOLEAN     NOT NULL DEFAULT TRUE,
+        owner_id     TEXT        NOT NULL,
+        tenant_id    TEXT        NOT NULL,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ravn_triggers_tenant_created
+        ON ravn_triggers (tenant_id, created_at DESC);
+  000081_ravn_trigger_store.down.sql: |
+    DROP INDEX IF EXISTS idx_ravn_triggers_tenant_created;
+    DROP TABLE IF EXISTS ravn_triggers;
+  000082_ravn_budget_ledger.up.sql: |
+    -- Durable fleet-wide budget ledger for the Ravn API's /budget routes
+    -- (GET /ravn/budget/fleet and /ravn/budget/{ravnId} were returning 503
+    -- because no store was wired). budget_ledger is a dynamic adapter
+    -- (budget_ledger.adapter); only used when it is set to
+    -- ravn.adapters.budget_ledger.postgres_store.LazyPostgresBudgetLedger — the
+    -- default (ravn.adapters.budget_ledger.FileBudgetLedger) is a local file.
+    -- One row per (tenant, ravn) per
+    -- UTC day. tenant_id is part of the primary key, not a bare index, so a
+    -- ravn_id collision across tenants cannot upsert into another tenant's row.
+    -- ravn_id is TEXT, not UUID: standalone/discovered residents are not
+    -- guaranteed to carry a UUID id, and this table must never 500 on a
+    -- caller-supplied id the way an earlier draft's UUID trigger id did.
+    -- Written synchronously by the Ravn API's POST /budget/spend, called by each
+    -- resident's DailyBudgetTracker (ravn.drive_loop._record_task_cost) as real
+    -- spend happens, with ravn_id/tenant_id derived server-side from the
+    -- caller's workload principal — never client-supplied.
+    CREATE TABLE IF NOT EXISTS ravn_budget_ledger (
+        tenant_id  TEXT        NOT NULL,
+        ravn_id    TEXT        NOT NULL,
+        day        DATE        NOT NULL,
+        spent_usd  NUMERIC     NOT NULL DEFAULT 0,
+        cap_usd    NUMERIC     NOT NULL DEFAULT 0,
+        warn_at    DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (tenant_id, ravn_id, day)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ravn_budget_ledger_tenant_day
+        ON ravn_budget_ledger (tenant_id, day);
+  000082_ravn_budget_ledger.down.sql: |
+    DROP INDEX IF EXISTS idx_ravn_budget_ledger_tenant_day;
+    DROP TABLE IF EXISTS ravn_budget_ledger;
+  000083_guild_node_join.up.sql: |
+    -- `niuu join` — machines (K8s clusters, DGX Sparks, laptops in mini/docker
+    -- mode) joined to Guild via a single-use pairing code, and the nodes that
+    -- results in. See docs/operator/joining-machines.md.
+
+    -- Server-side record of a minted pairing code. The code itself is a scoped
+    -- workload JWT (token_use=valkyrie_build, scopes=["node_join"]) so entry to
+    -- the join route is gated by the existing require_scope("node_join")
+    -- machinery; this table exists in addition to that so the code can be spent
+    -- exactly once even though the JWT itself stays structurally valid until it
+    -- expires (see .claude/rules/architecture.md).
+    CREATE TABLE IF NOT EXISTS niuu_pairing_codes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code_hash TEXT NOT NULL UNIQUE,
+        created_by TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        -- Operator consent, recorded at mint time, for the joining node to
+        -- register a plaintext (http://) instance URL. A node can never grant
+        -- itself this — only whoever minted the code decides.
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        -- Operator consent, recorded at mint time, for a node that does not
+        -- itself verify caller identity (host_auth.mode: none) to join a Guild
+        -- that runs host_auth.mode: oidc. Without this, Guild forwards a
+        -- caller's real bearer token to an instance that trusts everyone —
+        -- an explicit, admin-granted exception, never a node self-declaration.
+        allow_untrusted_node_auth BOOLEAN NOT NULL DEFAULT false,
+        expires_at TIMESTAMPTZ NOT NULL,
+        consumed_at TIMESTAMPTZ,
+        consumed_by_node_id UUID,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_pairing_codes_expires
+        ON niuu_pairing_codes(expires_at);
+
+    -- A machine joined through a pairing code. Node-originated calls
+    -- (heartbeat/leave) are authenticated by an Ed25519 signature checked
+    -- against public_key, never a bearer JWT.
+    CREATE TABLE IF NOT EXISTS niuu_nodes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        -- Base64-encoded raw 32-byte Ed25519 public key.
+        public_key TEXT NOT NULL,
+        tenant_id TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL,
+        -- Copied once from the pairing code that admitted this node (never
+        -- writable afterward — there is no node-update endpoint at all) so
+        -- every later heartbeat re-registration enforces the same
+        -- operator-granted transport consent, not a value the node supplies.
+        allow_plaintext BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ,
+        -- Strictly-increasing replay-protection watermark (Unix MILLISECONDS,
+        -- not seconds — a heartbeat and a leave issued within the same second
+        -- must both be able to advance it) for signed node requests. NULL
+        -- before the node's first signed call. Advanced only by the single
+        -- atomic conditional UPDATE in PostgresNodeRepository.try_advance_watermark;
+        -- never read-then-written from application code.
+        last_request_at BIGINT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_public_key
+        ON niuu_nodes(public_key);
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_nodes_tenant
+        ON niuu_nodes(tenant_id);
+
+    -- Node display names are shown to admins choosing what to revoke, so a
+    -- second node cannot masquerade as an existing one within the same tenant.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_nodes_tenant_name
+        ON niuu_nodes(tenant_id, name);
+
+    -- The real ownership link for instances a node registers. This column is
+    -- never exposed on InstanceCreateRequest/InstanceUpdateRequest, so the
+    -- authenticated PATCH /api/v1/niuu/instances/{id} route can never set or
+    -- clear it — only GuildJoinRepository (join/heartbeat) writes it. A slug
+    -- derived from the operator-chosen node *name* must never be the ownership
+    -- key (a node named to collide with an existing slug must not be able to
+    -- adopt that row) — node_id is a Guild-assigned UUID the node never
+    -- chooses, so it cannot be gamed the same way.
+    ALTER TABLE niuu_instances ADD COLUMN IF NOT EXISTS node_id UUID
+        REFERENCES niuu_nodes(id) ON DELETE CASCADE;
+
+    CREATE INDEX IF NOT EXISTS idx_niuu_instances_node_id
+        ON niuu_instances(node_id);
+
+    -- One row per (node, kind): concurrent heartbeats deciding "no existing row
+    -- for this kind, insert a new one" at the same time would otherwise both
+    -- succeed and leave two rows for the same node+kind. The second concurrent
+    -- INSERT now fails fast on this constraint instead of silently duplicating.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_niuu_instances_node_kind
+        ON niuu_instances(node_id, kind) WHERE node_id IS NOT NULL;
+  000083_guild_node_join.down.sql: |
+    DROP INDEX IF EXISTS idx_niuu_instances_node_kind;
+    DROP INDEX IF EXISTS idx_niuu_instances_node_id;
+    ALTER TABLE niuu_instances DROP COLUMN IF EXISTS node_id;
+
+    DROP INDEX IF EXISTS idx_niuu_nodes_tenant_name;
+    DROP INDEX IF EXISTS idx_niuu_nodes_tenant;
+    DROP INDEX IF EXISTS idx_niuu_nodes_public_key;
+    DROP TABLE IF EXISTS niuu_nodes;
+
+    DROP INDEX IF EXISTS idx_niuu_pairing_codes_expires;
+    DROP TABLE IF EXISTS niuu_pairing_codes;
+
+  000084_forge_notifications.up.sql: |
     -- Forge session notifications. A cursor-ordered feed projected from the durable
     -- session log (agent notification turns, reply_ready, attention) and direct submits,
     -- a per-reader read watermark, owner delivery rules and the delivery outbox.
@@ -1890,24 +2268,20 @@ data:
         ON forge_notification_deliveries (status, next_attempt_at);
     CREATE INDEX IF NOT EXISTS idx_forge_notification_deliveries_rule
         ON forge_notification_deliveries (rule_id);
-
-  000069_forge_notifications.down.sql: |
+  000084_forge_notifications.down.sql: |
     DROP TABLE IF EXISTS forge_notification_deliveries;
     DROP TABLE IF EXISTS forge_notification_rules;
     DROP TABLE IF EXISTS forge_notification_read_states;
     DROP TABLE IF EXISTS forge_notifications;
-
-  000070_forge_notification_delivery_rate_index.up.sql: |
+  000085_forge_notification_delivery_rate_index.up.sql: |
     -- Per-rule rate limiting counts a rule's recent successful deliveries. A partial
     -- index keeps that count proportional to the window, not the rule's history.
     CREATE INDEX IF NOT EXISTS idx_forge_notification_deliveries_rule_delivered
         ON forge_notification_deliveries (rule_id, delivered_at)
         WHERE status = 'delivered';
-
-  000070_forge_notification_delivery_rate_index.down.sql: |
+  000085_forge_notification_delivery_rate_index.down.sql: |
     DROP INDEX IF EXISTS idx_forge_notification_deliveries_rule_delivered;
-
-  000071_forge_notification_reads.up.sql: |
+  000086_forge_notification_reads.up.sql: |
     -- Individual activity acknowledgements supplement, never advance, the host watermark.
     CREATE TABLE IF NOT EXISTS forge_notification_reads (
         user_id TEXT NOT NULL,
@@ -1917,7 +2291,107 @@ data:
     );
     CREATE INDEX IF NOT EXISTS idx_forge_notification_reads_notification
         ON forge_notification_reads (notification_id);
-
-  000071_forge_notification_reads.down.sql: |
+  000086_forge_notification_reads.down.sql: |
     DROP TABLE IF EXISTS forge_notification_reads;
+  lineage-aliases.json: |
+    {
+      "000050_session_definition.up.sql": [
+        {
+          "filename": "000049_session_definition.up.sql",
+          "sha256": "445459e6efb424224c25d3e04dde7ba84aa19765f444261969df7c271c6f172b"
+        }
+      ],
+      "000051_device_tokens.up.sql": [
+        {
+          "filename": "000050_device_tokens.up.sql",
+          "sha256": "8300e019b70f71d38e4258071a4e7a794a401001ffe9b2f0838d374fdbcc0f1d"
+        }
+      ],
+      "000052_session_activity_state_since.up.sql": [
+        {
+          "filename": "000051_session_activity_state_since.up.sql",
+          "sha256": "be4f049338d0892efcdda16ee40138e6015491f562f27fcc2b4cc3b0c856c031"
+        }
+      ],
+      "000069_session_turn_started_at.up.sql": [
+        {
+          "filename": "000052_session_turn_started_at.up.sql",
+          "sha256": "cb98b1e1cd325b8c3b30f674ff8da711586b13ea665ae26d31b632de7b1bf919"
+        },
+        {
+          "filename": "000062_session_turn_started_at.up.sql",
+          "sha256": "cb98b1e1cd325b8c3b30f674ff8da711586b13ea665ae26d31b632de7b1bf919"
+        }
+      ],
+      "000070_message_delivery_claims.up.sql": [
+        {
+          "filename": "000053_message_delivery_claims.up.sql",
+          "sha256": "1a5bb4da1acaf2c174668ebefc7eba81cee8771213d81dc91b9ae274400ed1a0"
+        },
+        {
+          "filename": "000063_message_delivery_claims.up.sql",
+          "sha256": "1a5bb4da1acaf2c174668ebefc7eba81cee8771213d81dc91b9ae274400ed1a0"
+        }
+      ],
+      "000071_remove_duplicate_event_log_index.up.sql": [
+        {
+          "filename": "000054_remove_duplicate_event_log_index.up.sql",
+          "sha256": "d247d1ea35c013bb3aac35afcab76d017d729b276cd9bc6f3cb13ef2c92f9505"
+        },
+        {
+          "filename": "000064_remove_duplicate_event_log_index.up.sql",
+          "sha256": "d247d1ea35c013bb3aac35afcab76d017d729b276cd9bc6f3cb13ef2c92f9505"
+        }
+      ],
+      "000072_startup_schema_history.up.sql": [
+        {
+          "filename": "000055_startup_schema_history.up.sql",
+          "sha256": "d691bdc83fa0257005ff511431ddd78ea4ec1e828a1fa1cbe3565146306cf3e7"
+        },
+        {
+          "filename": "000065_startup_schema_history.up.sql",
+          "sha256": "d691bdc83fa0257005ff511431ddd78ea4ec1e828a1fa1cbe3565146306cf3e7"
+        }
+      ],
+      "000073_forge_projects.up.sql": [
+        {
+          "filename": "000066_forge_projects.up.sql",
+          "sha256": "d3628fef1c1118f1398dea4ca663fbffbc193dc3eda5dc4494dbc4ef641604e4"
+        }
+      ],
+      "000074_session_coordination_revision.up.sql": [
+        {
+          "filename": "000067_session_coordination_revision.up.sql",
+          "sha256": "2e82f5a71bf5f14422d775f2a65b907bb58c863ea677c60bb7a5b2b0d6531e36"
+        },
+        {
+          "filename": "000068_session_coordination_revision.up.sql",
+          "sha256": "2e82f5a71bf5f14422d775f2a65b907bb58c863ea677c60bb7a5b2b0d6531e36"
+        }
+      ],
+      "000075_session_read_state.up.sql": [
+        {
+          "filename": "000067_session_read_state.up.sql",
+          "sha256": "f299590b681fa7ebd09fbbd5f9b95104b7896f52ab1ffc08a667e3f9c08b6b77"
+        }
+      ],
+      "000084_forge_notifications.up.sql": [
+        {
+          "filename": "000069_forge_notifications.up.sql",
+          "sha256": "fb4b5f0b554c64b4912b115da1abd3785bd93da1f9721b21f27a78dc184df591"
+        }
+      ],
+      "000085_forge_notification_delivery_rate_index.up.sql": [
+        {
+          "filename": "000070_forge_notification_delivery_rate_index.up.sql",
+          "sha256": "4ccc122704749af75930af3204d9d9a2c0936fd27a9279ab24ca3af54be9e2ff"
+        }
+      ],
+      "000086_forge_notification_reads.up.sql": [
+        {
+          "filename": "000071_forge_notification_reads.up.sql",
+          "sha256": "b52942b02f15d19d300c7d2330a74c43477adedc0c3779a53bd9a0b3904389bf"
+        }
+      ]
+    }
 {{- end }}

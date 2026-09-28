@@ -27,7 +27,14 @@ rules:
   # NOTE: If PVCs are in a different namespace, enable rbac.clusterWide
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # Owner-scoped, short-lived file browser pods and direct exec output (no file logs).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
   {{- end }}
   # Access to pods for session management
   - apiGroups: [""]
@@ -40,7 +47,15 @@ rules:
   # Access to secrets for API keys
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs:
+      - get
+      - list
+      - watch
+      {{- if .Values.workflowExecutionCredentials.enabled }}
+      - create
+      - patch
+      - delete
+      {{- end }}
   # Access to configmaps
   - apiGroups: [""]
     resources: ["configmaps"]
@@ -90,7 +105,14 @@ rules:
   # Cluster-wide access to PVCs (cross-namespace provisioning)
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # Owner-scoped, short-lived file browser pods and direct exec output (no file logs).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
   {{- end }}
   {{- if or (contains "InfisicalAgent" .Values.secretInjection.adapter) (contains "OpenBaoAgentInjectionAdapter" .Values.secretInjection.adapter) }}
   # Cluster-wide access to injector coordination resources in the session namespace
@@ -108,6 +130,12 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
+  {{- /*
+  No secrets rule here, deliberately. workflowExecutionCredentials writes
+  per-session bearer Secrets into the release namespace, which the namespaced
+  Role above already covers. A ClusterRole rule would grant Secret
+  create/patch/delete in every namespace of the cluster.
+  */}}
   {{- with .Values.rbac.extraClusterRules }}
   {{- toYaml . | nindent 2 }}
   {{- end }}

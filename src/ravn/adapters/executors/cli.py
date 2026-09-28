@@ -32,12 +32,15 @@ from ravn.domain.models import (
     ToolResult,
     TurnResult,
 )
+from ravn.domain.permission_mode import PermissionMode, parse_permission_mode
 from ravn.ports.channel import ChannelPort
 from ravn.ports.checkpoint import CheckpointPort
 from ravn.ports.executor import ExecutionAgentPort, ExecutorPort
 from ravn.tool_observability import tool_argument_attributes
 
 logger = logging.getLogger(__name__)
+
+_RAVN_TOOLS_MCP_ALLOW_RULE = "mcp__ravn-tools__*"
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,54 @@ def _delegates_permission_config_to_cli(cls: type[CLITransport]) -> bool:
     return (
         cls.__module__ == "skuld.transports.codex_ws" and cls.__name__ == "CodexWebSocketTransport"
     )
+
+
+def _supports_read_only_mcp_boundary(cls: type[CLITransport]) -> bool:
+    """Return whether *cls* implements the explicit MCP-only native boundary."""
+    if not bool(getattr(cls, "supports_read_only_mcp_boundary", False)):
+        return False
+    parameters = inspect.signature(cls).parameters
+    return {"read_only_mcp_only", "allowed_mcp_tools"}.issubset(parameters)
+
+
+def _model_gateway_transport_kwargs(
+    cls: type[CLITransport],
+    *,
+    url: str,
+    token: str,
+    persona: str,
+    model: str,
+) -> dict[str, str]:
+    """Return the kwargs that point *cls* at the session's model gateway, or raise.
+
+    A persona bound to the gateway has no other route to its model: without the
+    gateway its CLI would call the vendor's own API with a model that vendor
+    does not serve.
+    """
+    subject = (
+        f"Persona {persona!r} (model {model!r}) must reach its model through the model gateway"
+    )
+    if not url.strip():
+        raise ValueError(
+            f"{subject}, but this runtime has no gateway URL (SKULD__MODEL_GATEWAY__URL, "
+            "read as runtime_executor.model_gateway_url). A Docker-mode session receives "
+            "it, with SKULD__MODEL_GATEWAY__TOKEN, from the Model server integration; a "
+            "runtime that does not receive it cannot run this persona, so give the "
+            "persona a cloud model there."
+        )
+    if not token.strip():
+        raise ValueError(
+            f"{subject} at {url.strip()!r}, but the gateway token is blank; the CLI "
+            "would present no credential, or the host's own login, to the gateway. "
+            "Set SKULD__MODEL_GATEWAY__TOKEN (runtime_executor.model_gateway_token)."
+        )
+    if not {"model_gateway_url", "model_gateway_token"}.issubset(inspect.signature(cls).parameters):
+        raise ValueError(
+            f"{subject}, but CLI transport {cls.__module__}.{cls.__name__} cannot be "
+            "routed through one; select a transport that accepts model_gateway_url "
+            "and model_gateway_token"
+        )
+    return {"model_gateway_url": url.strip(), "model_gateway_token": token}
 
 
 def _sum_model_usage(raw: dict | None) -> TokenUsage:
@@ -726,9 +777,17 @@ class CliTransportExecutor(ExecutorPort):
         transport_adapter: str = "skuld.transports.subprocess.SubprocessTransport",
         transport_kwargs: dict[str, Any] | None = None,
         ravn_tool_mcp_timeout_seconds: float = 3600.0,
+        model_gateway: bool = False,
+        model_gateway_url: str = "",
+        model_gateway_token: str = "",
     ) -> None:
         self._transport_adapter = transport_adapter
         self._transport_kwargs = dict(transport_kwargs or {})
+        # Set per persona by the workflow that bound it; the URL and token are
+        # the session's gateway and are used only when this persona asks.
+        self._model_gateway = model_gateway
+        self._model_gateway_url = model_gateway_url
+        self._model_gateway_token = model_gateway_token
         self._ravn_tool_mcp_timeout_seconds = max(
             1.0,
             float(ravn_tool_mcp_timeout_seconds),
@@ -744,7 +803,10 @@ class CliTransportExecutor(ExecutorPort):
         workspace_dir = str(kwargs.get("workspace_dir", ""))
         session: Session = kwargs["session"]
         task_id = str(kwargs.get("task_id") or session.id)
-        permission_mode = str(kwargs.get("permission_mode", "workspace_write"))
+        # Required, and parsed with the same parser the permission builder
+        # uses: a missing or unrecognised mode must not become a writable run.
+        permission_mode = parse_permission_mode(kwargs["permission_mode"])
+        read_only = permission_mode == PermissionMode.READ_ONLY
         tools = list(kwargs.get("tools", []))
         transport_kwargs = {
             "workspace_dir": workspace_dir,
@@ -754,8 +816,8 @@ class CliTransportExecutor(ExecutorPort):
             "initial_prompt": "",
         }
         if not _delegates_permission_config_to_cli(self._binding.cls):
-            transport_kwargs["skip_permissions"] = permission_mode != "prompt"
-        if "mcp_servers" in kwargs:
+            transport_kwargs["skip_permissions"] = permission_mode != PermissionMode.PROMPT
+        if "mcp_servers" in kwargs and not read_only:
             transport_kwargs["mcp_servers"] = _with_ravn_tool_mcp_server(
                 list(kwargs["mcp_servers"]),
                 persona=str(kwargs.get("persona", "")),
@@ -766,6 +828,60 @@ class CliTransportExecutor(ExecutorPort):
                 trace_carrier=get_observability().inject(),
             )
         transport_kwargs.update(self._transport_kwargs)
+        if self._model_gateway:
+            transport_kwargs.update(
+                _model_gateway_transport_kwargs(
+                    self._binding.cls,
+                    url=self._model_gateway_url,
+                    token=self._model_gateway_token,
+                    persona=str(kwargs.get("persona", "")),
+                    model=str(kwargs.get("model", "")),
+                )
+            )
+        if read_only:
+            # The generated server is the complete filtered ToolPort registry
+            # for this persona.  Rebuild it after transport overrides so an
+            # adapter default cannot reintroduce an unbounded MCP server.
+            transport_kwargs["mcp_servers"] = _with_ravn_tool_mcp_server(
+                [],
+                persona=str(kwargs.get("persona", "")),
+                tools=tools,
+                tool_timeout_seconds=self._ravn_tool_mcp_timeout_seconds,
+                conversation_id=str(session.id),
+                task_id=task_id,
+                trace_carrier=get_observability().inject(),
+            )
+        if read_only and _delegates_permission_config_to_cli(self._binding.cls):
+            # An explicit persona boundary must win over workload-level Codex
+            # defaults such as skip_permissions=true.  Coordinators use their
+            # bounded MCP read/git and A2A tools instead of Codex's native
+            # shell or native child agents, and denied operations cannot turn
+            # into an invisible approval wait.
+            transport_kwargs["skip_permissions"] = False
+            transport_kwargs["approval_policy"] = "never"
+            transport_kwargs["sandbox"] = "read-only"
+            transport_kwargs["shell_tool_enabled"] = False
+            transport_kwargs["multi_agent_enabled"] = False
+            transport_kwargs["read_only_mcp_only"] = True
+            for server in transport_kwargs["mcp_servers"]:
+                if server.get("name") != "ravn-tools":
+                    continue
+                server["default_tools_approval_mode"] = "approve"
+                server["enabled_tools"] = sorted(self._tool_name(tool) for tool in tools)
+        elif read_only:
+            if not _supports_read_only_mcp_boundary(self._binding.cls):
+                name = f"{self._binding.cls.__module__}.{self._binding.cls.__name__}"
+                raise ValueError(
+                    f"CLI transport {name} cannot enforce the read-only MCP-only boundary; "
+                    "select a transport with explicit read-only support"
+                )
+            # Claude-native tools are a separate surface from the filtered
+            # ToolPort registry.  Preserve only the exact registry exposed by
+            # the generated ravn-tools MCP server and force the transport's
+            # native tool set closed, regardless of workload-level defaults.
+            transport_kwargs["skip_permissions"] = False
+            transport_kwargs["read_only_mcp_only"] = True
+            transport_kwargs["allowed_mcp_tools"] = [_RAVN_TOOLS_MCP_ALLOW_RULE] if tools else []
 
         return CliTransportAgent(
             transport_binding=self._binding,
@@ -781,6 +897,13 @@ class CliTransportExecutor(ExecutorPort):
             preloaded_tools=tools,
             session_join_manager=kwargs.get("session_join_manager"),
         )
+
+    @staticmethod
+    def _tool_name(tool: object) -> str:
+        name = str(getattr(tool, "name", "")).strip()
+        if not name:
+            raise ValueError("read-only MCP tools must have a stable name")
+        return name
 
 
 def _with_ravn_tool_mcp_server(
@@ -830,6 +953,10 @@ def _with_ravn_tool_mcp_server(
             "command": sys.executable,
             "args": args,
             "env": env,
+            # This server exposes the exact ToolPort registry supplied by the
+            # persona.  Continuing without it would run a different, less
+            # capable agent than the configured workflow requested.
+            "required": True,
             # Commissioned builds can remain in a real A2A workflow for
             # minutes. Codex's short MCP default would cancel the local waiter
             # while leaving that remote task running.

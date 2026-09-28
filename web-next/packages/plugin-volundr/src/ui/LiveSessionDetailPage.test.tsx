@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ServicesProvider } from '@niuulabs/plugin-sdk';
+import { ChatConnectionsContext } from '@niuulabs/ui';
 import { createMockBifrostService } from '@niuulabs/plugin-bifrost';
+import { ApiClientError } from '@niuulabs/query';
 import { LiveSessionDetailPage, buildTelemetryTimelineRows } from './LiveSessionDetailPage';
 import * as chatHooks from './hooks/useSkuldChat';
 import {
@@ -536,6 +538,7 @@ function wrap(
     session?: VolundrSession | null;
     volundr?: Partial<IVolundrService>;
     sessionStore?: Partial<ISessionStore>;
+    openConnections?: () => void;
   } = {},
 ) {
   const session = opts.session === undefined ? RUNNING_SESSION : opts.session;
@@ -554,7 +557,9 @@ function wrap(
           metricsStream: createMockMetricsStream(),
         }}
       >
-        <LiveSessionDetailPage sessionId={sessionId} readOnly={opts.readOnly} />
+        <ChatConnectionsContext.Provider value={opts.openConnections}>
+          <LiveSessionDetailPage sessionId={sessionId} readOnly={opts.readOnly} />
+        </ChatConnectionsContext.Provider>
       </ServicesProvider>
     </QueryClientProvider>,
   );
@@ -1078,6 +1083,29 @@ describe('LiveSessionDetailPage', () => {
       expect(screen.getByText('Timeline')).toBeInTheDocument();
       expect(screen.getAllByText('workflow').length).toBeGreaterThanOrEqual(1);
       expect(screen.getByTestId('telemetry-breakdown')).toBeInTheDocument();
+    });
+
+    it('renders the stage breakdown when an earlier lifecycle has no children', async () => {
+      const firstRoot = TELEMETRY_TRACE.spans[0]!;
+      wrap('test-session-id-1234', {
+        volundr: {
+          getSessionTrace: vi.fn().mockResolvedValue({
+            ...TELEMETRY_TRACE,
+            spans: [
+              { ...firstRoot, id: 'empty-attempt', durationMs: 1_000 },
+              ...TELEMETRY_TRACE.spans,
+            ],
+          }),
+        },
+      });
+      await screen.findByTestId('live-session-detail-page');
+      fireEvent.click(screen.getByRole('tab', { name: /Telemetry/i }));
+
+      const breakdown = await screen.findByTestId('telemetry-breakdown');
+      expect(breakdown).toHaveTextContent('execution');
+      expect(screen.getByText('Timeline')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /execution trace details/i }));
+      expect(screen.getByTestId('telemetry-breakdown-task-segment-tool')).toBeInTheDocument();
     });
 
     it('keeps nested active child work out of top timeline segments', () => {
@@ -1932,6 +1960,64 @@ describe('LiveSessionDetailPage', () => {
       });
     });
 
+    it('shows why a start was refused, with the remedy as a link', async () => {
+      const failedSession: VolundrSession = { ...STOPPED_SESSION, status: 'failed' };
+      const service = buildVolundrService(failedSession);
+      service.resumeSession = vi
+        .fn()
+        .mockRejectedValue(
+          new ApiClientError(
+            'API request failed: 409',
+            409,
+            'No session slot is free: 4 of 4 sessions are running on this host. Stop or archive a session, or raise the session limit in Settings → Runtime (/settings/runtime/sessions).',
+          ),
+        );
+      service.getSession = vi.fn().mockResolvedValue(failedSession);
+      wrap('test-session-id-1234', { session: failedSession, volundr: service });
+
+      await screen.findByTestId('live-session-detail-page');
+      fireEvent.click(screen.getByTitle(/^Start session$/i));
+
+      const alert = await screen.findByTestId('session-action-error');
+      expect(alert).toHaveTextContent('4 of 4 sessions are running');
+      expect(screen.getByRole('link', { name: '/settings/runtime/sessions' })).toHaveAttribute(
+        'href',
+        '/settings/runtime/sessions',
+      );
+    });
+
+    it('shows why a session failed', async () => {
+      const failedSession: VolundrSession = {
+        ...STOPPED_SESSION,
+        status: 'failed',
+        error: 'Codex app-server failed to start: exited with code 1',
+      };
+      const service = buildVolundrService(failedSession);
+      service.getSession = vi.fn().mockResolvedValue(failedSession);
+      wrap('test-session-id-1234', { session: failedSession, volundr: service });
+      await screen.findByTestId('live-session-detail-page');
+      expect(screen.getByTestId('session-failure-reason')).toHaveTextContent(
+        'Codex app-server failed to start',
+      );
+    });
+
+    it('shows a non-terminal provider detail while provisioning', async () => {
+      const waitingSession: VolundrSession = {
+        ...STARTING_SESSION,
+        status: 'provisioning',
+        error: 'No CPU hosts available. Your request will be automatically retried.',
+      };
+      const service = buildVolundrService(waitingSession);
+      service.getSession = vi.fn().mockResolvedValue(waitingSession);
+      wrap('test-session-id-1234', { session: waitingSession, volundr: service });
+
+      await screen.findByTestId('live-session-detail-page');
+      expect(screen.getByTestId('session-provisioning-detail')).toHaveTextContent(
+        'No CPU hosts available',
+      );
+      expect(screen.queryByTestId('session-failure-reason')).not.toBeInTheDocument();
+    });
+
     it('shows delete button', async () => {
       wrap('test-session-id-1234');
       await screen.findByTestId('live-session-detail-page');
@@ -2244,6 +2330,28 @@ describe('LiveSessionDetailPage', () => {
       await waitFor(() => {
         expect(screen.getByTestId('session-stats')).toHaveTextContent('Msgs2');
       });
+    });
+
+    it('offers account reconnect and display preferences in the session toolbar', async () => {
+      const openConnections = vi.fn();
+      wrap('test-session-id-1234', { openConnections });
+      await screen.findByTestId('live-session-detail-page');
+      const toolbar = document.querySelector('.niuu-live-session__toolbar') as HTMLElement;
+      fireEvent.click(screen.getByRole('button', { name: 'Reconnect account' }));
+      expect(openConnections).toHaveBeenCalledOnce();
+      expect(toolbar).toContainElement(screen.getByTestId('conversation-view-toggle'));
+      // The conversation keeps his layout: no second row of display controls.
+      expect(screen.getAllByTestId('conversation-view-toggle')).toHaveLength(1);
+    });
+
+    it('offers no reconnect without a reconnect flow or on an archived session', async () => {
+      const first = wrap('test-session-id-1234');
+      await screen.findByTestId('live-session-detail-page');
+      expect(screen.queryByRole('button', { name: 'Reconnect account' })).toBeNull();
+      first.unmount();
+      wrap('test-session-id-1234', { readOnly: true, openConnections: vi.fn() });
+      await screen.findByTestId('live-session-detail-page');
+      expect(screen.queryByRole('button', { name: 'Reconnect account' })).toBeNull();
     });
 
     it('hides Tokens by default and shows the metric when enabled in settings', async () => {

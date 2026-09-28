@@ -75,12 +75,24 @@ class SettingsIntegrationsResourceSchema(SettingsResourceSchemaBase):
     enrollment_start_path: str = Field(serialization_alias="enrollmentStartPath")
     enrollment_status_path: str = Field(serialization_alias="enrollmentStatusPath")
     enrollment_cancel_path: str = Field(serialization_alias="enrollmentCancelPath")
+    enrollment_code_path: str = Field(default="", serialization_alias="enrollmentCodePath")
+
+
+class SettingsExternalIntegrationsResourceSchema(SettingsResourceSchemaBase):
+    """Resource descriptor for deployment-owned integration package management."""
+
+    type: Literal["external_integrations"] = "external_integrations"
+    list_path: str = Field(serialization_alias="listPath")
+    create_path: str = Field(serialization_alias="createPath")
+    delete_path: str = Field(serialization_alias="deletePath")
+    validate_path: str = Field(serialization_alias="validatePath")
 
 
 SettingsResourceSchema = Annotated[
     SettingsTokensResourceSchema
     | SettingsCredentialsResourceSchema
-    | SettingsIntegrationsResourceSchema,
+    | SettingsIntegrationsResourceSchema
+    | SettingsExternalIntegrationsResourceSchema,
     Field(discriminator="type"),
 ]
 

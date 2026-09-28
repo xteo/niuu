@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4, uuid5
 
@@ -16,8 +17,6 @@ import asyncpg
 from niuu.adapters.linear import GraphQLError, LinearGraphQLClient
 from niuu.domain.models import LINEAR_API_URL
 from ting.domain.models import (
-    ConfidenceEvent,
-    ConfidenceEventType,
     Phase,
     PhaseStatus,
     Run,
@@ -91,7 +90,6 @@ def _build_unassigned_phase(
         number=number,
         name="Unassigned",
         status=status,
-        confidence=0.0,
     )
 
 
@@ -115,13 +113,14 @@ _PROJECT_FIELDS = """
 
 _LIST_PROJECTS_QUERY = (
     """
-query ListProjects($first: Int!) {
-  projects(first: $first) {
+query ListProjects($first: Int!, $after: String) {
+  projects(first: $first, after: $after) {
     nodes {
 """
     + _PROJECT_FIELDS
     + """
     }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -235,10 +234,11 @@ query ListIssueRelations($projectId: ID!, $first: Int!) {
 
 _LIST_ISSUES_QUERY = (
     """
-query ListIssues($projectId: ID!, $first: Int!) {
+query ListIssues($projectId: ID!, $first: Int!, $after: String) {
   issues(
     filter: { project: { id: { eq: $projectId } } }
     first: $first
+    after: $after
     orderBy: updatedAt
   ) {
     nodes {
@@ -246,6 +246,7 @@ query ListIssues($projectId: ID!, $first: Int!) {
     + _ISSUE_FIELDS
     + """
     }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -253,13 +254,14 @@ query ListIssues($projectId: ID!, $first: Int!) {
 
 _LIST_ISSUES_BY_MILESTONE_QUERY = (
     """
-query ListIssuesByMilestone($projectId: ID!, $milestoneId: ID!, $first: Int!) {
+query ListIssuesByMilestone($projectId: ID!, $milestoneId: ID!, $first: Int!, $after: String) {
   issues(
     filter: {
       project: { id: { eq: $projectId } }
       projectMilestone: { id: { eq: $milestoneId } }
     }
     first: $first
+    after: $after
     orderBy: updatedAt
   ) {
     nodes {
@@ -267,6 +269,7 @@ query ListIssuesByMilestone($projectId: ID!, $milestoneId: ID!, $first: Int!) {
     + _ISSUE_FIELDS
     + """
     }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -519,8 +522,6 @@ class LinearTrackerAdapter(TrackerPort):
         if run.declared_files:
             files = "\n".join(f"- `{f}`" for f in run.declared_files)
             description += f"\n\n## Declared Files\n{files}"
-        if run.confidence:
-            description += f"\n\n**Confidence:** {run.confidence:.0%}"
 
         # Linear estimate is an integer (story points); clamp positive work to at least 1.
         estimate = None
@@ -584,7 +585,10 @@ class LinearTrackerAdapter(TrackerPort):
         project = data.get("project")
         if project is None:
             raise GraphQLError(f"Project not found: {saga_id}")
-        return self._project_to_saga(project)
+        return replace(
+            self._project_to_saga(project),
+            tracker_connection_id=self.connection_id,
+        )
 
     async def get_phase(self, tracker_id: str) -> Phase:
         if self._pool is not None:
@@ -633,8 +637,18 @@ class LinearTrackerAdapter(TrackerPort):
         if cached is not None:
             return cached  # type: ignore[return-value]
 
-        data = await self._gql.query(_LIST_PROJECTS_QUERY, {"first": 50})
-        nodes = data.get("projects", {}).get("nodes", [])
+        nodes: list[dict] = []
+        after: str | None = None
+        while True:
+            data = await self._gql.query(_LIST_PROJECTS_QUERY, {"first": 100, "after": after})
+            connection = data.get("projects", {})
+            nodes.extend(connection.get("nodes", []))
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = str(page_info.get("endCursor") or "").strip()
+            if not after:
+                raise GraphQLError("Linear projects pagination omitted endCursor")
         projects = [self._node_to_tracker_project(n) for n in nodes]
         self._gql.set_cached(cache_key, projects)
         return projects
@@ -669,18 +683,26 @@ class LinearTrackerAdapter(TrackerPort):
         if cached is not None:
             return cached  # type: ignore[return-value]
 
-        if milestone_id:
-            data = await self._gql.query(
-                _LIST_ISSUES_BY_MILESTONE_QUERY,
-                {"projectId": project_id, "milestoneId": milestone_id, "first": 100},
-            )
-        else:
-            data = await self._gql.query(
-                _LIST_ISSUES_QUERY,
-                {"projectId": project_id, "first": 100},
-            )
-
-        nodes = data.get("issues", {}).get("nodes", [])
+        query = _LIST_ISSUES_BY_MILESTONE_QUERY if milestone_id else _LIST_ISSUES_QUERY
+        nodes: list[dict] = []
+        after: str | None = None
+        while True:
+            variables: dict[str, object] = {
+                "projectId": project_id,
+                "first": 100,
+                "after": after,
+            }
+            if milestone_id:
+                variables["milestoneId"] = milestone_id
+            data = await self._gql.query(query, variables)
+            connection = data.get("issues", {})
+            nodes.extend(connection.get("nodes", []))
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = str(page_info.get("endCursor") or "").strip()
+            if not after:
+                raise GraphQLError("Linear issues pagination omitted endCursor")
         issues = [self._node_to_tracker_issue(n) for n in nodes]
         self._gql.set_cached(cache_key, issues)
         return issues
@@ -738,12 +760,12 @@ class LinearTrackerAdapter(TrackerPort):
         *,
         status: RunStatus | None = None,
         session_id: str | None = None,
-        confidence: float | None = None,
         pr_url: str | None = None,
         pr_id: str | None = None,
         retry_count: int | None = None,
         reason: str | None = None,
         owner_id: str | None = None,
+        tenant_id: str | None = None,
         phase_tracker_id: str | None = None,
         saga_tracker_id: str | None = None,
         chronicle_summary: str | None = None,
@@ -755,21 +777,21 @@ class LinearTrackerAdapter(TrackerPort):
         await self._pool.execute(
             """
             INSERT INTO run_progress
-                (tracker_id, status, session_id, confidence, pr_url, pr_id,
-                 retry_count, reason, owner_id, phase_tracker_id, saga_tracker_id,
-                 chronicle_summary, reviewer_session_id, review_round)
-            VALUES ($1, COALESCE($2, 'PENDING'), $3, $4, $5, $6,
-                    COALESCE($7, 0), $8, $9, $10, $11, $12, $13,
-                    COALESCE($14, 0))
-            ON CONFLICT (tracker_id) DO UPDATE SET
+                (tracker_id, status, session_id, pr_url, pr_id,
+                 retry_count, reason, owner_id, tenant_id, phase_tracker_id, saga_tracker_id,
+                 chronicle_summary, reviewer_session_id, review_round, tracker_connection_id)
+            VALUES ($1, COALESCE($2, 'PENDING'), $3, $4, $5,
+                    COALESCE($6, 0), $7, $8, $9, $10, $11, $12, $13,
+                    COALESCE($14, 0), $15)
+            ON CONFLICT (tracker_connection_id, tracker_id) DO UPDATE SET
                 status              = COALESCE($2, run_progress.status),
                 session_id          = COALESCE($3, run_progress.session_id),
-                confidence          = COALESCE($4, run_progress.confidence),
-                pr_url              = COALESCE($5, run_progress.pr_url),
-                pr_id               = COALESCE($6, run_progress.pr_id),
-                retry_count         = COALESCE($7, run_progress.retry_count),
-                reason              = COALESCE($8, run_progress.reason),
-                owner_id            = COALESCE($9, run_progress.owner_id),
+                pr_url              = COALESCE($4, run_progress.pr_url),
+                pr_id               = COALESCE($5, run_progress.pr_id),
+                retry_count         = COALESCE($6, run_progress.retry_count),
+                reason              = COALESCE($7, run_progress.reason),
+                owner_id            = COALESCE($8, run_progress.owner_id),
+                tenant_id           = COALESCE($9, run_progress.tenant_id),
                 phase_tracker_id    = COALESCE($10, run_progress.phase_tracker_id),
                 saga_tracker_id     = COALESCE($11, run_progress.saga_tracker_id),
                 chronicle_summary   = COALESCE($12, run_progress.chronicle_summary),
@@ -780,17 +802,18 @@ class LinearTrackerAdapter(TrackerPort):
             tracker_id,
             status.value if status is not None else None,
             session_id,
-            confidence,
             pr_url,
             pr_id,
             retry_count,
             reason,
             owner_id,
+            tenant_id,
             phase_tracker_id,
             saga_tracker_id,
             chronicle_summary,
             reviewer_session_id,
             review_round,
+            self.connection_id,
         )
         if status is not None:
             try:
@@ -819,8 +842,10 @@ class LinearTrackerAdapter(TrackerPort):
                 logger.exception("Failed to fetch run %s", row["tracker_id"])
         if stale_ids and self._pool is not None:
             await self._pool.execute(
-                "DELETE FROM run_progress WHERE tracker_id = ANY($1::text[])",
+                "DELETE FROM run_progress WHERE tracker_id = ANY($1::text[]) "
+                "AND tracker_connection_id = $2",
                 stale_ids,
+                self.connection_id,
             )
             logger.info("Cleaned up %d stale run_progress entries", len(stale_ids))
         return runs
@@ -829,17 +854,60 @@ class LinearTrackerAdapter(TrackerPort):
         if self._pool is None:
             return []
         rows = await self._pool.fetch(
-            "SELECT tracker_id FROM run_progress WHERE saga_tracker_id = $1",
+            "SELECT tracker_id FROM run_progress WHERE saga_tracker_id = $1 "
+            "AND tracker_connection_id = $2",
             saga_tracker_id,
+            self.connection_id,
         )
         return await self._collect_runs(rows)
+
+    async def get_authorized_run_progress_for_saga(
+        self,
+        saga_tracker_id: str,
+        *,
+        owner_id: str,
+        tenant_id: str,
+    ) -> list[Run]:
+        if self._pool is None:
+            return []
+        rows = await self._pool.fetch(
+            "SELECT tracker_id FROM run_progress WHERE saga_tracker_id = $1 "
+            "AND tracker_connection_id = $2 AND owner_id = $3 AND tenant_id = $4",
+            saga_tracker_id,
+            self.connection_id,
+            owner_id,
+            tenant_id,
+        )
+        return await self._collect_runs(rows)
+
+    async def has_unscoped_run_progress_for_saga(
+        self,
+        saga_tracker_id: str,
+        *,
+        owner_id: str,
+        tenant_id: str,
+    ) -> bool:
+        if self._pool is None or not tenant_id:
+            return False
+        return bool(
+            await self._pool.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM run_progress "
+                "WHERE saga_tracker_id = $1 AND tracker_connection_id = $2 "
+                "AND owner_id = $3 AND COALESCE(tenant_id, '') = '')",
+                saga_tracker_id,
+                self.connection_id,
+                owner_id,
+            )
+        )
 
     async def get_run_by_session(self, session_id: str) -> Run | None:
         if self._pool is None:
             return None
         row = await self._pool.fetchrow(
-            "SELECT tracker_id FROM run_progress WHERE session_id = $1",
+            "SELECT tracker_id FROM run_progress WHERE session_id = $1 "
+            "AND tracker_connection_id = $2",
             session_id,
+            self.connection_id,
         )
         if row is None:
             return None
@@ -849,8 +917,10 @@ class LinearTrackerAdapter(TrackerPort):
         if self._pool is None:
             return []
         rows = await self._pool.fetch(
-            "SELECT tracker_id FROM run_progress WHERE status = $1 ORDER BY updated_at",
+            "SELECT tracker_id FROM run_progress WHERE status = $1 "
+            "AND tracker_connection_id = $2 ORDER BY updated_at",
             status.value,
+            self.connection_id,
         )
         return await self._collect_runs(rows)
 
@@ -858,59 +928,14 @@ class LinearTrackerAdapter(TrackerPort):
         if self._pool is None:
             return None
         # Scan progress table for a tracker_id whose uuid5 matches run_id
-        rows = await self._pool.fetch("SELECT tracker_id FROM run_progress")
+        rows = await self._pool.fetch(
+            "SELECT tracker_id FROM run_progress WHERE tracker_connection_id = $1",
+            self.connection_id,
+        )
         for row in rows:
             if uuid5(UUID(int=0), row["tracker_id"]) == run_id:
                 return await self.get_run(row["tracker_id"])
         return None
-
-    # -- Confidence events --
-
-    async def add_confidence_event(self, tracker_id: str, event: ConfidenceEvent) -> None:
-        if self._pool is None:
-            raise RuntimeError("pool is required for add_confidence_event")
-        await self._pool.execute(
-            """
-            INSERT INTO run_confidence_events
-                (id, run_id, tracker_id, event_type, delta, score_after, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            """,
-            event.id,
-            event.run_id,
-            tracker_id,
-            event.event_type.value,
-            event.delta,
-            event.score_after,
-            event.created_at,
-        )
-        await self._pool.execute(
-            "UPDATE run_progress SET confidence = $2, updated_at = NOW() WHERE tracker_id = $1",
-            tracker_id,
-            event.score_after,
-        )
-
-    async def get_confidence_events(self, tracker_id: str) -> list[ConfidenceEvent]:
-        if self._pool is None:
-            return []
-        rows = await self._pool.fetch(
-            """
-            SELECT ce.* FROM run_confidence_events ce
-            WHERE ce.tracker_id = $1
-            ORDER BY ce.created_at
-            """,
-            tracker_id,
-        )
-        return [
-            ConfidenceEvent(
-                id=r["id"],
-                run_id=r["run_id"],
-                event_type=ConfidenceEventType(r["event_type"]),
-                delta=r["delta"],
-                score_after=r["score_after"],
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
 
     # -- Phase gate management --
 
@@ -928,9 +953,10 @@ class LinearTrackerAdapter(TrackerPort):
             """
             SELECT count(*) FILTER (WHERE status != 'MERGED') AS remaining
             FROM run_progress
-            WHERE phase_tracker_id = $1
+            WHERE phase_tracker_id = $1 AND tracker_connection_id = $2
             """,
             phase_tracker_id,
+            self.connection_id,
         )
         return row is not None and row["remaining"] == 0
 
@@ -940,10 +966,11 @@ class LinearTrackerAdapter(TrackerPort):
                 """
                 SELECT p.* FROM phases p
                 JOIN sagas s ON s.id = p.saga_id
-                WHERE s.tracker_id = $1
+                WHERE s.tracker_id = $1 AND s.tracker_connection_id = $2
                 ORDER BY p.number
                 """,
                 saga_tracker_id,
+                self.connection_id,
             )
             if rows:
                 phases = [self._row_to_phase(row) for row in rows]
@@ -951,9 +978,11 @@ class LinearTrackerAdapter(TrackerPort):
                     """
                     SELECT count(*) FROM run_progress
                     WHERE saga_tracker_id = $1
+                      AND tracker_connection_id = $2
                       AND (phase_tracker_id IS NULL OR phase_tracker_id = '')
                     """,
                     saga_tracker_id,
+                    self.connection_id,
                 )
                 if unassigned_count:
                     phases.append(
@@ -973,7 +1002,6 @@ class LinearTrackerAdapter(TrackerPort):
                 number=m.sort_order,
                 name=m.name,
                 status=PhaseStatus.PENDING,
-                confidence=0.0,
             )
             for m in milestones
         ]
@@ -1013,16 +1041,19 @@ class LinearTrackerAdapter(TrackerPort):
             SELECT s.*
             FROM sagas s
             JOIN run_progress rp ON rp.saga_tracker_id = s.tracker_id
-            WHERE rp.tracker_id = $1
+            WHERE rp.tracker_id = $1 AND rp.tracker_connection_id = $2
             """,
             tracker_id,
+            self.connection_id,
         )
         if row is not None:
             return self._row_to_saga(row)
 
         row = await self._pool.fetchrow(
-            "SELECT saga_tracker_id FROM run_progress WHERE tracker_id = $1",
+            "SELECT saga_tracker_id FROM run_progress WHERE tracker_id = $1 "
+            "AND tracker_connection_id = $2",
             tracker_id,
+            self.connection_id,
         )
         if row is None or not row["saga_tracker_id"]:
             return None
@@ -1035,9 +1066,10 @@ class LinearTrackerAdapter(TrackerPort):
             """
             SELECT phase_tracker_id, saga_tracker_id
             FROM run_progress
-            WHERE tracker_id = $1
+            WHERE tracker_id = $1 AND tracker_connection_id = $2
             """,
             tracker_id,
+            self.connection_id,
         )
         if row is None:
             return None
@@ -1051,8 +1083,10 @@ class LinearTrackerAdapter(TrackerPort):
         if self._pool is None:
             return None
         row = await self._pool.fetchrow(
-            "SELECT owner_id FROM run_progress WHERE tracker_id = $1",
+            "SELECT owner_id FROM run_progress WHERE tracker_id = $1 "
+            "AND tracker_connection_id = $2",
             tracker_id,
+            self.connection_id,
         )
         if row is None:
             return None
@@ -1065,7 +1099,10 @@ class LinearTrackerAdapter(TrackerPort):
             raise RuntimeError("pool is required for save_session_message")
         # Resolve tracker_id from run UUID
         tracker_id = str(message.run_id)
-        rows = await self._pool.fetch("SELECT tracker_id FROM run_progress")
+        rows = await self._pool.fetch(
+            "SELECT tracker_id FROM run_progress WHERE tracker_connection_id = $1",
+            self.connection_id,
+        )
         for row in rows:
             if uuid5(UUID(int=0), row["tracker_id"]) == message.run_id:
                 tracker_id = row["tracker_id"]
@@ -1073,8 +1110,9 @@ class LinearTrackerAdapter(TrackerPort):
         await self._pool.execute(
             """
             INSERT INTO run_session_messages
-                (id, run_id, tracker_id, session_id, content, sender, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (id, run_id, tracker_id, session_id, content, sender, created_at,
+                 tracker_connection_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
             message.id,
             message.run_id,
@@ -1083,6 +1121,7 @@ class LinearTrackerAdapter(TrackerPort):
             message.content,
             message.sender,
             message.created_at,
+            self.connection_id,
         )
 
     async def get_session_messages(self, tracker_id: str) -> list[SessionMessage]:
@@ -1091,10 +1130,11 @@ class LinearTrackerAdapter(TrackerPort):
         rows = await self._pool.fetch(
             """
             SELECT * FROM run_session_messages
-            WHERE tracker_id = $1
+            WHERE tracker_id = $1 AND tracker_connection_id = $2
             ORDER BY created_at
             """,
             tracker_id,
+            self.connection_id,
         )
         return [
             SessionMessage(
@@ -1114,8 +1154,9 @@ class LinearTrackerAdapter(TrackerPort):
         if self._pool is None:
             return None
         row = await self._pool.fetchrow(
-            "SELECT * FROM run_progress WHERE tracker_id = $1",
+            "SELECT * FROM run_progress WHERE tracker_id = $1 AND tracker_connection_id = $2",
             tracker_id,
+            self.connection_id,
         )
         return dict(row) if row else None
 
@@ -1218,7 +1259,6 @@ class LinearTrackerAdapter(TrackerPort):
             repos=[],
             feature_branch="feat/test",
             status=SagaStatus.ACTIVE,
-            confidence=0.0,
             created_at=now,
             base_branch="",
         )
@@ -1232,7 +1272,6 @@ class LinearTrackerAdapter(TrackerPort):
             number=int(node.get("sortOrder", 0)),
             name=node.get("name", ""),
             status=PhaseStatus.PENDING,
-            confidence=0.0,
         )
 
     @staticmethod
@@ -1244,7 +1283,6 @@ class LinearTrackerAdapter(TrackerPort):
             number=row["number"],
             name=row["name"],
             status=PhaseStatus(row["status"]),
-            confidence=row["confidence"],
         )
 
     @staticmethod
@@ -1261,13 +1299,13 @@ class LinearTrackerAdapter(TrackerPort):
             id=row["id"],
             tracker_id=row["tracker_id"],
             tracker_type=row["tracker_type"],
+            tracker_connection_id=row.get("tracker_connection_id") or "",
             slug=slug,
             name=row["name"],
             repos=list(row["repos"]),
             feature_branch=row.get("feature_branch") or f"feat/{slug}",
             base_branch=row["base_branch"],
             status=SagaStatus(row.get("status", "ACTIVE") or "ACTIVE"),
-            confidence=row["confidence"] or 0.0,
             created_at=row["created_at"] or datetime.now(UTC),
             owner_id=row.get("owner_id") or "",
             workflow_id=row.get("workflow_id"),
@@ -1295,9 +1333,6 @@ class LinearTrackerAdapter(TrackerPort):
             declared_files=[],
             estimate_hours=None,
             status=run_status,
-            confidence=float(progress["confidence"])
-            if progress and progress.get("confidence")
-            else 0.0,
             session_id=progress.get("session_id") if progress else None,
             branch=None,
             chronicle_summary=None,

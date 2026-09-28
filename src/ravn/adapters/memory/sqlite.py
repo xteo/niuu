@@ -291,15 +291,14 @@ class SqliteMemoryAdapter(MemoryPort):
 
         Both scales are normalised to [0, 1], so the substitution is dimensionally honest.
 
-        Any failure returns the candidates untouched: this runs before the agent may answer, and
-        a better order is never worth a turn.
+        A configured reranker must score all candidates or fail explicitly.
         """
         if self._reranker is None or len(results) < 2:
             return results
         documents = [getattr(r, "content", "") or "" for r in results]
         ranked = await self._reranker.rerank(query, documents)
-        if not ranked:
-            return results
+        if {index for index, _ in ranked} != set(range(len(results))):
+            raise ValueError("Configured reranker did not score every memory candidate")
         rescored = list(results)
         for index, score in ranked:
             rescored[index] = replace(results[index], score=float(score))

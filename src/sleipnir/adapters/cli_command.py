@@ -265,8 +265,13 @@ class CLICommandTransport(SleipnirSubscriber):
                 timeout=self._timeout_s,
             )
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    # The process exited before the timeout kill reached it.
+                    pass
+            await proc.communicate()
             logger.warning(
                 "CLI command timed out after %ds: %r (event=%s type=%s)",
                 self._timeout_s,
@@ -275,6 +280,15 @@ class CLICommandTransport(SleipnirSubscriber):
                 event.event_type,
             )
             return
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    # The process exited before the cancellation kill reached it.
+                    pass
+            await proc.communicate()
+            raise
 
         stdout_text = stdout_bytes.decode(errors="replace").rstrip() if stdout_bytes else ""
         stderr_text = stderr_bytes.decode(errors="replace").rstrip() if stderr_bytes else ""

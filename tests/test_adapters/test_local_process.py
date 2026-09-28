@@ -16,8 +16,8 @@ from uuid import uuid4
 import pytest
 import yaml
 
-import volundr.adapters.outbound.local_process as local_process_mod
 from niuu.mesh.ipc import skuld_mesh_addresses
+from volundr.adapters.outbound import local_process as local_process_mod
 from volundr.adapters.outbound.local_process import (
     DEFAULT_CLAUDE_BINARY,
     DEFAULT_MAX_CONCURRENT,
@@ -40,6 +40,7 @@ from volundr.domain.models import (
     SessionStatus,
 )
 from volundr.domain.ports import PodStartResult
+from volundr.domain.services.session import SessionCapacityError
 
 # ------------------------------------------------------------------
 # Fixtures
@@ -782,6 +783,95 @@ class TestAllowedMountPrefixes:
 class TestGitClone:
     """Tests for git clone and branch checkout."""
 
+    @pytest.mark.parametrize("detached", [False, True])
+    async def test_restart_preserves_existing_checkout(
+        self,
+        manager: LocalProcessPodManager,
+        git_session: Session,
+        default_spec: SessionSpec,
+        tmp_path: Path,
+        detached: bool,
+    ) -> None:
+        """Restart keeps local commits, the index, and uncommitted files offline."""
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+        remote = tmp_path / "remote"
+        git("init", "--initial-branch=main", str(remote))
+        (remote / "tracked.txt").write_text("original\n")
+        git("-C", str(remote), "add", "tracked.txt")
+        git(
+            "-C",
+            str(remote),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "Initial commit",
+        )
+        git_session.source = GitSource(repo=remote.as_uri(), branch="main")
+        workspace = await manager._provision_workspace(git_session, default_spec)
+        repo = workspace / "repo"
+        git("-C", str(repo), "checkout", "-b", "session-work")
+        git(
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Local work",
+        )
+        if detached:
+            git("-C", str(repo), "checkout", "--detach")
+        (repo / "tracked.txt").write_text("staged\n")
+        git("-C", str(repo), "add", "tracked.txt")
+        (repo / "tracked.txt").write_text("unstaged\n")
+        (repo / "untracked.txt").write_text("unsaved work\n")
+        before = {
+            path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()
+        }
+        remote.rename(tmp_path / "offline")
+
+        assert await manager._provision_workspace(git_session, default_spec) == workspace
+
+        after = {
+            path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()
+        }
+        assert after == before
+
+    @pytest.mark.parametrize("git_metadata", [False, True])
+    async def test_restart_rejects_incomplete_checkout_without_deleting_files(
+        self,
+        manager: LocalProcessPodManager,
+        git_session: Session,
+        default_spec: SessionSpec,
+        git_metadata: bool,
+    ) -> None:
+        repo = manager._workspaces_dir / str(git_session.id) / "repo"
+        repo.mkdir(parents=True)
+        if git_metadata:
+            (repo / ".git").mkdir()
+        work = repo / "unsaved.txt"
+        work.write_text("keep this work\n")
+
+        with pytest.raises(RuntimeError, match="Git clone failed|Existing git checkout"):
+            await manager._provision_workspace(git_session, default_spec)
+
+        assert work.read_text() == "keep this work\n"
+
     async def test_clone_calls_git(
         self,
         manager: LocalProcessPodManager,
@@ -1102,6 +1192,39 @@ class TestProcessSpawning:
         assert env["SKULD__PORT"] == "9100"
         assert env["SKULD__SESSION__ID"] == str(git_session.id)
 
+    async def test_spawn_renders_proxy_room_role_source(
+        self,
+        manager: LocalProcessPodManager,
+        git_session: Session,
+        default_spec: SessionSpec,
+        tmp_workspaces: Path,
+    ) -> None:
+        """This pod is reached exclusively through niuu.session_proxy on the
+        process backend, never a Kubernetes-style Gateway/ext_authz
+        boundary — the one backend where the proxy's own room-role header
+        is the correct source of truth for a missing header
+        (skuld.config.WsAuthConfig.room_role_source; every other backend
+        keeps the "deployment" default and renders nothing here)."""
+        workspace = tmp_workspaces / str(git_session.id)
+        workspace.mkdir(parents=True)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 42
+
+        with (
+            patch.object(manager, "_resolve_skuld_command", return_value=["python", "-m", "skuld"]),
+            patch.object(manager, "_resolve_claude_binary", return_value="/usr/bin/fake-claude"),
+            patch(
+                "asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=mock_proc,
+            ) as mock_exec,
+        ):
+            await manager._spawn_skuld(git_session, default_spec, workspace, 9100)
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["SKULD__WS_AUTH__ROOM_ROLE_SOURCE"] == "proxy"
+
     async def test_spawn_closes_log_file(
         self,
         manager: LocalProcessPodManager,
@@ -1152,6 +1275,32 @@ class TestProcessSpawning:
         env = LocalProcessPodManager._build_env(spec, Path("/tmp/ws"))
         assert env["FOO"] == "bar"
         assert env["NUM"] == "42"
+
+    def test_build_env_applies_contributed_env_vars(self) -> None:
+        """The integrations contributor's envVars list (SKULD__CLAUDE_AUTH, the
+        model gateway URL) reaches single-host sessions, not only Helm ones."""
+        spec = SessionSpec(
+            values={
+                "env": {"FOO": "bar"},
+                "envVars": [
+                    {
+                        "name": "SKULD__MODEL_GATEWAY__URL",
+                        "value": "http://niuu:8080/api/v1/bifrost",
+                    },
+                    {"name": "SKULD__CLAUDE_AUTH", "value": "api_key"},
+                ],
+            },
+            pod_spec=PodSpecAdditions(),
+        )
+        env = LocalProcessPodManager._build_env(spec, Path("/tmp/ws"))
+        assert env["SKULD__MODEL_GATEWAY__URL"] == "http://niuu:8080/api/v1/bifrost"
+        assert env["SKULD__CLAUDE_AUTH"] == "api_key"
+        assert env["FOO"] == "bar"
+
+    def test_build_env_rejects_nameless_env_vars(self) -> None:
+        spec = SessionSpec(values={"envVars": [{"value": "x"}]}, pod_spec=PodSpecAdditions())
+        with pytest.raises(ValueError, match="need a name"):
+            LocalProcessPodManager._build_env(spec, Path("/tmp/ws"))
 
     def test_build_env_sets_structured_workspace_dir(self) -> None:
         """The Skuld workspace is set through structured broker config."""
@@ -1448,12 +1597,13 @@ class TestProcessSpawning:
 
         assert result == flock_dir
         init_call = mock_run.call_args_list[0]
-        assert init_call.args[0][-6:] == [
+        assert init_call.args[0][-7:] == [
             "--mesh-transport",
             "ipc",
             "--no-http-gateway",
             "--base-port",
             "7486",
+            "--responsive",
             "--force",
         ]
         cluster = (flock_dir / "cluster.yaml").read_text(encoding="utf-8")
@@ -1647,6 +1797,90 @@ class TestProcessSpawning:
         assert "enabled: true" in node_config
         assert "broker_url: ws://127.0.0.1:9101/ws/ravn" in node_config
         assert f"workspace_root: {repo_dir}" in node_config
+
+    async def _start_single_node_flock(
+        self,
+        manager: LocalProcessPodManager,
+        workspace: Path,
+        session: Session,
+        flock_values: dict,
+        init_node_yaml: str,
+    ) -> dict:
+        """Run _start_flock over a node file `ravn flock init` wrote; return the node."""
+        workspace.mkdir(parents=True)
+        flock_dir = workspace / ".flock"
+        flock_dir.mkdir()
+        (flock_dir / "cluster.yaml").write_text("peers: []\n", encoding="utf-8")
+        (flock_dir / "node-reviewer.yaml").write_text(init_node_yaml, encoding="utf-8")
+        spec = SessionSpec(
+            values={"flock": {"personas": [{"name": "reviewer"}], **flock_values}},
+            pod_spec=PodSpecAdditions(
+                env=({"name": "SKULD__MESH__PEER_ID", "value": "skuld-test"},),
+                extra_containers=({"name": "ravn-reviewer"},),
+            ),
+        )
+        with (
+            patch("subprocess.run"),
+            patch("ravn.adapters.personas.loader.FilesystemPersonaAdapter") as loader_cls,
+        ):
+            loader_cls.return_value.load.return_value = MagicMock(allowed_tools=[])
+            await manager._start_flock(
+                session,
+                spec,
+                workspace,
+                FlockPortPlan(
+                    session_base_port=7484,
+                    ravn_base_port=7486,
+                    skuld_pub_port=7484,
+                    skuld_rep_port=7485,
+                    skuld_handshake_port=7584,
+                ),
+                skuld_port=9101,
+            )
+        return yaml.safe_load((flock_dir / "node-reviewer.yaml").read_text(encoding="utf-8"))
+
+    async def test_start_flock_never_inherits_the_host_llm_from_init(
+        self,
+        manager: LocalProcessPodManager,
+        tmp_workspaces: Path,
+        git_session: Session,
+    ) -> None:
+        """`ravn flock init` renders the host's own llm:; the session's LLM replaces it."""
+        node = await self._start_single_node_flock(
+            manager,
+            tmp_workspaces / "session-host-llm",
+            git_session,
+            {"llm_config": {"model": "Qwen/Qwen3.8-27B"}},
+            "persona: reviewer\n"
+            "llm:\n"
+            "  model: host/operator-model\n"
+            "  provider:\n"
+            "    adapter: ravn.adapters.llm.anthropic.AnthropicAdapter\n"
+            "    kwargs:\n"
+            "      api_key: host-secret\n",
+        )
+
+        assert node["llm"] == {"model": "Qwen/Qwen3.8-27B"}
+
+    async def test_start_flock_layers_workload_ravn_config_llm_last(
+        self,
+        manager: LocalProcessPodManager,
+        tmp_workspaces: Path,
+        git_session: Session,
+    ) -> None:
+        """Local nodes use the same LLM order as pod sidecars: ravn_config.llm lands last."""
+        node = await self._start_single_node_flock(
+            manager,
+            tmp_workspaces / "session-ravn-config-llm",
+            git_session,
+            {
+                "llm_config": {"model": "Qwen/Qwen3.8-27B", "max_tokens": 8192},
+                "ravn_config": {"llm": {"max_tokens": 2048, "timeout": 300}},
+            },
+            "persona: reviewer\n",
+        )
+
+        assert node["llm"] == {"model": "Qwen/Qwen3.8-27B", "max_tokens": 2048, "timeout": 300}
 
     async def test_start_flock_materializes_mimir_runtime_and_local_paths(
         self,
@@ -2182,8 +2416,14 @@ class TestStartStop:
             _mock_spawn(mgr, pid=os.getpid()),
         ):
             await mgr.start(session1, spec)
-            with pytest.raises(RuntimeError, match="Max concurrent sessions"):
+            capacity = await mgr.capacity()
+            assert (capacity.limit, capacity.active, capacity.available) == (1, 1, 0)
+            assert "pod_manager.max_concurrent" in capacity.remedy
+            with pytest.raises(SessionCapacityError, match="1 of 1 sessions are running") as info:
                 await mgr.start(session2, spec)
+            # the refusal tells the person where the limit is raised
+            assert "pod_manager.max_concurrent" in str(info.value)
+            assert info.value.capacity.available == 0
 
     async def test_dead_process_frees_concurrent_slot(
         self,
@@ -2247,7 +2487,7 @@ class TestStatus:
         session = Session(id=uuid4(), name="unknown")
         assert await manager.status(session) == SessionStatus.STOPPED
 
-    async def test_status_running(
+    async def test_status_provisioning_until_broker_ready(
         self,
         manager: LocalProcessPodManager,
         git_session: Session,
@@ -2259,7 +2499,31 @@ class TestStatus:
         ):
             await manager.start(git_session, default_spec)
 
+        with patch.object(manager, "_broker_healthy", AsyncMock(return_value=False)):
+            assert await manager.status(git_session) == SessionStatus.PROVISIONING
+        with patch.object(manager, "_broker_healthy", AsyncMock(return_value=True)):
+            assert await manager.wait_for_ready(git_session, timeout=1.0) == SessionStatus.RUNNING
         assert await manager.status(git_session) == SessionStatus.RUNNING
+
+    async def test_status_reobserves_readiness_of_adopted_process(
+        self,
+        manager: LocalProcessPodManager,
+        git_session: Session,
+        default_spec: SessionSpec,
+    ) -> None:
+        """A process adopted after an API restart has no in-memory readiness."""
+        with (
+            _mock_provision(manager),
+            _mock_spawn(manager),
+        ):
+            await manager.start(git_session, default_spec)
+        manager._ready.clear()
+
+        healthy = AsyncMock(return_value=True)
+        with patch.object(manager, "_broker_healthy", healthy):
+            assert await manager.status(git_session) == SessionStatus.RUNNING
+            assert await manager.status(git_session) == SessionStatus.RUNNING
+        healthy.assert_awaited_once()
 
     async def test_status_after_stop(
         self,
@@ -2290,8 +2554,36 @@ class TestStatus:
         ):
             await manager.start(git_session, default_spec)
 
-        result = await manager.wait_for_ready(git_session, timeout=5.0)
+        with patch.object(manager, "_broker_healthy", AsyncMock(return_value=True)):
+            result = await manager.wait_for_ready(git_session, timeout=5.0)
         assert result == SessionStatus.RUNNING
+
+    async def test_wait_for_ready_surfaces_terminal_broker_failure(
+        self,
+        manager: LocalProcessPodManager,
+        git_session: Session,
+        default_spec: SessionSpec,
+    ) -> None:
+        with _mock_provision(manager), _mock_spawn(manager):
+            await manager.start(git_session, default_spec)
+
+        sid = str(git_session.id)
+
+        async def _failed(_session_id: str) -> bool:
+            manager._broker_startup_failures[sid] = "workflow kickoff failed"
+            return False
+
+        with (
+            patch.object(manager, "_broker_healthy", _failed),
+            patch.object(manager, "_terminate_process", AsyncMock()) as terminate,
+        ):
+            result = await manager.wait_for_ready(git_session, timeout=1.0)
+
+        assert result == SessionStatus.FAILED
+        assert manager._processes[sid].state == ProcessState.FAILED
+        assert manager._processes[sid].error == "workflow kickoff failed"
+        assert await manager.status_detail(git_session) == "workflow kickoff failed"
+        terminate.assert_awaited_once()
 
     async def test_wait_for_ready_unknown_session(
         self,
@@ -2300,6 +2592,52 @@ class TestStatus:
         session = Session(id=uuid4(), name="unknown")
         result = await manager.wait_for_ready(session, timeout=1.0)
         assert result == SessionStatus.FAILED
+
+    async def test_broker_readiness_probe_fails_closed(
+        self,
+        manager: LocalProcessPodManager,
+    ) -> None:
+        sid = "probe-session"
+        manager._processes[sid] = ProcessInfo(session_id=sid, port=9191)
+
+        class _Response:
+            status_code = 200
+
+            def __init__(self, payload: object) -> None:
+                self.payload = payload
+
+            def json(self) -> object:
+                if isinstance(self.payload, Exception):
+                    raise self.payload
+                return self.payload
+
+        class _Client:
+            def __init__(self, payload: object, **_kwargs: object) -> None:
+                self.payload = payload
+
+            async def __aenter__(self) -> _Client:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def get(self, _url: str) -> _Response:
+                return _Response(self.payload)
+
+        for payload in ({}, {"ready": "true"}, ValueError("invalid json")):
+            with patch.object(
+                local_process_mod.httpx,
+                "AsyncClient",
+                lambda **kwargs: _Client(payload, **kwargs),
+            ):
+                assert await manager._broker_healthy(sid) is False
+
+        with patch.object(
+            local_process_mod.httpx,
+            "AsyncClient",
+            lambda **kwargs: _Client({"ready": True, "startup_state": "ready"}, **kwargs),
+        ):
+            assert await manager._broker_healthy(sid) is True
 
     async def test_wait_for_ready_timeout(
         self,
@@ -2763,12 +3101,13 @@ class TestLocalFlockMeshMode:
 
         assert result == flock_dir
         init_call = mock_run.call_args_list[0]
-        assert init_call.args[0][-6:] == [
+        assert init_call.args[0][-7:] == [
             "--mesh-transport",
             "ipc",
             "--no-http-gateway",
             "--base-port",
             "7486",
+            "--responsive",
             "--force",
         ]
         cluster = (flock_dir / "cluster.yaml").read_text(encoding="utf-8")
@@ -2860,6 +3199,22 @@ class TestLocalFlockMeshMode:
             values={
                 "flock": {
                     "personas": [{"name": "reviewer"}],
+                    "ravn_config": {
+                        "workflow_execution": {
+                            "enabled": True,
+                            "execution_id": "execution-test",
+                            "base_url": "https://ting.example/api/v1/ting",
+                            "auth_token": "runtime-only-token",
+                        },
+                        "gateway": {
+                            "platform": {
+                                "a2a_agent_card_urls": [
+                                    "https://ting.example/.well-known/agent-card.json"
+                                ],
+                                "a2a_trusted_origins": ["https://ting.example"],
+                            }
+                        },
+                    },
                 }
             },
             pod_spec=PodSpecAdditions(
@@ -2886,4 +3241,14 @@ class TestLocalFlockMeshMode:
         node_config = yaml.safe_load((flock_dir / "node-reviewer.yaml").read_text(encoding="utf-8"))
         assert node_config["gateway"]["platform"]["enabled"] is True
         assert node_config["gateway"]["platform"]["base_url"] == "http://192.168.1.106:8080"
+        assert node_config["gateway"]["platform"]["a2a_agent_card_urls"] == [
+            "https://ting.example/.well-known/agent-card.json"
+        ]
+        assert node_config["gateway"]["platform"]["a2a_trusted_origins"] == ["https://ting.example"]
+        assert node_config["workflow_execution"] == {
+            "enabled": True,
+            "execution_id": "execution-test",
+            "base_url": "https://ting.example/api/v1/ting",
+            "auth_token": "runtime-only-token",
+        }
         assert node_config["permission"]["workspace_root"] == str(repo_workspace)

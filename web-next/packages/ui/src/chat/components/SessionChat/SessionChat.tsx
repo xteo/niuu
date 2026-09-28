@@ -17,6 +17,9 @@ import {
   Eye,
   EyeOff,
   Trash2Icon,
+  ChevronRight,
+  ChevronDown,
+  Loader2,
 } from 'lucide-react';
 import { LoadingState } from '../../../data/states/LoadingState';
 import { ErrorState } from '../../../data/states/ErrorState';
@@ -55,9 +58,12 @@ import type {
 } from '../../types';
 import type { FileAttachment } from '../../hooks/useFileAttachments';
 import type { SlashCommand } from '../../utils/slashCommands';
+import { useConversationView } from '../../compactUxPrefs';
+import { ChatDisplayControls } from '../ChatDisplayControls';
 import { ToolImageProvider } from '../ToolImages';
 import { HistoryDetailsContext } from '../HistoryDetailsContext';
 import './SessionChat.css';
+import { ChatConnectionsButton } from '../../../ChatConnections';
 
 const SCROLL_THRESHOLD = 150;
 
@@ -287,12 +293,20 @@ export interface SessionChatProps {
   sessionHost?: string | null;
   /** Full chat endpoint URL */
   chatEndpoint?: string | null;
+  /** Resolved Forge history endpoint when the gateway is not the Forge API host */
+  historyEndpoint?: string | null;
   /** Session name shown in empty state */
   sessionName?: string;
   /** Optional extra class on the outer wrapper */
   className?: string;
   /** Show the built-in toolbar row. */
   showToolbar?: boolean;
+  /**
+   * Render the display controls (and account reconnect) above the conversation
+   * when there is no toolbar. Off when the host places `ChatDisplayControls` in
+   * its own toolbar.
+   */
+  showDisplayControls?: boolean;
   /** Token counts are opt-in to keep the conversation uncluttered. */
   showTokenUsage?: boolean;
   /** Hide the built-in internal visibility toggle when the page owns it externally. */
@@ -364,9 +378,11 @@ export function SessionChat({
   capabilities = {},
   sessionHost = null,
   chatEndpoint = null,
+  historyEndpoint = null,
   sessionName = 'Session',
   className,
   showToolbar = true,
+  showDisplayControls = true,
   showTokenUsage = false,
   showInternalToggle = true,
   internalVisibility,
@@ -424,6 +440,20 @@ export function SessionChat({
   );
   const [peerSidebarCollapsed, setPeerSidebarCollapsed] = useState(false);
   const [cascadePanelCollapsed, setCascadePanelCollapsed] = useState(false);
+  const conversationView = useConversationView();
+  const [expandedTurns, setExpandedTurns] = useState<ReadonlySet<string>>(new Set());
+
+  const toggleTurn = useCallback((turnId: string) => {
+    setExpandedTurns((prev) => {
+      const next = new Set(prev);
+      if (next.has(turnId)) {
+        next.delete(turnId);
+      } else {
+        next.add(turnId);
+      }
+      return next;
+    });
+  }, []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -575,6 +605,129 @@ export function SessionChat({
     }
     return result;
   }, [visibleMessages, isRoomMode, showInternal]);
+
+  // ── Compact (Codex-style) turn folding ──
+  // A turn opens at a user message and runs until the next user message. We
+  // render: the user message, an optional "Worked" disclosure for any
+  // intermediary assistant/tool/system steps, and the final assistant reply.
+  // Folding is a pure view concern; it does not change what is fetched.
+  type ChatMsg = (typeof visibleMessages)[number];
+  type CompactTurn = {
+    id: string;
+    user: ChatMsg | null;
+    intermediaries: ChatMsg[];
+    final: ChatMsg | null;
+    leading: ChatMsg[];
+  };
+
+  // Never fold across speakers, threads, visibility changes, or system notices.
+  // Consecutive contributions remain in transcript order, including when a
+  // participant returns after another participant has spoken.
+  const compactRoomGroups = useMemo(() => {
+    const groups: (MessageGroup | { type: 'compact'; turn: CompactTurn })[] = [];
+    let run: ChatMsg[] = [];
+    const flush = () => {
+      const final = run.at(-1);
+      if (!final) return;
+      groups.push({
+        type: 'compact',
+        turn: {
+          id: `room-turn-${run[0]!.id}`,
+          user: null,
+          leading: [],
+          intermediaries: run.slice(0, -1),
+          final,
+        },
+      });
+      run = [];
+    };
+    for (const group of renderedGroups) {
+      if (
+        group.type === 'thread' ||
+        group.message.role !== 'assistant' ||
+        group.message.metadata?.messageType
+      ) {
+        flush();
+        groups.push(group);
+        continue;
+      }
+      const message = group.message;
+      const previous = run.at(-1);
+      if (
+        previous &&
+        (previous.participant?.peerId !== message.participant?.peerId ||
+          previous.threadId !== message.threadId ||
+          previous.visibility !== message.visibility)
+      )
+        flush();
+      run.push(message);
+    }
+    flush();
+    return groups;
+  }, [renderedGroups]);
+
+  const compactTurns = useMemo((): CompactTurn[] => {
+    const turns: CompactTurn[] = [];
+    // Messages before the first user message (e.g. a resumed session opening
+    // with assistant output) are rendered as-is, ahead of the first turn.
+    const leadingPreamble: ChatMsg[] = [];
+    // While building a turn we keep every non-user message in `members`; on
+    // close we split off the last assistant message as the turn's answer.
+    let members: ChatMsg[] = [];
+    let currentUser: ChatMsg | null = null;
+    let sawUser = false;
+
+    const pushCurrent = () => {
+      if (!currentUser) return;
+      const intermediaries = [...members];
+      let finalMsg: ChatMsg | null = null;
+      for (let k = intermediaries.length - 1; k >= 0; k--) {
+        const candidate = intermediaries[k];
+        if (candidate && candidate.role === 'assistant') {
+          finalMsg = candidate;
+          intermediaries.splice(k, 1);
+          break;
+        }
+      }
+      turns.push({
+        id: `turn-${currentUser.id}`,
+        user: currentUser,
+        intermediaries,
+        final: finalMsg,
+        leading: [],
+      });
+      currentUser = null;
+      members = [];
+    };
+
+    for (const msg of visibleMessages) {
+      if (msg.role === 'user') {
+        pushCurrent();
+        sawUser = true;
+        currentUser = msg;
+        continue;
+      }
+      if (!sawUser) {
+        leadingPreamble.push(msg);
+        continue;
+      }
+      members.push(msg);
+    }
+    pushCurrent();
+
+    if (leadingPreamble.length > 0) {
+      turns.unshift({
+        id: 'turn-preamble',
+        user: null,
+        intermediaries: [],
+        final: null,
+        leading: leadingPreamble,
+      });
+    }
+    return turns;
+  }, [visibleMessages]);
+
+  const useCompact = conversationView === 'compact';
 
   const hasRunningAssistantMessage = visibleMessages.some(
     (message) => message.role === 'assistant' && message.status === 'running',
@@ -772,6 +925,141 @@ export function SessionChat({
     );
   }
 
+  const isBookmarked = (id: string): boolean => {
+    try {
+      return localStorage.getItem(`bookmark:${id}`) === '1';
+    } catch {
+      return false;
+    }
+  };
+
+  // Render a single visible message exactly as the expanded loop does. Shared
+  // by the expanded view and the compact "Worked" disclosure / final answer.
+  const renderMessageBody = (msg: (typeof visibleMessages)[number]): ReactNode => {
+    if (msg.metadata?.messageType === 'system') {
+      return <SystemMessage key={messageRenderKey(msg)} message={msg} />;
+    }
+    if ((isRoomMode && msg.participant) || isRoomSession) {
+      return (
+        <div
+          key={messageRenderKey(msg)}
+          id={`msg-${msg.id}`}
+          data-highlighted={highlightedMsgId === msg.id || undefined}
+        >
+          <RoomMessage
+            message={msg}
+            onSelectAgent={handleSelectAgent}
+            selectedAgentId={selectedAgentId}
+            onShowDetail={msg.participant ? handleShowDetail : undefined}
+            onCopy={handleCopy}
+            onRegenerate={onRegenerate}
+            onBookmark={onBookmark}
+            bookmarked={isBookmarked(msg.id)}
+          />
+        </div>
+      );
+    }
+    if (msg.role === 'user') {
+      return <UserMessage key={messageRenderKey(msg)} message={msg} />;
+    }
+    if (msg.status === 'running' && !hasNativeMessageParts(msg.parts)) {
+      return (
+        <StreamingMessage key={messageRenderKey(msg)} content={msg.content} parts={msg.parts} />
+      );
+    }
+    return (
+      <AssistantMessage
+        key={messageRenderKey(msg)}
+        message={msg}
+        showTokenUsage={showTokenUsage}
+        onCopy={handleCopy}
+        onRegenerate={onRegenerate}
+        onBookmark={onBookmark}
+        bookmarked={isBookmarked(msg.id)}
+      />
+    );
+  };
+
+  const renderSingleMessage = (msg: (typeof visibleMessages)[number]): ReactNode => (
+    // Every row is a scroll anchor for history paging, in compact and expanded views alike.
+    <div key={messageRenderKey(msg)} data-history-id={msg.id}>
+      {renderMessageBody(msg)}
+    </div>
+  );
+
+  // Compact rendering of one folded turn: question → "Worked" disclosure → answer.
+  const renderCompactTurn = (turn: (typeof compactTurns)[number]): ReactNode => {
+    const stepCount = turn.intermediaries.length;
+    // The "show tool calls and results" eye (showInternal) reveals the work
+    // inline: when it is on, every turn's intermediary steps (tool calls/results)
+    // are expanded without needing to click each "Worked" disclosure.
+    const expanded =
+      expandedTurns.has(turn.id) ||
+      showInternal ||
+      turn.intermediaries.some((message) => message.status === 'error');
+    const turnRunning =
+      turn.final?.status === 'running' || turn.intermediaries.some((m) => m.status === 'running');
+
+    let workedLabel: string;
+    if (turnRunning) {
+      workedLabel = 'Working…';
+    } else if (turn.user && turn.final) {
+      const seconds = Math.round(
+        (turn.final.createdAt.getTime() - turn.user.createdAt.getTime()) / 1000,
+      );
+      workedLabel =
+        Number.isFinite(seconds) && seconds > 0
+          ? `Worked for ${seconds}s`
+          : `Show work (${stepCount} step${stepCount === 1 ? '' : 's'})`;
+    } else {
+      workedLabel = `Show work (${stepCount} step${stepCount === 1 ? '' : 's'})`;
+    }
+
+    return (
+      <div key={turn.id} className="niuu-chat-compact-turn" data-testid="compact-turn">
+        {turn.leading.map((m) => renderSingleMessage(m))}
+        {turn.user && renderSingleMessage(turn.user)}
+        {stepCount > 0 && (
+          <div className="niuu-chat-worked">
+            <button
+              type="button"
+              className="niuu-chat-worked-trigger"
+              onClick={() => toggleTurn(turn.id)}
+              aria-expanded={expanded}
+              data-testid="worked-toggle"
+            >
+              {turnRunning ? (
+                <Loader2 className="niuu-chat-spinner-icon" aria-hidden />
+              ) : expanded ? (
+                <ChevronDown className="niuu-chat-control-icon" aria-hidden />
+              ) : (
+                <ChevronRight className="niuu-chat-control-icon" aria-hidden />
+              )}
+              <span>
+                {(isRoomMode || isRoomSession) && turn.final?.participant
+                  ? `${turn.final.participant.displayName || turn.final.participant.persona}: ${workedLabel}`
+                  : workedLabel}
+              </span>
+            </button>
+            {expanded && (
+              <div className="niuu-chat-worked-steps" data-testid="worked-steps">
+                {turn.intermediaries.map((m) => renderSingleMessage(m))}
+              </div>
+            )}
+          </div>
+        )}
+        {turn.final && renderSingleMessage(turn.final)}
+      </div>
+    );
+  };
+
+  const displayControls = (
+    <>
+      <ChatConnectionsButton />
+      <ChatDisplayControls />
+    </>
+  );
+
   return (
     <div
       className={cn('niuu-chat-outer-grid', className)}
@@ -795,6 +1083,9 @@ export function SessionChat({
       )}
 
       <div className="niuu-chat-wrapper">
+        {!showToolbar && showDisplayControls && (
+          <div className="niuu-chat-display-controls">{displayControls}</div>
+        )}
         {/* ── Toolbar ── */}
         {showToolbar && (
           <div className="niuu-chat-toolbar">
@@ -842,6 +1133,7 @@ export function SessionChat({
                   )}
                 </button>
               )}
+              {displayControls}
             </div>
 
             {connected && (
@@ -943,8 +1235,8 @@ export function SessionChat({
         {/* ── Messages ── */}
         {hasConversation || isStreaming || hasOlderHistory ? (
           <div className="niuu-chat-messages-container" ref={scrollContainerRef}>
-            <HistoryDetailsContext.Provider value={chatEndpoint}>
-              <ToolImageProvider endpoint={chatEndpoint}>
+            <HistoryDetailsContext.Provider value={historyEndpoint ?? chatEndpoint}>
+              <ToolImageProvider endpoint={historyEndpoint ?? chatEndpoint}>
                 <div className="niuu-chat-messages-inner">
                   {(hasOlderHistory || loadingOlderHistory || olderHistoryError) && (
                     <div className="niuu-chat-history-status">
@@ -963,93 +1255,23 @@ export function SessionChat({
                       </button>
                     </div>
                   )}
-                  {renderedGroups
-                    .map((group) => {
-                      if (group.type === 'thread') {
-                        return (
-                          <ThreadGroup
-                            key={group.threadId}
-                            messages={group.messages}
-                            isCollapsed={collapsedThreads.has(group.threadId)}
-                            onToggle={() => toggleThread(group.threadId)}
-                          />
-                        );
-                      }
-
-                      const msg = group.message;
-                      if (msg.metadata?.messageType === 'system') {
-                        return <SystemMessage key={messageRenderKey(msg)} message={msg} />;
-                      }
-
-                      if ((isRoomMode && msg.participant) || isRoomSession) {
-                        return (
-                          <div
-                            key={messageRenderKey(msg)}
-                            id={`msg-${msg.id}`}
-                            data-highlighted={highlightedMsgId === msg.id || undefined}
-                          >
-                            <RoomMessage
-                              message={msg}
-                              onSelectAgent={handleSelectAgent}
-                              selectedAgentId={selectedAgentId}
-                              onShowDetail={msg.participant ? handleShowDetail : undefined}
-                              onCopy={handleCopy}
-                              onRegenerate={onRegenerate}
-                              onBookmark={onBookmark}
-                              bookmarked={(() => {
-                                try {
-                                  return localStorage.getItem(`bookmark:${msg.id}`) === '1';
-                                } catch {
-                                  return false;
-                                }
-                              })()}
-                            />
-                          </div>
-                        );
-                      }
-
-                      if (msg.role === 'user') {
-                        return <UserMessage key={messageRenderKey(msg)} message={msg} />;
-                      }
-                      if (msg.status === 'running' && !hasNativeMessageParts(msg.parts)) {
-                        return (
-                          <StreamingMessage
-                            key={messageRenderKey(msg)}
-                            content={msg.content}
-                            parts={msg.parts}
-                          />
-                        );
-                      }
-                      return (
-                        <AssistantMessage
-                          key={messageRenderKey(msg)}
-                          message={msg}
-                          showTokenUsage={showTokenUsage}
-                          onCopy={handleCopy}
-                          onRegenerate={onRegenerate}
-                          onBookmark={onBookmark}
-                          bookmarked={(() => {
-                            try {
-                              return localStorage.getItem(`bookmark:${msg.id}`) === '1';
-                            } catch {
-                              return false;
-                            }
-                          })()}
-                        />
-                      );
-                    })
-                    .map((element, index) => {
-                      const group = renderedGroups[index]!;
-                      const id = group.type === 'single' ? group.message.id : group.threadId;
-                      return (
-                        <div
-                          key={group.type === 'single' ? messageRenderKey(group.message) : id}
-                          data-history-id={id}
-                        >
-                          {element}
-                        </div>
-                      );
-                    })}
+                  {useCompact && !isRoomMode && !isRoomSession
+                    ? compactTurns.map((turn) => renderCompactTurn(turn))
+                    : (useCompact ? compactRoomGroups : renderedGroups).map((group) => {
+                        if (group.type === 'compact') return renderCompactTurn(group.turn);
+                        if (group.type === 'thread') {
+                          return (
+                            <div key={group.threadId} data-history-id={group.threadId}>
+                              <ThreadGroup
+                                messages={group.messages}
+                                isCollapsed={collapsedThreads.has(group.threadId)}
+                                onToggle={() => toggleThread(group.threadId)}
+                              />
+                            </div>
+                          );
+                        }
+                        return renderSingleMessage(group.message);
+                      })}
 
                   {/* Streaming indicator */}
                   {isStreaming && (

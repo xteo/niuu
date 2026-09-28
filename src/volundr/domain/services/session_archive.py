@@ -19,8 +19,6 @@ from volundr.session_archive import (
 
 logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from uuid import UUID
 
@@ -364,9 +362,9 @@ class SessionArchiveService:
             after_seq = latest - max_frames
             logger.warning(
                 "Event-log rebuild for session %s truncated to the last %d of %d frames",
-                session_id,
-                max_frames,
-                latest,
+                str(session_id).replace("\n", "\\n").replace("\r", "\\r"),
+                int(max_frames),
+                int(latest),
             )
 
         all_entries: list = []
@@ -461,7 +459,7 @@ class SessionArchiveService:
     async def _load_timeline_payload(self, session_id: UUID) -> dict[str, Any] | None:
         if self._chronicle_service is None:
             return None
-        timeline = await self._chronicle_service.get_timeline(session_id)
+        timeline = await self._chronicle_service.session_timeline(session_id)
         if timeline is None:
             return None
         return {

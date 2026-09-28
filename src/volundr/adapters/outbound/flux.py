@@ -10,6 +10,13 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from niuu.adapters.flux import (
+    HELMRELEASE_GROUP,
+    HELMRELEASE_PLURAL,
+    HELMRELEASE_VERSION,
+    FluxHelmReleases,
+    create_flux_api_client,
+)
 from volundr.adapters.outbound.brokered_credentials import BrokeredCredentialPodManager
 from volundr.adapters.outbound.resident_container_spec import (
     resident_flock_labels,
@@ -40,13 +47,13 @@ from volundr.domain.ports import (
 
 logger = logging.getLogger(__name__)
 
-# Flux HelmRelease API coordinates
-HELMRELEASE_GROUP = "helm.toolkit.fluxcd.io"
-HELMRELEASE_VERSION = "v2"
-HELMRELEASE_PLURAL = "helmreleases"
 
-
-class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeController):
+class FluxPodManager(
+    FluxHelmReleases,
+    BrokeredCredentialPodManager,
+    PodManager,
+    ResidentRuntimeController,
+):
     """Flux-native implementation of PodManager.
 
     Creates / deletes HelmRelease CRs via the Kubernetes API.
@@ -75,6 +82,9 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
         session_defaults: dict | None = None,
         codex_auth_adapter: str = "skuld.codex_auth.VolundrCodexAuthProvider",
         codex_auth_kwargs: dict | None = None,
+        resident_platform_base_url: str = "",
+        resident_triggers_enabled: bool = False,
+        resident_budget_enabled: bool = False,
         **_extra: object,
     ):
         self._namespace = namespace
@@ -92,22 +102,73 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
         self._code_path = code_path
         self._gateway_domain = gateway_domain
         self._session_defaults = session_defaults or {}
+        # Every managed resident gets platform reachability so its own
+        # triggers/budget reporting (resident.triggers / resident.budget in
+        # the skuld chart) can work — this is baseline platform
+        # connectivity, not a Simple-mode-specific concern. Empty base URL
+        # (the default) means the operator has not wired this controller to
+        # a platform yet, so residents get no platform block at all rather
+        # than one with an empty, unreachable base_url.
+        self._resident_platform_base_url = resident_platform_base_url
+        self._resident_triggers_enabled = resident_triggers_enabled
+        self._resident_budget_enabled = resident_budget_enabled
+        if not resident_platform_base_url and (
+            resident_triggers_enabled or resident_budget_enabled
+        ):
+            # Without a base_url, _resident_values below never renders a
+            # "platform" block at all — resident_triggers_enabled/
+            # resident_budget_enabled would be silently ignored rather than
+            # doing what the operator who set them clearly wants (residents
+            # that execute triggers and report spend). Configured-but-
+            # impossible is fatal, not a silent no-op. See no-fallbacks.md.
+            raise ValueError(
+                "FluxPodManager: resident_triggers_enabled/resident_budget_enabled "
+                "require resident_platform_base_url to also be set — without it, "
+                "residents get no platform block and these flags do nothing. Set "
+                "podManager.kwargs.resident_platform_base_url (charts/volundr) "
+                "or clear both flags."
+            )
         self._configure_brokered_credentials(
             codex_auth_adapter=codex_auth_adapter,
             codex_auth_kwargs=codex_auth_kwargs,
         )
         self._api_client = None
+        self._realm_repository = None
+
+    def set_realm_repository(self, repository) -> None:
+        """Enable resolving a resident's realm slug for its Helm values.
+
+        Optional: without it, deploying a resident with ``realm_id`` set
+        raises in ``_resolve_realm_slug`` rather than silently deploying with
+        no realm/charter binding.
+        """
+        self._realm_repository = repository
+
+    async def _resolve_realm_slug(self, runtime: ResidentRuntime) -> str:
+        """Return the slug of the realm this resident is bound to, or "".
+
+        Mirrors LocalContainerResidentRuntimeController._resolve_realm_slug.
+        """
+        if runtime.realm_id is None:
+            return ""
+        if self._realm_repository is None:
+            raise RuntimeError(
+                f"resident {runtime.name!r} has realm_id={runtime.realm_id} but this "
+                "controller has no realm repository configured; call set_realm_repository "
+                "at composition time."
+            )
+        realm = await self._realm_repository.get_realm(runtime.realm_id)
+        if realm is None:
+            raise RuntimeError(
+                f"resident {runtime.name!r} names realm_id={runtime.realm_id}, but no "
+                "such realm exists; clear the resident's realm binding or restore the realm."
+            )
+        return realm.slug
 
     async def _get_api(self):
         """Lazy-load kubernetes_asyncio custom objects API."""
         if self._api_client is None:
-            from kubernetes_asyncio import client, config
-
-            try:
-                config.load_incluster_config()
-            except config.ConfigException:
-                await config.load_kube_config()
-            self._api_client = client.ApiClient()
+            self._api_client = await create_flux_api_client()
         from kubernetes_asyncio import client
 
         return client.CustomObjectsApi(self._api_client)
@@ -133,133 +194,6 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
 
     def initial_code_endpoint(self, session: Session) -> str | None:
         return self._code_endpoint(session.name, str(session.id))
-
-    def _build_helmrelease(
-        self,
-        name: str,
-        values: dict,
-        *,
-        labels: dict[str, str] | None = None,
-        annotations: dict[str, str] | None = None,
-    ) -> dict:
-        """Build a HelmRelease CR manifest."""
-        source_ref: dict = {
-            "kind": self._source_ref_kind,
-            "name": self._source_ref_name,
-        }
-        if self._source_ref_namespace:
-            source_ref["namespace"] = self._source_ref_namespace
-
-        metadata: dict[str, Any] = {
-            "name": name,
-            "namespace": self._namespace,
-            "labels": {
-                "app.kubernetes.io/managed-by": "volundr",
-                **(labels or {}),
-            },
-        }
-        if annotations:
-            metadata["annotations"] = annotations
-
-        return {
-            "apiVersion": f"{HELMRELEASE_GROUP}/{HELMRELEASE_VERSION}",
-            "kind": "HelmRelease",
-            "metadata": metadata,
-            "spec": {
-                "interval": self._interval,
-                "timeout": self._timeout,
-                "chart": {
-                    "spec": {
-                        "chart": self._chart_name,
-                        "version": self._chart_version,
-                        "sourceRef": source_ref,
-                    },
-                },
-                "values": values,
-            },
-        }
-
-    async def _apply_helmrelease(
-        self,
-        name: str,
-        values: dict,
-        *,
-        labels: dict[str, str] | None = None,
-        annotations: dict[str, str] | None = None,
-    ) -> None:
-        api = await self._get_api()
-        manifest = self._build_helmrelease(
-            name,
-            values,
-            labels=labels,
-            annotations=annotations,
-        )
-        try:
-            await api.create_namespaced_custom_object(
-                group=HELMRELEASE_GROUP,
-                version=HELMRELEASE_VERSION,
-                namespace=self._namespace,
-                plural=HELMRELEASE_PLURAL,
-                body=manifest,
-            )
-        except Exception as exc:
-            if "409" not in str(exc) and "AlreadyExists" not in str(exc):
-                raise
-            logger.info("HelmRelease %s already exists, patching", name)
-            await api.patch_namespaced_custom_object(
-                group=HELMRELEASE_GROUP,
-                version=HELMRELEASE_VERSION,
-                namespace=self._namespace,
-                plural=HELMRELEASE_PLURAL,
-                name=name,
-                body=manifest,
-                _content_type="application/merge-patch+json",
-            )
-
-    async def _get_helmrelease(self, name: str) -> dict[str, Any] | None:
-        api = await self._get_api()
-        try:
-            return await api.get_namespaced_custom_object(
-                group=HELMRELEASE_GROUP,
-                version=HELMRELEASE_VERSION,
-                namespace=self._namespace,
-                plural=HELMRELEASE_PLURAL,
-                name=name,
-            )
-        except Exception as exc:
-            if "404" in str(exc) or "NotFound" in str(exc):
-                return None
-            raise
-
-    async def _patch_helmrelease(self, name: str, body: dict[str, Any]) -> None:
-        api = await self._get_api()
-        await api.patch_namespaced_custom_object(
-            group=HELMRELEASE_GROUP,
-            version=HELMRELEASE_VERSION,
-            namespace=self._namespace,
-            plural=HELMRELEASE_PLURAL,
-            name=name,
-            body=body,
-            _content_type="application/merge-patch+json",
-        )
-
-    async def _delete_helmrelease(self, name: str) -> bool:
-        api = await self._get_api()
-        try:
-            await api.delete_namespaced_custom_object(
-                group=HELMRELEASE_GROUP,
-                version=HELMRELEASE_VERSION,
-                namespace=self._namespace,
-                plural=HELMRELEASE_PLURAL,
-                name=name,
-            )
-            logger.info("Deleted HelmRelease %s", name)
-            return True
-        except Exception as exc:
-            if "404" in str(exc) or "NotFound" in str(exc):
-                logger.debug("HelmRelease %s is already absent", name)
-                return False
-            raise
 
     async def start(
         self,
@@ -463,6 +397,28 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
     def _resident_release_name(runtime: ResidentRuntime) -> str:
         return f"resident-{runtime.id}"
 
+    def _resident_service_account_values(self, runtime: ResidentRuntime) -> dict[str, Any]:
+        """serviceAccountName for a resident's own workload identity.
+
+        Only set when this controller has a platform to authenticate to
+        (self._resident_platform_base_url) — a resident that never calls the
+        platform has no need of a dedicated ServiceAccount or the RBAC that
+        comes with one. When set, it is the *same* "resident-<uuid>" name as
+        the release itself (_resident_release_name) — the chart's
+        serviceaccount.yaml creates a ServiceAccount by this exact name (see
+        charts/skuld/templates/serviceaccount.yaml), and the platform's
+        workload-identity mapping's owner_id_claim_pattern
+        (workloadIdentity.residentMapping in charts/volundr) extracts this
+        same runtime id back out of the verified
+        "system:serviceaccount:<namespace>:resident-<uuid>" subject — so
+        GET/POST /api/v1/ravn/budget/* key rows by resident_runtimes.id, the
+        same id the web already passes, instead of one id shared by every
+        resident that matches a bare subject_prefix mapping.
+        """
+        if not self._resident_platform_base_url:
+            return {}
+        return {"serviceAccountName": self._resident_release_name(runtime)}
+
     def _backend_ref(self, runtime: ResidentRuntime) -> dict[str, Any]:
         release_name = self._resident_release_name(runtime)
         return {
@@ -486,6 +442,7 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
         self,
         runtime: ResidentRuntime,
         profile: ResidentDeploymentProfile,
+        realm_slug: str = "",
     ) -> dict[str, Any]:
         configured_values = profile.deployment.get("values") or {}
         if not isinstance(configured_values, dict):
@@ -505,6 +462,23 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
             "persona": persona,
             "routeId": str(runtime.id),
         }
+        if self._resident_platform_base_url:
+            resident_values["platform"] = {
+                "enabled": True,
+                "baseUrl": self._resident_platform_base_url,
+            }
+            if self._resident_triggers_enabled:
+                resident_values["triggers"] = {"enabled": True}
+            if self._resident_budget_enabled:
+                resident_values["budget"] = {"enabled": True}
+            # This release owns creating its ServiceAccount only because it
+            # assigns one unique to this runtime (resident-<runtime.id> —
+            # see _resident_service_account_values). Fleet-managed or
+            # otherwise-shared ServiceAccount names must never be created
+            # here (Helm ownership conflict, and uninstalling this one
+            # release would delete an SA other residents still use) — see
+            # charts/skuld's resident.serviceAccount.create (default false).
+            resident_values["serviceAccount"] = {"create": True}
         if runtime.model:
             resident_values["llm"] = {"model": runtime.model}
         if runtime.flock_id is not None:
@@ -514,6 +488,8 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
                 "role": runtime.flock_role,
                 "peerId": runtime.flock_peer_id,
             }
+        if realm_slug:
+            resident_values["realm"] = {"slug": realm_slug}
 
         flock_labels = resident_flock_labels(runtime, prefix="niuu.world")
         mesh_labels, mesh_annotations = resident_mesh_pod_metadata(runtime)
@@ -526,6 +502,7 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
                 "ownerId": runtime.owner_id,
             },
             "resident": resident_values,
+            **self._resident_service_account_values(runtime),
             "podLabels": {
                 "niuu.world/managed": "true",
                 "niuu.world/resident-id": str(runtime.id),
@@ -559,9 +536,10 @@ class FluxPodManager(BrokeredCredentialPodManager, PodManager, ResidentRuntimeCo
         profile: ResidentDeploymentProfile,
     ) -> ResidentRuntimeObservation:
         release_name = self._resident_release_name(runtime)
+        realm_slug = await self._resolve_realm_slug(runtime)
         await self._apply_helmrelease(
             release_name,
-            self._resident_values(runtime, profile),
+            self._resident_values(runtime, profile, realm_slug),
             labels={
                 "niuu.world/kind": "resident",
                 "niuu.world/resident-id": str(runtime.id),

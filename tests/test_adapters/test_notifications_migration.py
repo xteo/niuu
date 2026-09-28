@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-NAME = "000069_forge_notifications"
+NAME = "000084_forge_notifications"
 
 
 def _chart_block(name: str) -> str:
@@ -48,7 +48,7 @@ def test_up_migration_only_uses_idempotent_ddl():
     assert down.index("forge_notification_deliveries") < down.index("forge_notifications;")
 
 
-RATE_INDEX = "000070_forge_notification_delivery_rate_index"
+RATE_INDEX = "000085_forge_notification_delivery_rate_index"
 
 
 @pytest.mark.parametrize("direction", ["up", "down"])
@@ -69,18 +69,18 @@ def test_rate_index_is_partial_and_idempotent():
 
 @pytest.mark.parametrize("direction", ["up", "down"])
 def test_individual_reads_migration_is_identical_in_all_three_locations(direction):
-    name = f"000071_forge_notification_reads.{direction}.sql"
+    name = f"000086_forge_notification_reads.{direction}.sql"
     source = (ROOT / "migrations" / name).read_bytes()
     assert (ROOT / "src/cli/migrations/volundr" / name).read_bytes() == source
     assert _chart_block(name) == source.decode().strip()
 
 
 def test_individual_reads_migration_is_additive_idempotent_and_reader_scoped():
-    up = (ROOT / "migrations/000071_forge_notification_reads.up.sql").read_text()
+    up = (ROOT / "migrations/000086_forge_notification_reads.up.sql").read_text()
     assert "CREATE TABLE IF NOT EXISTS forge_notification_reads" in up
     assert "PRIMARY KEY (user_id, notification_id)" in up
     assert "REFERENCES forge_notifications(id) ON DELETE CASCADE" in up
     assert "CREATE INDEX IF NOT EXISTS" in up
     assert not re.search(r"\b(DELETE|UPDATE|ALTER)\s+(FROM\s+)?forge_notification_read_states", up)
-    down = (ROOT / "migrations/000071_forge_notification_reads.down.sql").read_text()
+    down = (ROOT / "migrations/000086_forge_notification_reads.down.sql").read_text()
     assert down.strip() == "DROP TABLE IF EXISTS forge_notification_reads;"

@@ -44,6 +44,10 @@ ingress:
 config:
   logLevel: "info"
   logFormat: "json"
+  # -- OpenTelemetry trace/metric export. Empty (the default) means
+  # unconfigured — observability.enabled defaults to false, a decision, not
+  # a fallback. Fields match niuu.domain.observability.ObservabilityConfig.
+  observability: {}
   host: "0.0.0.0"
   port: 8082
   cors:
@@ -131,10 +135,19 @@ credentialStore:
   kwargs: {}
   secretKwargs: []
 
+# Deployment-owned integration definitions can be mounted without adding
+# provider-specific code or credentials to the Niuu image.
+integrations: {}
+  # databaseName: niuu_shared
+  # definitionFiles: []  # Absolute paths supplied through extraVolumes/extraVolumeMounts.
+  # moduleManifestFiles: []  # Trusted external component manifests supplied through mounts.
+  # allowDefinitionOverrides: false
+  # definitions: []
+
 # Trusted login runner for interactive credential enrollment (e.g. the Codex
-# ChatGPT device login). Clusters with OpenShell configure
-# OpenShellCredentialEnrollmentRunner here; otherwise the integrations API
-# reports interactive enrollment as unavailable.
+# ChatGPT device login and Claude setup-token). Configure KubernetesLoginRunner
+# with kwargs.image (a pinned Skuld image) and kwargs.namespace (niuu-logins).
+# The chart creates the dedicated namespace and scoped permissions automatically.
 credentialEnrollmentRunner:
   adapter: "volundr.adapters.outbound.credential_enrollment_runner.UnsupportedCredentialEnrollmentRunner"
   kwargs: {}
@@ -174,8 +187,12 @@ envoy:
     keycloakHost: ""
     keycloakPort: 8080
     keycloakTls: false
+    keycloakCaFile: /etc/ssl/certs/ca-certificates.crt
     extraClaimHeaders: []
     bypassPrefixes:
+      - /api/v1/integrations/oauth/callback
+      - /api/v1/integrations/oauth/mcp/callback
+      - /api/v1/integrations/oauth/mcp/client-metadata
       - /api/v1/identity/auth/config
       - /api/v1/tokens/workload/exchange
       - /api/v1/tokens/workload/jwks
@@ -185,11 +202,74 @@ envoy:
       issuer: ""
       audiences: []
       jwksUri: ""
+      # Empty host uses the pod-local exchange; remote JWKS require verified TLS.
+      jwksHost: ""
+      jwksPort: 443
+      jwksTls: true
+      jwksCaFile: /etc/ssl/certs/ca-certificates.crt
       jwksTimeout: "5s"
       jwksCacheDurationSeconds: 300
       tenantClaim: "tenant_id"
       rolesClaim: "resource_access.volundr-api.roles"
       extraClaimHeaders: []
+  extraVolumeMounts: []
+  authorization:
+    # Optional central identity/PAT revocation check before gateway admission.
+    # Use identity.adapters.remote.RemoteHeaderAuthenticationAdapter with HTTPS authority_url.
+    identity: null
+    enabled: false
+    port: 9002
+    timeout: 1s
+    shutdownGraceSeconds: 5
+    extraVolumeMounts: []
+    readinessProbe:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    routes:
+    - path: /api/v1/identity/me
+      methods: [GET]
+      required_scope: identity:self
+    - path: /api/v1/tokens
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/identity
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/credentials
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/niuu/credentials
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/niuu/repos
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/integrations
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /internal/api/v1/integrations
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/tracker
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/features
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/personas
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
+    - path: /api/v1/ravn/personas
+      prefix: true
+      methods: [GET, HEAD, POST, PUT, PATCH, DELETE]
   extraHttpFilters: []
   extraClusters: []
 
@@ -207,6 +287,10 @@ workloadIdentity:
   mappings: []
 
 pat:
+  service_adapter: niuu.domain.services.pat.PATService
+  service_kwargs: {}
+  validator_adapter: niuu.domain.services.pat_validator.PATValidator
+  validator_kwargs: {}
   token_issuer_adapter: "niuu.adapters.memory_token_issuer.MemoryTokenIssuer"
   token_issuer_kwargs: {}
   ttl_days: 365
@@ -271,3 +355,19 @@ global:
   niuu:
     # -- Deployment cluster label used by Guild/Observatory discovery.
     cluster: unknown
+
+authorization:
+  adapter: "identity.adapters.cedar.CedarAuthorizationAdapter"
+  kwargs: {}
+  secret_kwargs_env: {}
+
+# Provider OAuth refresh is owned by the configured credential store in clusters.
+oauth:
+  miniModeRefreshEnabled: false
+  redirectBaseUrl: ""
+  mcpRequestTimeoutSeconds: 15
+  mcpStateTtlSeconds: 600
+  # -- Hostnames of your own MCP servers and their OAuth issuers allowed to resolve
+  # to private addresses (exact names or "*.domain" suffixes, e.g. "*.asgard.niuu.world").
+  # Every other MCP host must resolve to public addresses.
+  mcpInternalHosts: []

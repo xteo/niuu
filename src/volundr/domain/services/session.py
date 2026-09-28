@@ -24,12 +24,15 @@ from niuu.domain.services.forge_session_token import (
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
 from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
 from niuu.forge_mcp.models import ForgeMcpGrant
+from volundr.domain.execution_catalog import ExecutionCatalogError, ExecutionSelectionError
 from volundr.domain.models import (
     CleanupTarget,
     CommunicationRoute,
     EventType,
     GitSource,
     IntegrationConnection,
+    IntegrationType,
+    LocalMountSource,
     Principal,
     RealtimeEvent,
     Session,
@@ -49,10 +52,12 @@ from volundr.domain.ports import (
     LaunchSpecProvider,
     PodManager,
     Resource,
+    SessionCapacity,
     SessionCommunicationPort,
     SessionContext,
     SessionContribution,
     SessionContributor,
+    SessionExecutionResolver,
     SessionRepository,
     SessionSpanRepository,
     StoragePort,
@@ -69,6 +74,7 @@ from volundr.domain.services.forge_session_launch import (
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 if TYPE_CHECKING:
+    from niuu.ports.user_integration import UserIntegrationPort
     from volundr.adapters.outbound.git_registry import GitProviderRegistry
     from volundr.domain.notification_ports import NotificationRecorder
 
@@ -80,12 +86,36 @@ def _sanitize_log(value: object) -> str:
     return str(value).replace("\n", "\\n").replace("\r", "\\r")
 
 
+def _is_workflow_child_local_mount(session: Session, workload_config: dict) -> bool:
+    """Identify isolated workflow-child workspaces that need no Forge credential."""
+    if not isinstance(session.source, LocalMountSource):
+        return False
+    provenance = workload_config.get("provenance")
+    return isinstance(provenance, dict) and isinstance(provenance.get("workflow_execution"), dict)
+
+
 class SessionNotFoundError(Exception):
     """Raised when a session is not found."""
 
     def __init__(self, session_id: UUID):
         self.session_id = session_id
         super().__init__(f"Session not found: {session_id}")
+
+
+class SessionCapacityError(Exception):
+    """Raised when the runtime has no free session slot.
+
+    The message carries the numbers and the runtime's own remedy (where the
+    limit is raised), because the person who sees it is the one who has to
+    decide between stopping a session and raising the cap.
+    """
+
+    def __init__(self, capacity: SessionCapacity):
+        self.capacity = capacity
+        super().__init__(
+            f"No session slot is free: {capacity.active} of {capacity.limit} sessions are "
+            f"running on this host. Stop or archive a session, or {capacity.remedy}."
+        )
 
 
 class SessionStateError(Exception):
@@ -141,15 +171,18 @@ class SessionService:
         session_communication_port: SessionCommunicationPort | None = None,
         attention_notifier: AttentionNotifier | None = None,
         runtime_backend: str = "kubernetes",
+        execution_resolver: SessionExecutionResolver | None = None,
         public_origin: str = "http://localhost:8080",
         span_repository: SessionSpanRepository | None = None,
         notification_recorder: NotificationRecorder | None = None,
         forge_session_tokens: ForgeSessionTokenService | None = None,
         forge_mcp_default_grants: Iterable[ForgeMcpGrant | str] = (),
+        user_integration: UserIntegrationPort | None = None,
     ):
         self._repository = repository
         self._pod_manager = pod_manager
         self._git_registry = git_registry
+        self._user_integration = user_integration
         self._validate_repos = validate_repos
         self._broadcaster = broadcaster
         self._launch_spec_provider = launch_spec_provider
@@ -172,6 +205,7 @@ class SessionService:
         self._forge_session_tokens = forge_session_tokens
         self._forge_mcp_default_grants = frozenset(normalize_grants(forge_mcp_default_grants))
         self._runtime_backend = runtime_backend
+        self._execution_resolver = execution_resolver
         normalized_public_origin = public_origin.rstrip("/")
         if normalized_public_origin.startswith("https://"):
             self._public_ws_origin = "wss://" + normalized_public_origin.removeprefix("https://")
@@ -252,13 +286,8 @@ class SessionService:
             self._validate_repos,
         )
 
-        if isinstance(source, GitSource) and repo:
-            if self._git_registry and self._validate_repos:
-                await self._validate_repository(repo)
-            elif not self._git_registry:
-                logger.debug("Skipping repo validation: no git registry configured")
-            elif not self._validate_repos:
-                logger.debug("Skipping repo validation: validation disabled")
+        if isinstance(source, GitSource) and repo and self._validate_repos:
+            await self._validate_repository(repo, principal)
 
         session = Session(
             **({"id": session_id} if session_id else {}),
@@ -276,6 +305,7 @@ class SessionService:
             external_session_id=external_session_id,
             workload_config={"project_context": project_context} if project_context else {},
         )
+        await self._check_access(session, principal, "create")
         created = await self._repository.create(session)
 
         if self._broadcaster is not None:
@@ -283,58 +313,24 @@ class SessionService:
 
         return created
 
-    async def _validate_repository(self, repo: str) -> None:
-        """Validate that a repository exists and is accessible.
-
-        Args:
-            repo: Repository URL.
-
-        Raises:
-            RepoValidationError: If validation fails.
-        """
-        logger.info("Starting repository validation for: %s", _sanitize_log(repo))
-
-        if self._git_registry is None:
-            logger.warning(
-                "Git registry not configured, skipping repository validation for: %s",
-                _sanitize_log(repo),
-            )
+    async def _validate_repository(self, repo: str, principal: Principal | None = None) -> None:
+        """Validate deployments with the owner's integration, as repository browsing does."""
+        if (
+            self._runtime_backend in {"kubernetes", "openshell"}
+            and principal is not None
+            and self._user_integration is not None
+        ):
+            provider = await self._user_integration.find_git_provider_for(repo, principal.user_id)
+        elif self._git_registry is not None:
+            provider = self._git_registry.get_provider(repo)
+        else:
+            logger.debug("Skipping repo validation: no git registry configured")
             return
 
-        logger.debug(
-            "Git registry has %d provider(s) registered",
-            len(self._git_registry.providers),
-        )
-
-        provider = self._git_registry.get_provider(repo)
         if provider is None:
-            logger.error(
-                "No git provider supports repository URL: %s (registered providers: %s)",
-                _sanitize_log(repo),
-                ", ".join(
-                    f"{p.name} ({p.provider_type.value})" for p in self._git_registry.providers
-                )
-                if self._git_registry.providers
-                else "none",
-            )
             raise RepoValidationError(repo, "no git provider supports this repository URL")
-
-        logger.debug(
-            "Found provider %s (%s) for repository: %s",
-            provider.name,
-            provider.provider_type.value,
-            _sanitize_log(repo),
-        )
-
-        is_valid = await self._git_registry.validate_repo(repo)
-        if not is_valid:
-            logger.error(
-                "Repository validation failed for %s using provider %s",
-                _sanitize_log(repo),
-                provider.name,
-            )
+        if not await provider.validate_repo(repo):
             raise RepoValidationError(repo, "repository does not exist or is not accessible")
-
         logger.info(
             "Repository validation successful for %s (provider: %s)",
             _sanitize_log(repo),
@@ -349,18 +345,16 @@ class SessionService:
     ) -> None:
         """Verify principal has access to the session via AuthorizationPort.
 
-        Delegates to the configured authorization adapter. No-op when
-        principal is None (backward compat / dev mode) or when no
-        authorization adapter is configured.
+        Configured authorization requires a principal. Internal lifecycle
+        operations use private methods after establishing their own preconditions.
 
         Raises:
             SessionAccessDeniedError: If the principal lacks permission.
         """
-        if principal is None:
-            return
-
         if self._authorization is None:
             return
+        if principal is None:
+            raise SessionAccessDeniedError(session.id, "unauthenticated")
 
         resource = Resource(
             kind="session",
@@ -377,6 +371,10 @@ class SessionService:
     async def get_session(self, session_id: UUID) -> Session | None:
         """Get a session by ID."""
         return await self._repository.get(session_id)
+
+    async def get_many_sessions(self, session_ids: list[UUID]) -> dict[UUID, Session]:
+        """Batch-fetch sessions by ID. Returns only the ones that exist."""
+        return await self._repository.get_many(session_ids)
 
     async def with_read_states(
         self, sessions: list[Session], principal: Principal | None
@@ -415,28 +413,21 @@ class SessionService:
     ) -> None:
         if self._broadcaster is None:
             return
-        try:
-            session = await self._repository.get(session_id)
-            if session is None:
-                return
-            # Hint only: no reader's private marker is exposed to another reader. Consumers
-            # re-read the authorized projection. Finals use the owner-scoped fleet route.
-            await self._broadcaster.publish(
-                RealtimeEvent(
-                    type=EventType.SESSION_READ_STATE,
-                    data={
-                        "session_id": str(session_id),
-                        "owner_id": reader_id or session.owner_id or "",
-                    },
-                    timestamp=datetime.now(UTC),
-                )
+        session = await self._repository.get(session_id)
+        if session is None:
+            return
+        # Hint only: no reader's private marker is exposed to another reader. Consumers
+        # re-read the authorized projection. Finals use the owner-scoped fleet route.
+        await self._broadcaster.publish(
+            RealtimeEvent(
+                type=EventType.SESSION_READ_STATE,
+                data={
+                    "session_id": str(session_id),
+                    "owner_id": reader_id or session.owner_id or "",
+                },
+                timestamp=datetime.now(UTC),
             )
-        except Exception:
-            # The durable commit is authoritative. A missed hint is recovered by fleet relisting;
-            # never turn an already-committed CAS mutation into an ambiguous HTTP failure.
-            logger.warning(
-                "Could not publish read-state refresh hint for %s", session_id, exc_info=True
-            )
+        )
 
     async def update_activity(
         self,
@@ -546,6 +537,7 @@ class SessionService:
                         ),
                         "metadata": metadata,
                         "owner_id": session.owner_id or "",
+                        "tenant_id": session.tenant_id or "",
                     },
                     timestamp=updated.updated_at,
                 )
@@ -725,7 +717,10 @@ class SessionService:
     async def _auto_stop_completed_flock_session(self, session_id: UUID) -> None:
         """Stop a flock session that has reported an authoritative terminal outcome."""
         try:
-            await self.stop_session(session_id)
+            session = await self._repository.get(session_id)
+            if session is None:
+                raise SessionNotFoundError(session_id)
+            await self._stop_session(session, None)
         except SessionNotFoundError:
             logger.debug(
                 "Skipping auto-stop for completed flock session %s because it no longer exists",
@@ -755,25 +750,184 @@ class SessionService:
                 to the principal's tenant. Non-admin users see only their own
                 sessions.
         """
-        tenant_id = principal.tenant_id if principal else None
-        owner_id = None
-        if principal and TenantRole.ADMIN not in principal.roles:
-            owner_id = principal.user_id
-
-        if status is not None:
-            return await self._repository.list(
-                status=status,
-                tenant_id=tenant_id,
-                owner_id=owner_id,
-            )
+        tenant_id, owner_id = self.visibility_scope(principal)
 
         sessions = await self._repository.list(
+            status=status,
             tenant_id=tenant_id,
             owner_id=owner_id,
         )
-        if include_archived:
-            return sessions
-        return [s for s in sessions if s.status != SessionStatus.ARCHIVED]
+        if status is None and not include_archived:
+            sessions = [s for s in sessions if s.status != SessionStatus.ARCHIVED]
+        if principal is not None and self._authorization is not None:
+            allowed = await self._authorization.filter_allowed(
+                principal,
+                "list",
+                [
+                    Resource(
+                        kind="session",
+                        id=str(s.id),
+                        attr={"owner_id": s.owner_id, "tenant_id": s.tenant_id},
+                    )
+                    for s in sessions
+                ],
+            )
+            allowed_ids = {r.id for r in allowed if r.kind == "session"}
+            sessions = [s for s in sessions if str(s.id) in allowed_ids]
+        return sessions
+
+    def visibility_scope(self, principal: Principal | None) -> tuple[str | None, str | None]:
+        """Return the ``(tenant_id, owner_id)`` bounds of what *principal* may list.
+
+        ``None`` means unbounded. Every principal is bounded to its own tenant;
+        only a tenant admin sees other owners' sessions in that tenant. With
+        authorization configured, an absent principal is refused, never unbounded.
+
+        Raises:
+            PermissionError: Authorization is configured and no principal was given.
+        """
+        if self._authorization is not None and principal is None:
+            raise PermissionError("An authenticated principal is required to list sessions")
+        if principal is None:
+            return None, None
+        if TenantRole.ADMIN in principal.roles:
+            return principal.tenant_id, None
+        return principal.tenant_id, principal.user_id
+
+    @staticmethod
+    def within_scope(
+        scope: tuple[str | None, str | None],
+        *,
+        owner_id: str | None,
+        tenant_id: str | None,
+    ) -> bool:
+        """Return whether an owner/tenant attribution lies inside a ``visibility_scope``.
+
+        Missing owner or tenant never widens visibility: an unowned resource is
+        inside only an owner-unbounded (tenant admin) scope, and an untenanted
+        one inside no bounded scope.
+        """
+        tenant_scope, owner_scope = scope
+        if tenant_scope is not None and (tenant_id or None) != tenant_scope:
+            return False
+        if owner_scope is not None and (owner_id or None) != owner_scope:
+            return False
+        return True
+
+    @staticmethod
+    def attributed_resource(
+        resource_id: str,
+        *,
+        owner_id: str | None,
+        tenant_id: str | None,
+        room_viewers: Iterable[str] = (),
+        room_approvers: Iterable[str] = (),
+    ) -> Resource:
+        """Describe a session, or history attributed to one, to the authorization policy.
+
+        ``room_viewers``/``room_approvers`` are the Cedar Set attributes
+        computed from ACTIVE, unexpired ``session_participants`` grants (see
+        ``SessionParticipantService.active_grants``). They are empty by
+        default: every existing call site (read/update/delete/list,
+        chronicle attribution) never populates them, and the room-scoped
+        actions (``read_room``/``attach``/``resolve_gate``) are the only
+        Cedar actions whose policies reference them, so leaving them empty
+        never changes what those existing call sites can already do. There is
+        no separate room_speakers set: every active participant may speak,
+        so "viewer" already covers it — see RoomGrants' docstring.
+        """
+        return Resource(
+            kind="session",
+            id=resource_id,
+            attr={
+                "owner_id": owner_id or None,
+                "tenant_id": tenant_id or None,
+                "room_viewers": list(room_viewers),
+                "room_approvers": list(room_approvers),
+            },
+        )
+
+    async def authorizes(
+        self, principal: Principal | None, action: str, resource: Resource
+    ) -> bool:
+        """Return whether the configured authorization lets *principal* do *action*.
+
+        Without authorization every action is allowed. With authorization
+        configured, an absent principal is refused, never allowed.
+
+        Raises:
+            PermissionError: Authorization is configured and no principal was given.
+        """
+        if self._authorization is None:
+            return True
+        if principal is None:
+            raise PermissionError("An authenticated principal is required")
+        return await self._authorization.is_allowed(principal, action, resource)
+
+    async def filter_authorized(
+        self,
+        principal: Principal | None,
+        action: str,
+        resources: list[Resource],
+    ) -> list[Resource]:
+        """Return the *resources* the configured authorization lets *principal* act on.
+
+        Raises:
+            PermissionError: Authorization is configured and no principal was given.
+        """
+        if self._authorization is None:
+            return resources
+        if principal is None:
+            raise PermissionError("An authenticated principal is required")
+        return await self._authorization.filter_allowed(principal, action, resources)
+
+    async def get_authorized_session(
+        self, session_id: UUID, principal: Principal | None, action: str
+    ) -> Session:
+        """Return a session inside *principal*'s visibility scope that it may do *action* on.
+
+        Raises:
+            PermissionError: Authorization is configured and no principal was given.
+            SessionNotFoundError: No such session, or it is outside the scope.
+            SessionAccessDeniedError: The policy denies *action*.
+        """
+        scope = self.visibility_scope(principal)
+        session = await self._repository.get(session_id)
+        if session is None or not self.within_scope(
+            scope, owner_id=session.owner_id, tenant_id=session.tenant_id
+        ):
+            raise SessionNotFoundError(session_id)
+        resource = self.attributed_resource(
+            str(session.id), owner_id=session.owner_id, tenant_id=session.tenant_id
+        )
+        if not await self.authorizes(principal, action, resource):
+            user_id = principal.user_id if principal is not None else "unauthenticated"
+            raise SessionAccessDeniedError(session.id, user_id)
+        return session
+
+    async def may_observe(
+        self,
+        principal: Principal | None,
+        *,
+        session_id: str,
+        owner_id: str | None,
+        tenant_id: str | None,
+    ) -> bool:
+        """Return whether ``list_sessions`` would show this session to *principal*.
+
+        The realtime event stream uses this so a subscriber receives events for
+        exactly the sessions the list endpoint shows it. Missing owner or tenant
+        never widens visibility: an unowned session is visible only to a tenant
+        admin, and an untenanted one to no bounded principal.
+        """
+        scope = self.visibility_scope(principal)
+        if not self.within_scope(scope, owner_id=owner_id, tenant_id=tenant_id):
+            return False
+        return await self.authorizes(
+            principal,
+            "list",
+            self.attributed_resource(session_id, owner_id=owner_id, tenant_id=tenant_id),
+        )
 
     async def update_session(
         self,
@@ -853,9 +1007,22 @@ class SessionService:
         # Cancel provisioning task if active
         self._cancel_provisioning_task(session_id)
 
+        cleanup_context = None
+        if self._contributors:
+            cleanup_context = SessionContext(
+                principal=principal,
+                **await self._execution_context(session),
+            )
+
+        durable_compute = self._runtime_backend == "vm" or self._execution_resolver is not None
+
         try:
-            await self._pod_manager.stop(session)
+            stopped = await self._pod_manager.stop(session)
+            if durable_compute and not stopped:
+                raise RuntimeError("Compute infrastructure deletion was not confirmed")
         except Exception as e:
+            if durable_compute:
+                raise
             logger.warning(
                 "Failed to stop infrastructure for session %s during deletion: %s. "
                 "Proceeding with session deletion.",
@@ -864,7 +1031,7 @@ class SessionService:
             )
 
         # Run contributor cleanup in reverse order
-        await self._run_cleanup(session, principal)
+        await self._run_cleanup(session, principal, context=cleanup_context)
 
         deleted = await self._repository.delete(session_id)
 
@@ -875,7 +1042,11 @@ class SessionService:
             await self._run_targeted_cleanup(session_id, targets)
 
         if deleted and self._broadcaster is not None:
-            await self._broadcaster.publish_session_deleted(session_id)
+            await self._broadcaster.publish_session_deleted(
+                session_id,
+                owner_id=session.owner_id,
+                tenant_id=session.tenant_id,
+            )
 
         return deleted
 
@@ -938,6 +1109,63 @@ class SessionService:
                 exc_info=True,
             )
 
+    async def ensure_capacity(self, session: Session | None = None) -> None:
+        """Raise SessionCapacityError when the runtime has no free slot.
+
+        Runtimes without a fixed cap report no capacity and are never refused.
+        """
+        capacity = (
+            await self._pod_manager.capacity_for(session)
+            if session is not None
+            else await self._pod_manager.capacity()
+        )
+        if capacity is None or capacity.available > 0:
+            return
+        raise SessionCapacityError(capacity)
+
+    async def _resolve_execution_config(
+        self, session: Session, workload_config: dict, launch_spec: str | None
+    ) -> dict:
+        """Retain an existing pin, or resolve once before any runtime side effects."""
+        config = dict(workload_config)
+        pinned = session.workload_config.get("_compute_execution")
+        if pinned is not None:
+            config["_compute_execution"] = pinned
+        elif (
+            not config.get("execution_profile")
+            and not config.get("compute_profile")
+            and not await self._execution_resolver.has_legacy_allocation(session)
+        ):
+            if self._launch_spec_provider is not None:
+                selected = (
+                    self._launch_spec_provider.get(launch_spec)
+                    if launch_spec
+                    else self._launch_spec_provider.get_default("session")
+                )
+                if launch_spec and selected is None:
+                    raise ExecutionSelectionError("Selected launch spec is not configured")
+                if selected is not None:
+                    for key in ("execution_profile", "compute_profile"):
+                        if selected.workload_config.get(key):
+                            config[key] = selected.workload_config[key]
+        selected_session = session.model_copy(update={"workload_config": config})
+        plan = await self._execution_resolver.resolve_execution(selected_session)
+        if plan is not None:
+            config["_compute_execution"] = self._execution_resolver.execution_reference(plan)
+        return config
+
+    async def _execution_context(self, session: Session) -> dict:
+        if "_compute_execution" not in session.workload_config:
+            return {"runtime_backend": self._runtime_backend}
+        if self._execution_resolver is None:
+            raise ExecutionCatalogError("Pinned compute execution requires its configured catalog")
+        plan = await self._execution_resolver.execution_for(session)
+        return {
+            "runtime_backend": plan.runtime.contributor_backend,
+            "storage_backend": plan.runtime.storage_mode,
+            "runtime_capabilities": plan.runtime.capabilities,
+        }
+
     async def start_session(
         self,
         session_id: UUID,
@@ -968,6 +1196,11 @@ class SessionService:
         if not session.can_start():
             raise SessionStateError(session_id, "start", session.status)
 
+        if workload_config is not None and "_compute_execution" in workload_config:
+            raise ExecutionSelectionError(
+                "Compute execution references are managed by the session service"
+            )
+
         # Restart parity: persist the definition the first time it is supplied and
         # reuse the stored one on later restarts, so a session keeps its transport
         # (e.g. Grok ACP) instead of falling back to the platform default.
@@ -984,6 +1217,23 @@ class SessionService:
             workload_type = session.workload_type
         if not workload_config and session.workload_config:
             workload_config = dict(session.workload_config)
+        if self._execution_resolver is not None:
+            workload_config = await self._resolve_execution_config(
+                session, workload_config or {}, launch_spec
+            )
+        elif (workload_config or {}).get("execution_profile") or "_compute_execution" in (
+            workload_config or {}
+        ):
+            raise ExecutionSelectionError(
+                "Compute execution selection requires a configured catalog"
+            )
+        if workload_type == "ravn_flock" and not initial_prompt:
+            initial_prompt = str((workload_config or {}).get("initiative_context") or "")
+
+        if not integration_ids:
+            integration_ids = list((workload_config or {}).get("integration_ids") or [])
+        if integration_ids:
+            workload_config = {**(workload_config or {}), "integration_ids": integration_ids}
 
         # A project briefing is a persisted snapshot, including on restart. It is
         # separate from repository-owned AGENTS.md / CLAUDE.md files.
@@ -999,6 +1249,10 @@ class SessionService:
 
         # Set chat_endpoint eagerly — Flux/Gateway sessions know their public
         # route before the pod is ready; local mode falls back to the root proxy.
+        # Refuse here, before the session flips to STARTING, so the caller
+        # gets the answer instead of a session that fails a moment later.
+        await self.ensure_capacity(session)
+
         chat_endpoint = self._pod_manager.initial_chat_endpoint(session)
         if not chat_endpoint:
             chat_endpoint = f"{self._public_ws_origin}/s/{session_id}/session"
@@ -1083,6 +1337,11 @@ class SessionService:
                 workload_config=workload_config,
             )
 
+            # Contributors may have persisted launch configuration. Keep it
+            # when transitioning from starting to provisioning.
+            session = await self._repository.get(session.id)
+            if session is None:
+                return
             provisioning = (
                 session.with_status(SessionStatus.PROVISIONING)
                 .with_endpoints(
@@ -1102,8 +1361,45 @@ class SessionService:
             poll_task.add_done_callback(lambda t: self._provisioning_tasks.pop(final.id, None))
 
         except Exception as e:
-            logger.error("Provisioning failed for session %s: %s", session.id, e)
-            failed = session.with_status(SessionStatus.FAILED).with_error(str(e))
+            error = str(e).strip()
+            if not error:
+                error = (
+                    "Provisioning timed out"
+                    if isinstance(e, TimeoutError)
+                    else "Provisioning failed"
+                )
+            logger.error("Provisioning failed for session %s: %s", session.id, error)
+            # A failed start may already own partially-created infrastructure.
+            # Stop it before publishing the terminal session verdict so pending
+            # provider requests do not remain bound to a failed session forever.
+            #
+            # A cleanup failure here must never vanish (no-fallbacks): for a
+            # durable-compute backend (VM, or any backend behind an execution
+            # resolver) the machine keeps running and capacity keeps being
+            # charged if we merely warn-and-continue as before. Both failures
+            # are recorded on the session so an operator sees the full story,
+            # and reconcile_active_sessions() now also sweeps FAILED sessions
+            # for durable-compute backends (previously kubernetes-only) so the
+            # leaked infrastructure gets a retry on the next reconcile pass
+            # instead of being excluded from the sweep forever.
+            cleanup_error: str | None = None
+            try:
+                await self._pod_manager.stop(session)
+            except Exception as cleanup_exc:
+                cleanup_error = str(cleanup_exc).strip() or repr(cleanup_exc)
+                logger.error(
+                    "Failed to clean up infrastructure after provisioning failure for "
+                    "session %s; infrastructure may still be running and will be retried "
+                    "by the next reconcile sweep",
+                    _sanitize_log(session.id),
+                    exc_info=True,
+                )
+            session = await self._repository.get(session.id)
+            if session is None:
+                return
+            if cleanup_error is not None:
+                error = f"{error}; cleanup after provisioning failure also failed: {cleanup_error}"
+            failed = session.with_status(SessionStatus.FAILED).with_error(error)
             await self._repository.update(failed)
 
             if self._broadcaster is not None:
@@ -1125,6 +1421,10 @@ class SessionService:
         workload_config: dict | None = None,
     ):
         """Run the contributor pipeline and start pods with merged spec."""
+        workload_config = {**session.workload_config, **(workload_config or {})}
+        # A caller cannot change the internally persisted execution during contribution.
+        if "_compute_execution" in session.workload_config:
+            workload_config["_compute_execution"] = session.workload_config["_compute_execution"]
         # Auto-include all enabled integrations when none are specified.
         # Keep the fetched connections so contributors don't re-fetch by ID.
         resolved_connections: list[IntegrationConnection] = []
@@ -1134,18 +1434,59 @@ class SessionService:
                 fetched = await asyncio.gather(
                     *(self._integration_repo.get_connection(cid) for cid in integration_ids),
                 )
-                resolved_connections = [c for c in fetched if c is not None and c.enabled]
+                if any(c is None or not c.enabled for c in fetched):
+                    raise ValueError("Selected integration connection is missing or disabled")
+                resolved_connections = list(fetched)
+                if principal and any(
+                    connection.owner_id != principal.user_id for connection in resolved_connections
+                ):
+                    raise ValueError("Integration connection not found")
         elif principal and self._integration_repo:
             all_connections = await self._integration_repo.list_connections(
                 principal.user_id,
             )
             resolved_connections = [c for c in all_connections if c.enabled]
 
+        if integration_ids and self._integration_repo is None:
+            raise ValueError("Selected integrations require a configured integration repository")
+        # A saved selection can predate the owner's Git integration. Preserve
+        # explicit source-control choices; otherwise attach enabled sources.
+        if (
+            session.repo
+            and principal
+            and self._integration_repo
+            and integration_ids
+            and not any(
+                c.integration_type == IntegrationType.SOURCE_CONTROL for c in resolved_connections
+            )
+        ):
+            source_connections = await self._integration_repo.list_connections(
+                principal.user_id,
+                integration_type=IntegrationType.SOURCE_CONTROL,
+            )
+            resolved_connections.extend(c for c in source_connections if c.enabled)
+
+        workflow_child_local_mount = _is_workflow_child_local_mount(session, workload_config)
+        if workflow_child_local_mount:
+            resolved_connections = [
+                connection
+                for connection in resolved_connections
+                if connection.integration_type != IntegrationType.SOURCE_CONTROL
+            ]
+
+        if resolved_connections or workflow_child_local_mount:
+            workload_config = {
+                **(workload_config or {}),
+                "integration_ids": [c.id for c in resolved_connections],
+            }
+            session = session.model_copy(update={"workload_config": workload_config})
+            await self._repository.update(session)
+
         context = SessionContext(
             principal=principal,
             definition=definition,
             launch_spec=launch_spec,
-            runtime_backend=self._runtime_backend,
+            **await self._execution_context(session),
             terminal_restricted=terminal_restricted,
             credential_names=tuple(credential_names or ()),
             integration_ids=tuple(c.id for c in resolved_connections),
@@ -1154,7 +1495,9 @@ class SessionService:
             system_prompt=system_prompt,
             initial_prompt=initial_prompt,
             workload_type=workload_type,
-            workload_config=workload_config or {},
+            # Contributors never see the credential bookkeeping: an otherwise
+            # empty workload config must still read as empty to them.
+            workload_config=without_forge_mcp(workload_config),
         )
 
         contributions: list[SessionContribution] = []
@@ -1299,6 +1642,8 @@ class SessionService:
         self,
         session: Session,
         principal: Principal | None,
+        *,
+        context: SessionContext | None = None,
     ) -> None:
         """Run contributor cleanup in reverse config order.
 
@@ -1317,7 +1662,11 @@ class SessionService:
         if not self._contributors:
             return
 
-        context = SessionContext(principal=principal)
+        if context is None:
+            context = SessionContext(
+                principal=principal,
+                **await self._execution_context(session),
+            )
         for contributor in reversed(self._contributors):
             try:
                 await contributor.cleanup(session, context)
@@ -1364,7 +1713,8 @@ class SessionService:
             await self._persist_reconciled_session(current, result_status)
             return
 
-        msg = "Provisioning failed: infrastructure reported failure"
+        status_detail = await self._pod_manager.status_detail(current)
+        msg = status_detail or "Provisioning failed: infrastructure reported failure"
         failed = current.with_status(SessionStatus.FAILED).with_error(msg)
         await self._repository.update(failed)
         if self._broadcaster is not None:
@@ -1473,7 +1823,11 @@ class SessionService:
             raise SessionNotFoundError(session_id)
 
         await self._check_access(session, principal, "stop")
+        return await self._stop_session(session, principal)
 
+    async def _stop_session(self, session: Session, principal: Principal | None) -> Session:
+        """Stop an authorized session or complete an internal lifecycle transition."""
+        session_id = session.id
         if not session.can_stop():
             raise SessionStateError(session_id, "stop", session.status)
 
@@ -1487,8 +1841,16 @@ class SessionService:
             await self._broadcaster.publish_session_updated(stopping)
 
         try:
+            cleanup_context = None
+            if self._contributors:
+                cleanup_context = SessionContext(
+                    principal=principal,
+                    **await self._execution_context(session),
+                )
             stopped = await self._pod_manager.stop(session)
             if not stopped:
+                if self._runtime_backend == "vm" or self._execution_resolver is not None:
+                    raise RuntimeError("Compute infrastructure stop was not confirmed")
                 logger.warning(
                     "Pod manager could not find/cancel pods for session %s "
                     "(may already be stopped or task ID mismatch)",
@@ -1496,9 +1858,13 @@ class SessionService:
                 )
 
             # Run contributor cleanup in reverse order
-            await self._run_cleanup(session, principal)
+            await self._run_cleanup(session, principal, context=cleanup_context)
 
-            stopped = stopping.with_status(SessionStatus.STOPPED).with_cleared_endpoints()
+            stopped = (
+                stopping.with_status(SessionStatus.STOPPED)
+                .with_cleared_endpoints()
+                .model_copy(update={"error": None})
+            )
             final = await self._repository.update(stopped)
 
             if self._broadcaster is not None:
@@ -1541,7 +1907,7 @@ class SessionService:
             SessionStatus.STARTING,
             SessionStatus.PROVISIONING,
         ):
-            await self.stop_session(session_id)
+            await self.stop_session(session_id, principal=principal)
             session = await self._repository.get(session_id)
 
         # Only stopped/failed/created sessions can be archived
@@ -1626,7 +1992,12 @@ class SessionService:
                 lambda t, sid=session.id: self._provisioning_tasks.pop(sid, None)
             )
 
-    def _reconciled_session(self, session: Session, actual_status: SessionStatus) -> Session:
+    def _reconciled_session(
+        self,
+        session: Session,
+        actual_status: SessionStatus,
+        status_detail: str | None = None,
+    ) -> Session:
         """Return the corrected session row for a pod-status divergence.
 
         Dead runtimes clear endpoints and stamp a queryable ``liveness:`` error.
@@ -1642,7 +2013,7 @@ class SessionService:
             return (
                 session.with_status(SessionStatus.FAILED)
                 .with_cleared_endpoints()
-                .with_error("liveness: session runtime is no longer available")
+                .with_error(status_detail or "liveness: session runtime is no longer available")
             )
 
         target_status = actual_status
@@ -1655,7 +2026,7 @@ class SessionService:
                 or self._pod_manager.initial_chat_endpoint(session),
                 "code_endpoint": session.code_endpoint
                 or self._pod_manager.initial_code_endpoint(session),
-                "error": None,
+                "error": status_detail,
             }
         )
 
@@ -1663,8 +2034,9 @@ class SessionService:
         self,
         session: Session,
         actual_status: SessionStatus,
+        status_detail: str | None = None,
     ) -> Session:
-        updated = self._reconciled_session(session, actual_status)
+        updated = self._reconciled_session(session, actual_status, status_detail)
         final = await self._repository.update(updated)
         if self._broadcaster is not None:
             await self._broadcaster.publish_session_updated(final)
@@ -1690,22 +2062,38 @@ class SessionService:
             SessionStatus.STARTING,
             SessionStatus.PROVISIONING,
             SessionStatus.RUNNING,
+            SessionStatus.STOPPING,
         ]
+        durable_compute = self._runtime_backend == "vm" or self._execution_resolver is not None
         if self._runtime_backend == "kubernetes":
             statuses.extend(
                 [
                     SessionStatus.FAILED,
-                    SessionStatus.STOPPING,
                     SessionStatus.STOPPED,
                     SessionStatus.ARCHIVED,
                 ]
             )
+        elif durable_compute:
+            # Kubernetes sheds orphaned resources for terminal rows on its own,
+            # so only FAILED (a row a provisioning-cleanup failure can leave
+            # bound to still-running compute) needs to keep being swept for a
+            # durable-compute backend; see the comment in _provision_background.
+            statuses.append(SessionStatus.FAILED)
         sessions = [
             session for status in statuses for session in await self._repository.list(status=status)
         ]
         reconciled = 0
         for session in sessions:
+            if session.status == SessionStatus.FAILED and self._runtime_backend != "kubernetes":
+                # Swept only to release compute a failed cleanup left bound. Never
+                # ask for its status: a VM runtime reports a still-bound lease as
+                # provisioning and restarts it, which would resurrect the session.
+                if await self._pod_manager.stop(session):
+                    reconciled += 1
+                continue
+
             actual_status = await self._pod_manager.status(session)
+            status_detail = await self._pod_manager.status_detail(session)
 
             if session.status in {
                 SessionStatus.STOPPING,
@@ -1738,6 +2126,12 @@ class SessionService:
                 continue
 
             if actual_status == session.status:
+                if (
+                    actual_status in {SessionStatus.STARTING, SessionStatus.PROVISIONING}
+                    and session.error != status_detail
+                ):
+                    await self._persist_reconciled_session(session, actual_status, status_detail)
+                    reconciled += 1
                 continue
 
             logger.info(
@@ -1746,7 +2140,7 @@ class SessionService:
                 session.status.value,
                 actual_status.value,
             )
-            final = await self._persist_reconciled_session(session, actual_status)
+            final = await self._persist_reconciled_session(session, actual_status, status_detail)
             reconciled += 1
             if actual_status == SessionStatus.FAILED and self._runtime_backend == "kubernetes":
                 await self._pod_manager.stop(final)
@@ -1768,7 +2162,13 @@ class SessionService:
             return session
 
         actual_status = await self._pod_manager.status(session)
+        status_detail = await self._pod_manager.status_detail(session)
         if actual_status == session.status:
+            if (
+                actual_status in {SessionStatus.STARTING, SessionStatus.PROVISIONING}
+                and session.error != status_detail
+            ):
+                return await self._persist_reconciled_session(session, actual_status, status_detail)
             return session
 
         logger.info(
@@ -1783,7 +2183,7 @@ class SessionService:
         }:
             return session
 
-        return await self._persist_reconciled_session(session, actual_status)
+        return await self._persist_reconciled_session(session, actual_status, status_detail)
 
     async def mark_session_dead(self, session_id: UUID) -> Session | None:
         """Force a single session to be reconciled against the pod manager NOW.

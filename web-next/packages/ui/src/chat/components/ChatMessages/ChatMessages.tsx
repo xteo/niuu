@@ -17,6 +17,7 @@ import { MarkdownContent } from '../MarkdownContent';
 import { ToolBlock, ToolGroupBlock, groupContentBlocks } from '../ToolBlock';
 import type { ChatMessage, ChatMessagePart } from '../../types';
 import type { ContentBlock as ToolContentBlock } from '../ToolBlock';
+import { useCompactUxChatPrefs } from '../../compactUxPrefs';
 import './ChatMessages.css';
 import { ToolImageCard } from '../ToolImages';
 import { PresentedFileCard } from '../ConversationResources';
@@ -78,6 +79,34 @@ function extractTokens(usage: Record<string, { inputTokens?: number; outputToken
   return { input, output };
 }
 
+function MessageAttachments({ attachments }: Pick<ChatMessage, 'attachments'>) {
+  return (
+    <>
+      {' '}
+      {attachments && attachments.length > 0 && (
+        <div className="niuu-chat-attachment-row">
+          {attachments.map((att, i) =>
+            att.previewUrl ? (
+              <img
+                key={`${att.name}-${i}`}
+                src={att.previewUrl}
+                alt={att.name}
+                className="niuu-chat-attachment-preview"
+              />
+            ) : (
+              <span key={`${att.name}-${i}`} className="niuu-chat-attachment-badge">
+                <Paperclip className="niuu-chat-attachment-icon" />
+                <span>{att.name}</span>
+                <span className="niuu-chat-attachment-size">{formatFileSize(att.size)}</span>
+              </span>
+            ),
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
 /** Compact, rounded counts keep the conversation header quiet. */
 export function formatTokenCount(count: number): string {
   if (!Number.isFinite(count) || count < 0) return '0';
@@ -96,26 +125,23 @@ interface UserMessageProps {
 }
 
 export function UserMessage({ message }: UserMessageProps) {
+  const uxPrefs = useCompactUxChatPrefs();
   return (
-    <div className="niuu-chat-user-wrapper" data-testid="user-message">
+    <div
+      className="niuu-chat-user-wrapper"
+      data-testid="user-message"
+      data-timestamp={uxPrefs.timestamp}
+    >
       <div className="niuu-chat-user-bubble">
         <div className="niuu-chat-user-text">
           <MarkdownContent content={message.content} />
         </div>
-        {message.attachments && message.attachments.length > 0 && (
-          <div className="niuu-chat-attachment-row">
-            {message.attachments.map((att, i) => (
-              <span key={`${att.name}-${i}`} className="niuu-chat-attachment-badge">
-                <Paperclip className="niuu-chat-attachment-icon" />
-                <span>{att.name}</span>
-                <span className="niuu-chat-attachment-size">{formatFileSize(att.size)}</span>
-              </span>
-            ))}
-          </div>
-        )}
+        <MessageAttachments attachments={message.attachments} />
       </div>
       <div className="niuu-chat-msg-meta">
-        <span className="niuu-chat-timestamp">{formatTime(message.createdAt)}</span>
+        {uxPrefs.timestamp !== 'never' && (
+          <span className="niuu-chat-timestamp">{formatTime(message.createdAt)}</span>
+        )}
       </div>
     </div>
   );
@@ -180,15 +206,25 @@ export function AssistantMessage({
     handleCopyClick();
   }, [message.content, onCopy, handleCopyClick]);
 
+  const uxPrefs = useCompactUxChatPrefs();
+
   return (
-    <div className="niuu-chat-assistant-wrapper" data-testid="assistant-message">
-      <div className="niuu-chat-avatar">
-        <Hammer className="niuu-chat-avatar-icon" />
-      </div>
+    <div
+      className="niuu-chat-assistant-wrapper"
+      data-testid="assistant-message"
+      data-timestamp={uxPrefs.timestamp}
+    >
+      {uxPrefs.showAgentAvatar && (
+        <div className="niuu-chat-avatar">
+          <Hammer className="niuu-chat-avatar-icon" />
+        </div>
+      )}
       <div className="niuu-chat-assistant-body">
         <div className="niuu-chat-assistant-header">
           {model && <span className="niuu-chat-model-badge">{model}</span>}
-          <span className="niuu-chat-timestamp">{formatTime(message.createdAt)}</span>
+          {uxPrefs.timestamp !== 'never' && (
+            <span className="niuu-chat-timestamp">{formatTime(message.createdAt)}</span>
+          )}
           {message.status === 'running' && (
             <span className="niuu-chat-generating-label">
               <Loader2 className="niuu-chat-spinner-icon" />
@@ -205,6 +241,21 @@ export function AssistantMessage({
           )}
         </div>
 
+        {(!uxPrefs.showMessageActions || uxPrefs.copyMode === 'hover') && (
+          <button
+            type="button"
+            className={cn(
+              'niuu-chat-action-btn niuu-chat-copy',
+              uxPrefs.copyMode === 'hover' && 'niuu-chat-copy--hover',
+            )}
+            onClick={handleCopy}
+            title={copied ? 'Copied' : 'Copy'}
+            aria-label="Copy message"
+          >
+            {copied ? <Check /> : <Copy />}
+          </button>
+        )}
+        <MessageAttachments attachments={message.attachments} />
         {hasReasoning && (
           <div className="niuu-chat-reasoning">
             <button
@@ -246,40 +297,44 @@ export function AssistantMessage({
           )}
         </div>
 
-        <div className="niuu-chat-action-bar" hidden={message.status === 'running'}>
-          <button
-            type="button"
-            className="niuu-chat-action-btn"
-            onClick={handleCopy}
-            title={copied ? 'Copied' : 'Copy'}
-          >
-            {copied ? (
-              <Check className="niuu-chat-action-icon" />
-            ) : (
-              <Copy className="niuu-chat-action-icon" />
+        {uxPrefs.showMessageActions && message.status !== 'running' && (
+          <div className="niuu-chat-action-bar">
+            {uxPrefs.copyMode === 'inline' && (
+              <button
+                type="button"
+                className="niuu-chat-action-btn"
+                onClick={handleCopy}
+                title={copied ? 'Copied' : 'Copy'}
+              >
+                {copied ? (
+                  <Check className="niuu-chat-action-icon" />
+                ) : (
+                  <Copy className="niuu-chat-action-icon" />
+                )}
+              </button>
             )}
-          </button>
-          {onRegenerate && (
-            <button
-              type="button"
-              className="niuu-chat-action-btn"
-              onClick={() => onRegenerate(message.id)}
-              title="Regenerate"
-            >
-              <RefreshCw className="niuu-chat-action-icon" />
-            </button>
-          )}
-          {onBookmark && (
-            <button
-              type="button"
-              className={cn('niuu-chat-action-btn', bookmarked && 'niuu-chat-action-btn--active')}
-              onClick={() => onBookmark(message.id, !bookmarked)}
-              title={bookmarked ? 'Remove bookmark' : 'Bookmark'}
-            >
-              <Bookmark className="niuu-chat-action-icon" />
-            </button>
-          )}
-        </div>
+            {onRegenerate && (
+              <button
+                type="button"
+                className="niuu-chat-action-btn"
+                onClick={() => onRegenerate(message.id)}
+                title="Regenerate"
+              >
+                <RefreshCw className="niuu-chat-action-icon" />
+              </button>
+            )}
+            {onBookmark && (
+              <button
+                type="button"
+                className={cn('niuu-chat-action-btn', bookmarked && 'niuu-chat-action-btn--active')}
+                onClick={() => onBookmark(message.id, !bookmarked)}
+                title={bookmarked ? 'Remove bookmark' : 'Bookmark'}
+              >
+                <Bookmark className="niuu-chat-action-icon" />
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { useService } from '@niuulabs/plugin-sdk';
 import type { IBifrostService } from '@niuulabs/plugin-bifrost';
@@ -14,6 +14,11 @@ import {
   type ForgeStandardId,
 } from './quickLaunchModel';
 import { slugifySessionName, validateSessionName } from './launchWizardModel';
+import {
+  availableEngines,
+  quickLaunchIntegrationIds,
+  selectedEngineProvider,
+} from './launchEngines';
 import { useForgePreference } from './useForgePreference';
 import './QuickLaunch.css';
 
@@ -71,7 +76,19 @@ export function QuickLaunch({
   );
   const [folders, setFolders] = useState<Record<string, string>>({});
   const folder = host ? (folders[host.id] ?? savedFolder) : '';
-  const [sourceType, setSourceType] = useState('local_mount');
+  // Local folders exist only where the Forge mounts them; a mini-mode host
+  // defaults to one, a cluster to Git. A source the person picked stays. While
+  // a newly chosen Forge answers, the form keeps its shape but cannot launch.
+  const features = useQuery({
+    queryKey: ['volundr', 'features', host?.id],
+    queryFn: () => volundr.getFeatures(host?.id),
+    enabled: Boolean(host),
+    placeholderData: keepPreviousData,
+  });
+  const localMountsEnabled = Boolean(features.data?.localMountsEnabled);
+  const [pickedSource, setPickedSource] = useState<'git' | 'local_mount' | null>(null);
+  const sourceType =
+    pickedSource ?? (features.data?.miniMode && localMountsEnabled ? 'local_mount' : 'git');
   const [repo, setRepo] = useState('');
   const [branch, setBranch] = useState('');
   const repos = useQuery({
@@ -84,20 +101,43 @@ export function QuickLaunch({
     queryFn: () => repoCatalog.getBranches(repo),
     enabled: sourceType === 'git' && Boolean(repo),
   });
+  // The session carries the connected AI account that powers this standard and
+  // the Git account that lists the repository, as the advanced launch does.
+  const integrations = useQuery({
+    queryKey: ['volundr', 'integrations'],
+    queryFn: () => volundr.getIntegrations(),
+  });
+  const integrationCatalog = useQuery({
+    queryKey: ['volundr', 'integration-catalog'],
+    queryFn: () => volundr.getIntegrationCatalog(),
+  });
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
   const [launching, setLaunching] = useState(false);
   const submitting = useRef(false);
   const [launchError, setLaunchError] = useState('');
-  const loadError = hosts.error ?? catalog.error ?? definitions.error;
+  const loadError =
+    hosts.error ??
+    catalog.error ??
+    definitions.error ??
+    features.error ??
+    integrations.error ??
+    integrationCatalog.error;
   const available = model?.enabled && definitions.data?.some((d) => d.key === standard.definition);
   const nameError = validateSessionName(name.trim());
   const validSource =
     sourceType === 'local_mount'
-      ? folder.trim().startsWith('/')
+      ? localMountsEnabled && folder.trim().startsWith('/')
       : Boolean(repo.trim() && branch.trim());
   const canLaunch = Boolean(
-    host && available && validSource && !nameError && !loadError && !launching,
+    host &&
+    available &&
+    validSource &&
+    features.data &&
+    !features.isPlaceholderData &&
+    !nameError &&
+    !loadError &&
+    !launching,
   );
 
   async function launch(event: React.FormEvent) {
@@ -115,11 +155,24 @@ export function QuickLaunch({
             .at(-1)
             ?.replace(/\.git$/, '') ?? 'forge-session',
         ) || 'forge-session';
+      const local = sourceType === 'local_mount';
+      const engine = availableEngines(
+        definitions.data ?? [],
+        integrations.data ?? [],
+        integrationCatalog.data ?? [],
+      ).find((option) => option.definition.key === standard.definition);
       const session = await volundr.startSession({
         name: name.trim() || autoName,
         definition: standard.definition,
         model: modelId,
         instanceId: host.id,
+        integrationIds: quickLaunchIntegrationIds({
+          provider: selectedEngineProvider(engine, []),
+          integrations: integrations.data ?? [],
+          repos: repos.data ?? [],
+          repoUrl: repo.trim(),
+          local,
+        }),
         source:
           sourceType === 'local_mount'
             ? {
@@ -195,7 +248,11 @@ export function QuickLaunch({
               Forge
               <select
                 value={host?.id ?? ''}
-                onChange={(e) => setPreferredHost(e.target.value)}
+                onChange={(e) => {
+                  setPreferredHost(e.target.value);
+                  // A local folder is re-derived from the new Forge, which may not mount one.
+                  setPickedSource((current) => (current === 'local_mount' ? null : current));
+                }}
                 aria-label="Forge"
               >
                 {!host && <option value="">Select a Forge</option>}
@@ -208,8 +265,11 @@ export function QuickLaunch({
             </label>
             <label>
               Workspace source
-              <select value={sourceType} onChange={(e) => setSourceType(e.target.value)}>
-                <option value="local_mount">Local mount</option>
+              <select
+                value={sourceType}
+                onChange={(e) => setPickedSource(e.target.value as 'git' | 'local_mount')}
+              >
+                {localMountsEnabled && <option value="local_mount">Local mount</option>}
                 <option value="git">Git repository</option>
               </select>
             </label>

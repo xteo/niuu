@@ -241,6 +241,56 @@ async def test_stream_usage_is_recorded_before_terminal_chunk_is_yielded():
     assert records[0].agent_id == "resident-1"
 
 
+async def test_stream_records_token_usage_on_the_active_span(monkeypatch):
+    """router.stream() cannot know token usage (it arrives as SSE deltas);
+    _stream_with_tracking is the inbound layer that accumulates it, and must
+    attach it to the request span once the stream is drained."""
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from niuu import observability as obs_module
+    from niuu.observability import Observability
+
+    async def source():
+        yield (
+            'event: message_start\ndata: {"type":"message_start",'
+            '"message":{"usage":{"input_tokens":12}}}\n\n'
+            'event: message_delta\ndata: {"type":"message_delta",'
+            '"usage":{"output_tokens":7}}\n\n'
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry = Observability(tracer_provider=tracer_provider, meter_provider=MeterProvider())
+    monkeypatch.setattr(obs_module, "_active", telemetry)
+
+    with telemetry.span("request"):
+        stream = _stream_with_tracking(
+            source(),
+            "nvidia/nemotron-3-super",
+            0.0,
+            AgentIdentity(agent_id="resident-1", tenant_id="tenant-1", session_id="session-1"),
+            MemoryUsageStore(),
+            {},
+            "request-1",
+            AsyncMock(),
+            provider="valaskjalf-nemotron",
+        )
+        await anext(stream)
+
+    (span,) = exporter.get_finished_spans()
+    attrs = dict(span.attributes or {})
+    assert attrs["gen_ai.usage.input_tokens"] == 12
+    assert attrs["gen_ai.usage.output_tokens"] == 7
+    assert attrs["gen_ai.response.model"] == "nvidia/nemotron-3-super"
+    assert attrs["gen_ai.provider.name"] == "valaskjalf-nemotron"
+
+
 # ---------------------------------------------------------------------------
 # _load_adapter — api_key and custom timeout paths (router.py:46,48)
 # ---------------------------------------------------------------------------
@@ -379,7 +429,7 @@ class TestContentToOpenaiText:
 
     def test_list_of_text_blocks(self):
         blocks = [TextBlock(text="foo"), TextBlock(text="bar")]
-        assert _content_to_openai_text(blocks) == "foobar"
+        assert _content_to_openai_text(blocks) == "foo\nbar"
 
     def test_non_text_blocks_skipped(self):
         blocks = [
@@ -387,7 +437,7 @@ class TestContentToOpenaiText:
             ToolUseBlock(id="t1", name="my_tool", input={}),
             TextBlock(text="after"),
         ]
-        assert _content_to_openai_text(blocks) == "beforeafter"
+        assert _content_to_openai_text(blocks) == "before\nafter"
 
 
 class TestMessageToOpenai:
@@ -455,8 +505,8 @@ class TestAnthropicToOpenaiEdgeCases:
             model="gpt-4o",
             max_tokens=100,
             messages=[Message(role="user", content="hi")],
-            system=[TextBlock(text="You are"), TextBlock(text=" helpful.")],
+            system=[TextBlock(text="You are"), TextBlock(text="helpful.")],
         )
         payload = anthropic_to_openai(req, "gpt-4o")
         assert payload["messages"][0]["role"] == "system"
-        assert payload["messages"][0]["content"] == "You are helpful."
+        assert payload["messages"][0]["content"] == "You are\nhelpful."

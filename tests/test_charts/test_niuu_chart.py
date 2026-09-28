@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 from pathlib import Path
@@ -63,6 +64,10 @@ class TestIngressTemplate:
         assert "$root.Values.guild.enabled" in helpers_tpl
         assert "$root.Values.volundr.enabled" in helpers_tpl
 
+    def test_knowledge_deployments_route_to_guild(self) -> None:
+        rendered = _render_niuu_chart()
+        assert _service_for_path(rendered, "/api/v1/niuu/knowledge") == "niuu-test-guild"
+
     def test_renders_forge_route_to_guild_when_guild_enabled(self) -> None:
         """Render proof for the default aggregate deployment."""
         rendered = _render_niuu_chart()
@@ -107,11 +112,8 @@ def test_guild_envoy_accepts_websocket_upgrades() -> None:
     assert "- upgrade_type: websocket" in envoy_template
 
 
-def _render_niuu_chart(*extra_args: str) -> str:
-    helm = shutil.which("helm")
-    if not helm:
-        pytest.skip("helm is not installed")
-
+@functools.cache
+def _build_niuu_chart_dependencies(helm: str) -> None:
     dependency_result = subprocess.run(
         [helm, "dependency", "build", str(CHART_DIR)],
         capture_output=True,
@@ -123,6 +125,17 @@ def _render_niuu_chart(*extra_args: str) -> str:
             f"stdout:\n{dependency_result.stdout}\n"
             f"stderr:\n{dependency_result.stderr}"
         )
+
+
+# Rendering is a pure function of the chart and its arguments; the dependency
+# build alone costs seconds, and most tests render with identical arguments.
+@functools.cache
+def _render_niuu_chart(*extra_args: str) -> str:
+    helm = shutil.which("helm")
+    if not helm:
+        pytest.skip("helm is not installed")
+
+    _build_niuu_chart_dependencies(helm)
 
     result = subprocess.run(
         [
@@ -166,3 +179,17 @@ def _deployment_image(rendered_yaml: str, name: str) -> str:
         ):
             return document["spec"]["template"]["spec"]["containers"][0]["image"]
     raise AssertionError(f"deployment not found: {name}")
+
+
+@pytest.mark.parametrize("component", ["niuu-shared", "guild"])
+@pytest.mark.parametrize("local_tag,expected", [("shared-tag", "shared-tag"), ("", "global-tag")])
+def test_shared_image_tag_can_be_deployed_independently(component, local_tag, expected):
+    rendered = _render_niuu_chart(
+        "--set",
+        "global.image.tag=global-tag",
+        "--set",
+        f"{component}.image.tag={local_tag}",
+    )
+    assert (
+        _deployment_image(rendered, f"niuu-test-{component}") == f"ghcr.io/niuulabs/niuu:{expected}"
+    )
