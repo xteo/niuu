@@ -91,7 +91,9 @@ class TestBrokerComposition:
             BROKER_TOKEN_FILE_ENV: str(token_file),
         }
         assert "notify" in tools.instructions and "present-file" in tools.instructions
-        assert "reply ready" in tools.instructions
+        # The agent owns the "done" signal now that Forge no longer notifies on turn end.
+        assert "Forge sends nothing when a turn ends" in tools.instructions
+        assert "reply ready" not in tools.instructions
 
     def test_skill_is_materialized_outside_the_workspace(self, tmp_path) -> None:
         tools = _broker(tmp_path)._session_tools()

@@ -697,10 +697,14 @@ class PushNotificationConfig(BaseModel):
 
 
 class NotificationReplyReadyConfig(BaseModel):
-    """The automatic ``reply_ready`` notification raised for each final reply."""
+    """The automatic ``reply_ready`` notification raised for each final reply.
+
+    Off by default: a notification for every final reply buries the ones agents send on
+    purpose. Agents report a finished task with their own ``milestone`` instead.
+    """
 
     enabled: bool = Field(
-        default=True,
+        default=False,
         description="Record a reply_ready notification for every final assistant reply.",
     )
     title_chars: int = Field(
@@ -793,7 +797,7 @@ class NotificationsConfig(BaseModel):
         notifications:
           enabled: true
           reply_ready:
-            enabled: true
+            enabled: false
             title_chars: 120
             body_chars: 280
           public_web_url: "https://forge.example.com"

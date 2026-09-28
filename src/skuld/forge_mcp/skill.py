@@ -14,7 +14,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from niuu.forge_mcp.guidance import COMPACT_NOTIFICATION_GUIDANCE
+from niuu.forge_mcp.guidance import (
+    COMPACT_NOTIFICATION_GUIDANCE,
+    NOTIFICATION_TRIGGER_GUIDANCE,
+)
 from skuld.session_runtime import write_private_file
 
 FORGE_NOTIFY_SKILL = "forge-notify"
@@ -39,15 +42,7 @@ rules — on their phone or chat. It is how a long-running session gets the user
 
 ## When to notify
 
-- `milestone` (usually `success`): a meaningful piece of work is finished — tests green,
-  PR opened, migration applied, investigation concluded.
-- `decision` (`info`): you made a significant choice the user should know about — approach
-  picked, scope changed, something skipped on purpose.
-- `attention` (`warning`): you are blocked or need input/approval to continue — say exactly
-  what you need.
-- `error` (`warning` or `critical`): something failed that the user must know about — broken
-  build, data problem, missing credentials.
-- `info` (`info`): a brief FYI worth surfacing outside the transcript.
+{trigger_guidance}
 
 ## How to write one
 
@@ -60,8 +55,7 @@ rules — on their phone or chat. It is how a long-running session gets the user
 ## Do not
 
 - Send progress updates or narrate routine steps. One good notification beats five chatty ones.
-- Announce that the whole task is done just because your turn is ending — Forge raises
-  "reply ready" automatically at the end of every turn. Reserve `milestone` for real outcomes.
+- Notify just because your turn is ending. Send the `milestone` when the task is actually done.
 - Resend a notification whose `state` came back `pending`: it is stored in the session's
   durable log and reaches Forge by itself once Forge is reachable.
 
@@ -72,7 +66,10 @@ which session, host, project and model you are running as.
 
 def forge_notify_skill_markdown(server_name: str) -> str:
     return _SKILL_TEMPLATE.format(
-        skill=FORGE_NOTIFY_SKILL, server=server_name, compact_guidance=COMPACT_NOTIFICATION_GUIDANCE
+        skill=FORGE_NOTIFY_SKILL,
+        server=server_name,
+        trigger_guidance=NOTIFICATION_TRIGGER_GUIDANCE,
+        compact_guidance=COMPACT_NOTIFICATION_GUIDANCE,
     )
 
 

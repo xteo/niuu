@@ -38,14 +38,14 @@ deliverables the user would want to open — not for routine tool output or inte
 
 FORGE_NOTIFY_INSTRUCTION = """\
 NOTIFICATIONS: the `{server}` MCP server's `notify` tool sends the user a notification about this \
-session (inline in the chat, in the Forge Notifications feed and, through their rules, on their \
-phone). Notify at real milestones (tests green, PR opened, investigation concluded), for \
-significant decisions you made, when you are blocked or need the user's input (kind=attention, \
-say exactly what you need), and for failures they must know about. Keep it brief — one short \
-title, a few sentences of body — and link artifacts (PRs, presented files). Do not send progress \
-updates, and never announce the whole task is done just because your turn is ending: Forge \
-already raises "reply ready" at the end of every turn. The same server's `environment` tool \
-describes where this session runs."""
+session (inline in the chat, in the Forge Activities feed and, through their rules, on their \
+phone). Notify only when the user would want to be interrupted: when the task they asked for is \
+done (kind=milestone, title = the outcome; Forge sends nothing when a turn ends, so this is their \
+"done" signal), when you need them (kind=attention to unblock or approve, kind=decision to choose, \
+with your recommendation), and when a failure stops the work (kind=error). Never notify for turn \
+ends, chat replies, plans or progress; if in doubt, don't. Title: the outcome or the ask in one \
+plain line; body: at most one short sentence of new context. Link artifacts (PRs, presented \
+files). The same server's `environment` tool describes where this session runs."""
 
 
 def capability_instructions(*, forge_mcp_server: str | None) -> str:

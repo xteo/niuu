@@ -84,7 +84,8 @@ payloads) for the batch seqs, excluding conflicted seqs:
   - `source` is `system`, `severity` is `success`.
   - Title and body come from `summarize_reply(content, …)`, with limits from
     `NotificationsConfig`.
-  - It is only created when `notifications.reply_ready.enabled` (default true).
+  - It is only created when `notifications.reply_ready.enabled` (default **false** since
+    2026-09-28: one per final reply was noise; agents send a `milestone` when a task is done).
 
 The notification insert (`ON CONFLICT (dedupe_key) DO NOTHING RETURNING`), rule
 evaluation and the delivery inserts happen in **one transaction**. Rules are

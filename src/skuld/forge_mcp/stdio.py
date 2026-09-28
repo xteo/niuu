@@ -45,9 +45,9 @@ TOOLS_PATH = "/api/forge-mcp/tools"
 SERVER_NAME = "forge"
 SERVER_VERSION = "1.0.0"
 SERVER_INSTRUCTIONS = (
-    "Forge tools for this coding session: `notify` the user at milestones, decisions, "
-    "blockers and failures (briefly; never just because a turn ended — Forge raises "
-    "'reply ready' itself), `environment` to learn where you run, and read tools to "
+    "Forge tools for this coding session: `notify` the user only when they would want "
+    "to be interrupted (task done, you need them, or a failure stops the work; never for "
+    "turn ends or progress), `environment` to learn where you run, and read tools to "
     "inspect other sessions. Tools that act on other sessions need an operator grant."
 )
 _ERROR_BODY_CHARS = 500

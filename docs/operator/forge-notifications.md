@@ -15,7 +15,7 @@ This page covers how to operate the feature.
 | Source | Kind(s) | How it is recorded | Dedupe key |
 |---|---|---|---|
 | `agent` | milestone, decision, attention, error, info | The model calls the Forge MCP `notify` tool. Skuld appends a notification turn to the session log, and Forge projects it when the log batch is appended. | `turn:{session}:{turn_id}:{kind}` |
-| `system` | reply_ready | Every final assistant reply (the same rule that drives the session inbox). The title is the reply's first line and the body is a bounded excerpt. | `turn:{session}:{final_turn_id}:reply_ready` |
+| `system` | reply_ready | **Off by default** (`notifications.reply_ready.enabled`). When on: every final assistant reply (the same rule that drives the session inbox). The title is the reply's first line and the body is a bounded excerpt. | `turn:{session}:{final_turn_id}:reply_ready` |
 | `system` | attention | A session starts waiting for its owner (a question, confirmation or permission request). | `attention:{session}:{state_since}[:{request_id}]` |
 | `operator` | any except reply_ready | `POST /api/v1/forge/sessions/{id}/notifications` | `submit:{session}:{principal}:{idempotency_key}` |
 | `agent` (direct) | milestone, decision, attention, error, info | The same direct submit made by the session itself with its own session credential, for example through the Forge-hosted MCP endpoint | `submit:{session}:agent:{owner}:{idempotency_key}` |
@@ -348,7 +348,7 @@ the grants, the token lifecycle and the Forge-hosted MCP endpoint
 notifications:
   enabled: true              # projection, the API and the SSE event
   reply_ready:
-    enabled: true            # a reply_ready for every final reply
+    enabled: false           # true: a reply_ready for every final reply (noisy)
     title_chars: 120         # <= 200 (protocol limit)
     body_chars: 280          # <= 4000 (protocol limit)
   default_page_size: 50

@@ -30,7 +30,10 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
 )
-from niuu.forge_mcp.guidance import COMPACT_NOTIFICATION_GUIDANCE
+from niuu.forge_mcp.guidance import (
+    COMPACT_NOTIFICATION_GUIDANCE,
+    NOTIFICATION_TRIGGER_GUIDANCE,
+)
 from niuu.forge_mcp.models import (
     ForgeApiError,
     ForgeMcpGrant,
@@ -89,7 +92,9 @@ class _NotifyArgs(NotificationDraft):
     def _agent_kind(cls, value: NotificationKind) -> NotificationKind:
         if value not in AGENT_KINDS:
             allowed = ", ".join(sorted(kind.value for kind in AGENT_KINDS))
-            raise ValueError(f"agents may raise only: {allowed} (reply_ready is automatic)")
+            raise ValueError(
+                f"agents may raise only: {allowed} (reply_ready is reserved for Forge)"
+            )
         return value
 
 
@@ -265,28 +270,17 @@ _NOTIFY_SCHEMA = _object(
 _NOTIFY_DESCRIPTION = """\
 Notify the user about THIS session. The notification appears inline in the \
 conversation, in the Forge Notifications feed across every session and host, and \
-may reach the user's phone or chat through their delivery rules. Use it sparingly \
-and deliberately:
+may reach the user's phone or chat through their delivery rules.
 
-- milestone: a meaningful piece of work is finished (tests green, PR opened, \
-migration applied, investigation concluded) — not every step.
-- decision: you made a significant choice the user should know about (approach \
-picked, scope changed, something intentionally skipped).
-- attention: you are blocked or need the user's input or approval; say exactly \
-what you need.
-- error: something failed that the user must know about.
-- info: a brief FYI worth surfacing outside the transcript.
-
-Do NOT send progress updates or narrate routine steps; one good notification \
-beats five chatty ones. Do NOT announce that the whole task is complete merely \
-because your turn is ending: Forge raises a "reply ready" notification \
-automatically at the end of every turn. Link artifacts (PR URLs, files you presented \
-with present-file via kind=file and file_id, other sessions) in `links`.
+Link artifacts (PR URLs, files you presented with present-file via kind=file and \
+file_id, other sessions) in `links`.
 
 Returns {notification_id, turn_id, session_seq, state}. state=committed means \
 Forge recorded it; state=pending means it is saved in this session's durable log \
 and will reach Forge automatically when Forge is reachable — do not resend it."""
-_NOTIFY_DESCRIPTION += "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+_NOTIFY_DESCRIPTION += (
+    "\n\n" + NOTIFICATION_TRIGGER_GUIDANCE + "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+)
 
 
 _FEED_NOTIFY_SCHEMA = {
@@ -319,13 +313,13 @@ Record a notification in the Forge Notifications feed for a session you own \
 is not added to the session's transcript. It appears in the feed across every \
 host and may reach the owner's phone or chat through their delivery rules.
 
-kind: milestone (meaningful work finished), decision (a significant choice was \
-made), attention (someone must act or answer), error (a failure that matters) or \
-info (a brief FYI). Link artifacts in `links`. Do not send progress chatter.
+Link artifacts in `links`.
 
 idempotency_key is required: retrying with the same key returns the notification \
 already recorded. Returns {notification_id, seq, session_id, state}."""
-_FEED_NOTIFY_DESCRIPTION += "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+_FEED_NOTIFY_DESCRIPTION += (
+    "\n\n" + NOTIFICATION_TRIGGER_GUIDANCE + "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+)
 
 
 @dataclass(frozen=True)

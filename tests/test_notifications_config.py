@@ -13,7 +13,8 @@ from volundr.domain.models import Session
 
 def test_defaults_are_safe():
     config = NotificationsConfig()
-    assert config.enabled and config.reply_ready.enabled
+    assert config.enabled
+    assert not config.reply_ready.enabled  # one per final reply was noise; opt in if wanted
     assert (config.default_page_size, config.max_page_size) == (50, 200)
     assert config.sinks == []  # no external delivery by default
     assert config.dispatcher.max_attempts >= 1

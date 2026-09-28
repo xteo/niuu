@@ -409,7 +409,7 @@ sleipnir:
 # Forge session notifications: the feed, automatic reply_ready notifications, the
 # delivery outbox dispatcher and external sinks. Rendered verbatim as config.yaml's
 # `notifications:` section (snake_case keys; see NotificationsConfig). Empty keeps the
-# defaults: feed on, reply_ready on, dispatcher on (idle until an owner rule selects a
+# defaults: feed on, reply_ready off, dispatcher on (idle until an owner rule selects a
 # sink), no configured sinks. Telegram rules deliver through the owner's Telegram
 # integration and need no entry here. Sink secrets come from env vars named in
 # `secret_kwargs_env`; mount them with `extraEnv` (secretKeyRef). Example:

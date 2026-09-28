@@ -162,12 +162,17 @@ class TestToolList:
         assert "'message' grant" in tools["send_message"]["description"]
         assert "'lifecycle' grant" in tools["stop_session"]["description"]
         notify = tools["notify"]["description"]
-        assert "reply ready" in notify and "progress" in notify
+        # Forge no longer notifies on turn end, so the tool must say the agent owns "done".
+        assert "Forge sends nothing when a turn ends" in notify and "progress" in notify
+        assert "reply ready" not in notify
         kinds = tools["notify"]["inputSchema"]["properties"]["kind"]["enum"]
         assert "reply_ready" not in kinds and "milestone" in kinds
 
     def test_notify_and_generated_skills_share_compact_event_guidance(self, tmp_path) -> None:
-        from niuu.forge_mcp.guidance import COMPACT_NOTIFICATION_GUIDANCE
+        from niuu.forge_mcp.guidance import (
+            COMPACT_NOTIFICATION_GUIDANCE,
+            NOTIFICATION_TRIGGER_GUIDANCE,
+        )
         from niuu.forge_mcp.tools import _FEED_NOTIFY_DESCRIPTION, MAX_BODY_CHARS, MAX_TITLE_CHARS
         from skuld.forge_mcp.skill import (
             forge_notify_skill_markdown,
@@ -179,8 +184,13 @@ class TestToolList:
         notify = next(tool for tool in toolbox.list_tools() if tool["name"] == "notify")
         assert COMPACT_NOTIFICATION_GUIDANCE in notify["description"]
         assert COMPACT_NOTIFICATION_GUIDANCE in _FEED_NOTIFY_DESCRIPTION
+        # One definition of *when* to notify, shared by every agent-facing surface.
+        assert NOTIFICATION_TRIGGER_GUIDANCE in notify["description"]
+        assert NOTIFICATION_TRIGGER_GUIDANCE in _FEED_NOTIFY_DESCRIPTION
         skill = forge_notify_skill_markdown("forge")
         assert COMPACT_NOTIFICATION_GUIDANCE in skill
+        assert NOTIFICATION_TRIGGER_GUIDANCE in skill
+        assert "reply ready" not in skill.lower()
         assert "`forge` MCP server" in skill
         claude = materialize_claude_plugin(tmp_path, "forge")
         codex = materialize_codex_skills_root(tmp_path, "forge")
@@ -229,7 +239,7 @@ class TestOwnSession:
     @pytest.mark.parametrize(
         ("arguments", "message"),
         [
-            ({"kind": "reply_ready", "title": "done"}, "reply_ready is automatic"),
+            ({"kind": "reply_ready", "title": "done"}, "reply_ready is reserved for Forge"),
             ({"kind": "milestone", "title": "   "}, "title"),
             ({"kind": "milestone"}, "title"),
             ({"kind": "milestone", "title": "x", "extra": 1}, "extra"),
@@ -554,7 +564,7 @@ class TestFeedNotify:
         result = await toolbox.call(
             "notify", {"kind": "reply_ready", "title": "x", "idempotency_key": "k"}
         )
-        assert result.is_error and "reply_ready is automatic" in result.text
+        assert result.is_error and "reply_ready is reserved for Forge" in result.text
 
     async def test_environment_lists_the_granted_tools(self) -> None:
         toolbox, _ = _feed_toolbox()

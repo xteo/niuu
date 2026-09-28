@@ -13,7 +13,7 @@ Per engine (``_build_transport_kwargs`` hands every transport the merged
 * Grok ACP: ``session/new`` ``mcpServers`` (stdio form). ACP has no standard system
   prompt field, so no capability text is added; the tool descriptions carry it.
 * OpenCode, Muse, Pi, dsh and Claude remote-control: no MCP injection (their
-  transports take no MCP configuration); ``reply_ready`` still comes from Forge.
+  transports take no MCP configuration); Forge's automatic ``reply_ready`` is off by default.
 """
 
 from __future__ import annotations
