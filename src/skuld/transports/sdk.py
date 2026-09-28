@@ -612,7 +612,16 @@ class SDKTransport(CLITransport):
         if subtype == "ask_user_answer":
             request_id = kwargs.get("request_id")
             answers = kwargs.get("answers")
-            self.resolve_question(str(request_id or ""), answers)
+            if not self.resolve_question(str(request_id or ""), answers):
+                raise ValueError("Unknown or already answered Claude question")
+            await self._emit(
+                {
+                    "type": "ask_user_resolved",
+                    "request_id": str(request_id),
+                    "decision": "answered",
+                    "accepted": True,
+                }
+            )
             return
 
         if subtype == "slash_command":

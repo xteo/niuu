@@ -425,7 +425,7 @@ async def test_e4c_premature_other_enter_does_not_fake_success() -> None:
         await client.wait_for(
             lambda frames: any(
                 frame.get("request_id") == ask["request_id"]
-                and frame.get("decision") == "turn_ended"
+                and frame.get("decision") == "completed_elsewhere"
                 for frame in _resolved_frames(frames)
             ),
             timeout=5.0,
@@ -671,10 +671,20 @@ async def test_e6_sdk_emits_same_ask_user_question_shape_and_resolves(tmp_path) 
     assert opts == ["Postgres", "SQLite"]
 
     # --- resolve contract parity: resolve_question unblocks + threads the answer ---
-    assert transport.resolve_question(request_id, [{"answer": "SQLite"}]) is True, (
-        "resolve_question must find + resolve the pending question"
+    await transport.send_control(
+        "ask_user_answer", request_id=request_id, answers=[{"answer": "SQLite"}]
     )
     result = await asyncio.wait_for(ask_task, timeout=3.0)
+    assert _resolved_frames(events) == [
+        {
+            "type": "ask_user_resolved",
+            "request_id": request_id,
+            "decision": "answered",
+            "accepted": True,
+        }
+    ]
+    with pytest.raises(ValueError, match="already answered"):
+        await transport.send_control("ask_user_answer", request_id=request_id, answers=[])
 
     # The chosen option is threaded into the tool_result the model reads (the SDK
     # deny-with-answer mechanism). This is the SDK analogue of the tmux
@@ -700,7 +710,7 @@ async def test_e7_turn_end_clears_stale_prompt_and_does_not_replay() -> None:
 
     Leave an ask: unanswered; let the turn end (the Stop hook fires after the
     agent's blocked read is released). Assert the pending tty prompt is resolved
-    (ask_user_resolved with reason 'turn_ended'), the transport's
+    (ask_user_resolved with reason 'completed_elsewhere'), the transport's
     _pending_tty_prompts is empty, and the broker drops its reconnect-replay entry
     so a later client does NOT re-surface the stale question.
     """
@@ -727,12 +737,12 @@ async def test_e7_turn_end_clears_stale_prompt_and_does_not_replay() -> None:
         await page.wait_for_text("2. SQLite", timeout=8.0)
         await page.press("Enter")
 
-        # The turn ends -> the stale pending prompt is resolved with 'turn_ended'.
+        # Native tool completion retires the prompt before the turn-end cleanup.
         await client.wait_for(
             lambda frames: any(
                 f.get("type") == "ask_user_resolved"
                 and f.get("request_id") == request_id
-                and f.get("decision") == "turn_ended"
+                and f.get("decision") == "completed_elsewhere"
                 for f in frames
             ),
             timeout=8.0,

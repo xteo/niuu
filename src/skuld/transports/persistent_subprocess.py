@@ -548,8 +548,17 @@ class PersistentSubprocessTransport(CLITransport):
             request_id = str(kwargs.get("request_id") or "")
             answers = kwargs.get("answers")
             fut = self._pending_questions.get(request_id)
-            if fut is not None and not fut.done():
-                fut.set_result(answers if answers is not None else [])
+            if fut is None or fut.done():
+                raise ValueError("Unknown or already answered Claude question")
+            fut.set_result(answers if answers is not None else [])
+            await self._emit(
+                {
+                    "type": "ask_user_resolved",
+                    "request_id": request_id,
+                    "decision": "answered",
+                    "accepted": True,
+                }
+            )
             return
 
         if subtype == "slash_command":
