@@ -1583,16 +1583,19 @@ class TmuxInteractiveTransport(CLITransport):
         tool_use_id = self._coerce_str(payload.get("tool_use_id"))
         if not tool_use_id:
             return
-        question = next(
+        matched = next(
             (
-                pending
-                for pending in self._pending_tty_prompts.values()
+                (request_id, pending)
+                for request_id, pending in self._pending_tty_prompts.items()
                 if pending.get("native_tool_use_id") == tool_use_id
                 and pending.get("native_session_id") == payload.get("session_id")
             ),
             None,
         )
+        request_id, question = matched if matched else (None, None)
         if tool_use_id in self._question_result_ids:
+            if question is not None and not question.get("answer_in_flight"):
+                await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
             return
         # Parent attribution: compute BEFORE popping so the Task's OWN result carries parent=None
         # (a main-agent action) while a child result nests under the stack top.
@@ -1637,7 +1640,7 @@ class TmuxInteractiveTransport(CLITransport):
                 "transcript_path": payload.get("transcript_path"),
             },
         }
-        if question is not None:
+        if question is not None and question.get("kind") == "question":
             response = payload.get("tool_response")
             question["native_result"] = {
                 "is_error": is_error,
@@ -1645,8 +1648,15 @@ class TmuxInteractiveTransport(CLITransport):
                 "frame": frame,
             }
             await self._emit_question_result_once(tool_use_id, frame)
+            # Answers entered in Claude's terminal or another client also finish
+            # the native tool. Retire its card immediately, not at turn end.
+            # An in-flight UI answer still needs exact answer-consumption proof.
+            if not question.get("answer_in_flight"):
+                await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
             return
         await self._emit(frame)
+        if question is not None and not question.get("answer_in_flight"):
+            await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
 
     async def _emit_permission_request_from_hook(self, payload: dict[str, Any]) -> None:
         tool_input = payload.get("tool_input")
@@ -1903,6 +1913,10 @@ class TmuxInteractiveTransport(CLITransport):
             "kind": "permission",
             "tool_name": tool_name,
             "questions": [question],
+            # Permissions may be settled locally (including bypass mode). Bind
+            # their cleanup to the exact tool and native session, never its name.
+            "native_tool_use_id": self._coerce_str(payload.get("tool_use_id")),
+            "native_session_id": self._coerce_str(payload.get("session_id")),
         }
         await self._emit_ask_user_question(request_id, [question])
 
@@ -2090,11 +2104,13 @@ class TmuxInteractiveTransport(CLITransport):
                 "type": "ask_user_question",
                 "event_type": "ask_user_question",
                 "request_id": request_id,
-                "tool_use_id": request_id,
+                "tool_use_id": self._pending_tty_prompts[request_id].get("native_tool_use_id")
+                or request_id,
                 "questions": questions,
                 "metadata": {
                     "source": "tmux_tty_bridge",
                     "control_kind": self._pending_tty_prompts[request_id]["kind"],
+                    "requires_all_answers": True,
                     **(
                         {"answerable": False, "recovery_required": True}
                         if self._pending_tty_prompts[request_id].get("answer_uncertain")
@@ -2149,8 +2165,12 @@ class TmuxInteractiveTransport(CLITransport):
             if digit is None:
                 raise ValueError("The requested answer does not match the live Claude menu")
             pending["answer_uncertain"] = True
-            await self._send_key("Escape" if low == "deny" else str(digit), pane_id=pane_id)
-            await self._resolve_tty_answer(request_id, "deny" if low == "deny" else chosen)
+            pending["answer_in_flight"] = True
+            try:
+                await self._send_key("Escape" if low == "deny" else str(digit), pane_id=pane_id)
+                await self._resolve_tty_answer(request_id, "deny" if low == "deny" else chosen)
+            finally:
+                pending.pop("answer_in_flight", None)
             return
 
         plans = self._question_answer_plans(pending.get("questions"), answers)
@@ -2429,7 +2449,15 @@ class TmuxInteractiveTransport(CLITransport):
         first_row = next(
             (i for i, line in enumerate(lines) if _MENU_ROW_RE.match(line)), len(lines)
         )
-        if " ".join(plan["text"].split()) != " ".join(" ".join(lines[1:first_row]).split()):
+        prompt_lines = lines[1:first_row]
+        prompt = " ".join(" ".join(prompt_lines).split())
+        # Claude Code 2.1.280 draws a gutter before the question, including
+        # wrapped lines. It is widget decoration, not part of the hook's text.
+        # Keep exact question matching after removing only that left gutter.
+        gutterless = " ".join(
+            " ".join(re.sub(r"^\s*│ ?", "", line) for line in prompt_lines).split()
+        )
+        if " ".join(plan["text"].split()) not in (prompt, gutterless):
             return False
         rows = TmuxInteractiveTransport._menu_rows(screen)
         labels = []
@@ -2448,19 +2476,45 @@ class TmuxInteractiveTransport(CLITransport):
             return False
         if TmuxInteractiveTransport._menu_rows(screen) != [(1, "Submit answers"), (2, "Cancel")]:
             return False
-        observed: dict[str, str] = {}
-        question = None
-        for line in screen.splitlines():
-            value = line.strip()
+        # The review wraps both question and answer text, and newer Claude
+        # versions add a left gutter to the focused question. Reconstruct only
+        # this bounded review section; native tool-result proof remains exact.
+        body = screen.split("Review your answers", 1)[1].split("Ready to submit your answers?", 1)[
+            0
+        ]
+        entries: list[tuple[list[str], list[str]]] = []
+        question: list[str] | None = None
+        answer: list[str] | None = None
+        for line in body.splitlines():
+            value = re.sub(r"^\s*│ ?", "", line).strip()
+            if not value:
+                continue
             if value.startswith("● "):
-                question = value[2:]
+                question, answer = [value[2:]], []
+                entries.append((question, answer))
             elif value.startswith("→ ") and question is not None:
-                if question in observed:
+                if answer:
                     return False
-                observed[question] = value[2:]
-                question = None
-        return set(observed) == {p["text"] for p in plans} and all(
-            TmuxInteractiveTransport._question_answer_matches(observed[p["text"]], p) for p in plans
+                answer.append(value[2:])
+            elif question is not None:
+                (answer if answer else question).append(value)
+            else:
+                return False
+
+        def normalize(text: str) -> str:
+            return " ".join(text.split())
+
+        observed = {normalize(" ".join(q)): normalize(" ".join(a)) for q, a in entries if a}
+        return (
+            len(observed) == len(entries) == len(plans)
+            and set(observed) == {normalize(p["text"]) for p in plans}
+            and all(
+                TmuxInteractiveTransport._question_answer_matches(
+                    observed[normalize(p["text"])],
+                    {**p, "values": [normalize(value) for value in p["values"]]},
+                )
+                for p in plans
+            )
         )
 
     async def _drive_question_page(self, plan: dict[str, Any], *, pane_id: str | None) -> None:

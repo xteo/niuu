@@ -384,7 +384,8 @@ def _question_widget(header: str, question: str, options: list[str], *, multi: b
                 ]
             )
         else:
-            lines.extend([question, ""])
+            # Native Claude Code 2.1.280 decorates its question with a gutter.
+            lines.extend([f"│ {question}", ""])
             labels = [*options, custom or ("Type something" if multi else "Type something.")]
             for index, label in enumerate(labels):
                 marker = "❯" if index == focus else " "

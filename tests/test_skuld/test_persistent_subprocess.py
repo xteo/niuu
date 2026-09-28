@@ -446,6 +446,16 @@ class TestPermissionControlProtocol:
         response = written["response"]["response"]
         assert response["behavior"] == "deny"
         assert "Color: blue" in response["message"]
+        assert events[-1] == {
+            "type": "ask_user_resolved",
+            "request_id": question["request_id"],
+            "decision": "answered",
+            "accepted": True,
+        }
+        with pytest.raises(ValueError, match="already answered"):
+            await transport.send_control(
+                "ask_user_answer", request_id=question["request_id"], answers=[]
+            )
 
     @pytest.mark.asyncio
     async def test_ask_user_question_without_questions_denies(self, tmp_path) -> None:
@@ -457,9 +467,10 @@ class TestPermissionControlProtocol:
         assert "No questions" in response["message"]
 
     @pytest.mark.asyncio
-    async def test_unknown_answer_request_id_is_ignored(self, tmp_path) -> None:
+    async def test_unknown_answer_request_id_is_rejected(self, tmp_path) -> None:
         transport, _ = self._transport_with_stdin(tmp_path)
-        await transport.send_control("ask_user_answer", request_id="nope", answers=[])
+        with pytest.raises(ValueError, match="Unknown or already answered"):
+            await transport.send_control("ask_user_answer", request_id="nope", answers=[])
 
     @pytest.mark.asyncio
     async def test_initialize_handshake_resolves_on_control_response(self, tmp_path) -> None:
