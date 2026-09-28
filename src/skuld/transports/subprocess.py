@@ -17,6 +17,10 @@ from niuu.adapters.cli.runtime import (
     stop_subprocess as _stop_process,
 )
 from niuu.ports.cli import CLITransport, TransportCapabilities
+from skuld.claude_permission import (
+    DEFAULT_CLAUDE_PERMISSION_MODE,
+    resolve_claude_permission_mode,
+)
 from skuld.slash_commands import build_slash_command_catalog, compose_slash_command_text
 from skuld.transports.claude_env import claude_spawn_env
 from skuld.transports.mcp_config import build_claude_mcp_config
@@ -25,7 +29,6 @@ from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
 
-_DEFAULT_PERMISSION_MODE = "bypassPermissions"
 _MAX_RETRIES = 5
 _RETRY_BASE_DELAY_MS = 1000
 _TRANSPORT_ERROR_DELAY_MS = 2000
@@ -56,6 +59,7 @@ class SubprocessTransport(CLITransport):
         workspace_dir: str,
         model: str = "",
         skip_permissions: bool = False,
+        claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
@@ -67,6 +71,7 @@ class SubprocessTransport(CLITransport):
         self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
+        self._claude_permission_mode = resolve_claude_permission_mode(claude_permission_mode)
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
@@ -156,7 +161,7 @@ class SubprocessTransport(CLITransport):
         if self._model:
             cmd.extend(["--model", self._model])
         if self._skip_permissions:
-            cmd.extend(["--permission-mode", _DEFAULT_PERMISSION_MODE])
+            cmd.extend(["--permission-mode", self._claude_permission_mode])
         if self._session_id:
             cmd.extend(["--resume", self._session_id])
         cmd.extend(

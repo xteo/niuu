@@ -1272,16 +1272,19 @@ class SessionService:
         transport for their origin. Volundr-born sessions carry the
         ``cli_session_id`` captured from broker activity reports — restarting
         them reloads the prior conversation on whatever transport their
-        definition selects (SDK, persistent subprocess, and Codex WebSocket
+        definition selects (tmux, SDK, persistent subprocess, and Codex WebSocket
         all support resume).
         """
         if session.external_session_id:
             broker = spec.values.setdefault("broker", {})
             broker["resumeSessionId"] = session.external_session_id
             if session.origin == "claude":
+                # Claude Code on Forge runs in tmux so the session stays steerable;
+                # ``claude --resume`` reloads the imported conversation there.
                 broker["cliType"] = "claude"
+                broker["transport"] = "tmux-interactive"
                 broker["transportAdapter"] = (
-                    "skuld.transports.persistent_subprocess.PersistentSubprocessTransport"
+                    "skuld.transports.tmux_interactive.TmuxInteractiveTransport"
                 )
             if session.origin == "codex":
                 broker["cliType"] = "codex-ws"

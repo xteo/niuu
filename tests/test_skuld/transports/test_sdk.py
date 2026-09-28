@@ -179,6 +179,7 @@ async def test_start_and_stop_manage_sdk_context(monkeypatch, tmp_path) -> None:
         workspace_dir=str(tmp_path),
         model="claude-opus-4-20250514",
         skip_permissions=True,
+        claude_permission_mode="bypassPermissions",
         agent_teams=True,
         system_prompt="System prompt",
         mcp_servers=[{"name": "linear", "command": "uvx", "args": ["linear-mcp"]}],
@@ -1113,7 +1114,11 @@ async def test_flag_off_omits_can_use_tool_callback(monkeypatch, tmp_path) -> No
     factory = _ClientFactory([[]])
     monkeypatch.setattr("skuld.transports.sdk.ClaudeSDKClient", factory)
 
-    transport = SDKTransport(workspace_dir=str(tmp_path), skip_permissions=True)
+    transport = SDKTransport(
+        workspace_dir=str(tmp_path),
+        skip_permissions=True,
+        claude_permission_mode="bypassPermissions",
+    )
     await transport.start()
 
     assert factory.options.can_use_tool is None

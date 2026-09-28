@@ -30,6 +30,7 @@ from pydantic_settings import (
 from niuu.domain.observability import ObservabilityConfig
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.mesh.config import MeshNatsConfig
+from skuld.claude_permission import DEFAULT_CLAUDE_PERMISSION_MODE
 
 
 class SkuldObservabilityConfig(ObservabilityConfig):
@@ -774,6 +775,16 @@ class SkuldSettings(BaseSettings):
         default="",
         description=(
             "Claude Remote Control permission-mode override; empty follows skip_permissions."
+        ),
+    )
+    # A Forge node decides how unattended Claude sessions run: YOLO where the host allows it,
+    # Claude's classifier-gated ``auto`` mode elsewhere. Set it once in the node's config file
+    # (``claude_permission_mode: bypassPermissions`` on YOLO hosts). Claude transports validate it.
+    claude_permission_mode: str = Field(
+        default=DEFAULT_CLAUDE_PERMISSION_MODE,
+        description=(
+            "Claude Code --permission-mode used when skip_permissions is on "
+            "(auto, bypassPermissions or acceptEdits)."
         ),
     )
     # Default ON: Claude tmux sessions launch with agent teams (--teammate-mode

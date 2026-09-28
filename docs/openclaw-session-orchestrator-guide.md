@@ -320,6 +320,42 @@ session_definitions:
 
 That keeps the rest of the built-in Codex transport settings intact.
 
+#### Claude permission mode is a node setting
+
+Each Forge node decides how its unattended Claude sessions run. Skuld brokers on local-process nodes read the
+node's config file (`NIUU_CONFIG`), so set it once there instead of on every session request:
+
+```yaml
+# YOLO hosts (Thor, DGX Spark) must say so explicitly:
+claude_permission_mode: bypassPermissions
+# Every other node runs Claude's classifier-gated auto mode, which is also the default.
+claude_permission_mode: auto
+```
+
+It applies when `skipPermissions` is on, for the tmux, persistent-subprocess, subprocess and SDK transports,
+and for Remote Control unless `remote_control_permission_mode` overrides it. Accepted values are `auto`,
+`bypassPermissions` and `acceptEdits`, in any case. `plan`, `manual`, `dontAsk` and `default` need a human to
+answer prompts. Only Claude transports check the value: a typo stops that node's Claude broker at start with the
+remedy and leaves its Codex and other engines running. The broker logs the mode in effect and warns when the
+node left the default.
+
+A definition can override the node for its own sessions with `defaults.broker.claudePermissionMode`; clients
+cannot set it per request. Kubernetes-backed Forge pods do not read the node config file, so there the definition
+key is the way to set it. Brokers read the setting when they start: running sessions pick up a change on their
+next stop/start.
+
+Claude Code sessions should run in tmux (`TmuxInteractiveTransport`) so they stay steerable. Point
+the default definition at it:
+
+```yaml
+session_definitions:
+  skuldClaude:
+    defaults:
+      broker:
+        transport: tmux-interactive
+        transportAdapter: skuld.transports.tmux_interactive.TmuxInteractiveTransport
+```
+
 #### Remote-access URLs should use `server.external_host`
 
 When the server binds to `0.0.0.0`, that is only the listen address. It is not a usable browser-facing host for remote clients.

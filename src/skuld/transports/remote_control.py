@@ -35,6 +35,10 @@ import subprocess
 from contextlib import suppress
 
 from niuu.ports.cli import CLITransport, TransportCapabilities
+from skuld.claude_permission import (
+    DEFAULT_CLAUDE_PERMISSION_MODE,
+    resolve_claude_permission_mode,
+)
 from skuld.transports.session_env import session_process_env
 
 logger = logging.getLogger("skuld.transport")
@@ -64,6 +68,7 @@ class RemoteControlTransport(CLITransport):
         cli_binary: str = "claude",
         session_name: str = "volundr",
         remote_control_permission_mode: str = "",
+        claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
         **_kwargs: object,
     ) -> None:
         super().__init__()
@@ -74,6 +79,7 @@ class RemoteControlTransport(CLITransport):
         self._cli_binary = cli_binary
         self._session_name = session_name
         self._permission_mode = remote_control_permission_mode
+        self._claude_permission_mode = resolve_claude_permission_mode(claude_permission_mode)
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._url: str | None = None
@@ -117,7 +123,7 @@ class RemoteControlTransport(CLITransport):
         name = f"{base}-{self._token}" if self._token else base
         # The native app uses the host permission mode for the sessions it spawns.
         perm = self._permission_mode or (
-            "bypassPermissions" if self._skip_permissions else "default"
+            self._claude_permission_mode if self._skip_permissions else "default"
         )
         return [
             binary,

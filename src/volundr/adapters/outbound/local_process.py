@@ -1544,6 +1544,13 @@ class LocalProcessPodManager(PodManager):
             if sandbox:
                 env["SKULD__SANDBOX"] = str(sandbox)
 
+            # Per-definition override of the node's claude_permission_mode (node config file).
+            claude_permission_mode = broker.get(
+                "claudePermissionMode", broker.get("claude_permission_mode")
+            )
+            if claude_permission_mode:
+                env["SKULD__CLAUDE_PERMISSION_MODE"] = str(claude_permission_mode)
+
             if "agentTeams" in broker:
                 env["SKULD__AGENT_TEAMS"] = str(bool(broker["agentTeams"])).lower()
 

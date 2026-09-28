@@ -219,6 +219,36 @@ class TestSkuldEnv:
         assert env["SKULD__SANDBOX"] == "workspace-write"
         assert env["SKULD__AGENT_TEAMS"] == "true"
 
+    def test_build_env_maps_claude_permission_mode_override(self) -> None:
+        """A definition can override the node's claude_permission_mode for its sessions."""
+        spec = SessionSpec(
+            values={
+                "broker": {
+                    "cliType": "claude",
+                    "transport": "tmux-interactive",
+                    "skipPermissions": True,
+                    "claudePermissionMode": "auto",
+                }
+            },
+            pod_spec=PodSpecAdditions(),
+        )
+
+        env = LocalProcessPodManager._build_env(spec, Path("/tmp/ws"))
+
+        assert env["SKULD__CLAUDE_PERMISSION_MODE"] == "auto"
+
+    def test_build_env_leaves_claude_permission_mode_to_the_node(self, monkeypatch) -> None:
+        """Without an override the broker reads the node config file's setting."""
+        monkeypatch.delenv("SKULD__CLAUDE_PERMISSION_MODE", raising=False)
+        spec = SessionSpec(
+            values={"broker": {"cliType": "claude", "skipPermissions": True}},
+            pod_spec=PodSpecAdditions(),
+        )
+
+        env = LocalProcessPodManager._build_env(spec, Path("/tmp/ws"))
+
+        assert "SKULD__CLAUDE_PERMISSION_MODE" not in env
+
     def test_build_env_includes_telegram_runtime_channel(self) -> None:
         """Broker telegram values are mapped to Skuld env vars."""
         spec = SessionSpec(

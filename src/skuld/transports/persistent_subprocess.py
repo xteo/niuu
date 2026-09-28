@@ -41,6 +41,10 @@ from niuu.adapters.cli.runtime import (
     stop_subprocess as _stop_process,
 )
 from niuu.ports.cli import CLITransport, TransportCapabilities
+from skuld.claude_permission import (
+    DEFAULT_CLAUDE_PERMISSION_MODE,
+    resolve_claude_permission_mode,
+)
 from skuld.slash_commands import build_slash_command_catalog, compose_slash_command_text
 from skuld.transports.claude_env import claude_spawn_env
 from skuld.transports.mcp_config import build_claude_mcp_config
@@ -49,7 +53,6 @@ from skuld.transports.tool_shims import ensure_codex_tool_shims
 
 logger = logging.getLogger("skuld.transport")
 
-_DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
 # StreamReader buffer for Claude stdout — single JSON events (esp. tool
 # results or large file reads) routinely exceed asyncio's default 64 KB
@@ -90,6 +93,7 @@ class PersistentSubprocessTransport(CLITransport):
         workspace_dir: str,
         model: str = "",
         skip_permissions: bool = False,
+        claude_permission_mode: str = DEFAULT_CLAUDE_PERMISSION_MODE,
         agent_teams: bool = False,
         system_prompt: str = "",
         initial_prompt: str = "",
@@ -103,6 +107,7 @@ class PersistentSubprocessTransport(CLITransport):
         self._session_tools = session_tools
         self._model = model
         self._skip_permissions = skip_permissions
+        self._claude_permission_mode = resolve_claude_permission_mode(claude_permission_mode)
         self._agent_teams = agent_teams
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
@@ -301,7 +306,7 @@ class PersistentSubprocessTransport(CLITransport):
             # --permission-prompt-tool=stdio is set; see _handle_control_request.
             cmd.extend(["--permission-prompt-tool", "stdio"])
         elif self._skip_permissions:
-            cmd.extend(["--permission-mode", _DEFAULT_PERMISSION_MODE])
+            cmd.extend(["--permission-mode", self._claude_permission_mode])
         # ``--resume`` applies when re-spawning after a crash or when a
         # resume id was seeded for an imported session. Otherwise the first
         # spawn has no session yet — Claude assigns one in its first
