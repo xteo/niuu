@@ -1205,6 +1205,60 @@ page_path: council/demo/opinion-b.md
     expect(result.current.pendingInputRequests).toHaveLength(0);
   });
 
+  it('restores an answered question when Skuld rejects the answer', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+
+    const question = {
+      type: 'ask_user_question',
+      request_id: 'tty-1-abc',
+      questions: [{ question: 'Deliver how?', options: [{ label: 'Folio' }, { label: 'Tar' }] }],
+    };
+    act(() => {
+      wsHandlers.onMessage?.(JSON.stringify(question));
+    });
+    act(() => result.current.respondToInput('tty-1-abc', ['Folio']));
+    expect(result.current.pendingInputRequests).toHaveLength(0);
+
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'error',
+          code: 'question_answer_rejected',
+          request_id: 'tty-1-abc',
+          content: 'The live Claude menu does not match the pending question state',
+        }),
+      );
+    });
+    expect(result.current.pendingInputRequests).toEqual([
+      {
+        requestId: 'tty-1-abc',
+        questions: [{ prompt: 'Deliver how?', choices: ['Folio', 'Tar'] }],
+      },
+    ]);
+    expect(result.current.messages.at(-1)?.content).toContain('does not match');
+
+    act(() => result.current.respondToInput('tty-1-abc', ['Folio']));
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({ type: 'ask_user_resolved', request_id: 'tty-1-abc', decision: 'Folio' }),
+      );
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'error',
+          code: 'question_answer_rejected',
+          request_id: 'tty-1-abc',
+          content: 'late duplicate',
+        }),
+      );
+      wsHandlers.onMessage?.(
+        JSON.stringify({ type: 'error', code: 'turn_failed', request_id: 'other', content: 'x' }),
+      );
+    });
+    expect(result.current.pendingInputRequests).toHaveLength(0);
+  });
+
   it('ignores malformed clarification requests and clears pending input', async () => {
     const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
 

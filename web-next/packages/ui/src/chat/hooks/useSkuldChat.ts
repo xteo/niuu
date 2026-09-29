@@ -251,6 +251,9 @@ interface UseSkuldChatResult {
 }
 
 const SINGLE_PARTICIPANT_ID = 'skuld-primary';
+// Skuld's correlated rejections of an answer (skuld/control_errors.py): the question is
+// still pending natively, so its card must come back.
+const ANSWER_REJECTION_CODES = new Set(['question_answer_rejected', 'question_recovery_required']);
 const STORAGE_PREFIX = 'niuu.skuldChat.v2.';
 
 type PersistedAgentEvent = Omit<AgentInternalEvent, 'timestamp'> & { timestamp?: string };
@@ -786,6 +789,9 @@ export function useSkuldChat(
   );
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingInputRequests, setPendingInputRequests] = useState<InputRequest[]>([]);
+  // Answered but not yet resolved by Skuld: a rejected answer restores its card, so the
+  // question stays answerable instead of vanishing while the agent still waits on it.
+  const answeredInputRequestsRef = useRef(new Map<string, InputRequest>());
   const [availableCommandsState, setAvailableCommandsState] = useState<{
     url: string | null;
     commands: SlashCommand[];
@@ -1826,6 +1832,14 @@ export function useSkuldChat(
                   (typeof event.content === 'string' ? event.content : 'Unknown error'));
             if (event.code && event.request_id) {
               optimisticUserMessagesRef.current.delete(event.request_id);
+              const answered = answeredInputRequestsRef.current.get(event.request_id);
+              if (answered && ANSWER_REJECTION_CODES.has(event.code)) {
+                answeredInputRequestsRef.current.delete(event.request_id);
+                setPendingInputRequests((prev) => [
+                  ...prev.filter((request) => request.requestId !== answered.requestId),
+                  answered,
+                ]);
+              }
               setMessages((previous) => [
                 ...previous.map((message) =>
                   message.id === event.request_id
@@ -2065,6 +2079,7 @@ export function useSkuldChat(
               requestId: event.request_id,
               questions: normalizedQuestions,
             };
+            answeredInputRequestsRef.current.delete(inputRequest.requestId);
             setPendingInputRequests((prev) => [
               ...prev.filter((request) => request.requestId !== inputRequest.requestId),
               inputRequest,
@@ -2073,6 +2088,7 @@ export function useSkuldChat(
           }
           case 'ask_user_resolved': {
             if (!event.request_id) break;
+            answeredInputRequestsRef.current.delete(event.request_id);
             setPendingInputRequests((prev) =>
               prev.filter((request) => request.requestId !== event.request_id),
             );
@@ -2587,7 +2603,11 @@ export function useSkuldChat(
         request_id: requestId,
         answers: values.map((answer) => ({ answer })),
       });
-      setPendingInputRequests((prev) => prev.filter((request) => request.requestId !== requestId));
+      setPendingInputRequests((prev) => {
+        const answered = prev.find((request) => request.requestId === requestId);
+        if (answered) answeredInputRequestsRef.current.set(requestId, answered);
+        return prev.filter((request) => request.requestId !== requestId);
+      });
     },
     [sendJson],
   );
@@ -2598,6 +2618,7 @@ export function useSkuldChat(
     setAgentEvents(new Map());
     setPendingPermissions([]);
     setPendingInputRequests([]);
+    answeredInputRequestsRef.current.clear();
     internalStreamsRef.current.clear();
     resetStreaming();
   }, [resetStreaming]);

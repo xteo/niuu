@@ -763,6 +763,28 @@ describe('LiveSessionDetailPage', () => {
     expect(screen.queryByText('Human Gate Requested')).not.toBeInTheDocument();
   });
 
+  it('shows a pending agent question and sends the chosen answer', async () => {
+    const respondToInput = vi.fn();
+    mockChatState({
+      pendingInputRequests: [
+        {
+          requestId: 'tty-1-6f17f32f',
+          questions: [
+            { prompt: 'Which accent colour do you prefer?', choices: ['Amber', 'Teal', 'Violet'] },
+          ],
+        },
+      ],
+      respondToInput,
+    });
+
+    wrap('test-session-id-1234');
+
+    expect(await screen.findByText('Which accent colour do you prefer?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Teal' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
+    expect(respondToInput).toHaveBeenCalledWith('tty-1-6f17f32f', ['Teal']);
+  });
+
   it('surfaces mesh-driven workflow gates and sends change requests through chat', async () => {
     const sendDirectedMessages = vi.fn();
     mockChatState({
