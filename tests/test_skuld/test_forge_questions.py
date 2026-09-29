@@ -30,6 +30,9 @@ tmux"):
     resolve contract. Drift is documented.
   * E7 — turn end clears a stale prompt: an unanswered question, then the turn
     ends → the pending tty prompt is resolved+cleared and not replayed later.
+  * E8 — a question outlives the turn's max duration: waiting on the human is not
+    a stuck turn, so the question stays pending and awaiting_input, is replayed to
+    a client that connects later, and that client's answer is consumed.
 
 The tmux scenarios are @pytest.mark.integration (default addopts deselect them)
 and skip when tmux is unavailable. Run them on the real-tmux tier:
@@ -766,3 +769,51 @@ async def test_e7_turn_end_clears_stale_prompt_and_does_not_replay() -> None:
         assert replayed == [], (
             f"a resolved/cleared question must NOT be replayed to a new client; got {replayed}"
         )
+
+
+# --------------------------------------------------------------------------- E8
+
+
+@pytest.mark.integration
+@pytest.mark.tmux
+@pytest.mark.asyncio
+async def test_e8_question_outlives_turn_max_and_is_answerable_after_reconnect() -> None:
+    """E8: the turn watchdog never times out a turn blocked on a question.
+
+    Regression for a runner session (29 Sep 2026): one hour after the turn began the
+    watchdog ended it while Claude still showed the AskUserQuestion menu. The result
+    cleared every pending card, Forge reported the session idle, and a client that
+    connected afterwards got no question and could not answer it.
+    """
+    _require_tmux()
+
+    async with BrokerHarness(hooks=True, idle_timeout_s=0.3) as h:
+        first = await h.connect()
+        h.transport._turn_max_seconds = 0.5  # noqa: SLF001 - test seam
+        first.send({"type": "message", "content": "ask:Database|Which DB?|Postgres;SQLite"})
+        ask = await first.wait_for_type("ask_user_question", timeout=8.0)
+        request_id = ask["request_id"]
+
+        await asyncio.sleep(1.5)  # three times the turn's max duration
+        assert not [f for f in first.frames if f.get("type") == "result"]
+        assert request_id in h.broker._pending_ask_user_questions  # noqa: SLF001
+        assert h.broker._activity_state == "awaiting_input"  # noqa: SLF001
+        assert not _resolved_frames(first.frames)
+
+        later = await h.connect()
+        await later.wait_for(
+            lambda frames: any(f.get("request_id") == request_id for f in _ask_frames(frames)),
+            timeout=5.0,
+        )
+        await _page(h).wait_for_text("2. SQLite", timeout=8.0)
+        later.ask_user_answer(request_id, [{"answer": "SQLite"}])
+        await later.wait_for(
+            lambda frames: any(
+                f.get("type") == "ask_user_resolved"
+                and f.get("request_id") == request_id
+                and f.get("accepted") is True
+                for f in frames
+            ),
+            timeout=8.0,
+        )
+        await _page(h).wait_for_text("chose: SQLite", timeout=8.0)

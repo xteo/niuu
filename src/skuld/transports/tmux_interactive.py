@@ -110,6 +110,10 @@ _KEY_ALIASES = {
     "pagedown": "PageDown",
 }
 
+# Claude modes that render no gate of their own for AskUserQuestion: its
+# PermissionRequest hook still fires, but only the question menu is on screen.
+_NO_GATE_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
+
 _CLAUDE_HOOK_EVENTS = [
     "SessionStart",
     "UserPromptSubmit",
@@ -1932,11 +1936,14 @@ class TmuxInteractiveTransport(CLITransport):
         """
         tool_name = self._coerce_str(payload.get("tool_name")) or "this action"
         tool_input = payload.get("tool_input")
-        # In bypass mode AskUserQuestion still fires PermissionRequest for the
-        # question itself. PreToolUse already surfaced that exact question. Keep
-        # the advisory hook event, but do not invent a second authorization gate.
+        # In bypass and auto mode AskUserQuestion still fires PermissionRequest for
+        # the question itself, but Claude renders no gate: only the question menu.
+        # PreToolUse already surfaced that exact question. Keep the advisory hook
+        # event, but do not invent a second authorization gate. Claude reports its
+        # live mode in the hook payload (the runner may set it in user settings, and
+        # a user can switch modes mid-session); Skuld's own flag is the fallback.
         if (
-            self._skip_permissions
+            self._permission_mode_has_no_gate(payload)
             and tool_name == "AskUserQuestion"
             and isinstance(tool_input, dict)
             and tool_input.get("questions")
@@ -1971,6 +1978,28 @@ class TmuxInteractiveTransport(CLITransport):
             "native_session_id": self._coerce_str(payload.get("session_id")),
         }
         await self._emit_ask_user_question(request_id, [question])
+
+    def _permission_mode_has_no_gate(self, payload: dict[str, Any]) -> bool:
+        mode = self._coerce_str(payload.get("permission_mode"))
+        if mode:
+            return mode in _NO_GATE_PERMISSION_MODES
+        return self._skip_permissions
+
+    def _rows_show_pending_question(self, request_id: str, rows: list[tuple[int, str]]) -> bool:
+        """Whether the live menu is another pending question rather than this permission."""
+        live = {label.strip().casefold() for _, label in rows}
+        for other_id, pending in self._pending_tty_prompts.items():
+            if other_id == request_id or pending.get("kind") != "question":
+                continue
+            for question in pending.get("questions") or []:
+                labels = {
+                    option["label"].strip().casefold()
+                    for option in (question.get("options") or [])
+                    if isinstance(option, dict) and isinstance(option.get("label"), str)
+                }
+                if labels and labels <= live:
+                    return True
+        return False
 
     async def _surface_tty_ask_user_question(
         self, tool_input: dict[str, Any], *, payload: dict[str, Any] | None = None
@@ -2222,6 +2251,11 @@ class TmuxInteractiveTransport(CLITransport):
                 if self._pending_tty_prompts.get(request_id) is not pending:
                     raise ValueError(
                         "The native Claude permission prompt ended while its menu was rendering"
+                    )
+                if self._rows_show_pending_question(request_id, rows):
+                    raise ValueError(
+                        "The live Claude menu is a pending question, not this permission; "
+                        "no keys were sent. Answer the question instead"
                     )
                 digit = self._permission_menu_digit(low, rows)
                 if digit is None:
@@ -3477,11 +3511,24 @@ class TmuxInteractiveTransport(CLITransport):
             await self._emit_synthetic_delta(delta)
 
     async def _watch_turn_completion(self, done: asyncio.Event) -> None:
+        # Time a human spends on a pending question or permission is not turn time: the
+        # native CLI is blocked on its menu, and ending the turn would drop the only
+        # answerable record of that menu (and report the session idle) while it waits.
+        waited = 0.0
+        waiting_since: float | None = None
         try:
             while not done.is_set():
                 now = time.monotonic()
+                if self._pending_tty_prompts:
+                    if waiting_since is None:
+                        waiting_since = now
+                    await asyncio.sleep(0.2)
+                    continue
+                if waiting_since is not None:
+                    waited += now - waiting_since
+                    waiting_since = None
                 if self._hook_events_enabled:
-                    if now - self._turn_started_at >= self._turn_max_seconds:
+                    if now - self._turn_started_at - waited >= self._turn_max_seconds:
                         await self._finish_hook_turn(
                             content="",
                             reason="timeout",
@@ -3497,7 +3544,7 @@ class TmuxInteractiveTransport(CLITransport):
                 elif now - self._turn_started_at >= self._turn_no_output_timeout_s:
                     await self._finish_synthetic_turn(reason="no_terminal_output")
                     return
-                if now - self._turn_started_at >= self._turn_max_seconds:
+                if now - self._turn_started_at - waited >= self._turn_max_seconds:
                     await self._finish_synthetic_turn(reason="timeout", is_error=True)
                     return
                 await asyncio.sleep(0.2)

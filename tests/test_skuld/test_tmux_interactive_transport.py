@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -1489,6 +1490,47 @@ async def test_native_work_after_stop_rearms_completion_watchdog(tmp_path: Path)
         )
         assert transport._turn_done is not previous
         await _wait_until(lambda: any(e.get("stop_reason") == "timeout" for e in events))
+        assert not transport.is_turn_active
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_turn_max_clock_pauses_while_a_prompt_waits_for_the_human(tmp_path: Path) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    try:
+        transport._turn_max_seconds = 0.4
+        await transport.handle_claude_hook(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "review the diff"}
+        )
+        await transport.handle_claude_hook(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "ask",
+                "tool_input": {
+                    "questions": [
+                        {
+                            "question": "Deliver how?",
+                            "header": "Delivery",
+                            "options": [{"label": "Folio"}, {"label": "Tarball"}],
+                            "multiSelect": False,
+                        }
+                    ]
+                },
+            }
+        )
+        [rid] = list(transport._pending_tty_prompts)
+        await asyncio.sleep(1.2)  # three times the turn's max duration
+        assert transport.is_turn_active
+        assert rid in transport._pending_tty_prompts
+        assert not any(e["type"] in {"result", "ask_user_resolved"} for e in events)
+
+        transport._pending_tty_prompts.clear()  # answered: the turn clock resumes
+        resumed = time.monotonic()
+        await _wait_until(lambda: any(e.get("stop_reason") == "timeout" for e in events))
+        assert time.monotonic() - resumed >= 0.2  # the wait never counted as turn time
         assert not transport.is_turn_active
     finally:
         await transport.stop()
