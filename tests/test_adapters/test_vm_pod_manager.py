@@ -584,3 +584,19 @@ async def test_unconfirmed_sandbox_deletion_keeps_vm_and_capacity(setup):
     assert len(provider.machines) == 1
     assert (await manager.capacity()).available == 0
     assert next(iter(repository.leases.values())).state == LeaseState.READY
+
+
+async def test_status_of_a_ready_session_never_fails_on_a_concurrent_lease_operation(setup):
+    manager, service, repository, provider, runtime, store, session = setup
+    await manager.start(session, SessionSpec(values={}, pod_spec=PodSpecAdditions()))
+    assert await manager.wait_for_ready(session, 0.2) == SessionStatus.RUNNING
+    lease = next(iter(repository.leases.values()))
+    repository.leases[lease.id] = lease.model_copy(update={"state": LeaseState.READY})
+    busy = AsyncMock(side_effect=ComputeLeaseBusyError("in progress"))
+    service.mark_busy = busy
+    assert await manager.status(session) == SessionStatus.RUNNING
+    busy.assert_awaited_once()
+    repository.leases[lease.id] = lease.model_copy(update={"state": LeaseState.BUSY})
+    busy.reset_mock()
+    assert await manager.status(session) == SessionStatus.RUNNING
+    busy.assert_not_awaited()

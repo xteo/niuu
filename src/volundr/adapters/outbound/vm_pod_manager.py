@@ -697,7 +697,13 @@ class VmPodManager(PodManager):
             return SessionStatus.PROVISIONING
         if not await runtime.ready(lease, bootstrap):
             return SessionStatus.PROVISIONING
-        await service.mark_busy(lease.id)
+        if lease.state is not LeaseState.BUSY:
+            try:
+                await service.mark_busy(lease.id)
+            except ComputeLeaseBusyError:
+                # Another operation holds the allocation. The runtime is ready,
+                # so a read must not fail; the next status check records BUSY.
+                pass
         return SessionStatus.RUNNING
 
     async def status_detail(self, session: Session) -> str | None:
