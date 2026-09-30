@@ -441,6 +441,9 @@ class TmuxInteractiveTransport(CLITransport):
         self._send_lock = asyncio.Lock()
         # In-flight post-Enter submit-confirm loops (fire-and-forget; cancelled on stop()).
         self._confirm_submit_tasks: set[asyncio.Task[None]] = set()
+        # Re-read a permission gate's live menu once it draws (e.g. Workflow's own
+        # "Yes, run it / View raw script / No") so its real rows become answerable.
+        self._permission_refinements: set[asyncio.Task[None]] = set()
         # Assistant texts already emitted via MessageDisplay this turn (re-display dedup +
         # the Stop-hook final-message twin guard) + per-message flush accumulators.
         self._turn_displayed_texts: list[str] = []
@@ -773,6 +776,9 @@ class TmuxInteractiveTransport(CLITransport):
             for task in list(self._confirm_submit_tasks):
                 task.cancel()
             self._confirm_submit_tasks.clear()
+            for task in list(self._permission_refinements):
+                task.cancel()
+            self._permission_refinements.clear()
             for task in list(self._tail_tasks.values()):
                 task.cancel()
             for task in list(self._frame_tasks.values()):
@@ -1978,6 +1984,61 @@ class TmuxInteractiveTransport(CLITransport):
             "native_session_id": self._coerce_str(payload.get("session_id")),
         }
         await self._emit_ask_user_question(request_id, [question])
+        task = asyncio.create_task(
+            self._refine_permission_options(request_id),
+            name=f"tmux-permission-menu-{self._session_name}",
+        )
+        self._permission_refinements.add(task)
+        task.add_done_callback(self._permission_refinements.discard)
+
+    async def _refine_permission_options(self, request_id: str) -> None:
+        """Replace the generic Allow/Deny card with a custom gate's real menu rows.
+
+        Most gates render Claude's standard permission menu, which the generic card
+        already maps. Some tools draw their own confirmation (Workflow: "Yes, run it /
+        View raw script / No"); without its real labels no client could answer it.
+        """
+        rows = await self._capture_menu_rows_wait()
+        pending = self._pending_tty_prompts.get(request_id)
+        if (
+            not rows
+            or pending is None
+            or pending.get("kind") != "permission"
+            or pending.get("answer_in_flight")
+            or pending.get("answer_uncertain")
+            or self._rows_show_pending_question(request_id, rows)
+            or not self._custom_confirmation(rows)
+        ):
+            return
+        labels = [label for _, label in rows]
+        question = {**pending["questions"][0], "options": [{"label": label} for label in labels]}
+        pending["questions"] = [question]
+        pending["live_labels"] = labels
+        await self._emit_ask_user_question(request_id, pending["questions"])
+
+    @classmethod
+    def _custom_confirmation(cls, rows: list[tuple[int, str]]) -> bool:
+        """A yes/no-style menu that is not Claude's standard permission menu."""
+        if cls._permission_menu_digit("allow", rows) is not None:
+            return False
+        labels = [label.strip().casefold() for _, label in rows]
+        return (
+            len(set(labels)) == len(labels)
+            and any(re.match(r"(yes|allow)\b", label) for label in labels)
+            and any(re.match(r"(no|deny)\b", label) for label in labels)
+        )
+
+    @classmethod
+    def _custom_confirmation_digit(cls, chosen: str, rows: list[tuple[int, str]]) -> int | None:
+        """Map only the generic Deny onto a custom menu's unique "No" row.
+
+        A generic Allow never maps: a custom affirmative row can carry a broader scope
+        ("Yes, allow for this session"), so the client must choose the live label.
+        """
+        if chosen != "deny" or not cls._custom_confirmation(rows):
+            return None
+        matches = [d for d, label in rows if re.match(r"(no|deny)\b", label.strip().casefold())]
+        return matches[0] if len(matches) == 1 else None
 
     def _permission_mode_has_no_gate(self, payload: dict[str, Any]) -> bool:
         mode = self._coerce_str(payload.get("permission_mode"))
@@ -2239,7 +2300,9 @@ class TmuxInteractiveTransport(CLITransport):
         if kind == "permission":
             chosen = self._first_answer_text(answers)
             low = chosen.strip().casefold()
-            if low not in {"allow", "allow & don't ask again", "deny"}:
+            live = {label.strip().casefold(): label for label in pending.get("live_labels") or ()}
+            standard = low in {"allow", "allow & don't ask again", "deny"}
+            if not standard and low not in live:
                 raise ValueError("The requested answer is not a declared Claude permission option")
             # Claimed for the rest of this branch (see the question-path comment below):
             # `_capture_menu_rows_wait` is a bounded poll with real `await`s, and a
@@ -2257,12 +2320,21 @@ class TmuxInteractiveTransport(CLITransport):
                         "The live Claude menu is a pending question, not this permission; "
                         "no keys were sent. Answer the question instead"
                     )
-                digit = self._permission_menu_digit(low, rows)
+                standard_menu = self._permission_menu_digit(low, rows) if standard else None
+                if standard_menu is not None:
+                    digit = standard_menu
+                elif standard:
+                    digit = self._custom_confirmation_digit(low, rows)
+                else:
+                    digit = next((d for d, label in rows if label.strip().casefold() == low), None)
                 if digit is None:
                     raise ValueError("The requested answer does not match the live Claude menu")
                 pending["answer_uncertain"] = True
-                await self._send_key("Escape" if low == "deny" else str(digit), pane_id=pane_id)
-                await self._resolve_tty_answer(request_id, "deny" if low == "deny" else chosen)
+                # Claude's standard menu declines with Escape; a custom menu uses its own row.
+                escape = low == "deny" and standard_menu is not None
+                await self._send_key("Escape" if escape else str(digit), pane_id=pane_id)
+                decision = "deny" if low == "deny" else (live.get(low) or chosen)
+                await self._resolve_tty_answer(request_id, decision)
             finally:
                 pending.pop("answer_in_flight", None)
             return
