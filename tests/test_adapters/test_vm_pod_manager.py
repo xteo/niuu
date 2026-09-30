@@ -12,7 +12,9 @@ from niuu.ports.session_proxy import SessionProxyTarget
 from tests.compute_fakes import LeaseRepository, Provider
 from volundr.adapters.outbound.vm_pod_manager import VmPodManager
 from volundr.domain.compute import (
+    ComputeCapacityError,
     ComputeLeaseBusyError,
+    ComputeProvisioningLimitError,
     LeaseState,
     MachineBootstrap,
     MachineProviderError,
@@ -600,3 +602,82 @@ async def test_status_of_a_ready_session_never_fails_on_a_concurrent_lease_opera
     busy.reset_mock()
     assert await manager.status(session) == SessionStatus.RUNNING
     busy.assert_not_awaited()
+
+
+def _manager(setup, **kwargs):
+    _, service, repository, _, runtime, _, _ = setup
+    manager = VmPodManager(
+        profile="small", pool_id="pool", max_machines=1, poll_interval_seconds=0.001, **kwargs
+    )
+    manager.configure_compute(
+        service, repository, runtime, MachineBootstrap(), pool_id="pool", max_machines=1
+    )
+    return manager
+
+
+async def test_start_waits_behind_the_provisioning_limit_instead_of_failing(setup):
+    manager, service, repository, _, _, _, session = setup
+    acquire = service.acquire
+    refusals = 0
+
+    async def busy_pool(**claim):
+        nonlocal refusals
+        if refusals < 3:
+            refusals += 1
+            raise ComputeProvisioningLimitError("Compute pool provisioning limit reached")
+        return await acquire(**claim)
+
+    service.acquire = busy_pool
+    result = await manager.start(session, SessionSpec(values={}, pod_spec=PodSpecAdditions()))
+
+    assert refusals == 3
+    assert result.pod_name == str(next(iter(repository.leases)))
+
+
+async def test_a_full_pool_still_fails_at_once_and_a_stuck_queue_times_out(setup):
+    _, service, _, _, _, _, session = setup
+    manager = _manager(setup, provisioning_timeout_seconds=0.05)
+    spec = SessionSpec(values={}, pod_spec=PodSpecAdditions())
+
+    async def full(**claim):
+        raise ComputeCapacityError("Compute pool pool has no unreserved slots")
+
+    service.acquire = full
+    with pytest.raises(ComputeCapacityError, match="no unreserved slots"):
+        await manager.start(session, spec)
+
+    async def limited(**claim):
+        raise ComputeProvisioningLimitError("Compute pool provisioning limit reached")
+
+    service.acquire = limited
+    with pytest.raises(ComputeProvisioningLimitError):
+        await manager.start(session, spec)
+
+
+async def test_an_unprepared_runtime_is_logged_surfaced_and_named_on_timeout(setup, caplog):
+    _, _, repository, _, runtime, _, session = setup
+    manager = _manager(
+        setup,
+        provisioning_timeout_seconds=0.2,
+        runtime_wait_log_every=1000,
+        runtime_wait_surface_after=2,
+    )
+    reason = "Runner has no Skuld venv at /home/horde/.niuu-runner/venv-bc174c8d/bin/python"
+    runtime.start.side_effect = VmRuntimeUnavailableError(reason)
+
+    with caplog.at_level("WARNING", logger="volundr.adapters.outbound.vm_pod_manager"):
+        with pytest.raises(RuntimeError, match="did not become ready within 0.2s: Runner has no"):
+            await manager.start(session, SessionSpec(values={}, pod_spec=PodSpecAdditions()))
+
+    warnings = [r for r in caplog.records if "VM runtime not ready" in r.getMessage()]
+    assert len(warnings) == 1 and reason in warnings[0].getMessage()
+    # The session shows why it is still provisioning; a stop clears the reason.
+    assert await manager.status_detail(session) == f"Runtime not ready: {reason}"
+    runtime.start.side_effect = None
+    assert await manager.stop(session)
+    assert session.id not in manager._wait_reasons
+
+
+def test_runtime_wait_reporting_counts_must_be_positive():
+    with pytest.raises(ValueError, match="reporting counts"):
+        VmPodManager(profile="small", pool_id="pool", max_machines=1, runtime_wait_log_every=0)
