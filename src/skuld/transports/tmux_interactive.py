@@ -1056,19 +1056,22 @@ class TmuxInteractiveTransport(CLITransport):
         text = _PASTED_CONTENT_WRAPPER_RE.sub("", text)
         return " ".join(text.split())
 
-    def _match_prompt_correlation(self, prompt: str) -> tuple[str | None, str | None]:
+    def _match_prompt_correlation(self, prompt: str) -> tuple[bool, str | None, str | None]:
         """Pop the delivered-message correlation whose text matches this submitted
-        prompt and return its (msg_id, request_id). Returns (None, None) without
-        consuming anything when there's no match (a prompt we didn't originate, e.g.
-        a slash command typed directly in the pane), so ids are never mis-attributed."""
+        prompt and return (matched, msg_id, request_id). Returns (False, None, None)
+        without consuming anything when there's no match (a prompt we didn't originate,
+        e.g. a slash command typed directly in the pane), so ids are never mis-attributed.
+
+        ``matched`` is separate from the ids: the session's initial prompt is delivered
+        without a msg_id/request_id, yet it still proves the main pane's native id."""
         target = self._normalize_prompt(prompt)
         if not target:
-            return None, None
+            return False, None, None
         for i, (msg_id, request_id, norm) in enumerate(self._pending_prompt_correlations):
             if norm == target:
                 del self._pending_prompt_correlations[i]
-                return msg_id, request_id
-        return None, None
+                return True, msg_id, request_id
+        return False, None, None
 
     def _begin_turn(self) -> None:
         """Start tracking a new turn so its output streams and completion fires.
@@ -1283,12 +1286,12 @@ class TmuxInteractiveTransport(CLITransport):
             prompt_str = prompt if isinstance(prompt, str) else ""
             # Claude just took a user prompt into its flow. Correlate it back to the
             # message we pasted so the client can flip THAT steering bubble to active.
-            msg_id, request_id = self._match_prompt_correlation(prompt_str)
+            matched, msg_id, request_id = self._match_prompt_correlation(prompt_str)
             # NATIVE-ID CAPTURE: a prompt that correlates to something WE pasted is provably
             # the MAIN pane's conversation (teammate/subagent claude processes share this hook
             # endpoint and POST their OWN session ids — blind capture would wire a restart to
             # resume a subagent's conversation). Uncorrelated prompts are ignored.
-            if msg_id or request_id:
+            if matched:
                 native = payload.get("session_id")
                 if isinstance(native, str) and native.strip():
                     self._claude_native_session_id = native.strip()

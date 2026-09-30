@@ -1865,6 +1865,68 @@ async def test_pasted_content_wrapped_prompt_still_correlates(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_initial_prompt_without_ids_still_captures_the_native_session(
+    tmp_path: Path,
+) -> None:
+    """Regression from a Work runner session (gtc-web-sdk, 30 Sep 2026): a session
+    started with an initial prompt and never messaged again. The initial prompt is
+    pasted without a msg_id/request_id, so the matched correlation looked like "no
+    match", the native id was never captured, every AskUserQuestion failed
+    ``ControlRecoveryError("This question has no verifiable native tool identity")``,
+    and a terminal answer could not retire the card (awaiting_input stuck)."""
+    native = "5d3a6d7c-1f3b-4f7e-9d0e-2b1a4c6e8f00"
+    transport = FakeTmuxInteractiveTransport(
+        str(tmp_path), sdk_port=8081, initial_prompt="Review the GTC web SDK."
+    )
+    events = await _collect_events(transport)
+    await transport.start()
+    await transport.send_message("Review the GTC web SDK.")  # as the startup seed does
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Review the GTC web SDK.",
+            "session_id": native,
+        }
+    )
+    assert transport.session_id == native
+
+    questions = [
+        {
+            "question": "Which SDK target first?",
+            "header": "Target",
+            "options": [{"label": "Web"}, {"label": "Node"}],
+            "multiSelect": False,
+        }
+    ]
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "toolu_ask",
+            "session_id": native,
+            "tool_input": {"questions": questions},
+        }
+    )
+    [pending] = transport._pending_tty_prompts.values()
+    assert pending["native_tool_use_id"] == "toolu_ask"
+    assert pending["native_session_id"] == native
+
+    # Answered in the terminal: the native completion retires the card.
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "toolu_ask",
+            "session_id": native,
+            "tool_response": {"answers": {"Which SDK target first?": "Web"}},
+        }
+    )
+    assert not transport._pending_tty_prompts
+    assert any(e.get("type") == "ask_user_resolved" for e in events)
+    await transport.stop()
+
+
+@pytest.mark.asyncio
 async def test_turn_end_resolves_stale_prompt(tmp_path: Path) -> None:
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
     events = await _collect_events(transport)
