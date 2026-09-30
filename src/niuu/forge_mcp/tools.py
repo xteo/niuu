@@ -20,10 +20,13 @@ from niuu.domain.notifications import (
     AGENT_KINDS,
     MAX_BODY_CHARS,
     MAX_CORRELATION_ID_CHARS,
+    MAX_IMAGE_ALT_CHARS,
+    MAX_IMAGE_URL_CHARS,
     MAX_LINK_LABEL_CHARS,
     MAX_LINK_URL_CHARS,
     MAX_LINKS,
     MAX_TITLE_CHARS,
+    PRESENTED_FILE_ID_PATTERN,
     NotificationDraft,
     NotificationKind,
     NotificationLinkKind,
@@ -37,6 +40,7 @@ from niuu.domain.session_description import (
 )
 from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
+    NOTIFICATION_IMAGE_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
 )
 from niuu.forge_mcp.models import (
@@ -299,6 +303,32 @@ _NOTIFY_SCHEMA = _object(
             "maxLength": MAX_CORRELATION_ID_CHARS,
             "description": "Optional id tying related notifications together (e.g. a PR number).",
         },
+        "image": {
+            **_object(
+                {
+                    "file_id": {
+                        "type": "string",
+                        "pattern": PRESENTED_FILE_ID_PATTERN,
+                        "description": "The file_id present-file returned for the image.",
+                    },
+                    "url": {
+                        "type": "string",
+                        "pattern": "^https://",
+                        "maxLength": MAX_IMAGE_URL_CHARS,
+                        "description": "An https:// URL of an image already online.",
+                    },
+                    "alt": {
+                        "type": "string",
+                        "maxLength": MAX_IMAGE_ALT_CHARS,
+                        "description": "Short description of what the image shows.",
+                    },
+                }
+            ),
+            "description": (
+                "Optional image shown with the notification: exactly one of file_id "
+                "(from present-file) or url, plus alt text. Forge keeps its own copy."
+            ),
+        },
     },
     required=("kind", "title"),
 )
@@ -309,13 +339,19 @@ conversation, in the Forge Notifications feed across every session and host, and
 may reach the user's phone or chat through their delivery rules.
 
 Link artifacts (PR URLs, files you presented with present-file via kind=file and \
-file_id, other sessions) in `links`.
+file_id, other sessions) in `links`. Attach an image with `image: {file_id}` from \
+present-file, or `image: {url}`, and add `alt` text.
 
 Returns {notification_id, turn_id, session_seq, state}. state=committed means \
 Forge recorded it; state=pending means it is saved in this session's durable log \
 and will reach Forge automatically when Forge is reachable — do not resend it."""
 _NOTIFY_DESCRIPTION += (
-    "\n\n" + NOTIFICATION_TRIGGER_GUIDANCE + "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+    "\n\n"
+    + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\n"
+    + COMPACT_NOTIFICATION_GUIDANCE
+    + "\n\n"
+    + NOTIFICATION_IMAGE_GUIDANCE
 )
 
 
@@ -349,12 +385,18 @@ Record a notification in the Forge Notifications feed for a session you own \
 is not added to the session's transcript. It appears in the feed across every \
 host and may reach the owner's phone or chat through their delivery rules.
 
-Link artifacts in `links`.
+Link artifacts in `links`. Attach an image with `image: {file_id}` from \
+present-file, or `image: {url}`, and add `alt` text.
 
 idempotency_key is required: retrying with the same key returns the notification \
 already recorded. Returns {notification_id, seq, session_id, state}."""
 _FEED_NOTIFY_DESCRIPTION += (
-    "\n\n" + NOTIFICATION_TRIGGER_GUIDANCE + "\n\n" + COMPACT_NOTIFICATION_GUIDANCE
+    "\n\n"
+    + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\n"
+    + COMPACT_NOTIFICATION_GUIDANCE
+    + "\n\n"
+    + NOTIFICATION_IMAGE_GUIDANCE
 )
 
 
@@ -783,6 +825,8 @@ def _notification_summary(raw: dict[str, Any], *, max_body_chars: int) -> dict[s
         "source",
         "title",
         "links",
+        "image_state",
+        "image_error",
         "created_at",
         "read",
     )
