@@ -22,6 +22,8 @@ using the same append path as present-file.
   `input` = the draft, plus `notification_id`.
 - `turn.metadata` is `{kind: "notification", notification: <same input>}`. It
   never sets `final_output`.
+- The draft may carry one `image` reference (§11). It appears in `input` only when
+  set, so turns without an image keep their earlier shape.
 
 Notification id: `notification_id(turn_dedupe_key(session_id, turn.id, kind))`,
 where `session_id` is the Forge session UUID string.
@@ -107,8 +109,14 @@ The notification JSON (`NotificationResponse`):
  "owner_id":"…","tenant_id":"…","project_id":"…|null","kind":"milestone","severity":"info",
  "source":"agent","title":"…","body":"markdown","links":[{"label":"…","url":"…","kind":"url","file_id":null}],
  "engine":"claude|codex|…|null","model":"…|null","correlation_id":null,
+ "image":{"url":"/api/v1/forge/notifications/{id}/image",
+          "thumbnail_url":"/api/v1/forge/notifications/{id}/image?variant=thumb",
+          "mime":"image/png","width":1200,"height":800,"alt":"…|null"}|null,
+ "image_state":"pending|ready|failed|null","image_error":"…|null",
  "created_at":"ISO-8601","read":false,"instance_id":"<added by the Guild facade>"}
 ```
+`image` is present only when Forge holds a stored copy (§11); `image_state` is null
+when no image was attached.
 `read` is computed per reader as `seq <= read_through_seq` **or** an individual
 acknowledgement in `forge_notification_reads(user_id, notification_id, read_at)`.
 Opening a card must not advance the host watermark or clear other unopened cards.
@@ -137,6 +145,7 @@ request when the IDs differ. Never guess by text, timestamp or raw log sequence.
 | `GET /notifications/rules`, `POST /notifications/rules`, `PUT /notifications/rules/{id}`, `DELETE /notifications/rules/{id}` | Owner-scoped rule CRUD. |
 | `GET /notifications/{id}/deliveries` | Delivery status rows for one notification. |
 | `GET /notifications/sinks` | Available sink names for the rule UI: `[{name, label, requires_integration}]`. |
+| `GET /notifications/{id}/image[?variant=thumb]` | The stored image bytes (§11), with the same read access as the notification. 404 when there is no stored image. |
 
 `GET /notifications` query parameters:
 - Paging: `limit` (default 50, max 200), `before=<seq>` (newest first), or
@@ -165,7 +174,11 @@ An empty list in `match` means "any".
   without `read`.
 - Only the owner (or an admin) receives it. Filter it in the SSE handler before
   sending; other event types are unchanged.
-- The Guild facade forwards it unchanged, adding `instance_id` as it already does.
+- The Guild facade forwards it unchanged, adding `instance_id` as it already does
+  (and routing the image URLs, §6).
+- A notification with an image is broadcast once, when its image copy settles, so
+  the event carries the same `image` object as the feed. Its event may therefore
+  arrive after a later notification's; `seq` order in the feed is unchanged.
 - Clients recover gaps with `GET /notifications?after=<last seen seq per instance>`.
 - Sleipnir: `volundr.session.notification` is registered and mirrored from the
   broadcaster, like needs_input.
@@ -201,6 +214,11 @@ An empty list in `match` means "any".
   - `GET` returns the union de-duplicated by token (first instance wins), and fails
     naming an unreachable instance instead of setting
     `X-Forge-Unavailable-Instances`, since a partial list reads as "not registered".
+- Images: every notification the facade returns (feed pages, session lists, submits,
+  SSE events) has its `image.url` / `image.thumbnail_url` rewritten to the same path
+  plus `instance_id=<owning host>`. `GET /notifications/{id}/image` goes to the host
+  named by `instance_id` (the default host otherwise), like `PUT …/read`; the host
+  applies the notification's read access. A single Forge node returns the plain URL.
 
 ## 7. Delivery (delivery workstream)
 
@@ -309,3 +327,36 @@ As built (auth workstream). The operator guide is
   - A rules panel manages delivery rules.
 - Port `INotificationFeed`, with http and mock adapters and co-located tests.
   Playwright spec at `e2e/` (happy path, loading, error, keyboard).
+
+## 11. Notification images (shared)
+
+**Input.** `NotificationDraft.image` is an optional `NotificationImageRef`:
+`{"file_id": "pf_<32 hex>"}` (the id `present-file` returned) **or**
+`{"url": "https://…"}` — exactly one — plus optional `alt` (at most
+`MAX_IMAGE_ALT_CHARS` = 300 characters). Strict: extra keys, non-https URLs and URLs
+with credentials are refused. The MCP `notify` tool (transcript and feed modes) and
+`POST /sessions/{id}/notifications` accept it.
+
+**Copy.** Forge records the notification and a `pending` row in
+`forge_notification_images` (migration `000090`) in one transaction, then copies the
+bytes once in the background: `file_id` through the session's broker
+(`GET {broker}/api/files/presented/{file_id}`, resolved like the presented-file proxy),
+`url` by HTTPS GET (each redirect hop must be https and, unless
+`notifications.images.allow_private_networks`, resolve only to public addresses). The
+response must declare and decode as `image/png|jpeg|gif|webp`, within
+`MAX_IMAGE_BYTES` (10 MiB) and `MAX_IMAGE_PIXELS` (40 MP). Forge stores the original
+bytes and a thumbnail (long side `notifications.images.thumbnail_max_side`, 320 by
+default; PNG when transparent, JPEG otherwise).
+
+**State.** `image_state` is `pending` until the copy settles, then `ready` (with
+`image`) or `failed` (with `image_error`). The notification is never withheld or
+rolled back for its image, and a failed copy is final: Forge neither retries it nor substitutes anything.
+Replays never copy twice (the image row is keyed by the deterministic notification id).
+
+**Route.** `GET /api/v1/forge/notifications/{id}/image` serves the original, and
+`?variant=thumb` the thumbnail, with the stored content type,
+`Cache-Control: private, max-age=<notifications.images.cache_max_age_seconds>, immutable`
+and `X-Content-Type-Options: nosniff`. It requires exactly what reading the item
+requires (`forge:session:read` for scoped tokens, then owner or tenant admin); 404
+otherwise and whenever no image is stored.
+
