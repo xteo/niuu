@@ -531,6 +531,7 @@ sleipnir:
 #     dispatcher:
 #       max_attempts: 8
 #       default_rate_limit: {max_count: 60, window_seconds: 3600}
+#     images: {allow_private_networks: false, thumbnail_max_side: 320}
 #     sinks:
 #       - name: ops-webhook
 #         label: Ops webhook

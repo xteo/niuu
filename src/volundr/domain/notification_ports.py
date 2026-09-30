@@ -1,4 +1,5 @@
-"""Ports for Forge notifications: the feed, reader watermarks, rules and the outbox."""
+"""Ports for Forge notifications: the feed, reader watermarks, rules, the outbox and
+the durable image copies."""
 
 from __future__ import annotations
 
@@ -10,13 +11,18 @@ from niuu.ports.notifications import NotificationSink
 from volundr.domain.models import Session
 from volundr.domain.notifications import (
     ClaimedDelivery,
+    FetchedImage,
     Notification,
     NotificationCandidate,
     NotificationDelivery,
+    NotificationImageContent,
+    NotificationImageVariant,
     NotificationPage,
     NotificationQuery,
     NotificationRule,
     NotificationScope,
+    PendingNotificationImage,
+    ProcessedNotificationImage,
     ReadWatermark,
 )
 
@@ -31,9 +37,13 @@ class NotificationRepository(ABC):
         In ONE transaction: insert each candidate ``ON CONFLICT (dedupe_key) DO
         NOTHING``; for every row that is actually new, evaluate its owner's enabled
         rules (:func:`volundr.domain.notifications.rules_matching`) and insert a
-        ``pending`` delivery per match. Seqs are allocated and committed in the same
-        order, so a reader resuming ``after=<seq>`` never skips a late commit.
-        Returns only the NEW rows, in seq order; a replayed candidate yields nothing.
+        ``pending`` delivery per match, and a ``pending`` image row for a candidate
+        that carries an image. Seqs are allocated and committed in the same order, so
+        a reader resuming ``after=<seq>`` never skips a late commit. Returns only the
+        NEW rows, in seq order; a replayed candidate yields nothing.
+
+        Every notification this port returns carries its ``image`` state (``None``
+        when it has no image); none of them carries image bytes.
         """
 
     @abstractmethod
@@ -211,3 +221,69 @@ class NotificationRecorder(ABC):
 
         Called when the session stops waiting; returns how many were acknowledged.
         """
+
+
+class NotificationImageRepository(ABC):
+    """Durable notification image copies and the queue of copies still to make.
+
+    Rows are created ``pending`` by ``NotificationRepository.project``. Claims follow
+    the delivery outbox: ``FOR UPDATE SKIP LOCKED``, a lease, and settle calls fenced
+    by ``(notification_id, attempts)`` that return whether they applied.
+    """
+
+    @abstractmethod
+    async def claim_pending(
+        self, *, limit: int, lease_seconds: float
+    ) -> list[PendingNotificationImage]:
+        """Lease up to ``limit`` pending copies (unclaimed, or whose lease expired)."""
+
+    @abstractmethod
+    async def mark_ready(
+        self, pending: PendingNotificationImage, image: ProcessedNotificationImage
+    ) -> bool:
+        """Store the bytes and thumbnail and settle the claim as ``ready``."""
+
+    @abstractmethod
+    async def mark_failed(self, pending: PendingNotificationImage, *, error: str) -> bool:
+        """Settle the claim as ``failed`` with the reader-facing reason."""
+
+    @abstractmethod
+    async def get_content(
+        self, notification_id: UUID, variant: NotificationImageVariant
+    ) -> NotificationImageContent | None:
+        """Return stored bytes for a ``ready`` image, else ``None``."""
+
+
+class NotificationImageFetcher(ABC):
+    """Fetches the bytes an image reference points at, once.
+
+    A ``file_id`` is read through the session's broker (the presented-file route);
+    a ``url`` by HTTP GET. Raises
+    :class:`volundr.domain.notifications.NotificationImageError` with the reason when
+    the source refuses, is unreachable, is too large or is not an accepted image type.
+    """
+
+    @abstractmethod
+    async def fetch(self, pending: PendingNotificationImage) -> FetchedImage:
+        """Return the fetched bytes and their declared content type."""
+
+
+class NotificationImageProcessor(ABC):
+    """Decodes fetched bytes and builds the stored original plus a thumbnail.
+
+    CPU-bound and synchronous; callers run it off the event loop. Raises
+    :class:`volundr.domain.notifications.NotificationImageError` when the bytes are
+    not a decodable image of an accepted type within the protocol limits.
+    """
+
+    @abstractmethod
+    def process(self, fetched: FetchedImage) -> ProcessedNotificationImage:
+        """Return the image to store."""
+
+
+class NotificationImageScheduler(ABC):
+    """Lets the projection ask for pending image copies to be made now."""
+
+    @abstractmethod
+    def wake(self) -> None:
+        """Start working on pending copies without waiting for the next poll."""
