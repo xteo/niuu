@@ -987,6 +987,68 @@ class NotificationDispatcherConfig(BaseModel):
         return self
 
 
+class NotificationImagesConfig(BaseModel):
+    """Copying images attached to notifications (``image`` on notify / submit).
+
+    Forge copies each attached image once, in the background, and serves its own
+    copy. A ``file_id`` image is read through the session's broker; a ``url`` image
+    is fetched over https from a public host (see ``allow_private_networks``).
+    """
+
+    poll_interval_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Pause between polls for pending copies (e.g. left by a restart). A new "
+            "image wakes the worker at once."
+        ),
+    )
+    batch_size: int = Field(default=8, ge=1, description="Pending copies claimed per poll.")
+    lease_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="How long a claimed copy is held before another worker may re-claim it.",
+    )
+    fetch_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+        description="Upper bound for fetching one image. Must be shorter than lease_seconds.",
+    )
+    max_concurrent_fetches: int = Field(
+        default=4, ge=1, description="Image fetches in flight at once."
+    )
+    max_redirects: int = Field(
+        default=3, ge=0, description="Redirects followed for a url image (each hop is checked)."
+    )
+    allow_private_networks: bool = Field(
+        default=False,
+        description=(
+            "Let url images resolve to private, loopback, link-local or shared "
+            "(e.g. tailnet 100.64.0.0/10) addresses. Off: only public hosts are fetched."
+        ),
+    )
+    thumbnail_max_side: int = Field(
+        default=320, ge=1, description="Longest side of a stored thumbnail, in pixels."
+    )
+    thumbnail_jpeg_quality: int = Field(
+        default=85, ge=1, le=95, description="JPEG quality for opaque thumbnails."
+    )
+    cache_max_age_seconds: int = Field(
+        default=31_536_000,
+        ge=0,
+        description="Cache-Control max-age for served images; stored bytes never change.",
+    )
+    max_error_chars: int = Field(
+        default=300, ge=1, description="Longest image failure reason kept and shown."
+    )
+
+    @model_validator(mode="after")
+    def _ordered_timing(self) -> "NotificationImagesConfig":
+        if self.fetch_timeout_seconds >= self.lease_seconds:
+            raise ValueError("images.fetch_timeout_seconds must be shorter than lease_seconds")
+        return self
+
+
 class NotificationsConfig(BaseModel):
     """Forge session notifications: the feed, the projection and external delivery.
 
@@ -1002,6 +1064,9 @@ class NotificationsConfig(BaseModel):
             title_chars: 120
             body_chars: 280
           public_web_url: "https://forge.example.com"
+          images:
+            fetch_timeout_seconds: 20
+            thumbnail_max_side: 320
           sinks:
             - name: ops-webhook
               label: Ops webhook
@@ -1019,6 +1084,7 @@ class NotificationsConfig(BaseModel):
     default_page_size: int = Field(default=50, ge=1, description="Feed page size default.")
     max_page_size: int = Field(default=200, ge=1, description="Largest feed page allowed.")
     dispatcher: NotificationDispatcherConfig = Field(default_factory=NotificationDispatcherConfig)
+    images: NotificationImagesConfig = Field(default_factory=NotificationImagesConfig)
     sinks: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(

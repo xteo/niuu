@@ -17,6 +17,7 @@ from volundr.adapters.outbound.postgres_notifications import (
     FEED_ORDER_LOCK_SQL,
     INSERT_DELIVERY_SQL,
     INSERT_NOTIFICATION_SQL,
+    SELECT_IMAGE_STATES_SQL,
     SELECT_RULES_FOR_OWNERS_SQL,
     PostgresNotificationDeliveryRepository,
     PostgresNotificationRepository,
@@ -54,6 +55,17 @@ def _pool():
         target.fetchrow = AsyncMock(return_value=None)
         target.fetchval = AsyncMock()
     return pool, conn
+
+
+def _fetch_by_sql(pool, notification_rows, image_rows=()):
+    """Answer the feed query with ``notification_rows`` and the image-state query apart."""
+
+    async def fetch(sql, *args):
+        if sql == SELECT_IMAGE_STATES_SQL:
+            return list(image_rows)
+        return notification_rows
+
+    pool.fetch = AsyncMock(side_effect=fetch)
 
 
 def _candidate(key: str, **overrides) -> NotificationCandidate:
@@ -251,7 +263,7 @@ class TestFeed:
     async def test_list_feed_trims_the_probe_row(self):
         pool, _ = _pool()
         rows = [_notification_row(_candidate(str(i)), 10 - i) for i in range(3)]
-        pool.fetch.return_value = rows
+        _fetch_by_sql(pool, rows)
         repo = PostgresNotificationRepository(pool)
         page = await repo.list_feed(OWNER, NotificationQuery(limit=2), read_through_seq=0)
         assert [n.seq for n in page.items] == [10, 9] and page.next_before == 9
@@ -259,7 +271,7 @@ class TestFeed:
             OWNER, NotificationQuery(limit=2, after=0), read_through_seq=0
         )
         assert ascending.next_before is None
-        pool.fetch.return_value = rows[:1]
+        _fetch_by_sql(pool, rows[:1])
         last = await repo.list_feed(OWNER, NotificationQuery(limit=2), read_through_seq=0)
         assert last.next_before is None
 
@@ -270,10 +282,11 @@ class TestFeed:
         row = _notification_row(_candidate("a"), 1)
         pool.fetchrow.return_value = row
         assert (await repo.get(row["id"])).seq == 1
-        pool.fetch.return_value = [row]
+        _fetch_by_sql(pool, [row])
         sid = uuid4()
         assert len(await repo.list_for_session(sid, after=0, limit=5)) == 1
-        assert pool.fetch.await_args.args[1:] == (sid, 0, 5)
+        assert pool.fetch.await_args_list[0].args[1:] == (sid, 0, 5)
+        assert pool.fetch.await_args_list[1].args == (SELECT_IMAGE_STATES_SQL, [row["id"]])
         pool.fetchrow.return_value = {"head_seq": 9, "unread_count": 4}
         assert await repo.feed_counts(ADMIN, read_through_seq=5) == (9, 4)
         sql, *params = pool.fetchrow.await_args.args
