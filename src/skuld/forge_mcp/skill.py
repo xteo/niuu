@@ -16,6 +16,7 @@ from pathlib import Path
 
 from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
+    NOTIFICATION_IMAGE_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
 )
 from skuld.session_runtime import write_private_file
@@ -50,6 +51,7 @@ rules — on their phone or chat. It is how a long-running session gets the user
 
 - **Links**: attach the artifact — a PR or CI URL (`kind: pr` / `url`), a file you handed over
   with `present-file` (`kind: file`, `file_id` from its output), another session (`kind: session`).
+- **Image**: {image_guidance}
 - **correlation_id**: reuse one id (e.g. the PR number) for follow-ups about the same thing.
 
 ## Do not
@@ -70,6 +72,7 @@ def forge_notify_skill_markdown(server_name: str) -> str:
         server=server_name,
         trigger_guidance=NOTIFICATION_TRIGGER_GUIDANCE,
         compact_guidance=COMPACT_NOTIFICATION_GUIDANCE,
+        image_guidance=NOTIFICATION_IMAGE_GUIDANCE,
     )
 
 

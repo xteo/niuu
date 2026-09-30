@@ -77,6 +77,7 @@ from volundr.adapters.outbound.config_resident_profiles import (
 from volundr.adapters.outbound.git_registry import create_git_registry
 from volundr.adapters.outbound.linear import LinearAdapter
 from volundr.adapters.outbound.memory_secrets import InMemorySecretManager
+from volundr.adapters.outbound.notification_image_fetcher import SessionLookup
 from volundr.adapters.outbound.pg_event_sink import PostgresEventSink
 from volundr.adapters.outbound.pg_message_delivery import PostgresMessageDelivery
 from volundr.adapters.outbound.pg_session_event_log import PostgresSessionEventLog
@@ -97,6 +98,7 @@ from volundr.adapters.outbound.postgres_launch_specs import PostgresLaunchSpecRe
 from volundr.adapters.outbound.postgres_mappings import PostgresMappingRepository
 from volundr.adapters.outbound.postgres_notifications import (
     PostgresNotificationDeliveryRepository,
+    PostgresNotificationImageRepository,
     PostgresNotificationRepository,
     PostgresNotificationRuleRepository,
 )
@@ -157,6 +159,7 @@ from volundr.domain.services.credential_enrollment import (
 )
 from volundr.domain.services.event_ingestion import EventIngestionService
 from volundr.domain.services.mount_strategies import SecretMountStrategyRegistry
+from volundr.domain.services.notification_images import NotificationImageWorker
 from volundr.domain.services.notifications import NotificationService, engine_resolver_for
 from volundr.domain.services.resident_runtime import (
     ResidentRuntimeNotFoundError,
@@ -170,6 +173,7 @@ from volundr.infrastructure.database import database_pool
 from volundr.notification_composition import (
     NotificationDelivery,
     create_notification_delivery,
+    create_notification_image_worker,
     create_push_channel,
 )
 
@@ -218,8 +222,10 @@ def _create_notification_service(
     *,
     broadcaster: InMemoryEventBroadcaster,
     integration_repository: PostgresIntegrationRepository,
-) -> NotificationService | None:
-    """Compose the notification feed, rules and outbox (``notifications.enabled``)."""
+    session_lookup: SessionLookup,
+) -> tuple[NotificationService, NotificationImageWorker] | None:
+    """Compose the notification feed, rules, outbox and image worker
+    (``notifications.enabled``)."""
     config = settings.notifications
     if not config.enabled:
         logger.info("Forge notifications disabled (notifications.enabled=false)")
@@ -228,12 +234,25 @@ def _create_notification_service(
         name: (definition.defaults.get("broker") or {}).get("cliType")
         for name, definition in settings.session_definitions.items()
     }
-    return NotificationService(
-        PostgresNotificationRepository(pool),
+    repository = PostgresNotificationRepository(pool)
+    images = PostgresNotificationImageRepository(
+        pool, max_error_chars=config.images.max_error_chars
+    )
+    image_worker = create_notification_image_worker(
+        settings,
+        notifications=repository,
+        images=images,
+        session_lookup=session_lookup,
+        broadcaster=broadcaster,
+    )
+    service = NotificationService(
+        repository,
         PostgresNotificationRuleRepository(pool),
         PostgresNotificationDeliveryRepository(
             pool, max_error_chars=config.dispatcher.max_error_chars
         ),
+        image_repository=images,
+        image_scheduler=image_worker,
         broadcaster=broadcaster,
         reply_ready_enabled=config.reply_ready.enabled,
         reply_title_chars=config.reply_ready.title_chars,
@@ -249,6 +268,7 @@ def _create_notification_service(
         engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
         integration_repository=integration_repository,
     )
+    return service, image_worker
 
 
 def _create_notification_delivery(
@@ -760,10 +780,16 @@ def create_app(
             integration_registry = IntegrationRegistry(integration_definitions)
             integration_repo = PostgresIntegrationRepository(pool)
             mapping_repository = PostgresMappingRepository(pool)
-            notification_service = _create_notification_service(
-                settings, pool, broadcaster=broadcaster, integration_repository=integration_repo
+            notification_feed = _create_notification_service(
+                settings,
+                pool,
+                broadcaster=broadcaster,
+                integration_repository=integration_repo,
+                session_lookup=repository.get,
             )
+            notification_service, notification_image_worker = notification_feed or (None, None)
             app.state.notification_service = notification_service
+            app.state.notification_image_worker = notification_image_worker
             notification_delivery = _create_notification_delivery(
                 settings,
                 pool,
@@ -1326,6 +1352,9 @@ def create_app(
                         prefix="/api/v1/forge",
                         default_page_size=settings.notifications.default_page_size,
                         max_page_size=settings.notifications.max_page_size,
+                        image_cache_max_age_seconds=(
+                            settings.notifications.images.cache_max_age_seconds
+                        ),
                     )
                 )
             app.include_router(
@@ -1449,6 +1478,8 @@ def create_app(
             )
             if notification_delivery is not None:
                 await notification_delivery.start()
+            if notification_image_worker is not None:
+                await notification_image_worker.start()
             if settings.telegram_ingress.enabled:
                 await telegram_ingress.start()
             else:
@@ -1472,6 +1503,8 @@ def create_app(
                 await telegram_ingress.stop()
                 if notification_delivery is not None:
                     await notification_delivery.stop()
+                if notification_image_worker is not None:
+                    await notification_image_worker.stop()
                 background_task.cancel()
                 try:
                     await background_task
