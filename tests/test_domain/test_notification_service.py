@@ -293,6 +293,64 @@ class TestAttention:
         assert len(created.title) == 200 and len(created.body) == 4000
 
 
+class TestAttentionRetirement:
+    async def test_settled_questions_retire_only_their_own_unread_attention(self):
+        """Regression (gtc-web-sdk): "needs your input" stayed unread after answers."""
+        service, _ = _service()
+        session, other = _session(), _session(name="other")
+        since = datetime(2026, 9, 30, 12, tzinfo=UTC)
+        await service.record_attention(
+            session, state_since=since, kind="question", prompt="A?", request_id="q1"
+        )
+        [reply] = await service.project_log_entries(session, [_turn_entry(session, 1, "t1")])
+        q2 = await service.record_attention(
+            session, state_since=since, kind="permission", prompt="B?", request_id="q2"
+        )
+        elsewhere = await service.record_attention(
+            other, state_since=since, kind="question", prompt="C?", request_id="q3"
+        )
+        await service.mark_read(OWNER, q2.id)
+
+        assert await service.retire_attention(session) == 1  # q1; q2 was already read
+        feed = await service.list_feed(OWNER, NotificationQuery(limit=10, unread=True))
+        assert {n.id for n in feed.items} == {reply.id, elsewhere.id}
+        assert await service.retire_attention(session) == 0
+
+    async def test_retirement_pages_through_many_items(self):
+        store = InMemoryNotificationStore()
+        service = NotificationService(
+            store.feed,
+            store.rule_repo,
+            store.outbox,
+            reply_ready_enabled=True,
+            reply_title_chars=40,
+            reply_body_chars=60,
+            sinks=[],
+            attention_retire_page_size=2,
+        )
+        session = _session()
+        for i in range(5):
+            await service.record_attention(
+                session,
+                state_since=datetime(2026, 9, 30, 12, tzinfo=UTC),
+                kind="question",
+                prompt="Q?",
+                request_id=f"q{i}",
+            )
+        assert await service.retire_attention(session) == 5
+        with pytest.raises(ValueError, match="positive"):
+            NotificationService(
+                store.feed,
+                store.rule_repo,
+                store.outbox,
+                reply_ready_enabled=True,
+                reply_title_chars=40,
+                reply_body_chars=60,
+                sinks=[],
+                attention_retire_page_size=0,
+            )
+
+
 class TestSubmit:
     async def test_submit_is_idempotent_per_principal_and_key(self):
         service, _ = _service()

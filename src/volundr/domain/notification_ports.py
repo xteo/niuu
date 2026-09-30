@@ -200,3 +200,10 @@ class NotificationRecorder(ABC):
         request_id: str,
     ) -> Notification | None:
         """Record (idempotently) that ``session`` is waiting for its owner."""
+
+    async def retire_attention(self, session: Session) -> int:
+        """Acknowledge the owner's unread "needs your input" items for ``session``.
+
+        Called when the session stops waiting; returns how many were acknowledged.
+        """
+        return 0
