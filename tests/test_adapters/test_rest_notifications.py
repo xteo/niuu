@@ -21,6 +21,7 @@ from volundr.domain.services.notifications import NotificationService
 from volundr.domain.services.session import SessionService
 
 PREFIX = "/api/v1/forge"
+CACHE_MAX_AGE = 3600
 
 
 class OwnerOnly(AuthorizationPort):
@@ -50,6 +51,8 @@ def env():
         store.feed,
         store.rule_repo,
         store.outbox,
+        image_repository=store.images,
+        image_scheduler=store.image_scheduler,
         reply_ready_enabled=True,
         reply_title_chars=80,
         reply_body_chars=100,
@@ -59,7 +62,12 @@ def env():
     app.state.identity = EnvoyHeaderAuthenticationAdapter()  # trusts forwarded x-auth-*
     app.include_router(
         create_notifications_router(
-            service, session_service, prefix=PREFIX, default_page_size=2, max_page_size=5
+            service,
+            session_service,
+            prefix=PREFIX,
+            default_page_size=2,
+            max_page_size=5,
+            image_cache_max_age_seconds=CACHE_MAX_AGE,
         )
     )
     return TestClient(app), service, store, sessions

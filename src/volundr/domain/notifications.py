@@ -3,8 +3,15 @@
 The wire vocabulary (kinds, severities, sources, links, drafts and deterministic ids)
 is the shared contract in :mod:`niuu.domain.notifications`. This module adds what
 only Forge owns: the stored, cursor-ordered notification, how a reader's scope and
-feed query are expressed, the per-reader read watermark, owner delivery rules and
-the delivery outbox rows a dispatcher settles.
+feed query are expressed, the per-reader read watermark, owner delivery rules, the
+delivery outbox rows a dispatcher settles and the durable copy of an attached image.
+
+Image state. A notification recorded with an image reference gets an image row in
+the same transaction, ``pending``. Forge then copies the bytes once, outside the
+projection: ``ready`` when the image and its thumbnail are stored, ``failed`` (with
+the reason) when the copy was refused or could not be made. The notification itself
+is never withheld or rolled back because of its image; a failed copy is an explicit,
+reported state (``image_state``/``image_error`` on the item), never a silent drop.
 """
 
 from __future__ import annotations
@@ -22,11 +29,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from niuu.domain.models import Principal
 from niuu.domain.notifications import (
     NOTIFICATION_ADMIN_ROLE,
+    NOTIFICATION_IMAGE_THUMB_VARIANT,
+    NotificationImageRef,
     NotificationKind,
     NotificationLink,
     NotificationSeverity,
     NotificationSource,
     notification_id,
+    notification_image_url,
     notification_visible_to,
     severity_rank,
 )
@@ -55,6 +65,47 @@ def _metadata_text(metadata: dict[str, Any], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+class NotificationImageState(StrEnum):
+    """Where a notification's image copy stands (see the module docstring)."""
+
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class NotificationImageVariant(StrEnum):
+    """Which stored bytes the image route serves."""
+
+    ORIGINAL = "original"
+    THUMB = NOTIFICATION_IMAGE_THUMB_VARIANT
+
+
+class NotificationImage(BaseModel):
+    """A notification's image as readers see it: its state and, once stored, its shape."""
+
+    model_config = ConfigDict(frozen=True)
+
+    state: NotificationImageState
+    alt: str | None = None
+    mime: str | None = None
+    width: int | None = None
+    height: int | None = None
+    error: str | None = None
+
+    def wire(self, notification_id: UUID) -> dict[str, Any] | None:
+        """The item's ``image`` object, or ``None`` until the bytes are stored."""
+        if self.state is not NotificationImageState.READY:
+            return None
+        return {
+            "url": notification_image_url(notification_id),
+            "thumbnail_url": notification_image_url(notification_id, thumbnail=True),
+            "mime": self.mime,
+            "width": self.width,
+            "height": self.height,
+            "alt": self.alt,
+        }
+
+
 class Notification(BaseModel):
     """One stored notification: a durable, cursor-ordered feed entry."""
 
@@ -80,6 +131,7 @@ class Notification(BaseModel):
     correlation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+    image: NotificationImage | None = None
 
     @property
     def turn_id(self) -> str | None:
@@ -105,10 +157,13 @@ class Notification(BaseModel):
 
         This is exactly the ``session_notification`` SSE payload (contract §5).
         """
-        data = self.model_dump(mode="json", exclude={"dedupe_key", "metadata"})
+        data = self.model_dump(mode="json", exclude={"dedupe_key", "metadata", "image"})
         data["turn_id"] = self.turn_id
         data["resident_id"] = self.resident_id
         data["resident_session_id"] = self.resident_session_id
+        data["image"] = self.image.wire(self.id) if self.image is not None else None
+        data["image_state"] = self.image.state.value if self.image is not None else None
+        data["image_error"] = self.image.error if self.image is not None else None
         return data
 
 
@@ -134,6 +189,7 @@ class NotificationCandidate(BaseModel):
     model: str | None = None
     correlation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    image: NotificationImageRef | None = None
 
     @property
     def id(self) -> UUID:
@@ -254,6 +310,10 @@ class NotificationValidationError(NotificationError, ValueError):
 
 class NotificationReadStateConflictError(NotificationError):
     """Another change to the reader's watermark won; re-read before retrying."""
+
+
+class NotificationImageError(NotificationError):
+    """An attached image could not be copied. The message is the reader-facing reason."""
 
 
 class NotificationStoreUnavailableError(NotificationError):
@@ -516,3 +576,47 @@ class NotificationSinkInfo:
 INTEGRATION_SINK = NotificationSinkInfo(
     name="integration", label="Messaging integration", requires_integration=True
 )
+
+
+@dataclass(frozen=True)
+class PendingNotificationImage:
+    """A claimed image copy: what to fetch, for which notification, and its claim fence.
+
+    ``attempts`` already counts this claim; ``(notification_id, attempts)`` fences the
+    settle calls so a worker whose lease expired can no longer settle the row.
+    """
+
+    notification_id: UUID
+    session_id: UUID | None
+    ref: NotificationImageRef
+    attempts: int
+
+
+@dataclass(frozen=True)
+class FetchedImage:
+    """Bytes fetched for an image, with the content type their source declared."""
+
+    content: bytes
+    content_type: str
+
+
+@dataclass(frozen=True)
+class ProcessedNotificationImage:
+    """A decoded image ready to store: the original bytes plus a bounded thumbnail."""
+
+    mime: str
+    width: int
+    height: int
+    content: bytes
+    thumbnail_mime: str
+    thumbnail_width: int
+    thumbnail_height: int
+    thumbnail: bytes
+
+
+@dataclass(frozen=True)
+class NotificationImageContent:
+    """Stored image bytes as the image route serves them."""
+
+    mime: str
+    content: bytes
