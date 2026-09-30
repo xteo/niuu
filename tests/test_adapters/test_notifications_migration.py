@@ -84,3 +84,35 @@ def test_individual_reads_migration_is_additive_idempotent_and_reader_scoped():
     assert not re.search(r"\b(DELETE|UPDATE|ALTER)\s+(FROM\s+)?forge_notification_read_states", up)
     down = (ROOT / "migrations/000071_forge_notification_reads.down.sql").read_text()
     assert down.strip() == "DROP TABLE IF EXISTS forge_notification_reads;"
+
+
+IMAGES = "000072_forge_notification_images"
+
+
+@pytest.mark.parametrize("direction", ["up", "down"])
+def test_images_migration_is_identical_in_all_three_locations(direction):
+    name = f"{IMAGES}.{direction}.sql"
+    source = (ROOT / "migrations" / name).read_bytes()
+    assert (ROOT / "src/cli/migrations/volundr" / name).read_bytes() == source
+    assert _chart_block(name) == source.decode().strip()
+
+
+def test_images_migration_is_additive_idempotent_and_goes_with_its_notification():
+    up = (ROOT / "migrations" / f"{IMAGES}.up.sql").read_text()
+    assert re.findall(r"CREATE (?:TABLE|INDEX)\b(?! IF NOT EXISTS)", up) == []
+    assert "CREATE TABLE IF NOT EXISTS forge_notification_images (" in up
+    assert (
+        "notification_id UUID PRIMARY KEY REFERENCES forge_notifications(id) ON DELETE CASCADE"
+        in up
+    )
+    assert "CHECK (state IN ('pending', 'ready', 'failed'))" in up
+    assert "CHECK (source_kind IN ('file_id', 'url'))" in up
+    assert "WHERE state = 'pending'" in up
+    assert not re.search(r"\bALTER\s+TABLE\s+forge_notifications\b", up)
+    down = (ROOT / "migrations" / f"{IMAGES}.down.sql").read_text()
+    assert down.strip() == "DROP TABLE IF EXISTS forge_notification_images;"
+
+
+def test_images_migration_is_the_newest_volundr_migration():
+    names = sorted(path.name for path in (ROOT / "src/cli/migrations/volundr").glob("*.up.sql"))
+    assert names[-1] == f"{IMAGES}.up.sql"

@@ -166,6 +166,8 @@ def build_forge_app(
         store.feed,
         store.rule_repo,
         store.outbox,
+        image_repository=store.images,
+        image_scheduler=store.image_scheduler,
         reply_ready_enabled=True,
         reply_title_chars=80,
         reply_body_chars=100,
@@ -181,7 +183,12 @@ def build_forge_app(
     app.include_router(create_router(session_service, prefix=PREFIX))
     app.include_router(
         create_notifications_router(
-            notifications, session_service, prefix=PREFIX, default_page_size=20, max_page_size=50
+            notifications,
+            session_service,
+            prefix=PREFIX,
+            default_page_size=20,
+            max_page_size=50,
+            image_cache_max_age_seconds=3600,
         )
     )
     app.include_router(

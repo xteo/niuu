@@ -96,6 +96,8 @@ def _service(store=None, *, broadcaster=None, reply_ready=True, integrations=Non
         store.feed,
         store.rule_repo,
         store.outbox,
+        image_repository=store.images,
+        image_scheduler=store.image_scheduler,
         broadcaster=broadcaster,
         reply_ready_enabled=reply_ready,
         reply_title_chars=40,
