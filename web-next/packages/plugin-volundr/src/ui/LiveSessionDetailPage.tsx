@@ -4190,6 +4190,7 @@ function LiveSessionDetailPageInner({
                     onRewindFiles={chat.sendRewindFiles}
                     onPermissionRespond={chat.respondToPermission}
                     onInputRespond={chat.respondToInput}
+                    onInputDismiss={chat.dismissInputRequest}
                     onFetchFiles={fetchSessionMentionFiles}
                     onMessageCountChange={setVisibleMessageCount}
                     renderPermissions={permissionRenderer}

@@ -242,6 +242,8 @@ interface UseSkuldChatResult {
   sendResendPrompt: () => void;
   respondToPermission: (requestId: string, behavior: PermissionBehavior) => void;
   respondToInput: (requestId: string, values: string[]) => void;
+  /** Drop a card this client cannot answer (answered elsewhere, e.g. in the terminal). */
+  dismissInputRequest: (requestId: string) => void;
   sendInterrupt: () => void;
   sendSetModel: (model: string) => void;
   sendSetThinkingTokens: (tokens: number) => void;
@@ -254,6 +256,8 @@ const SINGLE_PARTICIPANT_ID = 'skuld-primary';
 // Skuld's correlated rejections of an answer (skuld/control_errors.py): the question is
 // still pending natively, so its card must come back.
 const ANSWER_REJECTION_CODES = new Set(['question_answer_rejected', 'question_recovery_required']);
+// Skuld cannot deliver an answer to this question; it comes back read-only.
+const RECOVERY_REQUIRED = 'question_recovery_required';
 const STORAGE_PREFIX = 'niuu.skuldChat.v2.';
 
 type PersistedAgentEvent = Omit<AgentInternalEvent, 'timestamp'> & { timestamp?: string };
@@ -792,6 +796,10 @@ export function useSkuldChat(
   // Answered but not yet resolved by Skuld: a rejected answer restores its card, so the
   // question stays answerable instead of vanishing while the agent still waits on it.
   const answeredInputRequestsRef = useRef(new Map<string, InputRequest>());
+  const pendingInputRequestsRef = useRef<InputRequest[]>([]);
+  useEffect(() => {
+    pendingInputRequestsRef.current = pendingInputRequests;
+  }, [pendingInputRequests]);
   const [availableCommandsState, setAvailableCommandsState] = useState<{
     url: string | null;
     commands: SlashCommand[];
@@ -1835,10 +1843,19 @@ export function useSkuldChat(
               const answered = answeredInputRequestsRef.current.get(event.request_id);
               if (answered && ANSWER_REJECTION_CODES.has(event.code)) {
                 answeredInputRequestsRef.current.delete(event.request_id);
+                const restored =
+                  event.code === RECOVERY_REQUIRED ? { ...answered, answerable: false } : answered;
                 setPendingInputRequests((prev) => [
                   ...prev.filter((request) => request.requestId !== answered.requestId),
-                  answered,
+                  restored,
                 ]);
+              } else if (event.code === RECOVERY_REQUIRED) {
+                const requestId = event.request_id;
+                setPendingInputRequests((prev) =>
+                  prev.map((request) =>
+                    request.requestId === requestId ? { ...request, answerable: false } : request,
+                  ),
+                );
               }
               setMessages((previous) => [
                 ...previous.map((message) =>
@@ -2078,6 +2095,7 @@ export function useSkuldChat(
             const inputRequest: InputRequest = {
               requestId: event.request_id,
               questions: normalizedQuestions,
+              ...(event.metadata?.answerable === false ? { answerable: false } : {}),
             };
             answeredInputRequestsRef.current.delete(inputRequest.requestId);
             setPendingInputRequests((prev) => [
@@ -2598,10 +2616,20 @@ export function useSkuldChat(
 
   const respondToInput = useCallback(
     (requestId: string, values: string[]) => {
+      const request = pendingInputRequestsRef.current.find(
+        (candidate) => candidate.requestId === requestId,
+      );
       sendJson({
         type: 'ask_user_answer',
         request_id: requestId,
-        answers: values.map((answer) => ({ answer })),
+        // Text that is not one of the offered choices is a custom ("Type something")
+        // answer; Skuld only accepts it when marked as free text.
+        answers: values.map((answer, index) => {
+          const choices = request?.questions[index]?.choices ?? [];
+          return choices.length > 0 && !choices.includes(answer)
+            ? { answer, free_text: answer }
+            : { answer };
+        }),
       });
       setPendingInputRequests((prev) => {
         const answered = prev.find((request) => request.requestId === requestId);
@@ -2611,6 +2639,11 @@ export function useSkuldChat(
     },
     [sendJson],
   );
+
+  const dismissInputRequest = useCallback((requestId: string) => {
+    answeredInputRequestsRef.current.delete(requestId);
+    setPendingInputRequests((prev) => prev.filter((request) => request.requestId !== requestId));
+  }, []);
 
   const clearMessages = useCallback(() => {
     setMessages([]);
@@ -2663,6 +2696,7 @@ export function useSkuldChat(
     sendResendPrompt,
     respondToPermission,
     respondToInput,
+    dismissInputRequest,
     sendInterrupt: () => sendJson({ type: 'interrupt' }),
     sendSetModel: (model: string) => sendJson({ type: 'set_model', model }),
     sendSetThinkingTokens: (tokens: number) =>
