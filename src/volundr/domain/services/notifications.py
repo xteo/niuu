@@ -130,7 +130,11 @@ class NotificationService(NotificationRecorder):
         sinks: list[NotificationSinkInfo],
         engine_resolver: EngineResolver | None = None,
         integration_repository: IntegrationRepository | None = None,
+        attention_retire_page_size: int = 200,
     ) -> None:
+        if attention_retire_page_size < 1:
+            raise ValueError("attention_retire_page_size must be positive")
+        self._attention_retire_page_size = attention_retire_page_size
         self._repository = repository
         self._rules = rule_repository
         self._deliveries = delivery_repository
@@ -232,6 +236,32 @@ class NotificationService(NotificationRecorder):
         )
         created = await self._record([candidate])
         return created[0] if created else None
+
+    async def retire_attention(self, session: Session) -> int:
+        """Acknowledge the owner's unread attention items once the question is settled.
+
+        Only items above the owner's read watermark can be unread; each is marked read
+        individually, so the rest of the feed's read state is untouched.
+        """
+        owner = session.owner_id or ""
+        if not owner:
+            return 0
+        after = (await self._repository.get_watermark(owner)).read_through_seq
+        retired = 0
+        while True:
+            page = await self._repository.list_for_session(
+                session.id, after=after, limit=self._attention_retire_page_size
+            )
+            attention = [item for item in page if item.kind == NotificationKind.ATTENTION]
+            if attention:
+                already = await self._repository.read_ids(owner, [item.id for item in attention])
+                for item in attention:
+                    if item.id not in already:
+                        await self._repository.mark_read(owner, item.id)
+                        retired += 1
+            if len(page) < self._attention_retire_page_size:
+                return retired
+            after = page[-1].seq
 
     async def submit(
         self,

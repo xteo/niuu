@@ -12,6 +12,11 @@ from volundr.domain.services import SessionService
 class RecordingRecorder(NotificationRecorder):
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.retired: list = []
+
+    async def retire_attention(self, session):
+        self.retired.append(session.id)
+        return 1
 
     async def record_attention(self, session, *, state_since, kind, prompt, request_id):
         self.calls.append(
@@ -115,3 +120,17 @@ async def test_recorder_failure_never_breaks_the_activity_report(
     assert updated.activity_state == SessionActivityState.AWAITING_INPUT
     assert any(event.type.value == "session_needs_input" for event in broadcaster.events)
     assert "recording the attention notification failed" in caplog.text
+
+
+async def test_leaving_awaiting_input_retires_its_attention(service, recorder):
+    session = await _session(service)
+    await service.update_activity(
+        session.id,
+        SessionActivityState.AWAITING_INPUT,
+        {"kind": "question", "prompt": "Which?", "request_id": "q1"},
+    )
+    assert recorder.retired == []
+    await service.update_activity(session.id, SessionActivityState.ACTIVE, {})
+    assert recorder.retired == [session.id]
+    await service.update_activity(session.id, SessionActivityState.IDLE, {})
+    assert recorder.retired == [session.id]  # only the transition out of awaiting_input

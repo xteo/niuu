@@ -569,6 +569,15 @@ class SessionService:
         if is_new_attention and self._notification_recorder is not None:
             await self._record_attention_isolated(updated, session, metadata)
 
+        # ...and once it stops waiting (answered in any client or the terminal, or the
+        # turn ended), its "needs your input" items must not stay unread.
+        if (
+            previous_state is SessionActivityState.AWAITING_INPUT
+            and state is not SessionActivityState.AWAITING_INPUT
+            and self._notification_recorder is not None
+        ):
+            await self._retire_attention_isolated(updated)
+
         # Fan a push out to the owner's devices off the activity hot-path (a slow
         # APNs/webhook call must not delay Skuld's activity report response).
         if is_new_attention and self._attention_notifier is not None:
@@ -612,6 +621,13 @@ class SessionService:
             )
         except Exception:
             logger.exception("recording the attention notification failed for %s", updated.id)
+
+    async def _retire_attention_isolated(self, updated: Session) -> None:
+        """Retire settled attention items without risking the activity report."""
+        try:
+            await self._notification_recorder.retire_attention(updated)
+        except Exception:
+            logger.exception("retiring attention notifications failed for %s", updated.id)
 
     @staticmethod
     def _is_new_attention_request(

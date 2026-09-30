@@ -21,7 +21,7 @@ import signal
 import tempfile
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -500,6 +500,11 @@ class TmuxInteractiveTransport(CLITransport):
         self._answer_lock = asyncio.Lock()
         self._question_result_emit_lock = asyncio.Lock()
         self._question_result_ids: deque[str] = deque(maxlen=question_result_history_limit)
+        # Claude's PermissionRequest hook carries no tool_use_id. PreToolUse (which runs
+        # first) does, so remember the main pane's recent tool ids by (tool, input) and
+        # bind a permission card to its tool; PostToolUse then closes it immediately.
+        self._main_tool_ids: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        self._main_tool_id_limit = question_result_history_limit
         self._tty_question_seq = 0
         self._last_result: dict | None = None
         self._slash_commands_cache = self._normalize_slash_command_items(
@@ -1594,6 +1599,12 @@ class TmuxInteractiveTransport(CLITransport):
         # parses) so a remote client can answer; the tool_use is still emitted below for history.
         if tool_name == "AskUserQuestion" and isinstance(tool_input, dict):
             await self._surface_tty_ask_user_question(tool_input, payload=payload)
+        if payload.get("tool_use_id") and not self._is_child_hook(payload):
+            key = self._tool_key(tool_name, tool_input)
+            self._main_tool_ids[key] = (tool_use_id, self._coerce_str(payload.get("session_id")))
+            self._main_tool_ids.move_to_end(key)
+            while len(self._main_tool_ids) > self._main_tool_id_limit:
+                self._main_tool_ids.popitem(last=False)
         # Parent attribution: a NON-Task tool firing while a Task subagent is in flight belongs
         # to that subagent (stack top). The Task tool's OWN tool_use is a main-agent action ->
         # parent stays None. Computed BEFORE the Task push below so a Task never self-references.
@@ -1656,6 +1667,27 @@ class TmuxInteractiveTransport(CLITransport):
             ),
             None,
         )
+        if (
+            matched is None
+            and self._coerce_str(payload.get("tool_name")) == "AskUserQuestion"
+            and not self._is_child_hook(payload)
+        ):
+            # A question surfaced without native identity (e.g. an older broker's
+            # session) still finishes with the same questions; close its card now.
+            asked = (payload.get("tool_input") or {}).get("questions")
+            orphan = next(
+                (
+                    (rid, pending)
+                    for rid, pending in self._pending_tty_prompts.items()
+                    if pending.get("kind") == "question"
+                    and not pending.get("native_tool_use_id")
+                    and asked
+                    and pending.get("questions") == asked
+                ),
+                None,
+            )
+            if orphan is not None and not orphan[1].get("answer_in_flight"):
+                await self._resolve_tty_answer(orphan[0], "completed_elsewhere", accepted=False)
         request_id, question = matched if matched else (None, None)
         if tool_use_id in self._question_result_ids:
             if question is not None and not question.get("answer_in_flight"):
@@ -1977,14 +2009,20 @@ class TmuxInteractiveTransport(CLITransport):
             "multiSelect": False,
         }
         self._cancel_submit_confirmations()
+        native_tool_use_id = self._coerce_str(payload.get("tool_use_id"))
+        native_session_id = self._coerce_str(payload.get("session_id"))
+        if not native_tool_use_id and not self._is_child_hook(payload):
+            bound = self._main_tool_ids.pop(self._tool_key(tool_name, tool_input), None)
+            if bound and (not native_session_id or bound[1] == native_session_id):
+                native_tool_use_id, native_session_id = bound
         self._pending_tty_prompts[request_id] = {
             "kind": "permission",
             "tool_name": tool_name,
             "questions": [question],
             # Permissions may be settled locally (including bypass mode). Bind
             # their cleanup to the exact tool and native session, never its name.
-            "native_tool_use_id": self._coerce_str(payload.get("tool_use_id")),
-            "native_session_id": self._coerce_str(payload.get("session_id")),
+            "native_tool_use_id": native_tool_use_id,
+            "native_session_id": native_session_id,
         }
         await self._emit_ask_user_question(request_id, [question])
         task = asyncio.create_task(
@@ -2042,6 +2080,10 @@ class TmuxInteractiveTransport(CLITransport):
             return None
         matches = [d for d, label in rows if re.match(r"(no|deny)\b", label.strip().casefold())]
         return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _tool_key(tool_name: str, tool_input: object) -> str:
+        return tool_name + "\0" + json.dumps(tool_input, sort_keys=True, default=str)
 
     def _permission_mode_has_no_gate(self, payload: dict[str, Any]) -> bool:
         mode = self._coerce_str(payload.get("permission_mode"))
@@ -2258,11 +2300,21 @@ class TmuxInteractiveTransport(CLITransport):
                     "requires_all_answers": True,
                     **(
                         {"answerable": False, "recovery_required": True}
-                        if self._pending_tty_prompts[request_id].get("answer_uncertain")
+                        if self._tty_prompt_unanswerable(self._pending_tty_prompts[request_id])
                         else {}
                     ),
                 },
             }
+        )
+
+    @staticmethod
+    def _tty_prompt_unanswerable(pending: dict[str, Any]) -> bool:
+        """A card no client can answer: uncertain delivery, or a question without the
+        native identity its answer proof needs (answer it in the terminal instead)."""
+        if pending.get("answer_uncertain"):
+            return True
+        return pending.get("kind") == "question" and not (
+            pending.get("native_tool_use_id") and pending.get("native_session_id")
         )
 
     @staticmethod

@@ -1259,6 +1259,76 @@ page_path: council/demo/opinion-b.md
     expect(result.current.pendingInputRequests).toHaveLength(0);
   });
 
+  it('keeps questions Skuld cannot answer read-only, and dismissable', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    const card = (id: string, answerable?: boolean) => ({
+      type: 'ask_user_question',
+      request_id: id,
+      questions: [{ question: 'Pick one?', options: [{ label: 'A' }, { label: 'B' }] }],
+      ...(answerable === false ? { metadata: { answerable: false, recovery_required: true } } : {}),
+    });
+
+    act(() => {
+      wsHandlers.onMessage?.(JSON.stringify(card('tty-1', false)));
+      wsHandlers.onMessage?.(JSON.stringify(card('tty-2')));
+    });
+    expect(
+      result.current.pendingInputRequests.map((r) => [r.requestId, r.answerable !== false]),
+    ).toEqual([
+      ['tty-1', false],
+      ['tty-2', true],
+    ]);
+
+    // An answer the broker cannot deliver brings the card back read-only, never answerable.
+    act(() => result.current.respondToInput('tty-2', ['A']));
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'error',
+          code: 'question_recovery_required',
+          request_id: 'tty-2',
+          content: 'This question has no verifiable native tool identity',
+        }),
+      );
+    });
+    expect(
+      result.current.pendingInputRequests.map((r) => [r.requestId, r.answerable !== false]),
+    ).toEqual([
+      ['tty-1', false],
+      ['tty-2', false],
+    ]);
+
+    act(() => result.current.dismissInputRequest('tty-1'));
+    expect(result.current.pendingInputRequests.map((r) => r.requestId)).toEqual(['tty-2']);
+  });
+
+  it('marks typed text that is not an offered choice as free text', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'ask_user_question',
+          request_id: 'tty-2',
+          questions: [
+            { question: 'Which version?', options: [{ label: '1.0' }, { label: '2.0' }] },
+            { question: 'Why?', options: [] },
+          ],
+        }),
+      );
+    });
+    act(() => result.current.respondToInput('tty-2', ['try a different version', 'because']));
+    expect(sendJson).toHaveBeenCalledWith({
+      type: 'ask_user_answer',
+      request_id: 'tty-2',
+      answers: [
+        { answer: 'try a different version', free_text: 'try a different version' },
+        { answer: 'because' },
+      ],
+    });
+  });
+
   it('ignores malformed clarification requests and clears pending input', async () => {
     const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
 
