@@ -1926,6 +1926,143 @@ async def test_initial_prompt_without_ids_still_captures_the_native_session(
     await transport.stop()
 
 
+_NATIVE = "5d3a6d7c-1f3b-4f7e-9d0e-2b1a4c6e8f00"
+_ASKED = [
+    {
+        "question": "Which SDK target first?",
+        "header": "Target",
+        "options": [{"label": "Web"}, {"label": "Node"}],
+        "multiSelect": False,
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_permission_card_binds_to_its_tool_and_closes_when_the_tool_runs(
+    tmp_path: Path,
+) -> None:
+    """Regression (gtc-web-sdk, 30 Sep): PermissionRequest carries no tool_use_id, so an
+    allowed "Read" card stayed open for 38 minutes, until the turn ended."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    transport._claude_native_session_id = _NATIVE
+    read = {"file_path": "/work/K3-stream-b.png"}
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": read,
+            "tool_use_id": "toolu_read",
+            "session_id": _NATIVE,
+        }
+    )
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Read",
+            "tool_input": read,
+            "session_id": _NATIVE,
+        }
+    )
+    [rid] = list(transport._pending_tty_prompts)
+    assert transport._pending_tty_prompts[rid]["native_tool_use_id"] == "toolu_read"
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": read,
+            "tool_use_id": "toolu_read",
+            "session_id": _NATIVE,
+            "tool_response": {},
+        }
+    )
+    assert not transport._pending_tty_prompts
+    resolved = [e for e in events if e.get("type") == "ask_user_resolved"]
+    assert [(e["request_id"], e["decision"]) for e in resolved] == [(rid, "completed_elsewhere")]
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_tool_never_binds_a_main_pane_permission(tmp_path: Path) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    await _collect_events(transport)
+    transport._claude_native_session_id = _NATIVE
+    read = {"file_path": "/work/a.png"}
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": read,
+            "tool_use_id": "toolu_child",
+            "session_id": _NATIVE,
+            "agent_id": "sub-1",
+        }
+    )
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Read",
+            "tool_input": read,
+            "session_id": _NATIVE,
+        }
+    )
+    [pending] = transport._pending_tty_prompts.values()
+    assert pending["native_tool_use_id"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_questions", [True, False])
+async def test_a_question_without_identity_closes_on_its_matching_result(
+    tmp_path: Path, same_questions: bool
+) -> None:
+    """Regression: an identity-less question stayed open until the turn ended."""
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    # No native id captured (older broker behaviour): the card has no identity.
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": _ASKED},
+            "tool_use_id": "toolu_q",
+            "session_id": _NATIVE,
+        }
+    )
+    [rid] = list(transport._pending_tty_prompts)
+    card = next(e for e in events if e.get("type") == "ask_user_question")
+    assert card["metadata"]["answerable"] is False
+    assert card["metadata"]["recovery_required"] is True
+    asked = _ASKED if same_questions else [{**_ASKED[0], "question": "Something else?"}]
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": asked},
+            "tool_use_id": "toolu_q",
+            "session_id": _NATIVE,
+            "tool_response": {"answers": {"Which SDK target first?": "Web"}},
+        }
+    )
+    assert (rid not in transport._pending_tty_prompts) is same_questions
+
+
+@pytest.mark.asyncio
+async def test_a_question_with_identity_is_offered_as_answerable(tmp_path: Path) -> None:
+    transport = FakeTmuxInteractiveTransport(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    transport._claude_native_session_id = _NATIVE
+    await transport.handle_claude_hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": _ASKED},
+            "tool_use_id": "toolu_q",
+            "session_id": _NATIVE,
+        }
+    )
+    card = next(e for e in events if e.get("type") == "ask_user_question")
+    assert "answerable" not in card["metadata"]
+
+
 @pytest.mark.asyncio
 async def test_turn_end_resolves_stale_prompt(tmp_path: Path) -> None:
     transport = FakeTmuxInteractiveTransport(str(tmp_path))
