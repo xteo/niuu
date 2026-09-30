@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 import httpx
 
-from niuu.domain.notifications import NotificationDraft
+from niuu.domain.notifications import NotificationDraft, draft_payload
 from niuu.forge_mcp.models import ForgeApiError
 from niuu.forge_mcp.ports import ForgeClient
 
@@ -171,7 +171,7 @@ class RestForgeClient(ForgeClient):
         idempotency_key: str,
         instance_id: str | None,
     ) -> dict[str, Any]:
-        body = {**draft.model_dump(mode="json"), "idempotency_key": idempotency_key}
+        body = {**draft_payload(draft), "idempotency_key": idempotency_key}
         return await self._object(
             "POST",
             f"/sessions/{quote(session_id)}/notifications",
