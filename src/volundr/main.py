@@ -62,6 +62,7 @@ from volundr.adapters.inbound.rest_openshell_credentials import (
     create_openshell_credentials_router,
 )
 from volundr.adapters.inbound.rest_prompts import create_prompts_router
+from volundr.adapters.inbound.rest_push import create_push_router
 from volundr.adapters.inbound.rest_resident_runtimes import create_resident_runtimes_router
 from volundr.adapters.inbound.rest_resources import create_resources_router
 from volundr.adapters.inbound.rest_secrets import create_canonical_secrets_router
@@ -176,6 +177,7 @@ from volundr.notification_composition import (
     create_notification_image_worker,
     create_push_channel,
 )
+from volundr.push_composition import create_push_gateway
 
 # Interval for periodic stats and heartbeat broadcasts (seconds)
 BROADCAST_INTERVAL = 30
@@ -687,12 +689,21 @@ def create_app(
                 sleipnir_publisher=sleipnir_bus,
             )
 
-            # Push / attention notifier (optional — enabled via push.enabled).
+            # The Guild push gateway (push.gateway.enabled): this node pushes for
+            # every Guild node's notifications. Configured-but-impossible (an
+            # unreadable APNs key, no HTTP/2) raises here and stops the start.
+            push_gateway = create_push_gateway(
+                settings.push, pool, device_repository, local_events=broadcaster
+            )
+            app.state.push_gateway = push_gateway
+
+            # Per-node attention notifier (push.enabled without the gateway).
             # Fans a "session needs you" push out to the owner's devices when a
-            # session enters awaiting_input.
+            # session enters awaiting_input. The gateway alerts for that moment
+            # from its `attention` notification instead.
             attention_notifier = None
             push_channel = None
-            if settings.push.enabled:
+            if settings.push.enabled and push_gateway is None:
                 try:
                     notification_channel = create_push_channel(settings)
                     push_channel = notification_channel
@@ -1091,6 +1102,7 @@ def create_app(
                 archive_service=archive_service,
                 external_session_service=external_session_service,
                 device_repository=device_repository,
+                push_enabled=settings.push.enabled,
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,
@@ -1360,6 +1372,8 @@ def create_app(
             app.include_router(
                 create_message_delivery_router(PostgresMessageDelivery(pool), session_service)
             )
+            if push_gateway is not None:
+                app.include_router(create_push_router(push_gateway, prefix="/api/v1/forge"))
             if settings.forge_mcp.http.enabled:
                 app.include_router(create_forge_mcp_router(settings.forge_mcp.http))
             app.state.forge_mcp_http = settings.forge_mcp.http.enabled
@@ -1480,6 +1494,8 @@ def create_app(
                 await notification_delivery.start()
             if notification_image_worker is not None:
                 await notification_image_worker.start()
+            if push_gateway is not None:
+                await push_gateway.start()
             if settings.telegram_ingress.enabled:
                 await telegram_ingress.start()
             else:
@@ -1505,6 +1521,8 @@ def create_app(
                     await notification_delivery.stop()
                 if notification_image_worker is not None:
                     await notification_image_worker.stop()
+                if push_gateway is not None:
+                    await push_gateway.stop()
                 background_task.cancel()
                 try:
                     await background_task

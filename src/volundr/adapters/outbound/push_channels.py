@@ -5,8 +5,9 @@ Selected via the dynamic-adapter config (``push.adapter`` + ``kwargs``):
 - ``LoggingNotificationChannel`` — default; logs only, no external calls.
 - ``WebhookNotificationChannel`` — POSTs the push to a relay URL (the relay
   owns device fan-out). HTTP/1.1, no extra dependencies.
-- ``ApnsNotificationChannel`` — direct Apple Push, token-based (JWT) auth.
-  Requires an HTTP/2 client (``h2`` installed); inject one for tests.
+- ``ApnsNotificationChannel`` — direct Apple Push, token-based (JWT) auth, for
+  this node's needs-input pushes. The Guild push gateway (``push.gateway``) is the
+  full path: alerts for every notification, Live Activity and widget pushes.
 
 Each channel has two entry points. ``send`` is the best-effort path the
 needs-input attention push uses: it logs failures and never raises.
@@ -32,8 +33,10 @@ from niuu.adapters.notifications.delivery_http import (
     transport_failure,
 )
 from niuu.ports.notifications import NotificationDeliveryError
+from volundr.adapters.outbound.apns_client import check_signing_key, load_signing_key
 from volundr.domain.models import DevicePlatform, DeviceToken, PushMessage
 from volundr.domain.ports import NotificationChannel
+from volundr.domain.push import PushEnvironment, PushTokenKind
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +131,11 @@ class ApnsNotificationChannel(NotificationChannel):
     """Direct Apple Push Notification service channel (token-based auth).
 
     Signs a short-lived ES256 JWT (PyJWT + cryptography) with the .p8 key and
-    delivers one request per iOS device over HTTP/2. Pushes use the
-    ``time-sensitive`` interruption level so the alert and Live Activity / widget
-    surface even under Focus.
+    delivers one request per iOS alert token over HTTP/2, on the APNs host of the
+    token's environment (``use_sandbox`` forces the sandbox host for every token).
+    Pushes use the ``time-sensitive`` interruption level so the alert surfaces
+    even under Focus. The key comes from ``private_key_path`` (the .p8 file) or,
+    as PEM text, from ``private_key``; a missing or wrong key raises here.
     """
 
     _PROD_HOST = "https://api.push.apple.com"
@@ -141,17 +146,24 @@ class ApnsNotificationChannel(NotificationChannel):
         *,
         team_id: str,
         key_id: str,
-        private_key: str,
         bundle_id: str,
+        private_key: str = "",
+        private_key_path: str = "",
         use_sandbox: bool = False,
         token_ttl_seconds: int = 3000,
         client: httpx.AsyncClient | None = None,
     ):
+        if bool(private_key) == bool(private_key_path):
+            raise ValueError("APNs needs exactly one of private_key_path and private_key")
+        if private_key_path:
+            private_key = load_signing_key(private_key_path)
+        else:
+            check_signing_key(private_key, source="the private_key setting")
         self._team_id = team_id
         self._key_id = key_id
         self._private_key = private_key
         self._bundle_id = bundle_id
-        self._host = self._SANDBOX_HOST if use_sandbox else self._PROD_HOST
+        self._use_sandbox = use_sandbox
         self._token_ttl = token_ttl_seconds
         self._client = client
         self._jwt_cache: str | None = None
@@ -180,8 +192,20 @@ class ApnsNotificationChannel(NotificationChannel):
             self._client = httpx.AsyncClient(http2=True, timeout=10.0)
         return self._client
 
+    @staticmethod
+    def _alert_devices(devices: list[DeviceToken]) -> list[DeviceToken]:
+        """The tokens an alert can go to: iOS alert tokens, not Live Activity or widget ones."""
+        return [
+            d for d in devices if d.platform is DevicePlatform.IOS and d.kind is PushTokenKind.ALERT
+        ]
+
+    def _host_for(self, device: DeviceToken) -> str:
+        if self._use_sandbox or device.environment is PushEnvironment.SANDBOX:
+            return self._SANDBOX_HOST
+        return self._PROD_HOST
+
     async def send(self, message: PushMessage, devices: list[DeviceToken]) -> None:
-        if not any(d.platform is DevicePlatform.IOS for d in devices):
+        if not self._alert_devices(devices):
             return
         try:
             await self.deliver(message, devices)
@@ -189,7 +213,7 @@ class ApnsNotificationChannel(NotificationChannel):
             logger.warning("APNs push failed for owner %s: %s", message.owner_id, exc)
 
     async def deliver(self, message: PushMessage, devices: list[DeviceToken]) -> str:
-        ios_devices = [d for d in devices if d.platform is DevicePlatform.IOS]
+        ios_devices = self._alert_devices(devices)
         if not ios_devices:
             raise NotificationDeliveryError(
                 "The owner has no registered iOS devices", retryable=False
@@ -245,7 +269,7 @@ class ApnsNotificationChannel(NotificationChannel):
         topic = device.app_bundle_id or self._bundle_id
         try:
             resp = await client.post(
-                f"{self._host}/3/device/{device.token}",
+                f"{self._host_for(device)}/3/device/{device.token}",
                 json=payload,
                 headers={
                     "authorization": f"bearer {auth}",

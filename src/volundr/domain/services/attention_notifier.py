@@ -16,6 +16,7 @@ from volundr.domain.ports import (
     DeviceTokenRepository,
     NotificationChannel,
 )
+from volundr.domain.push import PushTokenKind
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,9 @@ class PushAttentionNotifier(AttentionNotifier):
             request_id=request_id,
         )
         try:
-            devices = await self._device_repository.list_for_owner(owner_id)
+            devices = await self._device_repository.list_for_owner(
+                owner_id, kinds=(PushTokenKind.ALERT,)
+            )
             await self._channel.send(message, devices)
         except Exception:
             # A push failure must never break the session activity path.

@@ -113,6 +113,6 @@ def test_images_migration_is_additive_idempotent_and_goes_with_its_notification(
     assert down.strip() == "DROP TABLE IF EXISTS forge_notification_images;"
 
 
-def test_images_migration_is_the_newest_volundr_migration():
+def test_images_migration_follows_the_read_state_migration():
     names = sorted(path.name for path in (ROOT / "src/cli/migrations/volundr").glob("*.up.sql"))
-    assert names[-1] == f"{IMAGES}.up.sql"
+    assert names[names.index(f"{IMAGES}.up.sql") - 1] == "000071_forge_notification_reads.up.sql"

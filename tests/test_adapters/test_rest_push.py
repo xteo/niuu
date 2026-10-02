@@ -1,0 +1,157 @@
+"""The push gateway's status and test-push routes."""
+
+from __future__ import annotations
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from tests.support.push_fakes import (
+    THOR,
+    Clock,
+    FakeApns,
+    FakeDeviceRepository,
+    FakeGuildFeed,
+    FakePushDeliveryRepository,
+    device,
+    gateway_settings,
+    guild_notification,
+)
+from volundr.adapters.inbound.rest_push import create_push_router
+from volundr.domain.push import ApnsResult, PushEnvironment, PushTokenKind
+from volundr.domain.push_ports import GuildFeedError
+from volundr.domain.services.push_gateway import PushGateway
+
+AUTH = {"x-auth-user-id": "dev-user", "x-auth-tenant": "default"}
+URL = "/api/v1/forge/push"
+
+
+class Rig:
+    def __init__(self) -> None:
+        clock = Clock()
+        self.feed = FakeGuildFeed()
+        self.devices = FakeDeviceRepository(clock)
+        self.apns = FakeApns()
+        self.gateway = PushGateway(
+            self.feed,
+            self.devices,
+            FakePushDeliveryRepository(clock),
+            self.apns,
+            gateway_settings(),
+            clock=clock,
+        )
+        app = FastAPI()
+        app.state.identity = object()  # forwarded x-auth-* headers identify the caller
+        app.include_router(create_push_router(self.gateway))
+        self.client = TestClient(app)
+
+
+@pytest.fixture
+def rig() -> Rig:
+    return Rig()
+
+
+def test_status_reports_the_gateway(rig):
+    response = rig.client.get(f"{URL}/status", headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["running"] is False and body["nodes"] == {}
+    assert body["alerts_sent"] == 0 and body["last_tick_at"] is None
+    assert body["alerts_enabled"] is True
+
+
+def test_status_needs_a_caller(rig):
+    assert rig.client.get(f"{URL}/status").status_code == 401
+
+
+def test_test_alert_goes_to_the_callers_alert_tokens_only(rig):
+    rig.devices.add(
+        device("aaaaaaaa11111111", environment=PushEnvironment.SANDBOX),
+        device("bbbbbbbb22222222", owner_id="someone-else"),
+        device("cccccccc33333333", PushTokenKind.WIDGET),
+    )
+
+    response = rig.client.post(f"{URL}/test", json={}, headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "kind": "alert",
+        "sent": 1,
+        "accepted": 1,
+        "devices": [
+            {
+                "kind": "alert",
+                "environment": "sandbox",
+                "token_suffix": "11111111",
+                "accepted": True,
+                "detail": "accepted",
+                "apns_id": "apns-1",
+            }
+        ],
+    }
+    (push,) = rig.apns.sent
+    assert push.token == "aaaaaaaa11111111"
+    assert push.payload["aps"]["alert"] == {
+        "title": "Forge test push",
+        "body": "Push from Forge reaches this device.",
+    }
+
+
+def test_test_alert_with_its_own_text_and_a_refusal(rig):
+    rig.devices.add(device("aaaaaaaa11111111"))
+    rig.apns.answer("aaaaaaaa11111111", ApnsResult(403, "InvalidProviderToken"))
+
+    response = rig.client.post(
+        f"{URL}/test", json={"kind": "alert", "title": "Hello", "body": "World"}, headers=AUTH
+    )
+
+    body = response.json()
+    assert (body["sent"], body["accepted"]) == (1, 0)
+    assert body["devices"][0]["detail"] == "HTTP 403 InvalidProviderToken"
+    assert rig.apns.sent[0].payload["aps"]["alert"] == {"title": "Hello", "body": "World"}
+
+
+def test_test_live_activity_and_widget(rig):
+    rig.devices.add(
+        device("la-token-00000001", PushTokenKind.LIVE_ACTIVITY),
+        device("widget-token-0002", PushTokenKind.WIDGET),
+    )
+    rig.feed.add(guild_notification("n-1", instance_id=THOR))
+
+    live = rig.client.post(f"{URL}/test", json={"kind": "live_activity"}, headers=AUTH)
+    widget = rig.client.post(f"{URL}/test", json={"kind": "widget"}, headers=AUTH)
+
+    assert live.json()["accepted"] == 1 and widget.json()["accepted"] == 1
+    assert [push.push_type.value for push in rig.apns.sent] == ["liveactivity", "widgets"]
+
+
+def test_no_token_of_that_kind_is_a_404(rig):
+    response = rig.client.post(f"{URL}/test", json={"kind": "live_activity_start"}, headers=AUTH)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "You have no registered live_activity_start token on this Forge"
+    )
+
+
+def test_an_unreadable_guild_feed_is_a_502(rig):
+    rig.devices.add(device("la-token-00000001", PushTokenKind.LIVE_ACTIVITY))
+    rig.feed.error = GuildFeedError("The Guild feed answered HTTP 502")
+
+    response = rig.client.post(f"{URL}/test", json={"kind": "live_activity"}, headers=AUTH)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "The Guild feed answered HTTP 502"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"kind": "voip"}, {"title": ""}, {"title": "t" * 121}, {"body": "b" * 281}, {"token": "x"}],
+)
+def test_bad_requests_are_rejected(rig, body):
+    assert rig.client.post(f"{URL}/test", json=body, headers=AUTH).status_code == 422
+
+
+def test_test_push_needs_a_caller(rig):
+    assert rig.client.post(f"{URL}/test", json={}).status_code == 401

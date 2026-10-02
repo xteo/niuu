@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.support.push_fakes import Clock, FakeDeviceRepository
 from volundr.domain.models import (
     DevicePlatform,
     DeviceToken,
@@ -10,23 +11,15 @@ from volundr.domain.models import (
     Session,
     SessionStatus,
 )
-from volundr.domain.ports import DeviceTokenRepository, NotificationChannel
+from volundr.domain.ports import NotificationChannel
+from volundr.domain.push import PushTokenKind
 from volundr.domain.services.attention_notifier import PushAttentionNotifier
 
 
-class FakeDeviceRepo(DeviceTokenRepository):
+class FakeDeviceRepo(FakeDeviceRepository):
     def __init__(self, devices: list[DeviceToken] | None = None):
-        self._devices = devices or []
-
-    async def upsert(self, device: DeviceToken) -> DeviceToken:
-        self._devices.append(device)
-        return device
-
-    async def list_for_owner(self, owner_id: str) -> list[DeviceToken]:
-        return [d for d in self._devices if d.owner_id == owner_id]
-
-    async def delete(self, owner_id: str, token: str) -> bool:
-        return False
+        super().__init__(Clock())
+        self.add(*(devices or []))
 
 
 class RecordingChannel(NotificationChannel):
@@ -104,3 +97,20 @@ async def test_channel_error_is_swallowed():
 
     # Must not raise — a push failure cannot break the activity path.
     await notifier.notify_needs_input(_session(), kind="question", prompt="x", request_id="r")
+
+
+async def test_only_alert_tokens_are_handed_to_the_channel():
+    channel = RecordingChannel()
+    alert = DeviceToken(owner_id="user-1", platform=DevicePlatform.IOS, token="alert-1")
+    widget = DeviceToken(
+        owner_id="user-1",
+        platform=DevicePlatform.IOS,
+        token="widget-1",
+        kind=PushTokenKind.WIDGET,
+    )
+    notifier = PushAttentionNotifier(FakeDeviceRepo([alert, widget]), channel)
+
+    await notifier.notify_needs_input(_session(), kind="question", prompt="?", request_id="r")
+
+    ((_, devices),) = channel.sent
+    assert [device.token for device in devices] == ["alert-1"]
