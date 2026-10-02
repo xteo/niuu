@@ -409,7 +409,7 @@ sleipnir:
 # Apple push for Forge notifications. Rendered verbatim as config.yaml's `push:`
 # section (snake_case keys; see PushNotificationConfig). Empty keeps push off. One
 # node of a Guild runs the gateway: it holds the APNs key and the registered devices
-# and pushes for every node (alerts, Live Activity, widgets). The .p8 signing key is a
+# and pushes for every node (alerts, Live Activity, widgets, background). The .p8 key is a
 # file: mount it from a Secret and name its path. See
 # docs/operator/forge-notifications.md ("Apple push"). Example:
 #   push:

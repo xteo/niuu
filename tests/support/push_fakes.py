@@ -29,6 +29,7 @@ from volundr.domain.push_ports import (
 )
 from volundr.domain.services.push_gateway import (
     AlertSettings,
+    BackgroundSettings,
     LiveActivitySettings,
     PushGatewaySettings,
     WidgetSettings,
@@ -443,6 +444,7 @@ def gateway_settings(
     alerts: AlertSettings | None = None,
     live_activity: LiveActivitySettings | None = None,
     widgets: WidgetSettings | None = None,
+    background: BackgroundSettings | None = None,
     **overrides,
 ) -> PushGatewaySettings:
     values = {
@@ -468,6 +470,9 @@ def gateway_settings(
             start_min_interval_seconds=3600.0,
         ),
         "widgets": widgets or WidgetSettings(enabled=True, priority=5, min_interval_seconds=300.0),
+        # Off unless a test turns it on: most tests count the pushes of one type.
+        "background": background
+        or BackgroundSettings(enabled=False, priority=5, min_interval_seconds=900.0),
     }
     values.update(overrides)
     return PushGatewaySettings(**values)

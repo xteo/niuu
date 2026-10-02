@@ -16,13 +16,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from volundr.adapters.inbound.auth import extract_principal
 from volundr.domain.models import Principal
-from volundr.domain.push import PushTokenKind
+from volundr.domain.push import PushTestKind
 from volundr.domain.push_ports import GuildFeedError
 from volundr.domain.services.push_gateway import PushGateway
 
 #: Bounds of a test alert's text; a real alert's come from the notification.
 MAX_TEST_TITLE_CHARS = 120
 MAX_TEST_BODY_CHARS = 280
+#: The registration limit of a token (``DeviceToken.token``).
+MAX_TOKEN_CHARS = 512
 
 
 class PushTestRequest(BaseModel):
@@ -30,7 +32,13 @@ class PushTestRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: PushTokenKind = PushTokenKind.ALERT
+    kind: PushTestKind = PushTestKind.ALERT
+    token: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_TOKEN_CHARS,
+        description="Only this registered token; omitted pushes to every token for the kind",
+    )
     title: str = Field(default="Forge test push", min_length=1, max_length=MAX_TEST_TITLE_CHARS)
     body: str = Field(
         default="Push from Forge reaches this device.", max_length=MAX_TEST_BODY_CHARS
@@ -68,23 +76,28 @@ def create_push_router(gateway: PushGateway, *, prefix: str = "/api/v1/forge") -
     async def send_test_push(
         data: PushTestRequest, principal: Principal = Depends(extract_principal)
     ) -> PushTestResponse:
-        """Push once to each of the caller's registered tokens of ``kind``.
+        """Push once to the caller's registered tokens for ``kind``.
 
         ``alert`` shows the given title and body and opens the app's activity list;
-        ``live_activity`` and ``live_activity_start`` carry the caller's current
-        notifications; ``widget`` reloads the widgets. Throttles do not apply.
+        ``background`` is the silent push to the alert token; ``live_activity`` and
+        ``live_activity_start`` carry the caller's current notifications; ``widget``
+        reloads the widgets. ``token`` narrows it to one registered token. Throttles
+        do not apply.
         """
         try:
             results = await gateway.send_test(
-                principal.user_id, data.kind, title=data.title, body=data.body
+                principal.user_id, data.kind, title=data.title, body=data.body, token=data.token
             )
         except GuildFeedError as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
         if not results:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                f"You have no registered {data.kind.value} token on this Forge",
+            token_kind = data.kind.token_kind.value
+            detail = (
+                f"That token is not one of your registered {token_kind} tokens on this Forge"
+                if data.token
+                else f"You have no registered {token_kind} token on this Forge"
             )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail)
         return PushTestResponse(
             kind=data.kind.value,
             sent=len(results),

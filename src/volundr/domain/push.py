@@ -6,7 +6,8 @@ notification the Guild records, the push gateway sends:
 - an **alert** (``apns-push-type: alert``) that opens the notification in the app;
 - a **Live Activity** update (``liveactivity``) carrying the newest notifications,
   or a push-to-start when no activity is running;
-- a **widget** reload (``widgets``).
+- a **widget** reload (``widgets``);
+- a silent **background** push (``background``) that lets iOS wake the app.
 
 The payload shapes below are a wire contract with the app (its Swift
 ``ForgeNotificationsActivityContent`` and its deep-link parser), so the limits and
@@ -44,6 +45,8 @@ IMAGE_PENDING_STATE = "pending"
 #: APNs refuses a longer ``apns-collapse-id``.
 APNS_MAX_COLLAPSE_ID_BYTES = 64
 
+#: Why a background push was sent, as the app reads it (``forge.reason``).
+BACKGROUND_REASON = "notification"
 #: Topic suffixes APNs requires for the non-alert push types.
 LIVE_ACTIVITY_TOPIC_SUFFIX = ".push-type.liveactivity"
 WIDGETS_TOPIC_SUFFIX = ".push-type.widgets"
@@ -88,8 +91,27 @@ class ApnsPushType(StrEnum):
     """``apns-push-type`` values Forge sends."""
 
     ALERT = "alert"
+    BACKGROUND = "background"
     LIVE_ACTIVITY = "liveactivity"
     WIDGETS = "widgets"
+
+
+class PushTestKind(StrEnum):
+    """What an operator's test push sends; each goes to one kind of token."""
+
+    ALERT = "alert"
+    BACKGROUND = "background"
+    LIVE_ACTIVITY = "live_activity"
+    LIVE_ACTIVITY_START = "live_activity_start"
+    WIDGET = "widget"
+
+    @property
+    def token_kind(self) -> PushTokenKind:
+        """The registered tokens this push goes to (a background push wakes the
+        app through its alert token)."""
+        if self is PushTestKind.BACKGROUND:
+            return PushTokenKind.ALERT
+        return PushTokenKind(self.value)
 
 
 class LiveActivityEvent(StrEnum):
@@ -454,3 +476,8 @@ def live_activity_payload(
 def widget_payload() -> dict[str, Any]:
     """The WidgetKit reload push."""
     return {"aps": {"content-changed": True}}
+
+
+def background_payload() -> dict[str, Any]:
+    """The silent push that lets iOS wake the app to read every server it knows."""
+    return {"aps": {"content-available": 1}, "forge": {"reason": BACKGROUND_REASON}}

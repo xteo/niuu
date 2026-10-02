@@ -22,6 +22,8 @@ node:
    has no running activity (when enabled, at most once per interval).
 4. **Widgets.** Reloads the owner's widgets, at most once per interval per token;
    a reload held back by the interval is sent when the interval ends.
+5. **Background.** Sends the app a silent push through its alert token, with the
+   same interval rule, so iOS can wake it to read every server it knows.
 
 A token APNs reports as dead (410, ``BadDeviceToken``, ``Unregistered``,
 ``ExpiredToken``) is deleted.
@@ -54,11 +56,13 @@ from volundr.domain.push import (
     GuildNotification,
     InterruptionLevel,
     LiveActivityEvent,
+    PushTestKind,
     PushTokenKind,
     absolute_url,
     activity_deep_link,
     alert_payload,
     apns_topic,
+    background_payload,
     clip,
     live_activity_content_state,
     live_activity_payload,
@@ -81,10 +85,13 @@ NO_ALERT_DEVICE = "The owner has no alert device registered"
 ALERTS_DISABLED = "Alerts are switched off (push.gateway.alerts.enabled)"
 ALREADY_READ = "Already read when the gateway picked it up"
 
+#: Tokens pushed on every new notification, whatever its kind. The alert token is
+#: among them for the silent background push.
 _SURFACE_KINDS = (
     PushTokenKind.LIVE_ACTIVITY,
     PushTokenKind.LIVE_ACTIVITY_START,
     PushTokenKind.WIDGET,
+    PushTokenKind.ALERT,
 )
 
 
@@ -150,6 +157,15 @@ class WidgetSettings:
 
 
 @dataclass(frozen=True)
+class BackgroundSettings:
+    """``push.gateway.background``."""
+
+    enabled: bool
+    priority: int
+    min_interval_seconds: float
+
+
+@dataclass(frozen=True)
 class PushGatewaySettings:
     """Everything the gateway loop needs, from ``push.apns`` and ``push.gateway``."""
 
@@ -168,6 +184,7 @@ class PushGatewaySettings:
     alerts: AlertSettings
     live_activity: LiveActivitySettings
     widgets: WidgetSettings
+    background: BackgroundSettings
 
     def __post_init__(self) -> None:
         if not self.bundle_id:
@@ -196,6 +213,7 @@ class PushGatewayStats:
     live_activity_updates: int = 0
     live_activity_starts: int = 0
     widget_reloads: int = 0
+    background_wakes: int = 0
     tokens_pruned: int = 0
     apns_rejections: int = 0
     stale_settles: int = 0
@@ -230,8 +248,8 @@ class _Tick:
     page: GuildFeedPage | None = None
     loaded: bool = False
     retry_owners: set[str] = field(default_factory=set)
-    #: Widget tokens whose reload APNs could not take in this tick.
-    undelivered_widgets: set[UUID] = field(default_factory=set)
+    #: Tokens whose throttled push APNs could not take in this tick.
+    undelivered: set[UUID] = field(default_factory=set)
 
     async def newest(self) -> GuildFeedPage | None:
         """The merged newest page, or ``None`` while no node answers."""
@@ -385,7 +403,7 @@ class PushGateway:
         for owner_id in sorted(self._retry_owners):
             await self._refresh_surfaces(owner_id, tick)
             self._retry_owners.discard(owner_id)
-        await self._send_owed_widget_reloads(tick)
+        await self._send_owed_pushes(tick)
         self._retry_owners |= tick.retry_owners
         await self._prune(now)
         self.stats.ticks += 1
@@ -724,12 +742,13 @@ class PushGateway:
         if self._settings.live_activity.enabled and (live or starts):
             if await self._refresh_live_activity(owner_id, live, starts, tick):
                 tick.retry_owners.add(owner_id)
-        if not self._settings.widgets.enabled:
-            return
-        interval = self._settings.widgets.min_interval_seconds
-        for device in by_kind[PushTokenKind.WIDGET]:
-            if await self._devices.claim_push(device.id, min_interval_seconds=interval):
-                await self._reload_widget(device, tick)
+        for kind in (PushTokenKind.WIDGET, PushTokenKind.ALERT):
+            enabled, interval = self._throttle(kind)
+            if not enabled:
+                continue
+            for device in by_kind[kind]:
+                if await self._devices.claim_push(device.id, min_interval_seconds=interval):
+                    await self._send_throttled(device, tick)
 
     async def _refresh_live_activity(
         self,
@@ -829,41 +848,66 @@ class PushGateway:
             ),
         )
 
-    async def _reload_widget(self, device: DeviceToken, tick: _Tick) -> ApnsResult:
-        result = await self._send(
-            device,
-            ApnsPush(
-                token=device.token,
-                environment=device.environment,
-                topic=self._topic(device, ApnsPushType.WIDGETS),
-                push_type=ApnsPushType.WIDGETS,
-                priority=self._settings.widgets.priority,
-                payload=widget_payload(),
-            ),
+    def _throttle(self, kind: PushTokenKind) -> tuple[bool, float]:
+        """Whether the throttled push of ``kind`` tokens is on, and its interval:
+        the widget reload for widget tokens, the background push for alert tokens."""
+        if kind is PushTokenKind.WIDGET:
+            return self._settings.widgets.enabled, self._settings.widgets.min_interval_seconds
+        background = self._settings.background
+        return background.enabled, background.min_interval_seconds
+
+    def _widget_push(self, device: DeviceToken) -> ApnsPush:
+        return ApnsPush(
+            token=device.token,
+            environment=device.environment,
+            topic=self._topic(device, ApnsPushType.WIDGETS),
+            push_type=ApnsPushType.WIDGETS,
+            priority=self._settings.widgets.priority,
+            payload=widget_payload(),
         )
+
+    def _background_push(self, device: DeviceToken) -> ApnsPush:
+        return ApnsPush(
+            token=device.token,
+            environment=device.environment,
+            topic=self._topic(device, ApnsPushType.BACKGROUND),
+            push_type=ApnsPushType.BACKGROUND,
+            priority=self._settings.background.priority,
+            payload=background_payload(),
+        )
+
+    async def _send_throttled(self, device: DeviceToken, tick: _Tick) -> ApnsResult:
+        """Send a claimed widget reload or background push."""
+        widget = device.kind is PushTokenKind.WIDGET
+        push = self._widget_push(device) if widget else self._background_push(device)
+        result = await self._send(device, push)
         if result.accepted:
-            self.stats.widget_reloads += 1
+            if widget:
+                self.stats.widget_reloads += 1
+            else:
+                self.stats.background_wakes += 1
             return result
         if result.retryable:
-            # Not delivered: the reload stays owed and goes out on a later tick.
+            # Not delivered: the push stays owed and goes out on a later tick.
             await self._devices.release_push(device.id)
-            tick.undelivered_widgets.add(device.id)
+            tick.undelivered.add(device.id)
         return result
 
-    async def _send_owed_widget_reloads(self, tick: _Tick) -> None:
-        """Reloads the interval held back earlier, now that it has passed."""
-        if not self._settings.widgets.enabled:
-            return
-        owed = await self._devices.claim_owed_pushes(
-            PushTokenKind.WIDGET, min_interval_seconds=self._settings.widgets.min_interval_seconds
-        )
-        for device in owed:
-            if device.id in tick.undelivered_widgets:
-                # APNs could not take it a moment ago: the next tick tries again.
-                await self._devices.release_push(device.id)
+    async def _send_owed_pushes(self, tick: _Tick) -> None:
+        """Pushes the interval held back earlier, now that it has passed: the last
+        change always reaches the widgets and wakes the app."""
+        for kind in (PushTokenKind.WIDGET, PushTokenKind.ALERT):
+            enabled, interval = self._throttle(kind)
+            if not enabled:
                 continue
-            if device.platform is DevicePlatform.IOS:
-                await self._reload_widget(device, tick)
+            owed = await self._devices.claim_owed_pushes(kind, min_interval_seconds=interval)
+            for device in owed:
+                if device.id in tick.undelivered:
+                    # APNs could not take it a moment ago: the next tick tries again.
+                    await self._devices.release_push(device.id)
+                    continue
+                if device.platform is DevicePlatform.IOS:
+                    await self._send_throttled(device, tick)
 
     # -- Shared ------------------------------------------------------------
 
@@ -913,19 +957,30 @@ class PushGateway:
     # -- Operator tools ----------------------------------------------------
 
     async def send_test(
-        self, owner_id: str, kind: PushTokenKind, *, title: str, body: str
+        self,
+        owner_id: str,
+        kind: PushTestKind,
+        *,
+        title: str,
+        body: str,
+        token: str | None = None,
     ) -> list[PushTestResult]:
-        """Push once to each of the owner's tokens of ``kind``, ignoring throttles.
+        """Push once to the owner's registered tokens for ``kind``, ignoring throttles.
 
-        The alert opens the app's activity list; the Live Activity pushes carry the
-        owner's real current content.
+        ``token`` narrows it to that one registered token. The alert opens the app's
+        activity list; the Live Activity pushes carry the owner's real current
+        content; the background push and the widget reload are the real ones.
         """
-        devices = await self._ios_devices(owner_id, (kind,))
+        devices = [
+            device
+            for device in await self._ios_devices(owner_id, (kind.token_kind,))
+            if token is None or device.token == token
+        ]
         if not devices:
             return []
         now = self._clock()
         state: dict[str, Any] = {}
-        if kind in (PushTokenKind.LIVE_ACTIVITY, PushTokenKind.LIVE_ACTIVITY_START):
+        if kind in (PushTestKind.LIVE_ACTIVITY, PushTestKind.LIVE_ACTIVITY_START):
             page = await self._newest_page()
             if page is None:
                 raise GuildFeedError("No Guild node answers right now; try again in a moment")
@@ -933,11 +988,11 @@ class PushGateway:
         results: list[PushTestResult] = []
         for device in devices:
             result = await self._send(
-                device, self._test_push(device, state, now, title=title, body=body)
+                device, self._test_push(kind, device, state, now, title=title, body=body)
             )
             results.append(
                 PushTestResult(
-                    kind=device.kind.value,
+                    kind=kind.value,
                     environment=device.environment.value,
                     token_suffix=device.token[-_TOKEN_SUFFIX_CHARS:],
                     accepted=result.accepted,
@@ -948,13 +1003,20 @@ class PushGateway:
         return results
 
     def _test_push(
-        self, device: DeviceToken, state: dict[str, Any], now: datetime, *, title: str, body: str
+        self,
+        kind: PushTestKind,
+        device: DeviceToken,
+        state: dict[str, Any],
+        now: datetime,
+        *,
+        title: str,
+        body: str,
     ) -> ApnsPush:
         alerts = self._settings.alerts
-        match device.kind:
-            case PushTokenKind.LIVE_ACTIVITY:
+        match kind:
+            case PushTestKind.LIVE_ACTIVITY:
                 return self._live_activity_push(device, LiveActivityEvent.UPDATE, state, now)
-            case PushTokenKind.LIVE_ACTIVITY_START:
+            case PushTestKind.LIVE_ACTIVITY_START:
                 return self._live_activity_push(
                     device,
                     LiveActivityEvent.START,
@@ -963,15 +1025,10 @@ class PushGateway:
                     alert_title=clip(title, LIVE_ACTIVITY_TITLE_CHARS),
                     alert_body=body,
                 )
-            case PushTokenKind.WIDGET:
-                return ApnsPush(
-                    token=device.token,
-                    environment=device.environment,
-                    topic=self._topic(device, ApnsPushType.WIDGETS),
-                    push_type=ApnsPushType.WIDGETS,
-                    priority=self._settings.widgets.priority,
-                    payload=widget_payload(),
-                )
+            case PushTestKind.WIDGET:
+                return self._widget_push(device)
+            case PushTestKind.BACKGROUND:
+                return self._background_push(device)
         return ApnsPush(
             token=device.token,
             environment=device.environment,
@@ -1002,6 +1059,7 @@ class PushGateway:
             "live_activity_enabled": self._settings.live_activity.enabled,
             "live_activity_start_enabled": self._settings.live_activity.start_enabled,
             "widgets_enabled": self._settings.widgets.enabled,
+            "background_enabled": self._settings.background.enabled,
             **stats,
         }
 

@@ -76,7 +76,11 @@ class TestDefaults:
         assert gateway.live_activity.priority == 10
         assert gateway.live_activity.start.enabled is False
         assert gateway.live_activity.start.min_interval_seconds == 3600.0
-        assert gateway.widgets.min_interval_seconds == 300.0
+        assert gateway.widgets.min_interval_seconds == 120.0
+        assert gateway.widgets.priority == 10
+        assert gateway.background.enabled is True
+        assert gateway.background.min_interval_seconds == 900.0
+        assert gateway.background.priority == 5
 
     def test_apns_hosts(self):
         apns = ApnsConfig()
@@ -185,6 +189,7 @@ class TestComposition:
                     "start": {"enabled": True, "min_interval_seconds": 60},
                 },
                 widgets={"enabled": False, "min_interval_seconds": 600, "priority": 10},
+                background={"enabled": False, "min_interval_seconds": 1800},
             )
         )
 
@@ -200,6 +205,11 @@ class TestComposition:
         assert settings.live_activity.start_min_interval_seconds == 60
         assert (settings.widgets.enabled, settings.widgets.min_interval_seconds) == (False, 600)
         assert settings.widgets.priority == 10
+        assert (settings.background.enabled, settings.background.min_interval_seconds) == (
+            False,
+            1800,
+        )
+        assert settings.background.priority == 5
         assert settings.poll_interval_seconds == 5.0 and settings.page_size == 50
         assert settings.stream_enabled is False
         assert settings.node_retry_seconds == 30.0

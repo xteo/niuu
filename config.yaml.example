@@ -208,8 +208,8 @@ git:
 
 # Apple push for Forge notifications (optional). One node of a Guild runs the
 # gateway: it holds the APNs key and the registered devices and pushes for every
-# node (alerts, Live Activity, widgets). See docs/operator/forge-notifications.md
-# ("Apple push").
+# node of that Guild (alerts, Live Activity, widgets, background). Each Guild runs
+# its own. See docs/operator/forge-notifications.md ("Apple push").
 # push:
 #   enabled: true
 #   apns:
@@ -229,7 +229,9 @@ git:
 #     live_activity:
 #       start: {enabled: false}                 # push-to-start when no activity runs
 #     widgets:
-#       min_interval_seconds: 300
+#       min_interval_seconds: 120               # widget reloads, per token
+#     background:
+#       min_interval_seconds: 900               # silent pushes that wake the app, per token
 
 # Forge session notifications and their external delivery (optional).
 # Nothing leaves Forge unless a sink below (or an owner's messaging integration)

@@ -141,6 +141,52 @@ def test_no_token_of_that_kind_is_a_404(rig):
     )
 
 
+def test_background_push_goes_to_the_alert_token(rig):
+    rig.devices.add(device("aaaaaaaa11111111"), device("cccccccc33333333", PushTokenKind.WIDGET))
+
+    response = rig.client.post(f"{URL}/test", json={"kind": "background"}, headers=AUTH)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["kind"], body["sent"], body["accepted"]) == ("background", 1, 1)
+    assert body["devices"][0]["kind"] == "background"
+    (push,) = rig.apns.sent
+    assert push.token == "aaaaaaaa11111111"
+    assert push.push_type.value == "background"
+    assert push.payload == {"aps": {"content-available": 1}, "forge": {"reason": "notification"}}
+
+
+def test_background_without_an_alert_token_is_a_404(rig):
+    response = rig.client.post(f"{URL}/test", json={"kind": "background"}, headers=AUTH)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "You have no registered alert token on this Forge"
+
+
+def test_one_registered_token(rig):
+    rig.devices.add(device("aaaaaaaa11111111"), device("bbbbbbbb22222222"))
+
+    response = rig.client.post(
+        f"{URL}/test", json={"kind": "alert", "token": "bbbbbbbb22222222"}, headers=AUTH
+    )
+
+    assert response.json()["sent"] == 1
+    assert [push.token for push in rig.apns.sent] == ["bbbbbbbb22222222"]
+
+
+def test_a_token_that_is_not_registered_is_a_404(rig):
+    rig.devices.add(device("aaaaaaaa11111111"))
+
+    response = rig.client.post(
+        f"{URL}/test", json={"kind": "alert", "token": "ffffffff99999999"}, headers=AUTH
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "That token is not one of your registered alert tokens on this Forge"
+    )
+    assert rig.apns.sent == []
+
+
 def test_when_no_guild_node_answers_the_test_push_is_a_502(rig):
     rig.devices.add(device("la-token-00000001", PushTokenKind.LIVE_ACTIVITY))
     rig.feed.down[THOR] = GuildFeedError("Guild node inst-thor's feed answered HTTP 502")
@@ -153,7 +199,15 @@ def test_when_no_guild_node_answers_the_test_push_is_a_502(rig):
 
 @pytest.mark.parametrize(
     "body",
-    [{"kind": "voip"}, {"title": ""}, {"title": "t" * 121}, {"body": "b" * 281}, {"token": "x"}],
+    [
+        {"kind": "voip"},
+        {"title": ""},
+        {"title": "t" * 121},
+        {"body": "b" * 281},
+        {"token": ""},
+        {"token": "x" * 513},
+        {"device": "x"},
+    ],
 )
 def test_bad_requests_are_rejected(rig, body):
     assert rig.client.post(f"{URL}/test", json=body, headers=AUTH).status_code == 422

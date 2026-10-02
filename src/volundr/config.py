@@ -826,20 +826,48 @@ class PushWidgetsConfig(BaseModel):
 
     enabled: bool = Field(default=True, description="Send widget reload pushes.")
     min_interval_seconds: float = Field(
-        default=300.0,
+        default=120.0,
         gt=0,
         description=(
             "At most one reload per widget token in this interval; a reload held "
+            "back is sent when the interval ends, so the last change is never dropped."
+        ),
+    )
+    priority: int = Field(
+        default=10, ge=1, le=10, description="apns-priority of a widget reload (5 or 10)."
+    )
+
+
+class PushBackgroundConfig(BaseModel):
+    """Silent background pushes to the app's alert token.
+
+    They let iOS wake the app, which then reads every server it knows (a server
+    only knows its own Guild). iOS delivers only a few per hour, so they are spaced
+    per token.
+    """
+
+    enabled: bool = Field(default=True, description="Send background pushes.")
+    min_interval_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "At most one background push per alert token in this interval; one held "
             "back is sent when the interval ends."
         ),
     )
     priority: int = Field(
-        default=5, ge=1, le=10, description="apns-priority of a widget reload (5 or 10)."
+        default=5,
+        ge=1,
+        le=10,
+        description="apns-priority of a background push. APNs refuses 10 for this type.",
     )
 
 
 class PushGatewayConfig(BaseModel):
-    """The Guild push gateway: Apple pushes for every Guild node's notifications.
+    """The push gateway: Apple pushes for every notification of this server's Guild.
+
+    Any Forge server turns it on with configuration. A phone that uses several
+    servers registers with each; each pushes for its own Guild.
 
     One node holds the APNs key (``push.apns``) and the registered devices. It
     reads every node's notification feed through the Guild API at ``guild_url`` and
@@ -929,6 +957,7 @@ class PushGatewayConfig(BaseModel):
     alerts: PushAlertsConfig = Field(default_factory=PushAlertsConfig)
     live_activity: PushLiveActivityConfig = Field(default_factory=PushLiveActivityConfig)
     widgets: PushWidgetsConfig = Field(default_factory=PushWidgetsConfig)
+    background: PushBackgroundConfig = Field(default_factory=PushBackgroundConfig)
 
     @model_validator(mode="after")
     def _needs_guild(self) -> "PushGatewayConfig":

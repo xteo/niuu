@@ -27,7 +27,7 @@ from volundr.adapters.outbound.postgres_device_tokens import PostgresDeviceToken
 from volundr.adapters.outbound.postgres_push_gateway import PostgresPushDeliveryRepository
 from volundr.domain.push import ApnsResult, PushEnvironment, PushTokenKind
 from volundr.domain.push_ports import PushDeliveryStatus
-from volundr.domain.services.push_gateway import PushGateway
+from volundr.domain.services.push_gateway import BackgroundSettings, PushGateway
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
@@ -377,7 +377,12 @@ class TestGatewayEndToEnd:
         await devices.upsert(device("alert-1", environment=PushEnvironment.SANDBOX))
         await devices.upsert(device("la-1", PushTokenKind.LIVE_ACTIVITY, activity_id="act-1"))
         await devices.upsert(device("widget-1", PushTokenKind.WIDGET))
-        gateway, feed, apns, now = await self._gateway(txn_pool, devices, deliveries)
+        gateway, feed, apns, now = await self._gateway(
+            txn_pool,
+            devices,
+            deliveries,
+            background=BackgroundSettings(enabled=True, priority=5, min_interval_seconds=900.0),
+        )
         feed.add(
             guild_notification(
                 "1a97554b-96b1-5fac-baa4-5bf53ba35d92",
@@ -394,6 +399,7 @@ class TestGatewayEndToEnd:
             ("alert", "alert-1"),
             ("liveactivity", "la-1"),
             ("widgets", "widget-1"),
+            ("background", "alert-1"),
         ]
         alert = apns.sent[0]
         assert alert.environment is PushEnvironment.SANDBOX
@@ -409,9 +415,10 @@ class TestGatewayEndToEnd:
         assert tuple(row) == ("sent", "APNs accepted 1 of 1 devices", 1)
         assert await deliveries.load_positions() == {THOR: 0, MINI: 1}
 
-        # Nothing new: no push is repeated, and the widget stays inside its interval.
+        # Nothing new: no push is repeated; the widget and the background push stay
+        # inside their intervals.
         assert await gateway.run_once() == 0
-        assert len(apns.sent) == 3
+        assert len(apns.sent) == 4
 
     async def test_dead_tokens_are_deleted_from_the_table(self, txn_pool, devices, deliveries):
         for token, kind in (

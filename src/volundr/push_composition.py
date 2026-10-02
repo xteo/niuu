@@ -23,6 +23,7 @@ from volundr.config import ApnsConfig, PushGatewayConfig, PushNotificationConfig
 from volundr.domain.ports import DeviceTokenRepository, EventBroadcaster
 from volundr.domain.services.push_gateway import (
     AlertSettings,
+    BackgroundSettings,
     LiveActivitySettings,
     PushGateway,
     PushGatewaySettings,
@@ -69,6 +70,7 @@ def read_reader_token(path: str) -> str:
 def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
     gateway: PushGatewayConfig = push.gateway
     alerts, live, widgets = gateway.alerts, gateway.live_activity, gateway.widgets
+    background = gateway.background
     return PushGatewaySettings(
         bundle_id=push.apns.bundle_id,
         poll_interval_seconds=gateway.poll_interval_seconds,
@@ -115,6 +117,11 @@ def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
             enabled=widgets.enabled,
             priority=widgets.priority,
             min_interval_seconds=widgets.min_interval_seconds,
+        ),
+        background=BackgroundSettings(
+            enabled=background.enabled,
+            priority=background.priority,
+            min_interval_seconds=background.min_interval_seconds,
         ),
     )
 

@@ -362,17 +362,21 @@ notification links (`/volundr/…`) are made absolute against the same base.
 ## Apple push (the push gateway)
 
 With the push gateway, a notification recorded on **any** node of a Guild reaches the
-owner's iPhone while the app is closed, in three ways:
+owner's iPhone while the app is closed, in four ways:
 
-- an **alert** that opens the notification in the app;
+- an **alert** that opens the notification in the app (for the kinds that need the user);
 - a **Live Activity** update carrying the Guild's newest notifications (or a
   push-to-start when no activity is running, if enabled);
-- a **widget** reload.
+- a **widget** reload;
+- a silent **background** push that lets iOS wake the app.
+
+Any Forge server turns this on with configuration: its APNs key, key id, team id and the
+app's bundle id, and the switch. Nothing in it is specific to one server.
 
 The same gateway alerts for the needs-input moment, from the `attention` notification
 every node records, so the per-node needs-input push (`push.adapter`) is not used with it.
 
-### One key for the Guild
+### One gateway per Guild
 
 One node, the **gateway**, holds the APNs key and every registered device. It reads every
 node's feed through the Guild API on `push.gateway.guild_url` (the node list from the
@@ -381,6 +385,16 @@ registry, `GET /api/v1/niuu/instances`, and each node's notifications from
 need no key, no configuration and no new release: the gateway sees their notifications
 the way the app does, already tagged with the node (`instance_id`) the app uses in its
 links.
+
+A phone that uses several Forge servers (several Guilds that cannot reach each other)
+registers its tokens with each of them, and each server pushes for its own Guild. The
+pushes are built for that:
+
+- a Live Activity push replaces the whole card, and a server only knows its own Guild, so
+  the content names the server (`origin`) and the app merges every server the next time
+  it runs;
+- the background push is what lets iOS run the app for that merge;
+- the widget reads every server itself when it reloads, so any server's reload is enough.
 
 How a notification becomes a push:
 
@@ -393,8 +407,10 @@ How a notification becomes a push:
 2. Each pending alert is settled once: `sent`, `suppressed` (the alert rule below),
    `skipped` (the owner has no alert token) or `failed`. An alert APNs could not take
    (unreachable, 429, 5xx) is retried with backoff up to `max_attempts`.
-3. The owner's Live Activity and widget tokens are pushed for **every** new
-   notification, whatever its kind.
+3. The owner's Live Activity and widget tokens are pushed, and the app is sent a
+   background push, for **every** new notification, whatever its kind. Reading a
+   notification pushes nothing, so the Live Activity's top row is always the newest
+   event.
 
 Nodes are read one by one, at the same time. A node that does not answer within
 `request_timeout_seconds` (asleep, restarting, an older release without the feed) fails
@@ -538,10 +554,15 @@ running activity (no `live_activity` token, or APNs reported them all dead) gets
 at most once per `start.min_interval_seconds` per token. It is off by default: the app
 lets the user pin the activity, and a push-to-start brings it back after a dismissal.
 
-**Widgets** (`apns-push-type: widgets`, topic `<bundle id>.push-type.widgets`, priority 5):
-`{"aps": {"content-changed": true}}`, at most once per `widgets.min_interval_seconds` per
-token (iOS budgets these). A reload held back by the interval is sent when the interval
-ends, so the widget still shows the latest notification.
+**Widgets** (`apns-push-type: widgets`, topic `<bundle id>.push-type.widgets`, priority 10):
+`{"aps": {"content-changed": true}}`, at most once per `widgets.min_interval_seconds`
+(2 minutes) per token (iOS budgets these). A reload held back by the interval is sent
+when the interval ends, so the last change is never dropped.
+
+**Background** (`apns-push-type: background`, topic = the bundle id, priority 5), sent to
+every `alert` token: `{"aps": {"content-available": 1}, "forge": {"reason": "notification"}}`,
+at most once per `background.min_interval_seconds` (15 minutes) per token, with the same
+rule for one held back. iOS decides whether and when it wakes the app.
 
 ### Which notifications alert
 
@@ -581,16 +602,23 @@ To check it:
 # The gateway is running, reads every node and counts what it did.
 curl -s http://<host>:8080/api/v1/forge/push/status
 
-# After the app registered: push once to your own tokens of one kind
-# (alert | live_activity | live_activity_start | widget). Throttles do not apply.
+# After the app registered: push once to your own registered tokens. Throttles do not apply.
+#   kind: alert | background | live_activity | live_activity_start | widget
+#   token (optional): only that registered token; omitted pushes to every token for the kind
 curl -s -X POST http://<host>:8080/api/v1/forge/push/test \
   -H 'content-type: application/json' \
   -d '{"kind": "alert", "title": "Forge test push", "body": "It works"}'
+curl -s -X POST http://<host>:8080/api/v1/forge/push/test \
+  -H 'content-type: application/json' -d '{"kind": "widget", "token": "<hex token>"}'
 ```
 
-The answer lists each token (its last 8 characters, its environment) with APNs' verdict:
-`accepted`, or the HTTP status and reason. `404` means the caller has no token of that
-kind. Both routes exist only on the gateway node and through the Guild facade.
+`alert` shows the given title and body and opens the app's activity list. `background` is
+the silent push, sent to the alert tokens. `live_activity` and `live_activity_start` carry
+the caller's real current notifications. `widget` reloads the widgets. The answer lists
+each token (its last 8 characters, its environment) with APNs' verdict: `accepted`, or
+the HTTP status and reason. `404` means the caller has no registered token for that kind,
+or that `token` is not one of them. Both routes exist only on the gateway node and
+through the Guild facade.
 
 | Symptom | Likely cause |
 |---|---|
@@ -603,6 +631,7 @@ kind. Both routes exist only on the gateway node and through the Guild facade.
 | Test push: `HTTP 403 InvalidProviderToken` | Wrong `team_id` or `key_id`, or the key was revoked. |
 | Test push: `HTTP 400 BadDeviceToken` (the token is then deleted) | The token's `environment` is wrong: a development install registered as production, or the reverse. |
 | Test push: `HTTP 400 DeviceTokenNotForTopic` / `TopicDisallowed` | `bundle_id` (or the registration's `app_bundle_id`) is not the app's, or the key does not cover it. |
+| Background pushes are `accepted` but the app does not wake | iOS decides: it delivers only a few per hour, and none to an app the user force-quit or with Background App Refresh off. |
 | Alerts arrive but no Live Activity update | No `live_activity` token is registered (the activity is not running), and push-to-start is off. |
 | An alert row is `suppressed` | The reason is in its `detail` (`forge_push_deliveries`): kind, severity, source, age, quiet hours or rate limit. |
 
@@ -747,8 +776,12 @@ push:
       start: {enabled: false, min_interval_seconds: 3600}
     widgets:
       enabled: true
-      min_interval_seconds: 300
-      priority: 5
+      min_interval_seconds: 120    # a reload held back is sent when it ends
+      priority: 10
+    background:
+      enabled: true
+      min_interval_seconds: 900    # one held back is sent when it ends
+      priority: 5                  # APNs refuses 10 for a background push
 ```
 
 `push.gateway.enabled` needs `push.enabled`, every `push.apns` id and the key path, and

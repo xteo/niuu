@@ -16,10 +16,12 @@ from volundr.domain.push import (
     InterruptionLevel,
     LiveActivityEvent,
     PushEnvironment,
+    PushTestKind,
     absolute_url,
     activity_deep_link,
     alert_payload,
     apns_topic,
+    background_payload,
     live_activity_content_state,
     live_activity_payload,
     shorten,
@@ -388,6 +390,28 @@ class TestWidgetAndTopics:
     def test_widget_payload(self):
         assert widget_payload() == {"aps": {"content-changed": True}}
         assert json.dumps(widget_payload()) == '{"aps": {"content-changed": true}}'
+
+    def test_background_payload(self):
+        assert background_payload() == {
+            "aps": {"content-available": 1},
+            "forge": {"reason": "notification"},
+        }
+        assert (
+            json.dumps(background_payload(), separators=(",", ":"))
+            == '{"aps":{"content-available":1},"forge":{"reason":"notification"}}'
+        )
+        # A background push uses the app's own topic, like an alert.
+        assert apns_topic(BUNDLE, ApnsPushType.BACKGROUND) == "com.xteo.lexi.chat"
+        assert ApnsPushType.BACKGROUND.value == "background"
+
+    def test_each_test_push_goes_to_one_kind_of_token(self):
+        assert {kind.value: kind.token_kind.value for kind in PushTestKind} == {
+            "alert": "alert",
+            "background": "alert",
+            "live_activity": "live_activity",
+            "live_activity_start": "live_activity_start",
+            "widget": "widget",
+        }
 
     def test_topics(self):
         assert apns_topic(BUNDLE, ApnsPushType.ALERT) == "com.xteo.lexi.chat"

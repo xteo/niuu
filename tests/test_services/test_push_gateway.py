@@ -30,6 +30,7 @@ from volundr.domain.ports import EventBroadcaster
 from volundr.domain.push import (
     ApnsResult,
     PushEnvironment,
+    PushTestKind,
     PushTokenKind,
 )
 from volundr.domain.push_ports import GuildFeedError, PushDeliveryStatus
@@ -38,6 +39,7 @@ from volundr.domain.services.push_gateway import (
     ALREADY_READ,
     NO_ALERT_DEVICE,
     AlertSettings,
+    BackgroundSettings,
     LiveActivitySettings,
     PushGateway,
     PushGatewaySettings,
@@ -337,7 +339,7 @@ class TestUnreachableNodes:
 
         with pytest.raises(GuildFeedError, match="No Guild node answers right now"):
             await harness.gateway.send_test(
-                "dev-user", PushTokenKind.LIVE_ACTIVITY, title="t", body="b"
+                "dev-user", PushTestKind.LIVE_ACTIVITY, title="t", body="b"
             )
 
 
@@ -1141,7 +1143,7 @@ class TestTestPush:
         harness.devices.add(device("0123456789abcdef", environment=PushEnvironment.SANDBOX))
 
         results = await harness.gateway.send_test(
-            "dev-user", PushTokenKind.ALERT, title="Forge test push", body="It works"
+            "dev-user", PushTestKind.ALERT, title="Forge test push", body="It works"
         )
 
         (push,) = harness.apns.sent
@@ -1163,7 +1165,7 @@ class TestTestPush:
     async def test_no_token_of_that_kind(self, harness):
         harness.devices.add(device("alert-1"))
         results = await harness.gateway.send_test(
-            "dev-user", PushTokenKind.WIDGET, title="t", body="b"
+            "dev-user", PushTestKind.WIDGET, title="t", body="b"
         )
         assert results == [] and harness.apns.sent == []
 
@@ -1171,9 +1173,7 @@ class TestTestPush:
         harness.devices.add(device("la-1", PushTokenKind.LIVE_ACTIVITY))
         harness.feed.add(guild_notification("n-1"))
 
-        await harness.gateway.send_test(
-            "dev-user", PushTokenKind.LIVE_ACTIVITY, title="t", body="b"
-        )
+        await harness.gateway.send_test("dev-user", PushTestKind.LIVE_ACTIVITY, title="t", body="b")
 
         aps = harness.apns.sent[0].payload["aps"]
         assert aps["event"] == "update"
@@ -1185,7 +1185,7 @@ class TestTestPush:
         harness.devices.add(start)
 
         results = await harness.gateway.send_test(
-            "dev-user", PushTokenKind.LIVE_ACTIVITY_START, title="T" * 100, body="Body"
+            "dev-user", PushTestKind.LIVE_ACTIVITY_START, title="T" * 100, body="Body"
         )
 
         aps = harness.apns.sent[0].payload["aps"]
@@ -1201,12 +1201,167 @@ class TestTestPush:
         harness.apns.answer("widget-1", ApnsResult(410, "Unregistered"))
 
         (result,) = await harness.gateway.send_test(
-            "dev-user", PushTokenKind.WIDGET, title="t", body="b"
+            "dev-user", PushTestKind.WIDGET, title="t", body="b"
         )
 
         assert harness.apns.sent[0].payload == {"aps": {"content-changed": True}}
         assert not result.accepted and result.detail == "HTTP 410 Unregistered"
         assert harness.devices.tokens() == []
+
+    async def test_background(self, harness):
+        alert = device("0123456789abcdef", environment=PushEnvironment.SANDBOX)
+        alert.last_push_at = harness.clock.now  # Inside the interval: a test ignores it.
+        harness.devices.add(alert, device("widget-1", PushTokenKind.WIDGET))
+
+        (result,) = await harness.gateway.send_test(
+            "dev-user", PushTestKind.BACKGROUND, title="t", body="b"
+        )
+
+        (push,) = harness.apns.sent
+        assert push.token == "0123456789abcdef"
+        assert push.push_type.value == "background"
+        assert push.topic == BUNDLE
+        assert push.priority == 5
+        assert push.payload == {
+            "aps": {"content-available": 1},
+            "forge": {"reason": "notification"},
+        }
+        assert (result.kind, result.environment, result.accepted) == ("background", "sandbox", True)
+
+    async def test_one_registered_token_only(self, harness):
+        harness.devices.add(device("alert-aaaa"), device("alert-bbbb"))
+
+        results = await harness.gateway.send_test(
+            "dev-user", PushTestKind.ALERT, title="t", body="b", token="alert-bbbb"
+        )
+
+        assert [push.token for push in harness.apns.sent] == ["alert-bbbb"]
+        assert [result.token_suffix for result in results] == ["ert-bbbb"]
+
+    async def test_a_token_the_owner_did_not_register_gets_nothing(self, harness):
+        harness.devices.add(device("alert-aaaa"), device("theirs", owner_id="other"))
+
+        for token in ("unknown", "theirs"):
+            results = await harness.gateway.send_test(
+                "dev-user", PushTestKind.ALERT, title="t", body="b", token=token
+            )
+            assert results == []
+        assert harness.apns.sent == []
+
+
+class TestBackground:
+    """The silent push that lets iOS wake the app to merge every server."""
+
+    def _settings(self, **overrides) -> PushGatewaySettings:
+        values = {"enabled": True, "priority": 5, "min_interval_seconds": 900.0}
+        values.update(overrides)
+        return gateway_settings(background=BackgroundSettings(**values))
+
+    async def test_push_shape_and_it_goes_out_for_any_kind(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(
+            device("alert-1", environment=PushEnvironment.SANDBOX, app_bundle_id=None),
+            device("la-1", PushTokenKind.LIVE_ACTIVITY),
+        )
+        h.feed.add(guild_notification("n-1", kind="reply_ready"))
+
+        await h.gateway.run_once()
+
+        # No alert for this kind; the app is still woken.
+        assert h.apns.of_type("alert") == []
+        (push,) = h.apns.of_type("background")
+        assert push.token == "alert-1"
+        assert push.environment is PushEnvironment.SANDBOX
+        assert push.topic == BUNDLE
+        assert push.priority == 5
+        assert push.payload == {
+            "aps": {"content-available": 1},
+            "forge": {"reason": "notification"},
+        }
+        assert push.body() == b'{"aps":{"content-available":1},"forge":{"reason":"notification"}}'
+        assert push.collapse_id is None and push.expiration is None
+        assert h.gateway.stats.background_wakes == 1
+
+    async def test_it_accompanies_the_alert_on_the_same_token(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(device("alert-1"))
+        h.feed.add(guild_notification("n-1", kind="decision"))
+
+        await h.gateway.run_once()
+
+        assert [push.push_type.value for push in h.apns.sent] == ["alert", "background"]
+
+    async def test_at_most_one_per_interval_then_the_owed_one(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(device("alert-1"))
+        h.feed.add(guild_notification("n-1", kind="info"))
+        await h.gateway.run_once()
+
+        for seq in (2, 3):
+            h.clock.advance(300)
+            h.feed.add(guild_notification(f"n-{seq}", seq=seq, kind="info", created_at=h.clock.now))
+            await h.gateway.run_once()
+        assert len(h.apns.of_type("background")) == 1
+
+        # 899 s after the first one: still held back.
+        h.clock.advance(299)
+        await h.gateway.run_once()
+        assert len(h.apns.of_type("background")) == 1
+
+        # The interval ended: the wake the app is owed goes out, once.
+        h.clock.advance(1)
+        await h.gateway.run_once()
+        await h.gateway.run_once()
+        assert len(h.apns.of_type("background")) == 2
+        assert h.gateway.stats.background_wakes == 2
+
+    async def test_its_interval_is_separate_from_the_widgets(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(device("alert-1"), device("widget-1", PushTokenKind.WIDGET))
+        h.feed.add(guild_notification("n-1", kind="info"))
+        await h.gateway.run_once()
+
+        # After the widget interval (300 s here) but inside the background one.
+        h.clock.advance(301)
+        h.feed.add(guild_notification("n-2", seq=2, kind="info", created_at=h.clock.now))
+        await h.gateway.run_once()
+
+        assert len(h.apns.of_type("widgets")) == 2
+        assert len(h.apns.of_type("background")) == 1
+
+    async def test_one_apns_could_not_take_stays_owed(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(device("alert-1"))
+        h.apns.answer("alert-1", ApnsResult(503, "ServiceUnavailable"))
+        h.feed.add(guild_notification("n-1", kind="info"))
+
+        await h.gateway.run_once()
+        assert h.gateway.stats.background_wakes == 0
+        assert len(h.apns.of_type("background")) == 1
+
+        await h.gateway.run_once()
+        assert h.gateway.stats.background_wakes == 1
+
+    async def test_a_dead_alert_token_is_deleted(self):
+        h = await Harness(self._settings()).started()
+        h.devices.add(device("alert-gone"))
+        h.apns.answer("alert-gone", ApnsResult(410, "Unregistered"))
+        h.feed.add(guild_notification("n-1", kind="info"))
+
+        await h.gateway.run_once()
+
+        assert h.devices.tokens() == []
+
+    async def test_off_sends_none(self):
+        h = await Harness(self._settings(enabled=False)).started()
+        alert = device("alert-1")
+        h.devices.add(alert)
+        h.devices.owed.add(alert.id)
+        h.feed.add(guild_notification("n-1", kind="info"))
+
+        await h.gateway.run_once()
+
+        assert h.apns.sent == []
 
 
 class TestHousekeeping:
@@ -1237,6 +1392,7 @@ class TestHousekeeping:
         assert status["alerts_sent"] == 1 and status["ingested"] == 1
         assert status["last_tick_at"] == START.isoformat()
         assert status["alerts_enabled"] and status["widgets_enabled"]
+        assert status["background_enabled"] is False and status["background_wakes"] == 0
         assert status["live_activity_start_enabled"] is False
         assert Harness().gateway.status()["last_tick_at"] is None
 
