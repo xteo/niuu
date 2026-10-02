@@ -364,10 +364,12 @@ class PushGateway:
         fresh = await self._ingest(positions)
         await self._deliver_alerts()
         tick = _Tick(load=self._newest_page)
-        owners = {notification.owner_id for notification in fresh} | self._retry_owners
-        self._retry_owners = set()
-        for owner_id in sorted(owners):
+        # An owner leaves the set only once refreshed: if this tick fails part-way
+        # (the feed, the database), the next one still owes them their surfaces.
+        self._retry_owners |= {notification.owner_id for notification in fresh}
+        for owner_id in sorted(self._retry_owners):
             await self._refresh_surfaces(owner_id, tick)
+            self._retry_owners.discard(owner_id)
         await self._send_owed_widget_reloads(tick)
         self._retry_owners |= tick.retry_owners
         await self._prune(now)
@@ -395,6 +397,8 @@ class PushGateway:
         A new node starts ``catch_up_items`` before its head, so a notification
         recorded just before the node was found is still pushed; older ones are
         never replayed, and the alert policy's age limit holds back stale ones.
+        A node whose feed restarted (its head is behind the stored position, as
+        after its database was recreated) is read from its head again.
         """
         page = await self._feed.newest(limit=1)
         found = {
@@ -402,10 +406,23 @@ class PushGateway:
             for instance_id, head in page.positions.items()
             if instance_id not in positions
         }
-        if found:
-            await self._deliveries.save_positions(found)
+        rewound = {
+            instance_id: head
+            for instance_id, head in page.positions.items()
+            if instance_id in positions and head < positions[instance_id]
+        }
+        if found or rewound:
+            await self._deliveries.save_positions({**found, **rewound})
             positions.update(found)
+            positions.update(rewound)
+        if found:
             logger.info("Push gateway now reads %d more Guild node(s)", len(found))
+        if rewound:
+            logger.warning(
+                "Push gateway restarts %d Guild node(s) whose feed went back: %s",
+                len(rewound),
+                ", ".join(sorted(rewound)),
+            )
         self._discover = False
         self._last_discovery = now
 

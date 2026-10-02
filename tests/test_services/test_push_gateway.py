@@ -162,6 +162,24 @@ class TestIngest:
         assert harness.feed.newest_calls == [1]
         assert harness.deliveries.positions["inst-late"] == 1
 
+    async def test_a_node_whose_feed_restarted_is_read_from_its_new_head(self, harness, caplog):
+        harness.devices.add(device("alert-1"))
+        harness.deliveries.positions[MINI] = 500
+        harness.gateway._positions = None  # As after a restart: read the stored positions.
+        # The node's database was recreated: its feed starts again below the position.
+        harness.feed.add(guild_notification("m-1", instance_id=MINI, seq=1, read=True))
+
+        harness.clock.advance(301)
+        assert await harness.gateway.run_once() == 0
+        assert harness.deliveries.positions[MINI] == 1
+        assert "whose feed went back" in caplog.text
+
+        harness.feed.add(
+            guild_notification("m-2", instance_id=MINI, seq=2, created_at=harness.clock.now)
+        )
+        assert await harness.gateway.run_once() == 1
+        assert harness.deliveries.statuses() == {"m-2": "sent"}
+
     async def test_positions_survive_a_restart(self, harness):
         harness.feed.add(guild_notification("n-1", seq=1))
         await harness.gateway.run_once()
@@ -728,6 +746,25 @@ class TestLiveActivity:
         # Delivered: no third push without a new notification.
         await harness.gateway.run_once()
         assert len(harness.apns.of_type("liveactivity")) == 2
+
+    async def test_a_tick_that_fails_before_the_surfaces_still_owes_them(self, harness):
+        harness.devices.add(device("la-1", PushTokenKind.LIVE_ACTIVITY))
+        harness.feed.add(guild_notification("n-1"))
+        real_newest = harness.feed.newest
+
+        async def unreachable(*, limit: int):
+            raise GuildFeedError("The Guild feed answered HTTP 502")
+
+        # The notification is ingested, then the page for the Live Activity cannot be read.
+        harness.feed.newest = unreachable
+        with pytest.raises(GuildFeedError):
+            await harness.gateway.run_once()
+        assert harness.deliveries.positions[THOR] == 1
+        assert harness.apns.of_type("liveactivity") == []
+
+        harness.feed.newest = real_newest
+        assert await harness.gateway.run_once() == 0
+        assert len(harness.apns.of_type("liveactivity")) == 1
 
     async def test_disabled_live_activity_sends_none(self):
         h = await Harness(gateway_settings(live_activity=live_activity(enabled=False))).started()
