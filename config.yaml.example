@@ -206,6 +206,31 @@ git:
       #     - platform
       #     - infra
 
+# Apple push for Forge notifications (optional). One node of a Guild runs the
+# gateway: it holds the APNs key and the registered devices and pushes for every
+# node (alerts, Live Activity, widgets). See docs/operator/forge-notifications.md
+# ("Apple push").
+# push:
+#   enabled: true
+#   apns:
+#     team_id: ABCDE12345
+#     key_id: KEY1234567
+#     bundle_id: com.example.app
+#     private_key_path: /etc/volundr/apns/AuthKey_KEY1234567.p8   # the file, never its text
+#   gateway:
+#     enabled: true
+#     guild_url: http://127.0.0.1:8080          # the Guild API that serves the merged feed
+#     public_api_url: https://forge.example.com # image URLs in alerts; empty = no image
+#     origin_label: Forge                       # shown on a Live Activity it pushed
+#     alerts:
+#       kinds: [milestone, decision, attention, error]
+#       rate_limit: {max_count: 30, window_seconds: 3600}
+#       # quiet_hours: {start: "23:00", end: "07:00", timezone: Europe/Paris}
+#     live_activity:
+#       start: {enabled: false}                 # push-to-start when no activity runs
+#     widgets:
+#       min_interval_seconds: 300
+
 # Forge session notifications and their external delivery (optional).
 # Nothing leaves Forge unless a sink below (or an owner's messaging integration)
 # is selected by an owner rule. See docs/operator/forge-notifications.md.

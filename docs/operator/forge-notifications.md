@@ -318,6 +318,10 @@ Users can also connect a webhook as a messaging integration (slug `webhook`, con
 
 ### Push (opt-in)
 
+This is the per-node outbox sink. For the iPhone app (alerts for every Guild node, Live
+Activity and widgets) use the push gateway instead: see
+[Apple push](#apple-push-the-push-gateway).
+
 ```yaml
 notifications:
   sinks:
@@ -332,8 +336,8 @@ relay, or the logging default) to the devices the owner registered. It uses that
 channel even when `push.enabled` is false, so you can offer push rules without the
 automatic needs-input push.
 
-The existing needs-input push (`PushAttentionNotifier`, `push.enabled`) is unchanged. It
-still pushes every "session needs you" moment as it happens. To avoid a second push for
+The per-node needs-input push (`PushAttentionNotifier`, `push.enabled` without
+`push.gateway`) pushes every "session needs you" moment as it happens. To avoid a second push for
 the same moment, the push sink **suppresses** `attention` notifications raised by Forge
 itself (`source: system`) while `push.enabled` is on. Agent-raised `attention`
 notifications and every other kind are pushed. A rule that targets the push sink is the
@@ -341,7 +345,10 @@ only way other notifications reach a phone.
 
 APNs results: delivered if at least one device accepted. It is retryable when every
 device failed transiently (429/5xx, network). It is `dead` when the owner has no iOS
-devices or APNs rejected them all.
+alert tokens or APNs rejected them all. The channel (`ApnsNotificationChannel`) reads its
+key from `private_key_path` (the `.p8` file) or, as PEM text, from `private_key`
+(`secret_kwargs_env`); it sends only to `alert` tokens, each on the APNs host of its
+`environment`.
 
 ### Deep links
 
@@ -351,6 +358,242 @@ with `session_link_path` (default
 at the notification's card) or `feed_link_path` for sessionless notifications. Set
 `public_web_url` whenever Forge is reached through a proxy or a public hostname. Relative
 notification links (`/volundr/…`) are made absolute against the same base.
+
+## Apple push (the push gateway)
+
+With the push gateway, a notification recorded on **any** node of a Guild reaches the
+owner's iPhone while the app is closed, in three ways:
+
+- an **alert** that opens the notification in the app;
+- a **Live Activity** update carrying the Guild's newest notifications (or a
+  push-to-start when no activity is running, if enabled);
+- a **widget** reload.
+
+The same gateway alerts for the needs-input moment, from the `attention` notification
+every node records, so the per-node needs-input push (`push.adapter`) is not used with it.
+
+### One key for the Guild
+
+One node, the **gateway**, holds the APNs key and every registered device. It reads the
+Guild's merged feed through the Guild API (`GET /api/v1/forge/notifications?all_instances=true`
+on `push.gateway.guild_url`) and sends the pushes for every node. The other nodes need no
+key, no configuration and no new release: the gateway sees their notifications the way
+the app does, already tagged with the node (`instance_id`) the app uses in its links.
+
+How a notification becomes a push:
+
+1. The gateway keeps one position (`seq`) per node. It reads the feed after those
+   positions and stores each new notification as a pending alert, together with the
+   advanced positions, in one transaction. A restart or an unreachable node therefore
+   loses nothing. It reads the feed every `poll_interval_seconds` (5 s), and at once
+   when its own node records a notification, so a notification of the gateway's node
+   is pushed immediately and another node's within the poll interval.
+2. Each pending alert is settled once: `sent`, `suppressed` (the alert rule below),
+   `skipped` (the owner has no alert token) or `failed`. An alert APNs could not take
+   (unreachable, 429, 5xx) is retried with backoff up to `max_attempts`.
+3. The owner's Live Activity and widget tokens are pushed for **every** new
+   notification, whatever its kind.
+
+With `stream_enabled`, the gateway also listens to the Guild's live event stream and
+pushes another node's notification at once. That holds one streaming connection to
+`guild_url`. Leave it off when the Guild facade runs in the gateway's own process (the
+single-process host): an open stream to itself keeps the server from shutting down
+gracefully until the service's stop timeout.
+
+A node the gateway has not read before starts `catch_up_items` before its newest
+notification; older history is never replayed, and `alerts.max_age_seconds` keeps a
+stale notification from alerting after an outage.
+
+The gateway reads the Guild as **one identity**. Without `reader_token_path` it sends no
+credential, which suits a Guild running the AllowAll identity (every request is the same
+user). With real authentication, put a personal access token of the user in that file.
+The unread flags and count in the Live Activity are that reader's, so the gateway serves
+the Guild of one user; several human users would each need their own reader, which is
+not built.
+
+`guild_url` must be a Guild API origin. A single Forge node without the Guild facade does
+not serve the merged feed and is refused with a clear error.
+
+### Registering a device
+
+The app registers each token with `POST /api/v1/forge/devices`, on the Guild facade or on
+the gateway node directly, with the caller's normal credentials:
+
+```json
+{
+  "platform": "ios",
+  "token": "<hex token>",
+  "kind": "alert | live_activity | live_activity_start | widget",
+  "environment": "sandbox | production",
+  "app_bundle_id": "com.example.app",
+  "activity_id": "<Live Activity id, for live_activity only>"
+}
+```
+
+- One registration per `(token, kind)`. Registering again refreshes it; a token another
+  user registered before moves to the caller.
+- `kind`: `alert` is the app's device token; `live_activity` is the update token of one
+  running Live Activity (`activity_id` names it, and a newer token for the same activity
+  replaces the earlier one); `live_activity_start` is the push-to-start token; `widget`
+  is the widget extension's token. Omitted, it is `alert`.
+- `environment` selects the APNs host. A development install holds **sandbox** tokens;
+  TestFlight and App Store installs hold **production** tokens. Omitted, it is
+  `production`. A token sent to the wrong host is refused by APNs as `BadDeviceToken`
+  and deleted.
+- `app_bundle_id` is the APNs topic base; without it the gateway uses `push.apns.bundle_id`.
+- `201` with the stored registration. `503` when the node sends no pushes
+  (`push.enabled` is off), so a client can tell the token is not in use there.
+
+`GET /api/v1/forge/devices` lists the caller's registrations and
+`DELETE /api/v1/forge/devices/{token}` removes them (`?kind=` removes one kind). The Guild
+facade forwards all three to its default node, or to the node `instance_id` selects.
+Session credentials (an agent's own token) cannot use these routes.
+
+A token APNs reports as dead is deleted: HTTP `410`, or the reasons `BadDeviceToken`,
+`Unregistered` and `ExpiredToken`. The app registers again on its next launch.
+
+### What is pushed
+
+**Alert** (`apns-push-type: alert`, topic = the bundle id, `apns-collapse-id` = the
+notification id, `apns-expiration` = now + `expiration_seconds`):
+
+```json
+{
+  "aps": {
+    "alert": {"title": "<title>", "subtitle": "<session name>", "body": "<body, shortened>"},
+    "interruption-level": "time-sensitive | active",
+    "sound": "default",
+    "category": "FORGE_ACTIVITY",
+    "thread-id": "<session id>",
+    "mutable-content": 1
+  },
+  "deepLink": "lexichat://activity/<notification id>?inst=<instance id>&session=<session id>&turn=<turn id>",
+  "notification_id": "<notification id>",
+  "instance_id": "<instance id>",
+  "session_id": "<session id>",
+  "kind": "<kind>",
+  "image_url": "<absolute URL>",
+  "image_thumbnail_url": "<absolute URL>"
+}
+```
+
+`deepLink` carries only the query items that exist, and the id is percent-encoded.
+`subtitle` is the session name when the title does not already contain it.
+`interruption-level` is `time-sensitive` for `time_sensitive_kinds` (attention, decision,
+error by default) and `active` otherwise. `thread-id` and `session_id` are absent for a
+notification without a session. `mutable-content`, `image_url` and `image_thumbnail_url`
+appear only when the notification has an image and `public_api_url` is set; the URLs are
+the image route on that origin, routed to the node that holds the image. The alert does
+not wait for the node to copy the image: while the copy is in progress the URLs are
+already named, and the route answers 404 until the copy is stored (or for good, when the
+copy fails), so a client fetching the image treats 404 as "no image".
+
+**Live Activity** (`apns-push-type: liveactivity`, topic `<bundle id>.push-type.liveactivity`,
+priority 10), sent to every `live_activity` token of the owner:
+
+```json
+{
+  "aps": {
+    "timestamp": 1790923214,
+    "event": "update",
+    "stale-date": 1790952014,
+    "content-state": {
+      "items": [
+        {
+          "id": "<notification id>", "kind": "decision", "title": "<at most 90 characters>",
+          "sessionName": "<at most 40 characters>", "instanceID": "<instance id>",
+          "sessionID": "<session id>", "turnID": "<turn id>",
+          "createdAt": 812616014.0, "unread": true
+        }
+      ],
+      "unreadCount": 1,
+      "updatedAt": 812616016.0,
+      "origin": "<origin_label>"
+    }
+  }
+}
+```
+
+`content-state` matches the app's `ForgeNotificationsActivityContent`: at most three
+items, newest first, from the Guild's merged feed; absent values are left out. Dates are
+what Swift's `JSONDecoder` reads by default: a number of seconds since
+2001-01-01T00:00:00Z (Unix seconds minus 978307200). `stale-date` is now +
+`stale_seconds`. `origin` is `origin_label`, left out when empty. Titles and session names
+are cut to the app's limits by code point.
+
+With `live_activity.start.enabled`, an owner with a `live_activity_start` token and no
+running activity (no `live_activity` token, or APNs reported them all dead) gets
+`"event": "start"` instead, with `"attributes-type": "ForgeNotificationsActivityAttributes"`,
+`"attributes": {}` and `"alert": {"title": <notification title>, "body": <session name>}`,
+at most once per `start.min_interval_seconds` per token. It is off by default: the app
+lets the user pin the activity, and a push-to-start brings it back after a dismissal.
+
+**Widgets** (`apns-push-type: widgets`, topic `<bundle id>.push-type.widgets`, priority 5):
+`{"aps": {"content-changed": true}}`, at most once per `widgets.min_interval_seconds` per
+token (iOS budgets these). A reload held back by the interval is sent when the interval
+ends, so the widget still shows the latest notification.
+
+### Which notifications alert
+
+The gateway has one alert rule, in configuration (`push.gateway.alerts`), applied per
+owner. Nobody creates a delivery rule by hand: a registered alert token is the opt-in.
+
+- `kinds`: milestone, decision, attention and error by default. `info` and `reply_ready`
+  do not alert unless listed; they still update the Live Activity and the widgets.
+- `min_severity` and `sources` narrow it further.
+- `rate_limit`: at most `max_count` alerts per owner in any `window_seconds` (30 per hour
+  by default; `null` disables).
+- `quiet_hours`: `start`, `end`, `timezone` and `allow_min_severity`, with the meaning
+  they have on a delivery rule: inside the window only notifications at or above
+  `allow_min_severity` alert.
+- `max_age_seconds`: a notification older than this when the gateway reads it is not
+  alerted. One the reader already read is not alerted either.
+
+These alerts do not go through the delivery outbox, so owner rules
+(`/notifications/rules`) and `GET /notifications/{id}/deliveries` do not apply to them.
+Do not also select the `push` sink below with an APNs channel for the same owner: a
+notification of the gateway's own node would then alert twice.
+
+### Setting it up
+
+1. In the Apple Developer portal, create an APNs auth key (`.p8`). Note its key id and
+   the team id. Put the file on the gateway node, readable only by the Forge user.
+2. Add the `push:` section (see [Configuration](#configuration)) with `push.enabled`,
+   `push.apns` and `push.gateway`, and restart Forge. Migration `000073_push_gateway`
+   is applied at start.
+3. Start is refused, with the setting to fix, when the key file is missing, unreadable
+   or not an EC P-256 key, when the HTTP/2 library (`h2`) is missing, or when
+   `guild_url` is not an http(s) origin.
+
+To check it:
+
+```bash
+# The gateway is running, reads every node and counts what it did.
+curl -s http://<host>:8080/api/v1/forge/push/status
+
+# After the app registered: push once to your own tokens of one kind
+# (alert | live_activity | live_activity_start | widget). Throttles do not apply.
+curl -s -X POST http://<host>:8080/api/v1/forge/push/test \
+  -H 'content-type: application/json' \
+  -d '{"kind": "alert", "title": "Forge test push", "body": "It works"}'
+```
+
+The answer lists each token (its last 8 characters, its environment) with APNs' verdict:
+`accepted`, or the HTTP status and reason. `404` means the caller has no token of that
+kind. Both routes exist only on the gateway node and through the Guild facade.
+
+| Symptom | Likely cause |
+|---|---|
+| `POST /devices` answers 404 through the Guild | The Guild facade is older than this release. |
+| `POST /devices` answers 503 | `push.enabled` is off on that node. |
+| `status` shows `last_error`: "The Guild feed is unreachable" | `guild_url` is wrong, or the Guild is not up yet (the gateway reads again every `poll_interval_seconds`). |
+| `status` shows `last_error`: "… answered HTTP 401/403" | The Guild needs a credential: set `reader_token_path`. |
+| `nodes` lacks a node | It was unreachable when the gateway looked; it is found within `discovery_interval_seconds`, or on its next notification. |
+| Test push: `HTTP 403 InvalidProviderToken` | Wrong `team_id` or `key_id`, or the key was revoked. |
+| Test push: `HTTP 400 BadDeviceToken` (the token is then deleted) | The token's `environment` is wrong: a development install registered as production, or the reverse. |
+| Test push: `HTTP 400 DeviceTokenNotForTopic` / `TopicDisallowed` | `bundle_id` (or the registration's `app_bundle_id`) is not the app's, or the key does not cover it. |
+| Alerts arrive but no Live Activity update | No `live_activity` token is registered (the activity is not running), and push-to-start is off. |
+| An alert row is `suppressed` | The reason is in its `detail` (`forge_push_deliveries`): kind, severity, source, age, quiet hours or rate limit. |
 
 ## Troubleshooting
 
@@ -432,6 +675,75 @@ notifications:
       secret_kwargs_env: {secret: FORGE_OPS_WEBHOOK_SECRET}
 ```
 
+The push gateway has its own section. The defaults are shown; `enabled`, `apns` and
+`gateway.enabled` / `guild_url` are what an operator sets:
+
+```yaml
+push:
+  enabled: true              # push on: the gateway below, or else the per-node adapter
+  apns:
+    team_id: ""              # Apple Developer team id
+    key_id: ""               # id of the APNs auth key
+    bundle_id: ""            # the app's bundle id (topic for a token without one)
+    private_key_path: ""     # the AuthKey_<KEYID>.p8 file; never its contents
+    token_ttl_seconds: 3000  # provider JWT reuse (20 to 59 minutes)
+    request_timeout_seconds: 10
+    production_url: https://api.push.apple.com
+    sandbox_url: https://api.sandbox.push.apple.com
+  gateway:
+    enabled: false           # true on the one node that pushes for the Guild
+    guild_url: ""            # Guild API origin, e.g. http://127.0.0.1:8080
+    reader_token_path: ""    # bearer token file; empty for an AllowAll Guild
+    public_api_url: ""       # origin a phone reaches, for image URLs; empty = no image
+    origin_label: ""         # this server's name on a Live Activity it pushed
+    request_timeout_seconds: 15
+    poll_interval_seconds: 5 # how often the Guild feed is read
+    stream_enabled: false    # also listen to the Guild's live events (see above)
+    stream_retry_seconds: 5
+    page_size: 50            # notifications read per node per request
+    feed_page_size: 20       # newest notifications read for the Live Activity
+    catch_up_items: 10       # read back on a newly found node
+    discovery_interval_seconds: 300
+    retention_seconds: 604800      # settled alert rows kept
+    max_detail_chars: 500
+    alerts:
+      enabled: true
+      kinds: [milestone, decision, attention, error]
+      min_severity: info
+      sources: []                  # empty = any
+      time_sensitive_kinds: [attention, decision, error]
+      low_priority_kinds: []       # apns-priority 5
+      body_chars: 280
+      expiration_seconds: 3600
+      max_age_seconds: 900
+      rate_limit: {max_count: 30, window_seconds: 3600}   # null = none
+      quiet_hours: null            # {start: "23:00", end: "07:00", timezone: Europe/Paris,
+                                   #  allow_min_severity: critical}
+      category: FORGE_ACTIVITY
+      sound: default               # empty = silent
+      deep_link_base: lexichat://activity
+      session_subtitle: true
+      batch_size: 20
+      lease_seconds: 60
+      max_attempts: 5
+      backoff_base_seconds: 15
+      backoff_max_seconds: 600
+    live_activity:
+      enabled: true
+      priority: 10
+      stale_seconds: 28800
+      start: {enabled: false, min_interval_seconds: 3600}
+    widgets:
+      enabled: true
+      min_interval_seconds: 300
+      priority: 5
+```
+
+`push.gateway.enabled` needs `push.enabled`, every `push.apns` id and the key path, and
+`guild_url`; it refuses a customised `push.adapter` / `push.kwargs`, which configure the
+per-node needs-input push it replaces. In Helm, set `push:` in `values.yaml` (rendered
+verbatim) and mount the key file from a Secret.
+
 Sink names use lowercase letters, digits, `.`, `_` and `-`. `integration` is reserved.
 Every key of a sink entry except `label`, `adapter` and `secret_kwargs_env` is passed to
 the adapter. `secret_kwargs_env` maps a kwarg to the environment variable that holds its
@@ -465,13 +777,24 @@ per notification with an image (cascading from it), holding the reference, the c
 state (`pending`/`ready`/`failed`, with a lease and attempt fence), and once stored the
 original bytes, the thumbnail, their types and sizes. A partial index covers pending rows.
 
+Migration `000073_push_gateway` serves the push gateway. It extends `device_tokens` with
+`kind`, `environment`, `activity_id`, `last_push_at` and `push_due`, and makes a token
+unique per `(token, kind)` instead of per owner (existing rows become production alert
+tokens; of a token two owners had registered, the newest row is kept). It adds
+`forge_push_gateway_state` (the gateway's position per node) and `forge_push_deliveries`
+(its alert outbox, one row per `(instance_id, notification_id)`, with partial indexes for
+due, sent and settled rows).
+
 The migrations ship in `migrations/`, in the Helm migrations configmap, and in the CLI
 bundle (`src/cli/migrations/volundr/`). Mini mode applies them at startup.
 
 To check them, and the dispatcher against a local webhook receiver, on a disposable
 PostgreSQL database, run:
 `FORGE_HISTORY_TEST_DATABASE_URL=postgresql://… pytest -m integration tests/test_adapters/test_notifications_postgres_integration.py tests/test_adapters/test_notification_dispatcher_postgres_integration.py`.
-The `database` lane of `scripts/verify_forge.py` includes both.
+The `database` lane of `scripts/verify_forge.py` includes both. The push gateway's stores
+and its migration are checked by
+`TEST_DATABASE_PORT=… pytest -m integration tests/integration/volundr/test_push_gateway.py`
+(the shared integration fixtures; never point them at a live database).
 
 
 ## Individual activity reads and durable reply anchors (local follow-up)

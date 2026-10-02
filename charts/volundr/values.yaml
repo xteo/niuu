@@ -406,6 +406,26 @@ sleipnir:
   kwargs: {}
   secretKwargs: []
 
+# Apple push for Forge notifications. Rendered verbatim as config.yaml's `push:`
+# section (snake_case keys; see PushNotificationConfig). Empty keeps push off. One
+# node of a Guild runs the gateway: it holds the APNs key and the registered devices
+# and pushes for every node (alerts, Live Activity, widgets). The .p8 signing key is a
+# file: mount it from a Secret and name its path. See
+# docs/operator/forge-notifications.md ("Apple push"). Example:
+#   push:
+#     enabled: true
+#     apns:
+#       team_id: ABCDE12345
+#       key_id: KEY1234567
+#       bundle_id: com.example.app
+#       private_key_path: /etc/volundr/apns/AuthKey_KEY1234567.p8
+#     gateway:
+#       enabled: true
+#       guild_url: http://niuu-guild:8080            # the Guild API (merged feed)
+#       public_api_url: https://forge.example.com    # image URLs in alerts
+#       origin_label: Forge
+push: {}
+
 # Forge session notifications: the feed, automatic reply_ready notifications, the
 # delivery outbox dispatcher and external sinks. Rendered verbatim as config.yaml's
 # `notifications:` section (snake_case keys; see NotificationsConfig). Empty keeps the

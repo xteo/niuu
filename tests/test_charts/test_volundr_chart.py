@@ -569,6 +569,45 @@ class TestConfigMapTemplate:
         assert parsed.dispatcher.default_rate_limit is None
         assert parsed.sinks[0]["secret_kwargs_env"] == {"secret": "FORGE_OPS_WEBHOOK_SECRET"}
 
+    def test_push_section_renders_into_config(self, tmp_path):
+        from tests.helpers.apns_keys import write_p8
+        from volundr.config import PushNotificationConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "push" not in render()
+        key = write_p8(tmp_path)
+        config = render(
+            "--set-json",
+            'push={"enabled":true,'
+            '"apns":{"team_id":"ABCDE12345","key_id":"KEY1234567",'
+            f'"bundle_id":"com.example.app","private_key_path":"{key}"}},'
+            '"gateway":{"enabled":true,"guild_url":"http://niuu-guild:8080",'
+            '"origin_label":"Forge","alerts":{"rate_limit":null},'
+            '"live_activity":{"start":{"enabled":true}}}}',
+        )
+        parsed = PushNotificationConfig.model_validate(config["push"])
+        assert parsed.enabled and parsed.gateway.enabled
+        assert parsed.apns.key_id == "KEY1234567"
+        assert parsed.apns.private_key_path == str(key)
+        assert parsed.gateway.guild_url == "http://niuu-guild:8080"
+        assert parsed.gateway.alerts.rate_limit is None
+        assert parsed.gateway.live_activity.start.enabled is True
+
     def test_forge_mcp_section_renders_into_config(self):
         from volundr.config import ForgeMcpConfig
 
