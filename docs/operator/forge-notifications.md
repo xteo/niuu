@@ -374,11 +374,13 @@ every node records, so the per-node needs-input push (`push.adapter`) is not use
 
 ### One key for the Guild
 
-One node, the **gateway**, holds the APNs key and every registered device. It reads the
-Guild's merged feed through the Guild API (`GET /api/v1/forge/notifications?all_instances=true`
-on `push.gateway.guild_url`) and sends the pushes for every node. The other nodes need no
-key, no configuration and no new release: the gateway sees their notifications the way
-the app does, already tagged with the node (`instance_id`) the app uses in its links.
+One node, the **gateway**, holds the APNs key and every registered device. It reads every
+node's feed through the Guild API on `push.gateway.guild_url` (the node list from the
+registry, `GET /api/v1/niuu/instances`, and each node's notifications from
+`GET /api/v1/forge/notifications`) and sends the pushes for all of them. The other nodes
+need no key, no configuration and no new release: the gateway sees their notifications
+the way the app does, already tagged with the node (`instance_id`) the app uses in its
+links.
 
 How a notification becomes a push:
 
@@ -393,6 +395,14 @@ How a notification becomes a push:
    (unreachable, 429, 5xx) is retried with backoff up to `max_attempts`.
 3. The owner's Live Activity and widget tokens are pushed for **every** new
    notification, whatever its kind.
+
+Nodes are read one by one, at the same time. A node that does not answer within
+`request_timeout_seconds` (asleep, restarting, an older release without the feed) fails
+only its own read: the gateway keeps pushing for the others, leaves that node alone for
+`node_retry_seconds`, then tries again and catches up from its stored position. While a
+node is away the Live Activity shows the newest notifications of the nodes that answer.
+`GET /push/status` lists such nodes under `unreachable_nodes`, with the reason; the log
+says it once when it starts and once when the node is back.
 
 With `stream_enabled`, the gateway also listens to the Guild's live event stream and
 pushes another node's notification at once. That holds one streaming connection to
@@ -411,8 +421,8 @@ The unread flags and count in the Live Activity are that reader's, so the gatewa
 the Guild of one user; several human users would each need their own reader, which is
 not built.
 
-`guild_url` must be a Guild API origin. A single Forge node without the Guild facade does
-not serve the merged feed and is refused with a clear error.
+`guild_url` must be a Guild API origin. A single Forge node without the Guild facade has
+no registry and is refused with a clear error.
 
 ### Registering a device
 
@@ -588,7 +598,8 @@ kind. Both routes exist only on the gateway node and through the Guild facade.
 | `POST /devices` answers 503 | `push.enabled` is off on that node. |
 | `status` shows `last_error`: "The Guild feed is unreachable" | `guild_url` is wrong, or the Guild is not up yet (the gateway reads again every `poll_interval_seconds`). One such warning in the log right after a start is normal when the Guild runs in the same process: the gateway starts before the server accepts connections. |
 | `status` shows `last_error`: "… answered HTTP 401/403" | The Guild needs a credential: set `reader_token_path`. |
-| `nodes` lacks a node | It was unreachable when the gateway looked; it is found within `discovery_interval_seconds`, or on its next notification. |
+| `unreachable_nodes` names a node | It does not answer its feed read (the reason is given): asleep, restarting, or a release without the notification feed. Its notifications are caught up once it answers. |
+| `nodes` lacks a node | It has not answered since the gateway started, or it is not an enabled Forge instance in the Guild registry. A new node is found within `discovery_interval_seconds`. |
 | Test push: `HTTP 403 InvalidProviderToken` | Wrong `team_id` or `key_id`, or the key was revoked. |
 | Test push: `HTTP 400 BadDeviceToken` (the token is then deleted) | The token's `environment` is wrong: a development install registered as production, or the reverse. |
 | Test push: `HTTP 400 DeviceTokenNotForTopic` / `TopicDisallowed` | `bundle_id` (or the registration's `app_bundle_id`) is not the app's, or the key does not cover it. |
@@ -696,12 +707,13 @@ push:
     reader_token_path: ""    # bearer token file; empty for an AllowAll Guild
     public_api_url: ""       # origin a phone reaches, for image URLs; empty = no image
     origin_label: ""         # this server's name on a Live Activity it pushed
-    request_timeout_seconds: 15
+    request_timeout_seconds: 5     # one read of one node
+    node_retry_seconds: 30         # a node that did not answer is left alone this long
     poll_interval_seconds: 5 # how often the Guild feed is read
     stream_enabled: false    # also listen to the Guild's live events (see above)
     stream_retry_seconds: 5
     page_size: 50            # notifications read per node per request
-    feed_page_size: 20       # newest notifications read for the Live Activity
+    feed_page_size: 20       # newest notifications read per node for the Live Activity
     catch_up_items: 10       # read back on a newly found node
     discovery_interval_seconds: 300
     retention_seconds: 604800      # settled alert rows kept
@@ -791,10 +803,12 @@ bundle (`src/cli/migrations/volundr/`). Mini mode applies them at startup.
 To check them, and the dispatcher against a local webhook receiver, on a disposable
 PostgreSQL database, run:
 `FORGE_HISTORY_TEST_DATABASE_URL=postgresql://… pytest -m integration tests/test_adapters/test_notifications_postgres_integration.py tests/test_adapters/test_notification_dispatcher_postgres_integration.py`.
-The `database` lane of `scripts/verify_forge.py` includes both. The push gateway's stores
-and its migration are checked by
-`TEST_DATABASE_PORT=… pytest -m integration tests/integration/volundr/test_push_gateway.py`
-(the shared integration fixtures; never point them at a live database).
+The `database` lane of `scripts/verify_forge.py` includes both, and the push gateway's
+checks: `tests/integration/volundr/test_push_gateway.py` (its stores and the migration,
+through the shared integration fixtures and `TEST_DATABASE_PORT=…`) and
+`tests/test_adapters/test_push_gateway_postgres_integration.py` (the migration through
+the startup runner and concurrent workers, with `FORGE_HISTORY_TEST_DATABASE_URL`).
+Never point either at a live database.
 
 
 ## Individual activity reads and durable reply anchors (local follow-up)

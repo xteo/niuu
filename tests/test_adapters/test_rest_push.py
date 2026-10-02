@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -40,6 +42,9 @@ class Rig:
             gateway_settings(),
             clock=clock,
         )
+        # One tick, as after a start: the gateway knows the Guild's nodes.
+        self.feed.add_node(THOR)
+        asyncio.run(self.gateway.run_once())
         app = FastAPI()
         app.state.identity = object()  # forwarded x-auth-* headers identify the caller
         app.include_router(create_push_router(self.gateway))
@@ -56,8 +61,9 @@ def test_status_reports_the_gateway(rig):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["running"] is False and body["nodes"] == {}
-    assert body["alerts_sent"] == 0 and body["last_tick_at"] is None
+    assert body["running"] is False and body["nodes"] == {THOR: 0}
+    assert body["unreachable_nodes"] == {}
+    assert body["alerts_sent"] == 0 and body["ticks"] == 1
     assert body["alerts_enabled"] is True
 
 
@@ -135,14 +141,14 @@ def test_no_token_of_that_kind_is_a_404(rig):
     )
 
 
-def test_an_unreadable_guild_feed_is_a_502(rig):
+def test_when_no_guild_node_answers_the_test_push_is_a_502(rig):
     rig.devices.add(device("la-token-00000001", PushTokenKind.LIVE_ACTIVITY))
-    rig.feed.error = GuildFeedError("The Guild feed answered HTTP 502")
+    rig.feed.down[THOR] = GuildFeedError("Guild node inst-thor's feed answered HTTP 502")
 
     response = rig.client.post(f"{URL}/test", json={"kind": "live_activity"}, headers=AUTH)
 
     assert response.status_code == 502
-    assert response.json()["detail"] == "The Guild feed answered HTTP 502"
+    assert response.json()["detail"] == "No Guild node answers right now; try again in a moment"
 
 
 @pytest.mark.parametrize(

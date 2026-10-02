@@ -151,15 +151,15 @@ class TestIngest:
         assert h.deliveries.statuses() == {"s-4": "suppressed", "s-5": "sent"}
 
     async def test_discovery_runs_again_after_its_interval(self, harness):
-        harness.feed.newest_calls.clear()
+        assert harness.feed.nodes_calls == 1
         await harness.gateway.run_once()
-        assert harness.feed.newest_calls == []
+        assert harness.feed.nodes_calls == 1
 
         harness.feed.add(guild_notification("x-1", instance_id="inst-late", seq=1))
         harness.clock.advance(301)
         await harness.gateway.run_once()
 
-        assert harness.feed.newest_calls == [1]
+        assert harness.feed.nodes_calls == 2
         assert harness.deliveries.positions["inst-late"] == 1
 
     async def test_a_node_whose_feed_restarted_is_read_from_its_new_head(self, harness, caplog):
@@ -193,14 +193,152 @@ class TestIngest:
             clock=harness.clock,
         )
         harness.feed.add(guild_notification("n-2", seq=2))
+        harness.feed.after_calls.clear()
         assert await restarted.run_once() == 1
-        assert harness.feed.after_calls[-2] == {THOR: 1, MINI: 0}
+        assert sorted(harness.feed.after_calls) == [(MINI, 0), (THOR, 1)]
 
-    async def test_an_unreadable_feed_raises(self, harness):
-        harness.feed.error = GuildFeedError("The Guild feed answered HTTP 502")
+    async def test_an_unreachable_guild_fails_the_tick(self):
+        h = Harness()
+        h.feed.add_node(THOR)
+        h.feed.error = GuildFeedError("The Guild registry is unreachable: ConnectError")
+        with pytest.raises(GuildFeedError, match="registry is unreachable"):
+            await h.gateway.run_once()
+
+        # The Guild is back: the node list is asked for again at once.
+        h.feed.error = None
+        await h.gateway.run_once()
+        assert h.deliveries.positions == {THOR: 0}
+
+    async def test_nodes_are_read_separately_with_their_own_position(self, harness):
         harness.feed.add(guild_notification("n-1", seq=1))
-        with pytest.raises(GuildFeedError):
-            await harness.gateway.run_once()
+        await harness.gateway.run_once()
+        harness.feed.after_calls.clear()
+
+        await harness.gateway.run_once()
+
+        assert sorted(harness.feed.after_calls) == [(MINI, 0), (THOR, 1)]
+
+    async def test_a_node_no_longer_listed_is_not_read(self, harness):
+        del harness.feed.feeds[MINI]
+        harness.clock.advance(301)
+        await harness.gateway.run_once()
+        harness.feed.after_calls.clear()
+
+        await harness.gateway.run_once()
+
+        assert harness.feed.after_calls == [(THOR, 0)]
+        # Its position is kept: if the node is listed again it resumes there.
+        assert harness.deliveries.positions[MINI] == 0
+
+
+class TestUnreachableNodes:
+    DOWN = GuildFeedError("Guild node inst-mini-m6's feed answered HTTP 502")
+
+    async def test_a_node_that_does_not_answer_never_holds_up_the_others(self, harness, caplog):
+        harness.devices.add(device("alert-1"), device("la-1", PushTokenKind.LIVE_ACTIVITY))
+        harness.feed.down[MINI] = self.DOWN
+        harness.feed.add(guild_notification("n-1", seq=1))
+        harness.feed.add(guild_notification("m-1", instance_id=MINI, seq=1))
+
+        assert await harness.gateway.run_once() == 1
+
+        assert harness.deliveries.statuses() == {"n-1": "sent"}
+        assert harness.deliveries.positions == {THOR: 1, MINI: 0}
+        # The Live Activity is built from the nodes that answer.
+        (update,) = harness.apns.of_type("liveactivity")
+        assert [i["id"] for i in update.payload["aps"]["content-state"]["items"]] == ["n-1"]
+        assert harness.gateway.status()["unreachable_nodes"] == {MINI: str(self.DOWN)}
+        assert harness.gateway.stats.node_failures == 1
+        assert f"cannot read Guild node {MINI}" in caplog.text
+
+    async def test_it_is_left_alone_until_its_retry_time_then_caught_up(self, harness, caplog):
+        caplog.set_level("INFO", logger="volundr.domain.services.push_gateway")
+        harness.devices.add(device("alert-1"))
+        harness.feed.down[MINI] = self.DOWN
+        harness.feed.add(guild_notification("m-1", instance_id=MINI, seq=1))
+        await harness.gateway.run_once()
+        harness.feed.after_calls.clear()
+        caplog.clear()
+
+        # Inside the retry time the node is not asked at all.
+        harness.clock.advance(29)
+        await harness.gateway.run_once()
+        assert harness.feed.after_calls == [(THOR, 0)]
+
+        # Still down at its retry time: one more try, said once in the log.
+        harness.clock.advance(1)
+        await harness.gateway.run_once()
+        assert (MINI, 0) in harness.feed.after_calls
+        assert harness.gateway.stats.node_failures == 2
+        assert "cannot read Guild node" not in caplog.text
+
+        # Back: its notification is pushed (recorded 60 s ago, inside the age limit).
+        del harness.feed.down[MINI]
+        harness.clock.advance(30)
+        assert await harness.gateway.run_once() == 1
+        assert harness.deliveries.statuses() == {"m-1": "sent"}
+        assert harness.gateway.status()["unreachable_nodes"] == {}
+        assert f"reads Guild node {MINI} again" in caplog.text
+
+    async def test_a_different_error_is_logged_again(self, harness, caplog):
+        harness.feed.down[MINI] = self.DOWN
+        await harness.gateway.run_once()
+        caplog.clear()
+
+        harness.feed.down[MINI] = GuildFeedError("Guild node inst-mini-m6's feed is unreachable")
+        harness.clock.advance(30)
+        await harness.gateway.run_once()
+
+        assert "feed is unreachable" in caplog.text
+
+    async def test_every_node_down_is_quiet_and_the_surfaces_stay_owed(self, harness):
+        harness.devices.add(device("la-1", PushTokenKind.LIVE_ACTIVITY))
+        harness.feed.add(guild_notification("n-1", seq=1))
+        harness.gateway._retry_owners.add("dev-user")
+        harness.feed.down = {THOR: self.DOWN, MINI: self.DOWN}
+
+        # No node answers: the tick still completes, nothing is pushed.
+        assert await harness.gateway.run_once() == 0
+        assert harness.apns.of_type("liveactivity") == []
+        assert harness.gateway._retry_owners == {"dev-user"}
+
+        harness.feed.down = {}
+        harness.clock.advance(30)
+        await harness.gateway.run_once()
+        assert len(harness.apns.of_type("liveactivity")) == 1
+        assert harness.gateway._retry_owners == set()
+
+    async def test_a_node_down_when_first_listed_is_found_at_its_retry_time(self):
+        h = Harness()
+        h.feed.add_node(THOR)
+        h.feed.add_node(MINI)
+        h.feed.down[MINI] = self.DOWN
+        h.devices.add(device("alert-1"))
+
+        await h.gateway.run_once()
+        assert h.deliveries.positions == {THOR: 0}
+        assert h.feed.nodes_calls == 1
+
+        # Not due yet: no new discovery.
+        h.clock.advance(10)
+        await h.gateway.run_once()
+        assert h.feed.nodes_calls == 1
+
+        # At its retry time the node is looked for again, long before the interval.
+        del h.feed.down[MINI]
+        h.clock.advance(20)
+        await h.gateway.run_once()
+        assert h.feed.nodes_calls == 2
+        assert h.deliveries.positions == {THOR: 0, MINI: 0}
+
+    async def test_a_test_push_says_when_no_node_answers(self, harness):
+        harness.devices.add(device("la-1", PushTokenKind.LIVE_ACTIVITY))
+        harness.feed.down = {THOR: self.DOWN, MINI: self.DOWN}
+
+        with pytest.raises(GuildFeedError, match="No Guild node answers right now"):
+            await harness.gateway.send_test(
+                "dev-user", PushTokenKind.LIVE_ACTIVITY, title="t", body="b"
+            )
 
 
 class TestAlerts:
@@ -557,7 +695,7 @@ class TestAlerts:
     async def test_a_row_whose_lease_expired_too_often_is_given_up(self, harness):
         harness.devices.add(device("alert-1"))
         harness.feed.add(guild_notification("n-1"))
-        await harness.gateway._ingest(harness.deliveries.positions)
+        await harness.gateway._ingest(harness.gateway._positions, harness.clock.now)
         harness.deliveries.row("n-1").attempts = 3
 
         await harness.gateway.run_once()
@@ -569,7 +707,7 @@ class TestAlerts:
     async def test_a_lost_claim_is_counted_not_settled_twice(self, harness):
         harness.devices.add(device("alert-1"))
         harness.feed.add(guild_notification("n-1"), guild_notification("n-2", seq=2))
-        await harness.gateway._ingest(harness.deliveries.positions)
+        await harness.gateway._ingest(harness.gateway._positions, harness.clock.now)
         claimed = await harness.deliveries.claim_due(limit=5, lease_seconds=60)
         # Another worker re-claimed both rows before this one settled them.
         for delivery in claimed:
@@ -601,12 +739,12 @@ class TestLiveActivity:
             device("la-1", PushTokenKind.LIVE_ACTIVITY, activity_id="act-1"),
             device("la-2", PushTokenKind.LIVE_ACTIVITY, environment=PushEnvironment.SANDBOX),
         )
-        harness.feed.unread_count = 2
-        harness.feed.nodes[THOR] = [
+        harness.feed.unread_counts = {THOR: 1, MINI: 1}
+        harness.feed.feeds[THOR] = [
             guild_notification("t-1", seq=1, created_at=START - timedelta(minutes=30), read=True),
             guild_notification("t-2", seq=2, created_at=START - timedelta(minutes=5)),
         ]
-        harness.feed.nodes[MINI] = [
+        harness.feed.feeds[MINI] = [
             guild_notification(
                 "m-1", instance_id=MINI, seq=1, created_at=START - timedelta(minutes=10), read=True
             ),
@@ -724,7 +862,8 @@ class TestLiveActivity:
 
         await harness.gateway.run_once()
 
-        assert harness.feed.newest_calls == [20]
+        # One read per node for the whole tick, whatever the number of owners.
+        assert sorted(harness.feed.newest_calls) == [(MINI, 20), (THOR, 20)]
         states = {
             push.token: [item["id"] for item in push.payload["aps"]["content-state"]["items"]]
             for push in harness.apns.of_type("liveactivity")
@@ -750,19 +889,23 @@ class TestLiveActivity:
     async def test_a_tick_that_fails_before_the_surfaces_still_owes_them(self, harness):
         harness.devices.add(device("la-1", PushTokenKind.LIVE_ACTIVITY))
         harness.feed.add(guild_notification("n-1"))
-        real_newest = harness.feed.newest
+        real_list = harness.devices.list_for_owner
+        calls = 0
 
-        async def unreachable(*, limit: int):
-            raise GuildFeedError("The Guild feed answered HTTP 502")
+        async def database_gone(owner_id, *, kinds=None):
+            nonlocal calls
+            calls += 1
+            if calls == 2:  # The alert devices were read; the surface devices cannot be.
+                raise RuntimeError("connection lost")
+            return await real_list(owner_id, kinds=kinds)
 
-        # The notification is ingested, then the page for the Live Activity cannot be read.
-        harness.feed.newest = unreachable
-        with pytest.raises(GuildFeedError):
+        # The notification is ingested, then the tick breaks before the Live Activity.
+        harness.devices.list_for_owner = database_gone
+        with pytest.raises(RuntimeError):
             await harness.gateway.run_once()
         assert harness.deliveries.positions[THOR] == 1
         assert harness.apns.of_type("liveactivity") == []
 
-        harness.feed.newest = real_newest
         assert await harness.gateway.run_once() == 0
         assert len(harness.apns.of_type("liveactivity")) == 1
 
@@ -1090,6 +1233,7 @@ class TestHousekeeping:
 
         assert status["running"] is False
         assert status["nodes"] == {MINI: 0, THOR: 1}
+        assert status["unreachable_nodes"] == {}
         assert status["alerts_sent"] == 1 and status["ingested"] == 1
         assert status["last_tick_at"] == START.isoformat()
         assert status["alerts_enabled"] and status["widgets_enabled"]
@@ -1167,12 +1311,13 @@ class TestLoop:
         await self._until(lambda: h.gateway.stats.ticks == 2)
         await h.gateway.stop()
 
-    async def test_a_feed_failure_is_counted_and_the_loop_goes_on(self):
+    async def test_a_guild_failure_is_counted_said_once_and_the_loop_goes_on(self, caplog):
         h = Harness(gateway_settings(poll_interval_seconds=0.01, stream_enabled=False))
-        h.feed.error = GuildFeedError("The Guild feed is unreachable: ConnectError")
+        h.feed.error = GuildFeedError("The Guild registry is unreachable: ConnectError")
         await h.gateway.start()
-        await self._until(lambda: h.gateway.stats.loop_errors >= 1)
-        assert h.gateway.stats.last_error == "The Guild feed is unreachable: ConnectError"
+        await self._until(lambda: h.gateway.stats.loop_errors >= 3)
+        assert h.gateway.stats.last_error == "The Guild registry is unreachable: ConnectError"
+        assert caplog.text.count("Push gateway could not read the Guild") == 1
 
         h.feed.error = None
         await self._until(lambda: h.gateway.stats.ticks >= 1)
@@ -1236,6 +1381,7 @@ class TestSettings:
             ({"poll_interval_seconds": 0}, "must be positive"),
             ({"stream_retry_seconds": 0}, "must be positive"),
             ({"catch_up_items": -1}, "catch_up_items"),
+            ({"node_retry_seconds": -1}, "node_retry_seconds"),
         ],
     )
     def test_gateway_settings_are_checked(self, overrides, message):

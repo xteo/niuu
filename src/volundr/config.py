@@ -842,16 +842,17 @@ class PushGatewayConfig(BaseModel):
     """The Guild push gateway: Apple pushes for every Guild node's notifications.
 
     One node holds the APNs key (``push.apns``) and the registered devices. It
-    reads the Guild's merged notification feed at ``guild_url`` and sends the alert,
-    Live Activity and widget pushes for every node, so no other node needs a key.
+    reads every node's notification feed through the Guild API at ``guild_url`` and
+    sends the alert, Live Activity and widget pushes for all of them, so no other
+    node needs a key.
     """
 
     enabled: bool = Field(default=False, description="Run the push gateway on this node.")
     guild_url: str = Field(
         default="",
         description=(
-            "Origin of the Guild API that serves the merged feed "
-            "(/api/v1/forge/notifications?all_instances=true), e.g. http://127.0.0.1:8080."
+            "Origin of the Guild API (its registry and its notification feed), "
+            "e.g. http://127.0.0.1:8080."
         ),
     )
     reader_token_path: str = Field(
@@ -862,7 +863,17 @@ class PushGatewayConfig(BaseModel):
         ),
     )
     request_timeout_seconds: float = Field(
-        default=15.0, gt=0, description="Timeout for one Guild feed request."
+        default=5.0,
+        gt=0,
+        description=(
+            "Timeout for one read of one Guild node. A node that does not answer in "
+            "time fails only its own read."
+        ),
+    )
+    node_retry_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        description="How long a node that did not answer is left alone before the next try.",
     )
     poll_interval_seconds: float = Field(
         default=5.0,
@@ -888,7 +899,7 @@ class PushGatewayConfig(BaseModel):
     feed_page_size: int = Field(
         default=20,
         ge=3,
-        description="Newest notifications read to build the Live Activity content.",
+        description="Newest notifications read per node to build the Live Activity content.",
     )
     catch_up_items: int = Field(
         default=10,

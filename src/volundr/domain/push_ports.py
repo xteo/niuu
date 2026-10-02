@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
@@ -25,34 +25,44 @@ class ApplePushClient(ABC):
 
 
 class GuildFeedError(Exception):
-    """The Guild feed could not be read (unreachable, refused or malformed)."""
+    """The Guild, or one of its nodes, could not be read (unreachable, refused, malformed)."""
 
 
 @dataclass(frozen=True)
 class GuildFeedPage:
-    """One page of the Guild's merged feed.
+    """One page of one node's notification feed, as the Guild serves it.
 
-    ``positions`` is where reading continues, per node (the newest ``seq`` seen, or
-    the node's head for a newest-first page). ``unread_count`` is the reader's.
+    ``position`` is where reading continues: the node's head ``seq`` for a newest
+    page, the last ``seq`` returned for a page read after a position.
+    ``unread_count`` is the reader's on that node.
     """
 
     items: list[GuildNotification]
-    positions: dict[str, int] = field(default_factory=dict)
+    position: int = 0
     unread_count: int = 0
 
 
 class GuildFeed(ABC):
-    """Reads every Guild node's notifications through the Guild API."""
+    """Reads each Guild node's notifications through the Guild API.
+
+    Every read names one node, so a node that does not answer delays and fails
+    only its own read: the gateway keeps pushing for the others.
+    """
 
     @abstractmethod
-    async def newest(self, *, limit: int) -> GuildFeedPage:
-        """The newest notifications across the Guild, newest first, with each
-        reachable node's head position."""
+    async def nodes(self) -> list[str]:
+        """The Guild's enabled Forge nodes (their ids), from its registry. No node
+        is contacted, so an unreachable node is still listed."""
 
     @abstractmethod
-    async def after(self, positions: Mapping[str, int], *, limit: int) -> GuildFeedPage:
-        """Notifications recorded after ``positions`` on the nodes it names,
-        oldest first, with the positions to continue from."""
+    async def newest(self, node: str, *, limit: int) -> GuildFeedPage:
+        """``node``'s newest notifications, newest first, with its head position
+        and the reader's unread count there."""
+
+    @abstractmethod
+    async def after(self, node: str, position: int, *, limit: int) -> GuildFeedPage:
+        """``node``'s notifications recorded after ``position``, oldest first, with
+        the position to continue from."""
 
     @abstractmethod
     def notification_events(self) -> AsyncIterator[str]:

@@ -1,4 +1,4 @@
-"""The push gateway's reader of the Guild's merged notification feed."""
+"""The push gateway's reader of the Guild: its registry and each node's feed."""
 
 from __future__ import annotations
 
@@ -58,125 +58,170 @@ def feed_for(guild: Guild, *, reader_token: str = "") -> HttpGuildFeed:
     )
 
 
+class TestNodes:
+    async def test_lists_the_enabled_forge_nodes_from_the_registry(self):
+        guild = Guild(
+            httpx.Response(
+                200,
+                json=[
+                    {"id": THOR, "kind": "volundr", "slug": "local", "enabled": True},
+                    {"id": MINI, "kind": "volundr", "slug": "mini-m6", "enabled": True},
+                    {"id": "", "kind": "volundr"},
+                    {"slug": "no-id"},
+                    "nope",
+                ],
+            )
+        )
+
+        assert await feed_for(guild).nodes() == [THOR, MINI]
+
+        request = guild.requests[0]
+        assert request.url.path == "/api/v1/niuu/instances"
+        assert dict(request.url.params) == {"kind": "volundr", "enabledOnly": "true"}
+        assert "authorization" not in request.headers
+
+    async def test_the_reader_token_is_sent_as_a_bearer(self):
+        guild = Guild(httpx.Response(200, json=[]))
+        assert await feed_for(guild, reader_token="pat-123").nodes() == []
+        assert guild.requests[0].headers["authorization"] == "Bearer pat-123"
+
+    async def test_something_that_is_not_a_guild(self):
+        guild = Guild(httpx.Response(200, json={"detail": "Not Found"}))
+        with pytest.raises(GuildFeedError, match="must be a Guild API origin"):
+            await feed_for(guild).nodes()
+
+    async def test_an_unreachable_guild(self):
+        guild = Guild(httpx.ConnectError("refused"))
+        with pytest.raises(GuildFeedError, match="The Guild registry is unreachable: ConnectError"):
+            await feed_for(guild).nodes()
+
+    @pytest.mark.parametrize("status", [401, 403, 404, 500])
+    async def test_a_refusing_guild(self, status):
+        guild = Guild(httpx.Response(status, json={"detail": "no"}))
+        with pytest.raises(GuildFeedError, match=f"The Guild registry answered HTTP {status}"):
+            await feed_for(guild).nodes()
+
+
 class TestNewest:
-    async def test_reads_the_merged_feed_with_heads_and_unread_count(self):
+    async def test_reads_one_nodes_newest_page_with_its_head_and_unread_count(self):
         guild = Guild(
             httpx.Response(
                 200,
                 json={
-                    "items": [item("n-2", THOR, 323), item("m-1", MINI, 7, read=True)],
-                    "next_before": "opaque",
-                    "next_after": encode_cursor({THOR: 323, MINI: 7}),
+                    "items": [item("n-2", THOR, 323), item("n-1", THOR, 322, read=True)],
+                    "next_before": encode_cursor({THOR: 322}),
+                    "next_after": encode_cursor({THOR: 323}),
                     "unread_count": 1,
                     "instances": {
-                        THOR: {"head_seq": 323, "read_through_seq": 321, "unread_count": 1},
-                        MINI: {"head_seq": 7, "read_through_seq": 7, "unread_count": 0},
-                        "broken": {"head_seq": "7"},
+                        THOR: {"head_seq": 323, "read_through_seq": 322, "unread_count": 1},
                     },
                 },
             )
         )
 
-        page = await feed_for(guild).newest(limit=20)
+        page = await feed_for(guild).newest(THOR, limit=20)
 
         request = guild.requests[0]
         assert request.url.path == "/api/v1/forge/notifications"
-        assert dict(request.url.params) == {"all_instances": "true", "limit": "20"}
-        assert "authorization" not in request.headers
-        assert [(n.id, n.instance_id, n.read) for n in page.items] == [
-            ("n-2", THOR, False),
-            ("m-1", MINI, True),
-        ]
-        assert page.positions == {THOR: 323, MINI: 7}
+        params = dict(request.url.params)
+        assert params["all_instances"] == "true" and params["limit"] == "20"
+        # A cursor naming only this node, at no position: the facade reads only it.
+        assert decode_cursor(params["before"]) == {THOR: None}
+        assert [(n.id, n.read) for n in page.items] == [("n-2", False), ("n-1", True)]
+        assert page.position == 323
         assert page.unread_count == 1
 
     async def test_the_reader_token_is_sent_as_a_bearer(self):
-        guild = Guild(httpx.Response(200, json={"items": [], "instances": {}}))
-        page = await feed_for(guild, reader_token="pat-123").newest(limit=1)
+        guild = Guild(httpx.Response(200, json={"items": [], "instances": {THOR: {"head_seq": 0}}}))
+        page = await feed_for(guild, reader_token="pat-123").newest(THOR, limit=1)
         assert guild.requests[0].headers["authorization"] == "Bearer pat-123"
-        assert page.items == [] and page.unread_count == 0
+        assert (page.items, page.position, page.unread_count) == ([], 0, 0)
 
-    async def test_a_single_node_is_not_a_guild_feed(self):
-        guild = Guild(httpx.Response(200, json={"items": [], "head_seq": 3, "next_before": None}))
-        with pytest.raises(GuildFeedError, match="must be a Guild API origin"):
-            await feed_for(guild).newest(limit=1)
+    @pytest.mark.parametrize(
+        "instances", [None, {}, {MINI: {"head_seq": 7}}, {THOR: {"head_seq": "7"}}, {THOR: 7}]
+    )
+    async def test_a_node_the_guild_did_not_read_has_no_head(self, instances):
+        guild = Guild(httpx.Response(200, json={"items": [], "instances": instances}))
+        with pytest.raises(GuildFeedError, match="returned no head position"):
+            await feed_for(guild).newest(THOR, limit=1)
 
-    async def test_malformed_items_are_skipped(self, caplog):
+    async def test_malformed_items_and_other_nodes_items_are_skipped(self, caplog):
         guild = Guild(
             httpx.Response(
                 200,
                 json={
-                    "items": ["nope", {"id": "x"}, item("n-1", THOR, 1)],
+                    "items": ["nope", {"id": "x"}, item("m-1", MINI, 9), item("n-1", THOR, 1)],
                     "instances": {THOR: {"head_seq": 1}},
                 },
             )
         )
-        page = await feed_for(guild).newest(limit=5)
+        page = await feed_for(guild).newest(THOR, limit=5)
         assert [n.id for n in page.items] == ["n-1"]
         assert "Ignoring a malformed Guild feed item" in caplog.text
 
 
 class TestAfter:
-    async def test_sends_the_positions_as_the_guilds_cursor(self):
+    async def test_reads_one_node_after_its_position(self):
         guild = Guild(
             httpx.Response(
                 200,
                 json={
-                    "items": [item("m-2", MINI, 8), item("n-3", THOR, 324)],
-                    "next_after": encode_cursor({THOR: 324, MINI: 8}),
+                    "items": [item("n-3", THOR, 324), item("n-4", THOR, 325)],
+                    "next_after": encode_cursor({THOR: 325}),
                 },
             )
         )
 
-        page = await feed_for(guild).after({THOR: 323, MINI: 7}, limit=50)
+        page = await feed_for(guild).after(THOR, 323, limit=50)
 
         params = dict(guild.requests[0].url.params)
         assert params["all_instances"] == "true" and params["limit"] == "50"
-        assert decode_cursor(params["after"]) == {THOR: 323, MINI: 7}
-        assert [n.id for n in page.items] == ["m-2", "n-3"]
-        assert page.positions == {THOR: 324, MINI: 8}
+        assert decode_cursor(params["after"]) == {THOR: 323}
+        assert "before" not in params
+        assert [n.id for n in page.items] == ["n-3", "n-4"]
+        assert page.position == 325
 
-    async def test_a_null_position_is_left_out(self):
-        guild = Guild(
-            httpx.Response(200, json={"items": [], "next_after": encode_cursor({THOR: None})})
-        )
-        page = await feed_for(guild).after({THOR: 0}, limit=5)
-        assert page.positions == {}
+    async def test_nothing_new_keeps_the_position(self):
+        guild = Guild(httpx.Response(200, json={"items": [], "next_after": encode_cursor({})}))
+        page = await feed_for(guild).after(THOR, 323, limit=5)
+        assert (page.items, page.position) == ([], 323)
 
     @pytest.mark.parametrize("cursor", [None, 12])
     async def test_a_missing_cursor_is_an_error(self, cursor):
         guild = Guild(httpx.Response(200, json={"items": [], "next_after": cursor}))
         with pytest.raises(GuildFeedError, match="no next_after cursor"):
-            await feed_for(guild).after({THOR: 0}, limit=5)
+            await feed_for(guild).after(THOR, 0, limit=5)
 
     async def test_an_unreadable_cursor_is_an_error(self):
         guild = Guild(httpx.Response(200, json={"items": [], "next_after": "!!!"}))
         with pytest.raises(GuildFeedError, match="unreadable cursor"):
-            await feed_for(guild).after({THOR: 0}, limit=5)
+            await feed_for(guild).after(THOR, 0, limit=5)
 
 
-class TestFailures:
-    async def test_unreachable(self):
-        guild = Guild(httpx.ConnectError("refused"))
-        with pytest.raises(GuildFeedError, match="unreachable: ConnectError"):
-            await feed_for(guild).newest(limit=1)
+class TestNodeFailures:
+    async def test_a_node_that_hangs_times_out_on_its_own_read(self):
+        guild = Guild(httpx.ReadTimeout("no answer"))
+        with pytest.raises(GuildFeedError) as excinfo:
+            await feed_for(guild).after(THOR, 0, limit=5)
+        assert str(excinfo.value) == f"Guild node {THOR}'s feed is unreachable: ReadTimeout"
 
     @pytest.mark.parametrize("status", [401, 403, 502])
-    async def test_refused_or_failing(self, status):
+    async def test_refused_or_not_answering(self, status):
         guild = Guild(httpx.Response(status, json={"detail": "no"}))
-        with pytest.raises(GuildFeedError, match=f"HTTP {status}"):
-            await feed_for(guild).newest(limit=1)
+        with pytest.raises(GuildFeedError) as excinfo:
+            await feed_for(guild).newest(THOR, limit=1)
+        assert str(excinfo.value) == f"Guild node {THOR}'s feed answered HTTP {status}"
 
     async def test_not_json(self):
         guild = Guild(httpx.Response(200, content=b"<html>"))
         with pytest.raises(GuildFeedError, match="invalid JSON"):
-            await feed_for(guild).newest(limit=1)
+            await feed_for(guild).newest(THOR, limit=1)
 
     @pytest.mark.parametrize("payload", [[], {"items": "x"}, {}])
     async def test_unexpected_shape(self, payload):
         guild = Guild(httpx.Response(200, json=payload))
         with pytest.raises(GuildFeedError, match="unexpected shape"):
-            await feed_for(guild).newest(limit=1)
+            await feed_for(guild).after(THOR, 0, limit=1)
 
 
 class TestConstruction:
@@ -191,6 +236,8 @@ class TestConstruction:
     async def test_owns_and_closes_its_client(self):
         feed = HttpGuildFeed(guild_url=GUILD + "/", timeout_seconds=5)
         assert feed._feed_url == f"{GUILD}/api/v1/forge/notifications"
+        assert feed._instances_url == f"{GUILD}/api/v1/niuu/instances"
+        assert feed._client.timeout == httpx.Timeout(5)
         await feed.close()
         assert feed._client.is_closed
 

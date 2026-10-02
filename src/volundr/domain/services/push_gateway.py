@@ -4,11 +4,14 @@ One Forge node (the gateway) holds the APNs key and every registered device. It
 reads the Guild's merged notification feed and, for each new notification on any
 node:
 
-1. **Ingest.** Reads the feed after its stored per-node positions and records each
+1. **Ingest.** Reads each node's feed after its stored position and records every
    new notification as a pending alert, with the advanced positions, in one
    transaction. Live events (this node's own, and optionally the Guild's stream)
    only wake the loop early; the feed is the source of truth and is read at least
-   every poll interval, so a missed event or a restart loses nothing.
+   every poll interval, so a missed event or a restart loses nothing. Nodes are
+   read separately and at the same time: one that does not answer fails only its
+   own read and is left alone for ``node_retry_seconds``, so it never holds up
+   the pushes for the others.
 2. **Alert.** Claims pending alerts with a lease and settles each: ``suppressed``
    by the alert policy (kind, severity, source, age, quiet hours, rate limit),
    ``skipped`` when the owner has no alert device, ``sent`` when APNs accepted it
@@ -158,6 +161,7 @@ class PushGatewaySettings:
     feed_page_size: int
     catch_up_items: int
     discovery_interval_seconds: float
+    node_retry_seconds: float
     retention_seconds: float
     public_api_url: str
     origin_label: str
@@ -174,8 +178,8 @@ class PushGatewaySettings:
             )
         if self.poll_interval_seconds <= 0 or self.stream_retry_seconds <= 0:
             raise ValueError("poll_interval_seconds and stream_retry_seconds must be positive")
-        if self.catch_up_items < 0:
-            raise ValueError("catch_up_items must not be negative")
+        if self.catch_up_items < 0 or self.node_retry_seconds < 0:
+            raise ValueError("catch_up_items and node_retry_seconds must not be negative")
 
 
 @dataclass
@@ -195,6 +199,7 @@ class PushGatewayStats:
     tokens_pruned: int = 0
     apns_rejections: int = 0
     stale_settles: int = 0
+    node_failures: int = 0
     loop_errors: int = 0
     stream_reconnects: int = 0
     last_tick_at: datetime | None = None
@@ -221,15 +226,18 @@ _TOKEN_SUFFIX_CHARS = 8
 class _Tick:
     """One tick's lazily read newest page (shared by every owner's Live Activity)."""
 
-    load: Callable[[], Awaitable[GuildFeedPage]]
+    load: Callable[[], Awaitable[GuildFeedPage | None]]
     page: GuildFeedPage | None = None
+    loaded: bool = False
     retry_owners: set[str] = field(default_factory=set)
     #: Widget tokens whose reload APNs could not take in this tick.
     undelivered_widgets: set[UUID] = field(default_factory=set)
 
-    async def newest(self) -> GuildFeedPage:
-        if self.page is None:
+    async def newest(self) -> GuildFeedPage | None:
+        """The merged newest page, or ``None`` while no node answers."""
+        if not self.loaded:
             self.page = await self.load()
+            self.loaded = True
         return self.page
 
 
@@ -256,6 +264,11 @@ class PushGateway:
         self._clock = clock
         self.stats = PushGatewayStats()
         self._positions: dict[str, int] | None = None
+        #: The Guild's Forge nodes as its registry last listed them.
+        self._nodes: list[str] = []
+        #: Nodes that did not answer: their last error, and when to try them again.
+        self._node_errors: dict[str, str] = {}
+        self._node_retry_at: dict[str, datetime] = {}
         self._discover = True
         self._last_discovery: datetime | None = None
         self._last_prune: datetime | None = None
@@ -313,8 +326,10 @@ class PushGateway:
                 raise
             except GuildFeedError as exc:
                 self.stats.loop_errors += 1
+                if str(exc) != self.stats.last_error:
+                    # Said once when it starts, not on every poll while it lasts.
+                    logger.warning("Push gateway could not read the Guild: %s", exc)
                 self.stats.last_error = str(exc)
-                logger.warning("Push gateway could not read the Guild feed: %s", exc)
             except Exception as exc:
                 self.stats.loop_errors += 1
                 self.stats.last_error = type(exc).__name__
@@ -361,7 +376,7 @@ class PushGateway:
         """Ingest, alert and refresh the surfaces once; returns how many were new."""
         now = self._clock()
         positions = await self._positions_for_tick(now)
-        fresh = await self._ingest(positions)
+        fresh = await self._ingest(positions, now)
         await self._deliver_alerts()
         tick = _Tick(load=self._newest_page)
         # An owner leaves the set only once refreshed: if this tick fails part-way
@@ -379,37 +394,113 @@ class PushGateway:
         self.stats.last_error = ""
         return len(fresh)
 
-    async def _newest_page(self) -> GuildFeedPage:
-        return await self._feed.newest(limit=self._settings.feed_page_size)
+    # -- Reading the Guild, node by node -----------------------------------
+
+    def _readable(self, nodes: list[str], now: datetime) -> list[str]:
+        """``nodes`` minus those that failed lately and are not due for a retry."""
+        return [
+            node
+            for node in nodes
+            if node not in self._node_retry_at or self._node_retry_at[node] <= now
+        ]
+
+    async def _read_nodes(
+        self,
+        nodes: list[str],
+        read: Callable[[str], Awaitable[GuildFeedPage]],
+        now: datetime,
+    ) -> dict[str, GuildFeedPage]:
+        """Read several nodes at once; a node that fails is set aside, not fatal."""
+        results = await asyncio.gather(*(read(node) for node in nodes), return_exceptions=True)
+        pages: dict[str, GuildFeedPage] = {}
+        for node, result in zip(nodes, results, strict=True):
+            if isinstance(result, GuildFeedError):
+                self._node_failed(node, result, now)
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            self._node_answered(node)
+            pages[node] = result
+        return pages
+
+    def _node_failed(self, node: str, error: GuildFeedError, now: datetime) -> None:
+        self.stats.node_failures += 1
+        self._node_retry_at[node] = now + timedelta(seconds=self._settings.node_retry_seconds)
+        text = str(error)
+        if self._node_errors.get(node) == text:
+            return  # Logged when it started; say it once, not on every retry.
+        self._node_errors[node] = text
+        logger.warning("Push gateway cannot read Guild node %s: %s", node, text)
+
+    def _node_answered(self, node: str) -> None:
+        self._node_retry_at.pop(node, None)
+        if self._node_errors.pop(node, None) is not None:
+            logger.info("Push gateway reads Guild node %s again", node)
+
+    async def _newest_page(self) -> GuildFeedPage | None:
+        """The Guild's newest notifications, merged from every node that answers.
+
+        ``None`` while no node answers: there is nothing to show yet.
+        """
+        now = self._clock()
+        positions = self._positions or {}
+        nodes = self._readable([node for node in self._nodes if node in positions], now)
+        limit = self._settings.feed_page_size
+        pages = await self._read_nodes(
+            nodes, lambda node: self._feed.newest(node, limit=limit), now
+        )
+        if not pages:
+            return None
+        merged = sorted(
+            (item for page in pages.values() for item in page.items),
+            key=_recorded_order,
+            reverse=True,
+        )
+        return GuildFeedPage(
+            items=merged[:limit],
+            unread_count=sum(page.unread_count for page in pages.values()),
+        )
 
     async def _positions_for_tick(self, now: datetime) -> dict[str, int]:
         if self._positions is None:
             self._positions = await self._deliveries.load_positions()
-        interval = self._settings.discovery_interval_seconds
-        last = self._last_discovery
-        if self._discover or last is None or (now - last).total_seconds() >= interval:
+        if self._discovery_due(self._positions, now):
             await self._discover_nodes(self._positions, now)
         return self._positions
 
+    def _discovery_due(self, positions: dict[str, int], now: datetime) -> bool:
+        interval = self._settings.discovery_interval_seconds
+        last = self._last_discovery
+        if self._discover or last is None or (now - last).total_seconds() >= interval:
+            return True
+        # A listed node that did not answer when it was found is tried again as
+        # soon as its retry time comes, not only at the next interval.
+        waiting = [node for node in self._nodes if node not in positions]
+        return bool(self._readable(waiting, now))
+
     async def _discover_nodes(self, positions: dict[str, int], now: datetime) -> None:
-        """Start reading nodes the gateway has no position for.
+        """List the Guild's nodes and start reading those without a position.
 
         A new node starts ``catch_up_items`` before its head, so a notification
         recorded just before the node was found is still pushed; older ones are
         never replayed, and the alert policy's age limit holds back stale ones.
         A node whose feed restarted (its head is behind the stored position, as
-        after its database was recreated) is read from its head again.
+        after its database was recreated) is read from its head again. A node that
+        does not answer is tried again at the next discovery.
         """
-        page = await self._feed.newest(limit=1)
+        self._nodes = await self._feed.nodes()
+        heads = await self._read_nodes(
+            self._readable(self._nodes, now), lambda node: self._feed.newest(node, limit=1), now
+        )
         found = {
-            instance_id: max(0, head - self._settings.catch_up_items)
-            for instance_id, head in page.positions.items()
-            if instance_id not in positions
+            node: max(0, page.position - self._settings.catch_up_items)
+            for node, page in heads.items()
+            if node not in positions
         }
         rewound = {
-            instance_id: head
-            for instance_id, head in page.positions.items()
-            if instance_id in positions and head < positions[instance_id]
+            node: page.position
+            for node, page in heads.items()
+            if node in positions and page.position < positions[node]
         }
         if found or rewound:
             await self._deliveries.save_positions({**found, **rewound})
@@ -426,14 +517,28 @@ class PushGateway:
         self._discover = False
         self._last_discovery = now
 
-    async def _ingest(self, positions: dict[str, int]) -> list[GuildNotification]:
+    async def _ingest(self, positions: dict[str, int], now: datetime) -> list[GuildNotification]:
         fresh: list[GuildNotification] = []
-        while positions and not self._stopping.is_set():
-            page = await self._feed.after(positions, limit=self._settings.page_size)
-            if not page.items:
+        limit = self._settings.page_size
+        nodes = self._readable([node for node in self._nodes if node in positions], now)
+        while nodes and not self._stopping.is_set():
+            pages = await self._read_nodes(
+                nodes, lambda node: self._feed.after(node, positions[node], limit=limit), now
+            )
+            items = sorted(
+                (item for page in pages.values() for item in page.items), key=_recorded_order
+            )
+            advanced = {
+                node: page.position
+                for node, page in pages.items()
+                if page.position != positions[node]
+            }
+            if not items and not advanced:
                 break
-            fresh.extend(await self._deliveries.record(page.items, page.positions))
-            positions.update(page.positions)
+            fresh.extend(await self._deliveries.record(items, advanced))
+            positions.update(advanced)
+            # A full page may have more behind it: read those nodes again.
+            nodes = [node for node, page in pages.items() if len(page.items) >= limit]
         return fresh
 
     # -- Alerts ------------------------------------------------------------
@@ -636,6 +741,8 @@ class PushGateway:
         """Update (or start) the owner's Live Activity; True when a retry is owed."""
         settings = self._settings.live_activity
         page = await tick.newest()
+        if page is None:
+            return True  # No node answers right now: the update stays owed.
         now = self._clock()
         items = self._owner_items(owner_id, page)
         if not items:
@@ -820,6 +927,8 @@ class PushGateway:
         state: dict[str, Any] = {}
         if kind in (PushTokenKind.LIVE_ACTIVITY, PushTokenKind.LIVE_ACTIVITY_START):
             page = await self._newest_page()
+            if page is None:
+                raise GuildFeedError("No Guild node answers right now; try again in a moment")
             state = self._content_state(self._owner_items(owner_id, page), page, now)
         results: list[PushTestResult] = []
         for device in devices:
@@ -888,12 +997,21 @@ class PushGateway:
         return {
             "running": self._task is not None and not self._task.done(),
             "nodes": dict(sorted((self._positions or {}).items())),
+            "unreachable_nodes": dict(sorted(self._node_errors.items())),
             "alerts_enabled": self._settings.alerts.enabled,
             "live_activity_enabled": self._settings.live_activity.enabled,
             "live_activity_start_enabled": self._settings.live_activity.start_enabled,
             "widgets_enabled": self._settings.widgets.enabled,
             **stats,
         }
+
+
+_NO_TIME = datetime.min.replace(tzinfo=UTC)
+
+
+def _recorded_order(notification: GuildNotification) -> tuple[datetime, str, int]:
+    """Sort key across nodes: the time recorded, then the node, then its ``seq``."""
+    return (notification.created_at or _NO_TIME, notification.instance_id, notification.seq)
 
 
 def _severity(notification: GuildNotification) -> NotificationSeverity:

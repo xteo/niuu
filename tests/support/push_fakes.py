@@ -114,56 +114,59 @@ def device(
 
 
 class FakeGuildFeed(GuildFeed):
-    """Per-node feeds merged like the Guild facade does."""
+    """A Guild of in-memory node feeds, read node by node like the real one."""
 
     def __init__(self) -> None:
-        self.nodes: dict[str, list[GuildNotification]] = {}
-        self.unread_count = 0
+        self.feeds: dict[str, list[GuildNotification]] = {}
+        self.unread_counts: dict[str, int] = {}
+        #: The Guild itself is unreachable: every call fails.
         self.error: GuildFeedError | None = None
-        self.after_calls: list[dict[str, int]] = []
-        self.newest_calls: list[int] = []
+        #: Nodes that do not answer (the registry still lists them).
+        self.down: dict[str, GuildFeedError] = {}
+        self.nodes_calls = 0
+        self.newest_calls: list[tuple[str, int]] = []
+        self.after_calls: list[tuple[str, int]] = []
         self.events: asyncio.Queue[str | Exception | None] = asyncio.Queue()
         self.closed = False
 
     def add(self, *notifications: GuildNotification) -> None:
         for notification in notifications:
-            self.nodes.setdefault(notification.instance_id, []).append(notification)
+            self.feeds.setdefault(notification.instance_id, []).append(notification)
 
     def add_node(self, instance_id: str) -> None:
-        self.nodes.setdefault(instance_id, [])
+        self.feeds.setdefault(instance_id, [])
 
-    def _fail(self) -> None:
+    def _fail(self, node: str | None = None) -> None:
         if self.error is not None:
             raise self.error
+        if node is not None and node in self.down:
+            raise self.down[node]
 
-    async def newest(self, *, limit: int) -> GuildFeedPage:
+    async def nodes(self) -> list[str]:
         self._fail()
-        self.newest_calls.append(limit)
-        merged = sorted(
-            (item for items in self.nodes.values() for item in items),
-            key=lambda item: (item.created_at or START, item.seq),
-            reverse=True,
+        self.nodes_calls += 1
+        return list(self.feeds)
+
+    async def newest(self, node: str, *, limit: int) -> GuildFeedPage:
+        self.newest_calls.append((node, limit))
+        self._fail(node)
+        items = sorted(self.feeds.get(node, []), key=lambda item: item.seq, reverse=True)
+        return GuildFeedPage(
+            items=items[:limit],
+            position=max((item.seq for item in items), default=0),
+            unread_count=self.unread_counts.get(node, 0),
         )
-        heads = {
-            instance_id: max((item.seq for item in items), default=0)
-            for instance_id, items in self.nodes.items()
-        }
-        return GuildFeedPage(items=merged[:limit], positions=heads, unread_count=self.unread_count)
 
-    async def after(self, positions: Mapping[str, int], *, limit: int) -> GuildFeedPage:
-        self._fail()
-        self.after_calls.append(dict(positions))
-        items: list[GuildNotification] = []
-        advanced: dict[str, int] = {}
-        for instance_id, position in positions.items():
-            node = sorted(
-                (item for item in self.nodes.get(instance_id, []) if item.seq > position),
-                key=lambda item: item.seq,
-            )[:limit]
-            items.extend(node)
-            advanced[instance_id] = max((item.seq for item in node), default=position)
-        items.sort(key=lambda item: (item.created_at or START, item.instance_id, item.seq))
-        return GuildFeedPage(items=items, positions=advanced)
+    async def after(self, node: str, position: int, *, limit: int) -> GuildFeedPage:
+        self.after_calls.append((node, position))
+        self._fail(node)
+        items = sorted(
+            (item for item in self.feeds.get(node, []) if item.seq > position),
+            key=lambda item: item.seq,
+        )[:limit]
+        return GuildFeedPage(
+            items=items, position=max((item.seq for item in items), default=position)
+        )
 
     async def notification_events(self) -> AsyncIterator[str]:
         while True:
@@ -451,6 +454,7 @@ def gateway_settings(
         "feed_page_size": 20,
         "catch_up_items": 0,
         "discovery_interval_seconds": 300.0,
+        "node_retry_seconds": 30.0,
         "retention_seconds": 604800.0,
         "public_api_url": "http://thor.tail737f2a.ts.net:8080",
         "origin_label": "Thor",

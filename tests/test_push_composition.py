@@ -54,6 +54,7 @@ class TestDefaults:
     def test_gateway_defaults(self):
         gateway = PushGatewayConfig()
         assert gateway.poll_interval_seconds == 5.0 and gateway.stream_enabled is False
+        assert gateway.request_timeout_seconds == 5.0 and gateway.node_retry_seconds == 30.0
         assert gateway.alerts.kinds == [
             NotificationKind.MILESTONE,
             NotificationKind.DECISION,
@@ -201,6 +202,7 @@ class TestComposition:
         assert settings.widgets.priority == 10
         assert settings.poll_interval_seconds == 5.0 and settings.page_size == 50
         assert settings.stream_enabled is False
+        assert settings.node_retry_seconds == 30.0
 
     def test_a_missing_key_file_stops_the_start(self, tmp_path):
         push = PushNotificationConfig(**push_config(tmp_path / "AuthKey_MISSING.p8"))
