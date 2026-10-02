@@ -586,7 +586,7 @@ kind. Both routes exist only on the gateway node and through the Guild facade.
 |---|---|
 | `POST /devices` answers 404 through the Guild | The Guild facade is older than this release. |
 | `POST /devices` answers 503 | `push.enabled` is off on that node. |
-| `status` shows `last_error`: "The Guild feed is unreachable" | `guild_url` is wrong, or the Guild is not up yet (the gateway reads again every `poll_interval_seconds`). |
+| `status` shows `last_error`: "The Guild feed is unreachable" | `guild_url` is wrong, or the Guild is not up yet (the gateway reads again every `poll_interval_seconds`). One such warning in the log right after a start is normal when the Guild runs in the same process: the gateway starts before the server accepts connections. |
 | `status` shows `last_error`: "… answered HTTP 401/403" | The Guild needs a credential: set `reader_token_path`. |
 | `nodes` lacks a node | It was unreachable when the gateway looked; it is found within `discovery_interval_seconds`, or on its next notification. |
 | Test push: `HTTP 403 InvalidProviderToken` | Wrong `team_id` or `key_id`, or the key was revoked. |
