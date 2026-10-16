@@ -162,6 +162,17 @@ class SessionRepository(ABC):
         """
 
     @abstractmethod
+    async def update_description(
+        self, session_id: UUID, changes: dict[str, str | None], now: datetime
+    ) -> Session | None:
+        """Write only the given description keys (normalized; ``None`` clears).
+
+        A key's ``*_updated_at`` stamp (and ``updated_at``) moves to ``now`` only
+        when its stored value actually changes. Returns the stored session, or
+        ``None`` when it no longer exists. Ordinary updates never write these columns.
+        """
+
+    @abstractmethod
     async def get_read_states(
         self,
         session_ids: list[UUID],

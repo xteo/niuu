@@ -2926,8 +2926,10 @@ class TmuxInteractiveTransport(CLITransport):
         parts: list[str] = []
         if self._steering_instructions_enabled:
             parts.append(_STEERING_INPUT_INSTRUCTION)
-        # Always advertise the session capabilities (present-file, and the Forge notify MCP
-        # when the broker injected it) so any Forge agent can hand the user a file or ping them.
+        # Always advertise the session capabilities (present-file, and the Forge notify MCP and
+        # forge-describe when the broker injected it) so any Forge agent can hand the user a
+        # file, ping them and say what it is doing. The fallback names present-file only:
+        # without SessionTools there is no broker loopback for forge-describe to reach.
         if self._session_tools is not None:
             parts.append(self._session_tools.instructions)
         else:

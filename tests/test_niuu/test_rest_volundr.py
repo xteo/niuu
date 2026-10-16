@@ -1081,6 +1081,60 @@ def test_update_session_proxies_put_rename_to_owner_with_body() -> None:
 
 
 @respx.mock
+def test_update_session_description_passes_explicit_null_through_to_owner() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2", "name": "Session 2"})
+    )
+    stored = {"id": "s2", "short_description": "Done: shipped", "description": None}
+    route = respx.put("http://beta/api/v1/forge/sessions/s2/description").mock(
+        return_value=Response(200, json=stored)
+    )
+
+    response = client.put(
+        "/api/v1/forge/sessions/s2/description",
+        headers=_headers(),
+        json={"short_description": "Done: shipped", "description": None},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["instance_id"] == "beta"
+    assert {key: payload[key] for key in stored} == stored
+    import json as _json
+
+    assert _json.loads(route.calls.last.request.content) == {
+        "short_description": "Done: shipped",
+        "description": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("remote", "status"),
+    [
+        (Response(405, json={"detail": "Method Not Allowed"}), 501),
+        (Response(404, json={"detail": "Not Found"}), 501),
+        (Response(404, text="gone"), 404),
+        (Response(404, json={"detail": "Session not found: s2"}), 404),
+        (Response(403, json={"detail": "bound to another session"}), 403),
+    ],
+)
+@respx.mock
+def test_update_session_description_on_an_older_owner_is_501(remote, status) -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2", "name": "Session 2"})
+    )
+    respx.put("http://beta/api/v1/forge/sessions/s2/description").mock(return_value=remote)
+
+    response = client.put(
+        "/api/v1/forge/sessions/s2/description", headers=_headers(), json={"description": "x"}
+    )
+
+    assert response.status_code == status
+
+
+@respx.mock
 def test_proxy_routes_fall_back_to_empty_payloads_when_remote_returns_non_dict_content() -> None:
     client = _client([_instance("beta", base_url="http://beta")])
     respx.get("http://beta/api/v1/forge/sessions/s2").mock(

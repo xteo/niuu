@@ -29,6 +29,11 @@ from niuu.domain.services.token_scope import (
     FORGE_SESSION_READ_SCOPE,
     require_scope,
 )
+from niuu.domain.session_description import (
+    DESCRIPTION_MAX_CHARS,
+    SHORT_DESCRIPTION_MAX_CHARS,
+    SessionDescriptionPatch,
+)
 from niuu.domain.session_endpoint import public_session_endpoint
 from niuu.domain.text_projection import projection_revision
 from niuu.forge_mcp.models import ForgeMcpGrant
@@ -546,6 +551,20 @@ class SessionCreate(BaseModel):
         default=None,
         description="Forge MCP grants for the session (see ForgeMcpSessionOptions).",
     )
+    short_description: str | None = Field(
+        default=None,
+        description=(
+            "Seed the one-line description of what the session is doing (whitespace "
+            f"collapsed, truncated to {SHORT_DESCRIPTION_MAX_CHARS} characters)."
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        description=(
+            "Seed the fuller status, markdown allowed (stripped, truncated to "
+            f"{DESCRIPTION_MAX_CHARS} characters)."
+        ),
+    )
 
     @field_validator("workload_config")
     @classmethod
@@ -649,6 +668,26 @@ class SessionUpdate(BaseModel):
                 "model": "claude-sonnet-4-6",
                 "branch": "fix/auth-bypass",
                 "tracker_issue_id": "PROJ-1234",
+            },
+        },
+    }
+
+
+class SessionDescriptionUpdate(SessionDescriptionPatch):
+    """Request body for ``PUT /sessions/{id}/description``.
+
+    Partial: a key that is sent replaces the stored value and ``null`` clears it;
+    an omitted key is left unchanged. ``short_description`` is folded to one line
+    and truncated to 140 characters, ``description`` stripped and truncated to
+    4,000; a blank value is stored as ``null``.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
+            "example": {
+                "short_description": "Adding session descriptions to Forge; tests next",
+                "description": "## Status\n- migration done\n- REST route in review",
             },
         },
     }
@@ -957,6 +996,22 @@ class SessionResponse(BaseModel):
         default=None,
         description="Captured CLI/agent conversation id; present once the session is resumable",
     )
+    short_description: str | None = Field(
+        default=None,
+        description="Agent-maintained one-line summary of what the session is doing; null if unset",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Agent-maintained fuller status (markdown); null if unset",
+    )
+    short_description_updated_at: str | None = Field(
+        default=None,
+        description="ISO 8601 time short_description last changed; null if never set",
+    )
+    description_updated_at: str | None = Field(
+        default=None,
+        description="ISO 8601 time description last changed; null if never set",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -1062,6 +1117,18 @@ class SessionResponse(BaseModel):
             origin=session.origin,
             external_session_id=session.external_session_id,
             cli_session_id=session.cli_session_id,
+            short_description=session.short_description,
+            description=session.description,
+            short_description_updated_at=(
+                session.short_description_updated_at.isoformat()
+                if session.short_description_updated_at
+                else None
+            ),
+            description_updated_at=(
+                session.description_updated_at.isoformat()
+                if session.description_updated_at
+                else None
+            ),
         )
 
 
@@ -1659,6 +1726,8 @@ def create_router(
             "project_instance_id": project_service.instance_id if project_service else None,
             # GET /sessions/{id}/attachments: every document/image of a session in one call.
             "attachments_index": True,
+            # PUT /sessions/{id}/description + short_description/description on records.
+            "session_descriptions": True,
         }
 
     @router.get("/repos/branches", response_model=list[str], tags=["Repositories"])
@@ -2215,6 +2284,40 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session not found: {session_id}",
             )
+
+    @router.put(
+        "/sessions/{session_id}/description",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
+        response_model=SessionResponse,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def update_session_description(
+        request: Request,
+        data: SessionDescriptionUpdate,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> SessionResponse:
+        """Set or clear a session's short and long descriptions.
+
+        Open to operators and to the session's own token (its agent keeps the
+        description current). Changes reach clients as ``session_updated`` on the
+        fleet event stream.
+        """
+        _require_bound_workload_session(request, session_id)
+        principal = await _optional_principal(request)
+        try:
+            session = await forge.update_description(session_id, data, principal=principal)
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+        except SessionNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        return _session_response(session)
 
     @router.delete(
         "/sessions/{session_id}",

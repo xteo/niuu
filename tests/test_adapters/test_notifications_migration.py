@@ -113,6 +113,9 @@ def test_images_migration_is_additive_idempotent_and_goes_with_its_notification(
     assert down.strip() == "DROP TABLE IF EXISTS forge_notification_images;"
 
 
-def test_images_migration_is_the_newest_volundr_migration():
+def test_images_migration_is_the_newest_notification_migration():
     names = sorted(path.name for path in (ROOT / "src/cli/migrations/volundr").glob("*.up.sql"))
-    assert names[-1] == f"{IMAGES}.up.sql"
+    notifications = [name for name in names if "_forge_notification" in name]
+    assert notifications[-1] == f"{IMAGES}.up.sql"
+    # Only the session descriptions migration (000087) runs after it on this line.
+    assert names[names.index(f"{IMAGES}.up.sql") + 1 :] == ["000087_session_descriptions.up.sql"]

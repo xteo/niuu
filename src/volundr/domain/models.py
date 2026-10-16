@@ -527,6 +527,26 @@ class Session(BaseModel):
         ),
     )
 
+    short_description: str | None = Field(
+        default=None,
+        description=(
+            "Agent-maintained one-line summary of what the session is doing now and its "
+            "goal. Written only by the targeted description update."
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        description="Agent-maintained fuller status (markdown allowed).",
+    )
+    short_description_updated_at: datetime | None = Field(
+        default=None,
+        description="When short_description last changed value.",
+    )
+    description_updated_at: datetime | None = Field(
+        default=None,
+        description="When description last changed value.",
+    )
+
     model_config = {"frozen": False}
 
     @property

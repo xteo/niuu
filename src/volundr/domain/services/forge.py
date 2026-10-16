@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from niuu.domain.session_description import DESCRIPTION_FIELDS, SessionDescriptionPatch
 from niuu.forge_mcp.credentials import normalize_grants
 from volundr.domain.services.forge_session_launch import FORGE_MCP_KEY, GRANTS_KEY
 from volundr.domain.session_broker import broker_base_url
@@ -129,6 +130,7 @@ class ForgeService:
             workspace_id=data.workspace_id,
             tracker_issue_id=data.issue_id,
             issue_tracker_url=data.issue_url,
+            description=_seeded_description(data),
             **(project_options or {}),
         )
         workload_config = dict(data.workload_config or {})
@@ -219,6 +221,15 @@ class ForgeService:
             tracker_issue_id=tracker_issue_id,
             principal=principal,
         )
+
+    async def update_description(
+        self,
+        session_id: UUID,
+        patch: SessionDescriptionPatch,
+        *,
+        principal: Principal | None = None,
+    ) -> Session:
+        return await self._session_service.update_description(session_id, patch, principal)
 
     async def delete_session(
         self,
@@ -530,3 +541,12 @@ class ForgeService:
             message_count=message_count,
             cost=cost,
         )
+
+
+def _seeded_description(data) -> SessionDescriptionPatch | None:
+    """The description keys a create request sent, normalized; None when it sent none."""
+    sent = getattr(data, "model_fields_set", set())
+    values = {name: getattr(data, name) for name in DESCRIPTION_FIELDS if name in sent}
+    if not values:
+        return None
+    return SessionDescriptionPatch.model_validate(values)

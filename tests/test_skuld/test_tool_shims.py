@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from skuld.transports.tool_shims import ensure_codex_tool_shims
@@ -141,3 +142,26 @@ mimir:
     assert (bin_dir / "mimir_read").exists()
     assert env["RAVN_CONFIG"] == str(config_path)
     assert "RAVN_MIMIR_PATH" not in env
+
+
+def test_forge_describe_shim_is_installed_and_validates_its_arguments(tmp_path: Path) -> None:
+    bin_dir, _ = ensure_codex_tool_shims(str(tmp_path / "ws"))
+    shim = bin_dir / "forge-describe"
+    assert shim.stat().st_mode & 0o111
+    base = {"PATH": "/usr/bin:/bin"}
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(shim), *args], env=base, capture_output=True, text=True, timeout=30
+        )
+
+    assert run().returncode == 2
+    assert run("--help").returncode == 0
+    assert run("--short").returncode == 2
+    assert run("stray").returncode == 2
+    both = run("--long", "a", "--long-file", str(tmp_path / "x"))
+    assert both.returncode == 2 and "not both" in both.stderr
+    missing = run("--long-file", str(tmp_path / "absent.md"))
+    assert missing.returncode == 2 and "cannot read" in missing.stderr
+    unavailable = run("--short=Fixing CI")
+    assert unavailable.returncode == 3 and "not available" in unavailable.stderr
