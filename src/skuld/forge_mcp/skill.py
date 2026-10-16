@@ -61,6 +61,14 @@ rules — on their phone or chat. It is how a long-running session gets the user
 
 `list_notifications` shows what was already reported (avoid duplicates); `environment` tells you
 which session, host, project and model you are running as.
+
+## Keep the session description current (not a notification)
+
+`describe_session` (or the `forge-describe` command) sets what this session is doing, shown in
+every session list without interrupting anyone. Set `short_description` — one plain line, the
+current step and the goal — when you start, whenever the phase changes, when blocked
+("Blocked on …") and when done ("Done: …"). Put the fuller status someone opening the session
+would want in `description` (markdown). Send only what changed; `null` clears a field.
 """
 
 

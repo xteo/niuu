@@ -96,5 +96,11 @@
       "filename": "000071_forge_notification_reads.up.sql",
       "sha256": "b52942b02f15d19d300c7d2330a74c43477adedc0c3779a53bd9a0b3904389bf"
     }
+  ],
+  "000089_session_descriptions.up.sql": [
+    {
+      "filename": "000087_session_descriptions.up.sql",
+      "sha256": "3d47e0afee0c560b32bc66ae6d9857cd277806564ae748d55917d77b5ba99b88"
+    }
   ]
 }
