@@ -1316,6 +1316,30 @@ class SessionEventLogRepository(ABC):
         rows = await self.read_after(session_id, after_seq=low, limit=max(wanted) - low)
         return [row for row in rows if row.seq in wanted]
 
+    async def read_after_excluding(
+        self,
+        session_id: UUID,
+        after_seq: int = 0,
+        limit: int = 1000,
+        exclude_kinds: frozenset[str] = frozenset(),
+    ) -> list[SessionLogEntry]:
+        """Like :meth:`read_after`, skipping rows whose ``kind`` is in ``exclude_kinds``.
+
+        Up to ``limit`` KEPT rows; an empty list means the log is exhausted. This
+        concrete default filters :meth:`read_after` pages so in-memory fakes inherit it;
+        SQL adapters override it to filter in the query.
+        """
+        kept: list[SessionLogEntry] = []
+        while len(kept) < limit:
+            page = await self.read_after(session_id, after_seq=after_seq, limit=limit)
+            if not page:
+                break
+            after_seq = page[-1].seq
+            kept.extend(row for row in page if row.kind not in exclude_kinds)
+            if len(page) < limit:
+                break
+        return kept[:limit]
+
     async def import_history(
         self, session_id: UUID, source_id: str, entries: list[SessionLogEntry]
     ) -> int:
