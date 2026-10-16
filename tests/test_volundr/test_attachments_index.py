@@ -14,19 +14,31 @@ from uuid import uuid4
 
 import pytest
 
-from tests.test_domain.test_session_archive_service import InMemorySessionEventLog
+from tests.test_domain.test_session_archive_service import (
+    InMemorySessionEventLog as _BareEventLog,
+)
 from tests.test_volundr.test_conversation_db_fallback import (
     _build_client,
     _strip_ambient_env,  # noqa: F401 - autouse fixture, hermetic env
 )
 from volundr.domain.models import Session, SessionLogEntry, SessionStatus
+from volundr.domain.ports import SessionEventLogRepository
 from volundr.domain.services import SessionArchiveService
 from volundr.domain.services.attachments_index import (
+    FOLD_EXCLUDED_KINDS,
+    AttachmentsFold,
     build_attachments_index,
     filter_attachments,
 )
+from volundr.domain.services.transcript_rebuild import rebuild_turns
 
 _PATH = "/api/v1/forge/sessions/{sid}/attachments"
+
+
+class InMemorySessionEventLog(_BareEventLog, SessionEventLogRepository):
+    """The shared fake, with the port's concrete defaults (``read_after_excluding``)."""
+
+
 _NOW = datetime(2026, 10, 16, 10, 4, 0, tzinfo=UTC)
 _FULL_ENVELOPE = json.dumps(
     {
@@ -279,43 +291,153 @@ async def test_unknown_session_is_404():
     assert client.get(_PATH.format(sid=uuid4())).status_code == 404
 
 
+def _full_rebuild_ids(rows: list[SessionLogEntry], sid) -> list[str]:
+    kept = [row for row in rows if row.kind not in FOLD_EXCLUDED_KINDS]
+    return [i["tool_use_id"] for i in build_attachments_index(rebuild_turns(kept).turns, sid)]
+
+
 @pytest.mark.asyncio
-async def test_index_is_cached_on_head_seq_and_refreshes_when_the_log_grows():
+async def test_index_is_cached_on_head_seq_and_refreshes_from_the_settled_turn():
     client, sid, event_log = await _client_for(_frames)
     first = client.get(_PATH.format(sid=sid)).json()
 
-    reads = 0
+    read_from: list[int] = []
     original = event_log.read_after
 
-    async def counting_read_after(*args, **kwargs):
-        nonlocal reads
-        reads += 1
-        return await original(*args, **kwargs)
+    async def recording_read_after(session_id, after_seq=0, limit=1000):
+        read_from.append(after_seq)
+        return await original(session_id, after_seq=after_seq, limit=limit)
 
-    event_log.read_after = counting_read_after
+    event_log.read_after = recording_read_after
     assert client.get(_PATH.format(sid=sid)).json() == first
-    assert reads == 0
+    assert read_from == []
 
     await event_log.append(
         [_turn_row(sid, 8, _present_file_turn("t-late", "pf_late", "late.txt", "text/plain"))]
     )
     refreshed = client.get(_PATH.format(sid=sid)).json()
-    assert reads > 0
+    # Seq 5 is the last assistant turn row: only the frames after it are re-read.
+    assert read_from[0] == 5
     assert refreshed["revision"] == "8"
-    assert refreshed["items"][-1]["tool_use_id"] == "pf_late"
+    ids = [i["tool_use_id"] for i in refreshed["items"]]
+    assert ids == _full_rebuild_ids(await original(sid, after_seq=0, limit=100), sid)
+    assert ids[-1] == "pf_late"
 
 
 @pytest.mark.asyncio
-async def test_truncated_log_reports_incomplete(monkeypatch):
-    client, sid, _ = await _client_for(_frames)
-    original = SessionArchiveService.get_attachments
+async def test_fold_matches_one_full_rebuild_page_by_page():
+    sid = uuid4()
+    rows = _frames(sid)
+    noise = [
+        SessionLogEntry(
+            session_id=sid, seq=100 + i, kind="terminal_frame", payload={"rows": ["x"]}, ts=_NOW
+        )
+        for i in range(3)
+    ]
+    event_log = InMemorySessionEventLog([*rows, *noise])
+    service = SessionArchiveService(
+        None, _NoopStorage(), None, event_log_repository=event_log, attachments_page_size=1
+    )
 
-    async def small_window(self, session_id, max_frames=50_000):
-        return await original(self, session_id, max_frames=3)
+    index = await service.get_attachments(sid)
 
-    monkeypatch.setattr(SessionArchiveService, "get_attachments", small_window)
+    assert [i["tool_use_id"] for i in index["items"]] == _full_rebuild_ids(rows, sid)
+    assert index["revision"] == "102" and index["complete"] is True
 
-    assert client.get(_PATH.format(sid=sid)).json()["complete"] is False
+
+@pytest.mark.asyncio
+async def test_raw_only_log_past_the_ceiling_reports_incomplete():
+    sid = uuid4()
+    raw = [
+        SessionLogEntry(
+            session_id=sid,
+            seq=seq,
+            kind="assistant",
+            payload={"message": {"content": [{"type": "text", "text": f"step {seq}"}]}},
+            ts=_NOW,
+            role="assistant",
+        )
+        for seq in range(1, 6)
+    ]
+    service = SessionArchiveService(
+        None,
+        _NoopStorage(),
+        None,
+        event_log_repository=InMemorySessionEventLog(raw),
+        attachments_page_size=2,
+        attachments_max_pending=3,
+    )
+
+    assert (await service.get_attachments(sid))["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_history_import_marker_settles_the_imported_frames():
+    sid = uuid4()
+    imported = SessionLogEntry(
+        session_id=sid,
+        seq=1,
+        kind="assistant",
+        payload={
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "su_old",
+                        "name": "SendUserFile",
+                        "input": {"files": ["/w/old.pdf"]},
+                    }
+                ]
+            }
+        },
+        ts=_NOW,
+        role="assistant",
+    )
+    marker = SessionLogEntry(
+        session_id=sid, seq=2, kind="history_import", payload={"partial": False}, ts=_NOW
+    )
+    later = _turn_row(sid, 3, _present_file_turn("t-new", "pf_new", "new.md", "text/markdown"))
+    service = SessionArchiveService(
+        None,
+        _NoopStorage(),
+        None,
+        event_log_repository=InMemorySessionEventLog([imported, marker, later]),
+        attachments_page_size=1,
+    )
+
+    index = await service.get_attachments(sid)
+
+    assert [i["tool_use_id"] for i in index["items"]] == ["su_old", "pf_new"]
+    assert index["items"][0]["turn_seq"] < index["items"][1]["turn_seq"]
+
+
+def test_real_sorted_key_read_envelope_is_an_image():
+    envelope = json.dumps(
+        {
+            "file": {
+                "base64": "iVBORw0KGgo" + "A" * 4096,
+                "dimensions": {"displayHeight": 720, "displayWidth": 1280},
+                "originalSize": 64060,
+                "type": "image/png",
+            },
+            "type": "image",
+        },
+        sort_keys=True,
+    )
+    turns = [
+        {
+            "id": "t1",
+            "role": "assistant",
+            "parts": [
+                _read("r1", "/w/a.png"),
+                {"type": "tool_result", "tool_use_id": "r1", "content": envelope},
+            ],
+        }
+    ]
+
+    (item,) = build_attachments_index(turns, "s")
+
+    assert item["mime"] == "image/png" and item["image"] == {"w": 1280, "h": 720}
 
 
 @pytest.mark.asyncio
@@ -469,3 +591,36 @@ async def test_service_cache_is_lru_bounded():
         await service.get_attachments(sid)
 
     assert list(service._attachments_cache) == [str(sids[1])]
+
+
+def test_fold_keeps_the_settled_copy_of_a_repeated_tool_use():
+    sid = uuid4()
+    turn = _present_file_turn("t-doc", "pf_doc", "plan.md", "text/markdown")
+    replay = SessionLogEntry(
+        session_id=sid,
+        seq=2,
+        kind="assistant",
+        payload={"message": {"content": turn["parts"]}},
+        ts=_NOW,
+        role="assistant",
+    )
+    fold = AttachmentsFold(str(sid), max_pending=10)
+    pending = fold.settle([_turn_row(sid, 1, turn), replay])
+
+    items, _ = fold.items(pending)
+
+    assert [i["turn_id"] for i in items] == ["t-doc"]
+
+
+@pytest.mark.asyncio
+async def test_port_default_skips_excluded_kinds_across_pages():
+    sid = uuid4()
+    rows = [
+        SessionLogEntry(session_id=sid, seq=seq, kind=kind, payload={}, ts=_NOW)
+        for seq, kind in enumerate(["terminal_frame", "terminal_frame", "user", "result"], 1)
+    ]
+    log = InMemorySessionEventLog(rows)
+
+    kept = await log.read_after_excluding(sid, limit=1, exclude_kinds=frozenset({"terminal_frame"}))
+
+    assert [row.seq for row in kept] == [3]
