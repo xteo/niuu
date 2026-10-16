@@ -122,6 +122,8 @@ from volundr.domain.services import (
     StatsService,
     TokenService,
 )
+from volundr.domain.services.attachments_index import KINDS as ATTACHMENT_KINDS
+from volundr.domain.services.attachments_index import filter_attachments
 from volundr.domain.services.forge_session_launch import (
     FORGE_MCP_KEY,
     ForgeMcpGrantEscalationError,
@@ -1829,6 +1831,8 @@ def create_router(
             "project_contract_version": 2 if project_service is not None else 0,
             "project_lightweight": project_service is not None,
             "project_instance_id": project_service.instance_id if project_service else None,
+            # GET /sessions/{id}/attachments: every document/image of a session in one call.
+            "attachments_index": True,
         }
 
     @router.get("/repos/branches", response_model=list[str], tags=["Repositories"])
@@ -3975,6 +3979,64 @@ def create_router(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(e),
             )
+
+    @router.get(
+        "/sessions/{session_id}/attachments",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+        tags=["Sessions"],
+        responses={
+            400: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    async def get_session_attachments(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+        kind: str | None = Query(None, description="'document' or 'image'; omit for both"),
+    ) -> dict:
+        """Every document and image the session delivered, whole session, no paging.
+
+        Built from the same durable rebuild the conversation route falls back to, cached
+        on the event log's head seq: one rebuild on a cold session, a dictionary hit
+        afterwards. Ordered by turn then block; identity is ``tool_use_id``.
+        """
+        if kind is not None and kind not in ATTACHMENT_KINDS:
+            raise HTTPException(400, "kind must be 'document' or 'image'")
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        principal = await _optional_principal(request)
+        try:
+            await forge.ensure_access(session, principal, "read")
+        except SessionAccessDeniedError as exc:
+            raise HTTPException(403, f"Access denied to session {session_id}") from exc
+        started = time.perf_counter()
+        try:
+            index = await forge.get_attachments(session_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc) or "Session archive service not available",
+            ) from None
+        items = filter_attachments(index["items"], kind)
+        logger.info(
+            "[perf] attachments session=%s kind=%s items=%d turns=%d ms=%.1f",
+            _sanitize_log(session_id),
+            kind or "all",
+            len(items),
+            index.get("total_turns", 0),
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return {
+            "session_id": index["session_id"],
+            "revision": index["revision"],
+            "complete": index["complete"],
+            "items": items,
+        }
 
     @router.get(
         "/sessions/{session_id}/conversation/turns/{turn_id}",
