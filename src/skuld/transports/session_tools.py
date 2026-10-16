@@ -26,6 +26,7 @@ from skuld.session_runtime import write_private_file
 from skuld.transports.mcp_config import build_claude_mcp_payload
 
 PRESENT_FILE_URL_ENV = "FORGE_PRESENT_FILE_URL"
+FORGE_DESCRIBE_URL_ENV = "FORGE_DESCRIBE_URL"
 BROKER_TOKEN_FILE_ENV = "FORGE_BROKER_TOKEN_FILE"
 CLAUDE_MCP_CONFIG_FILE = "claude-mcp.json"
 
@@ -48,11 +49,21 @@ plain line; body: at most one short sentence of new context. Link artifacts (PRs
 files). The same server's `environment` tool describes where this session runs."""
 
 
+SESSION_DESCRIPTION_INSTRUCTION = """\
+SESSION DESCRIPTION: keep a one-line description of what this session is doing current, so anyone \
+glancing at the session list (web, phone) can tell. Run `forge-describe --short "…"` when you \
+start, whenever the phase of the work changes, when blocked ("Blocked on …") and when done \
+("Done: …"); add `--long "…"` or `--long-file <path>` for the fuller status (markdown) someone \
+opening the session would want. The `{server}` MCP server's `describe_session` tool does the \
+same."""
+
+
 def capability_instructions(*, forge_mcp_server: str | None) -> str:
-    """The capability text for a session: present-file always, notify when the MCP is on."""
+    """Capability text: present-file always; notify and descriptions when the MCP is on."""
     parts = [PRESENT_FILE_INSTRUCTION]
     if forge_mcp_server:
         parts.append(FORGE_NOTIFY_INSTRUCTION.format(server=forge_mcp_server))
+        parts.append(SESSION_DESCRIPTION_INSTRUCTION.format(server=forge_mcp_server))
     return "\n\n".join(parts)
 
 

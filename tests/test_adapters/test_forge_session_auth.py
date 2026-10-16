@@ -73,6 +73,7 @@ class TestPolicyTable:
             ("POST", "/sessions/S/log", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("POST", "/sessions/S/activity", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("POST", "/sessions/S/usage", FORGE_NOTIFY_SCOPE, Binding.OWN),
+            ("PUT", "/sessions/S/description", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("POST", "/mcp", None, Binding.NONE),
         ],
     )
@@ -89,6 +90,8 @@ class TestPolicyTable:
             ("DELETE", "/sessions/S"),
             ("PATCH", "/sessions/S/archive"),
             ("PUT", "/sessions/S"),
+            ("PATCH", "/sessions/S/description"),
+            ("POST", "/sessions/S/description"),
             ("GET", "/notifications/rules"),
             ("POST", "/notifications/rules"),
             ("PUT", "/notifications/rules/r"),
