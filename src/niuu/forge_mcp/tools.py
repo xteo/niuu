@@ -30,6 +30,11 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
 )
+from niuu.domain.session_description import (
+    DESCRIPTION_FIELDS,
+    DESCRIPTION_MAX_CHARS,
+    SHORT_DESCRIPTION_MAX_CHARS,
+)
 from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
@@ -179,6 +184,18 @@ class _CreateSessionArgs(_Args):
         if value is not None and not value.startswith("/"):
             raise ValueError("local_path must be absolute")
         return value
+
+
+class _DescribeSessionArgs(_Args):
+    short_description: str | None = None
+    description: str | None = None
+
+    def changes(self) -> dict[str, str | None]:
+        return {
+            name: getattr(self, name)
+            for name in DESCRIPTION_FIELDS
+            if name in self.model_fields_set
+        }
 
 
 # --------------------------------------------------------------------------- schemas
@@ -342,6 +359,35 @@ class ToolSpec:
         return {"name": self.name, "description": description, "inputSchema": self.input_schema}
 
 
+_DESCRIBE_SESSION_DESCRIPTION = (
+    "Set what your own Forge session is doing, so anyone glancing at the session list "
+    "(web, phone) can tell. Keep `short_description` current: set it when you start, "
+    "whenever the phase of the work changes, when you are blocked ('Blocked on …') and "
+    "when you finish ('Done: …'). One plain-text line naming the current step and the "
+    f"goal; it is folded to one line and cut at {SHORT_DESCRIPTION_MAX_CHARS} characters. "
+    "Use `description` for the fuller status someone opening the session would want "
+    f"(markdown, up to {DESCRIPTION_MAX_CHARS} characters). Send only the keys you are "
+    "changing: an omitted key is kept, null clears it. Setting the same text again is "
+    "harmless. This is not a notification and interrupts no one."
+)
+
+_DESCRIBE_SESSION_SCHEMA = _object(
+    {
+        "short_description": {
+            "type": ["string", "null"],
+            "description": (
+                "One line: what this session is doing now and its goal, e.g. "
+                "'Adding retry to the upload client; tests next'. null clears it."
+            ),
+        },
+        "description": {
+            "type": ["string", "null"],
+            "description": "Fuller status in markdown: progress, decisions, next steps. "
+            "null clears it.",
+        },
+    }
+)
+
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="environment",
@@ -359,6 +405,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=_NOTIFY_DESCRIPTION,
         input_schema=_NOTIFY_SCHEMA,
         args_model=_NotifyArgs,
+    ),
+    ToolSpec(
+        name="describe_session",
+        description=_DESCRIBE_SESSION_DESCRIPTION,
+        input_schema=_DESCRIBE_SESSION_SCHEMA,
+        args_model=_DescribeSessionArgs,
     ),
     ToolSpec(
         name="list_notifications",
@@ -611,6 +663,10 @@ def _session_summary(raw: dict[str, Any]) -> dict[str, Any]:
         "last_active": raw.get("last_active"),
         "message_count": raw.get("message_count"),
         "error": raw.get("error"),
+        "short_description": raw.get("short_description"),
+        "description": raw.get("description"),
+        "short_description_updated_at": raw.get("short_description_updated_at"),
+        "description_updated_at": raw.get("description_updated_at"),
     }
     return {key: value for key, value in summary.items() if value not in (None, {}, "")}
 
@@ -694,6 +750,7 @@ class ForgeMcpToolbox:
         self._handlers: dict[str, Callable[[Any], Awaitable[ToolResult]]] = {
             "environment": self._environment,
             "notify": notify,
+            "describe_session": self._describe_session,
             "list_notifications": self._list_notifications,
             "list_sessions": self._list_sessions,
             "get_session": self._get_session,
@@ -780,6 +837,34 @@ class ForgeMcpToolbox:
                 "session_id": recorded.get("session_id"),
                 "source": recorded.get("source"),
                 "state": "committed",
+            }
+        )
+
+    async def _describe_session(self, args: _DescribeSessionArgs) -> ToolResult:
+        session_id = self._host.session_id
+        if not session_id:
+            return ToolResult.error(
+                "describe_session describes your own Forge session, and this agent is "
+                "not running in one."
+            )
+        changes = args.changes()
+        if not changes:
+            return ToolResult.error(
+                "describe_session needs short_description, description, or both (null clears one)."
+            )
+        stored = await self._client.update_description(session_id, changes)
+        return self._ok(
+            {
+                "session_id": session_id,
+                **{
+                    key: stored.get(key)
+                    for key in (
+                        "short_description",
+                        "description",
+                        "short_description_updated_at",
+                        "description_updated_at",
+                    )
+                },
             }
         )
 

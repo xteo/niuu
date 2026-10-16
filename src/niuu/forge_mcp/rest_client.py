@@ -178,3 +178,10 @@ class RestForgeClient(ForgeClient):
             params=self._instance_params(instance_id),
             json=body,
         )
+
+    async def update_description(
+        self, session_id: str, changes: dict[str, str | None]
+    ) -> dict[str, Any]:
+        return await self._object(
+            "PUT", f"/sessions/{quote(session_id)}/description", json=dict(changes)
+        )

@@ -454,7 +454,9 @@ async def test_feature_flag_advertises_the_index():
     client, _, _ = await _client_for(_frames)
     client.app.state.storage = type("S", (), {"supports_home_volumes": False})()
 
-    assert client.get("/api/v1/forge/feature-flags").json()["attachments_index"] is True
+    flags = client.get("/api/v1/forge/feature-flags").json()
+    assert flags["attachments_index"] is True
+    assert flags["session_descriptions"] is True
 
 
 def test_builder_handles_content_arrays_and_orphan_results():
