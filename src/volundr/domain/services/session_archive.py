@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from niuu.domain.text_projection import projection_revision
 from volundr.domain.models import LocalMountSource
+from volundr.domain.services.attachments_index import build_attachments_index
 from volundr.domain.services.transcript_rebuild import rebuild_turns
 from volundr.log_aggregate import aggregate_workspace_logs
 from volundr.session_archive import (
@@ -52,12 +55,17 @@ class SessionArchiveService:
         *,
         chronicle_service: ChronicleService | None = None,
         event_log_repository: SessionEventLogRepository | None = None,
+        attachments_cache_size: int = 256,
     ) -> None:
         self._session_service = session_service
         self._storage = storage
         self._archive_store = archive_store
         self._chronicle_service = chronicle_service
         self._event_log_repository = event_log_repository
+        # session id -> (durable head seq, index payload); LRU-bounded.
+        self._attachments_cache: OrderedDict[str, tuple[int, dict[str, Any]]] = OrderedDict()
+        self._attachments_cache_size = attachments_cache_size
+        self._attachments_locks: dict[str, asyncio.Lock] = {}
 
     async def resolve_workspace_dir(self, session_id: UUID) -> Path:
         """Resolve the first accessible workspace path for a session."""
@@ -327,6 +335,100 @@ class SessionArchiveService:
 
         return session, candidates
 
+    async def _read_event_log(
+        self, session_id: UUID, max_frames: int, latest: int | None = None
+    ) -> tuple[list, bool]:
+        """Page in the newest ``max_frames`` durable frames; True when older ones were cut.
+
+        Callers check that an event-log repository is configured."""
+        after_seq = 0
+        if latest is None:
+            try:
+                latest = await self._event_log_repository.latest_seq(session_id)
+            except Exception:  # tolerate repos without a fast MAX(seq) — fall back to head read
+                latest = 0
+        truncated = latest > max_frames
+        if truncated:
+            after_seq = latest - max_frames
+            logger.warning(
+                "Event-log rebuild for session %s truncated to the last %d of %d frames",
+                str(session_id).replace("\n", "\\n").replace("\r", "\\r"),
+                int(max_frames),
+                int(latest),
+            )
+
+        all_entries: list = []
+        limit = 5000
+        while True:
+            entries = await self._event_log_repository.read_after(
+                session_id,
+                after_seq=after_seq,
+                limit=limit,
+            )
+            if not entries:
+                break
+            for entry in entries:
+                after_seq = max(after_seq, int(entry.seq))
+            all_entries.extend(entries)
+            if len(entries) < limit or len(all_entries) >= max_frames:
+                break
+        return all_entries, truncated
+
+    async def get_attachments(self, session_id: UUID, max_frames: int = 50_000) -> dict[str, Any]:
+        """Every document/image the session delivered, from ONE durable rebuild.
+
+        The durable event log is read first: it is the complete record, including the
+        in-progress tail of a running session (an on-demand archive can predate a resume).
+        The index is cached on the log's head seq, so an unchanged session answers from
+        memory; per-session single-flight keeps concurrent cold calls to one rebuild.
+        """
+        sid = str(session_id)
+        lock = self._attachments_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            head = await self.latest_event_seq(session_id)
+            cached = self._attachments_cache.get(sid)
+            if cached is not None and head > 0 and cached[0] == head:
+                self._attachments_cache.move_to_end(sid)
+                return cached[1]
+            turns, items, complete = await self._attachments_source(session_id, head, max_frames)
+            payload = {
+                "session_id": sid,
+                "revision": str(head) if head > 0 else projection_revision(turns),
+                "complete": complete,
+                "total_turns": len(turns),
+                "items": items,
+            }
+            if head > 0:
+                self._attachments_cache[sid] = (head, payload)
+                self._attachments_cache.move_to_end(sid)
+                while len(self._attachments_cache) > self._attachments_cache_size:
+                    evicted, _ = self._attachments_cache.popitem(last=False)
+                    self._attachments_locks.pop(evicted, None)
+            return payload
+
+    async def _attachments_source(
+        self, session_id: UUID, head: int, max_frames: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+        """``(turns, items, complete)``; the CPU-bound fold runs off the event loop."""
+        sid = str(session_id)
+        if self._event_log_repository is not None and head > 0:
+            entries, truncated = await self._read_event_log(session_id, max_frames, latest=head)
+
+            def fold() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                turns = rebuild_turns(entries).turns
+                return turns, build_attachments_index(turns, sid)
+
+            turns, items = await asyncio.to_thread(fold)
+            if turns:
+                return turns, items, not truncated
+        try:
+            transcript = await self.get_transcript(session_id)
+        except SessionArchiveNotAvailableError:
+            return [], [], True
+        turns = transcript.get("turns") if isinstance(transcript, dict) else None
+        turns = turns if isinstance(turns, list) else []
+        return turns, await asyncio.to_thread(build_attachments_index, turns, sid), True
+
     async def _load_event_log_transcript(
         self, session_id: UUID, max_frames: int = 50_000
     ) -> dict[str, Any] | None:
@@ -352,37 +454,7 @@ class SessionArchiveService:
         """
         if self._event_log_repository is None:
             return None
-
-        after_seq = 0
-        try:
-            latest = await self._event_log_repository.latest_seq(session_id)
-        except Exception:  # tolerate repos without a fast MAX(seq) — fall back to head read
-            latest = 0
-        if latest > max_frames:
-            after_seq = latest - max_frames
-            logger.warning(
-                "Event-log rebuild for session %s truncated to the last %d of %d frames",
-                str(session_id).replace("\n", "\\n").replace("\r", "\\r"),
-                int(max_frames),
-                int(latest),
-            )
-
-        all_entries: list = []
-        limit = 5000
-        while True:
-            entries = await self._event_log_repository.read_after(
-                session_id,
-                after_seq=after_seq,
-                limit=limit,
-            )
-            if not entries:
-                break
-            for entry in entries:
-                after_seq = max(after_seq, int(entry.seq))
-            all_entries.extend(entries)
-            if len(entries) < limit or len(all_entries) >= max_frames:
-                break
-
+        all_entries, _ = await self._read_event_log(session_id, max_frames)
         result = rebuild_turns(all_entries)
         if not result.turns:
             return None  # preserve the existing None -> fall-through contract
