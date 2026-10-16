@@ -92,7 +92,7 @@ and `notify` still work, because they go through the broker. Set
 
 | Grant | Adds scope | Tools |
 |---|---|---|
-| none | `forge:notify`, `forge:session:read` | `environment`, `notify`, `list_notifications`, `list_sessions`, `get_session`, `session_transcript` |
+| none | `forge:notify`, `forge:session:read` | `environment`, `notify`, `describe_session`, `list_notifications`, `list_sessions`, `get_session`, `session_transcript` |
 | `message` | `forge:session:message` | `send_message`, `message_status` |
 | `lifecycle` | `forge:session:lifecycle` | `create_session`, `start_session`, `stop_session` (never delete or archive) |
 
@@ -147,6 +147,7 @@ session of the same owner.
 | `POST /sessions` | `forge:session:lifecycle` | acts as the owner |
 | `POST /sessions/{id}/start`, `/resume`, `/stop` | `forge:session:lifecycle` | peer |
 | `POST /sessions/{id}/log`, `/activity`, `/usage` | `forge:notify` | own |
+| `PUT /sessions/{id}/description` (never `PUT /sessions/{id}`) | `forge:notify` | own |
 | `POST /mcp` | none. Every tool call re-enters this table. | none |
 
 Everything else is denied to session credentials. That includes notification rules,
