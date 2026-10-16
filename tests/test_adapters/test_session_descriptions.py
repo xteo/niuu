@@ -320,3 +320,94 @@ class TestSessionToken:
         stored = await forge.sessions.get(own.id)
         assert stored.description == "## Notes"
         assert broadcaster.updates()[-1]["description"] == "## Notes"
+
+
+class TestFleetEndToEnd:
+    """Through the Guild facade: create seeded, describe over MCP, read the fleet SSE."""
+
+    async def test_seed_describe_and_stream(self, forge, broadcaster, monkeypatch) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from niuu.adapters.inbound import rest_volundr
+        from niuu.adapters.inbound.forge_session_stream import merge_events
+        from tests.test_niuu.test_rest_volundr import _client, _headers, _instance
+
+        local = _instance(
+            "local",
+            base_url="embedded://local-forge",
+            is_default=True,
+            config={"transport": "embedded"},
+        )
+        facade = _client([local], embedded_forge_app=forge.app)
+
+        created = facade.post(
+            f"{PREFIX}/sessions",
+            json={"name": "fleet", "short_description": "Starting: read the brief"},
+            headers=_headers(),
+        )
+        assert created.status_code == 201, created.text
+        seeded = created.json()
+        assert seeded["instance_id"] == "local"
+        assert seeded["short_description"] == "Starting: read the brief"
+        session_id = uuid.UUID(seeded["id"])
+
+        # POST /sessions also started it; the agent holds the credential that launch minted.
+        task = forge.session_service._provisioning_tasks.get(session_id)
+        if task is not None:
+            await task
+        started, spec = forge.pod_manager.start_calls[-1]
+        assert started.id == session_id
+        token = spec.forge_session.token
+        message = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "describe_session",
+                "arguments": {"short_description": "Blocked on CI", "description": "## Log"},
+            },
+        }
+        result = forge.client.post(
+            f"{PREFIX}/mcp", json=message, headers={**JSON_RPC, **bearer(token)}
+        ).json()["result"]
+        assert result["isError"] is False, result
+        moved = result["structuredContent"]["short_description_updated_at"]
+        assert moved > seeded["short_description_updated_at"]
+
+        record = facade.get(f"{PREFIX}/sessions/{session_id}", headers=_headers()).json()
+        assert record["short_description"] == "Blocked on CI"
+        assert record["short_description_updated_at"] == moved
+
+        # The fleet stream replays what Forge broadcast, serialized by the real merger.
+        events = list(broadcaster.events)
+
+        async def subscribe(_principal):
+            for event in events:
+                yield event
+
+        forge.app.state.session_event_stream = SimpleNamespace(
+            authorize=lambda _principal: None, subscribe=subscribe
+        )
+
+        async def until_drained(sources, **kwargs):
+            async for frame in merge_events(sources, **{**kwargs, "keepalive_seconds": 1}):
+                if b"forge_stream_status" in frame:
+                    return
+                yield frame
+
+        monkeypatch.setattr(rest_volundr, "merge_events", until_drained)
+        stream = facade.get(f"{PREFIX}/sessions/stream", headers=_headers())
+        frames = [
+            (block.split("\n")[0].removeprefix("event: "), json.loads(block.split("data: ")[1]))
+            for block in stream.text.split("\n\n")
+            if block.startswith("event: ")
+        ]
+        updates = [data for name, data in frames if name == "session_updated"]
+        described = [u for u in updates if u.get("short_description") == "Blocked on CI"]
+        assert described, frames
+        frame = described[-1]
+        assert frame["instance_id"] == "local"
+        assert frame["description"] == "## Log"
+        assert frame["short_description_updated_at"] == moved
+        assert all(set(FIELDS) <= set(data) for _, data in frames if "status" in data)
