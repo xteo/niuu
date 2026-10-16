@@ -23,6 +23,7 @@ from niuu.domain.services.forge_session_token import (
     new_launch_id,
 )
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
+from niuu.domain.session_description import SessionDescriptionPatch
 from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
 from niuu.forge_mcp.models import ForgeMcpGrant
 from volundr.domain.execution_catalog import ExecutionCatalogError, ExecutionSelectionError
@@ -227,6 +228,7 @@ class SessionService:
         coordination: SessionCoordination | None = None,
         session_id: UUID | None = None,
         project_context: str = "",
+        description: SessionDescriptionPatch | None = None,
     ) -> Session:
         """Create a new session.
 
@@ -242,6 +244,7 @@ class SessionService:
                 and tenant_id on the session.
             origin: Where the session originated (volundr, claude, codex).
             external_session_id: Native CLI session id for imported sessions.
+            description: Optional seeded short/long description (already normalized).
 
         Returns:
             Created session.
@@ -303,6 +306,10 @@ class SessionService:
             external_session_id=external_session_id,
             workload_config={"project_context": project_context} if project_context else {},
         )
+        if description is not None:
+            seeded = {k: v for k, v in description.changes().items() if v is not None}
+            stamps = {f"{name}_updated_at": session.created_at for name in seeded}
+            session = session.model_copy(update={**seeded, **stamps})
         await self._check_access(session, principal, "create")
         created = await self._repository.create(session)
 
@@ -959,6 +966,28 @@ class SessionService:
 
         return result
 
+    async def update_description(
+        self,
+        session_id: UUID,
+        patch: SessionDescriptionPatch,
+        principal: Principal | None = None,
+    ) -> Session:
+        """Write the sent description keys; publish only when a stored value changed."""
+        session = await self._repository.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+        await self._check_access(session, principal, "update")
+        changes = patch.changes()
+        if not changes:
+            return session
+        result = await self._repository.update_description(session_id, changes, datetime.now(UTC))
+        if result is None:
+            raise SessionNotFoundError(session_id)
+        changed = any(getattr(result, name) != getattr(session, name) for name in changes)
+        if changed and self._broadcaster is not None:
+            await self._broadcaster.publish_session_updated(result)
+        return result
+
     async def update_coordination(
         self,
         session: Session,
@@ -1261,10 +1290,10 @@ class SessionService:
                 "workload_config": workload_config or {},
             }
         )
-        await self._repository.update(starting)
+        stored = await self._repository.update(starting)
 
         if self._broadcaster is not None:
-            await self._broadcaster.publish_session_updated(starting)
+            await self._broadcaster.publish_session_updated(stored)
 
         # Launch provisioning in background — don't block the HTTP response
         task = asyncio.create_task(
@@ -1386,10 +1415,10 @@ class SessionService:
             if cleanup_error is not None:
                 error = f"{error}; cleanup after provisioning failure also failed: {cleanup_error}"
             failed = session.with_status(SessionStatus.FAILED).with_error(error)
-            await self._repository.update(failed)
+            stored = await self._repository.update(failed)
 
             if self._broadcaster is not None:
-                await self._broadcaster.publish_session_updated(failed)
+                await self._broadcaster.publish_session_updated(stored)
 
     async def _start_with_pipeline(
         self,
@@ -1705,9 +1734,9 @@ class SessionService:
         status_detail = await self._pod_manager.status_detail(current)
         msg = status_detail or "Provisioning failed: infrastructure reported failure"
         failed = current.with_status(SessionStatus.FAILED).with_error(msg)
-        await self._repository.update(failed)
+        stored = await self._repository.update(failed)
         if self._broadcaster is not None:
-            await self._broadcaster.publish_session_updated(failed)
+            await self._broadcaster.publish_session_updated(stored)
         await self._emit_session_failed(failed, msg)
 
     def _cancel_provisioning_task(self, session_id: UUID) -> None:
@@ -1824,10 +1853,10 @@ class SessionService:
         self._cancel_provisioning_task(session_id)
 
         stopping = session.with_status(SessionStatus.STOPPING)
-        await self._repository.update(stopping)
+        stored = await self._repository.update(stopping)
 
         if self._broadcaster is not None:
-            await self._broadcaster.publish_session_updated(stopping)
+            await self._broadcaster.publish_session_updated(stored)
 
         try:
             cleanup_context = None
@@ -1866,10 +1895,10 @@ class SessionService:
             return final
         except Exception as e:
             failed = stopping.with_status(SessionStatus.FAILED).with_error(str(e))
-            await self._repository.update(failed)
+            stored = await self._repository.update(failed)
 
             if self._broadcaster is not None:
-                await self._broadcaster.publish_session_updated(failed)
+                await self._broadcaster.publish_session_updated(stored)
 
             raise
 

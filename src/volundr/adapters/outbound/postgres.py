@@ -42,10 +42,14 @@ class PostgresSessionRepository(SessionRepository):
                  launch_spec_id, archived_at, owner_id, tenant_id, workload_type,
                  origin, external_session_id, cli_session_id, session_definition,
                  activity_state, activity_metadata, activity_state_since,
-                 workload_config, turn_started_at, coordination, actor_id)
+                 workload_config, turn_started_at,
+                 short_description, description,
+                 short_description_updated_at, description_updated_at,
+                 coordination, actor_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-                    $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+                    $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+                    $33, $34, $35, $36)
             """,
             session.id,
             session.name,
@@ -77,6 +81,10 @@ class PostgresSessionRepository(SessionRepository):
             session.activity_state_since,
             json.dumps(session.workload_config or {}),
             session.turn_started_at,
+            session.short_description,
+            session.description,
+            session.short_description_updated_at,
+            session.description_updated_at,
             session.coordination.model_dump_json() if session.coordination else None,
             session.actor_id,
         )
@@ -167,7 +175,9 @@ class PostgresSessionRepository(SessionRepository):
             WHERE id = $1
             RETURNING coordination, coordination_revision, workload_config,
                       activity_state, activity_metadata, activity_state_since,
-                      turn_started_at, last_active
+                      turn_started_at, last_active,
+                      short_description, description,
+                      short_description_updated_at, description_updated_at
             """,
             session.id,
             session.name,
@@ -213,6 +223,8 @@ class PostgresSessionRepository(SessionRepository):
                 "activity_state_since": row["activity_state_since"],
                 "turn_started_at": row["turn_started_at"],
                 "last_active": row["last_active"],
+                # Never written here: the stored description wins over a stale copy.
+                **self._description_fields(row),
             }
         )
 
@@ -234,6 +246,36 @@ class PostgresSessionRepository(SessionRepository):
             session.coordination_revision,
             session.owner_id,
             session.tenant_id,
+        )
+        return self._row_to_session(row) if row is not None else None
+
+    async def update_description(
+        self, session_id: UUID, changes: dict[str, str | None], now: datetime
+    ) -> Session | None:
+        # $2/$4 say whether a key was sent. SET expressions read the pre-update row,
+        # so a stamp only moves when the sent value differs from the stored one.
+        row = await self._pool.fetchrow(
+            """UPDATE sessions SET
+                   short_description = CASE WHEN $2 THEN $3 ELSE short_description END,
+                   short_description_updated_at = CASE
+                       WHEN $2 AND $3::text IS DISTINCT FROM short_description
+                       THEN $6 ELSE short_description_updated_at END,
+                   description = CASE WHEN $4 THEN $5 ELSE description END,
+                   description_updated_at = CASE
+                       WHEN $4 AND $5::text IS DISTINCT FROM description
+                       THEN $6 ELSE description_updated_at END,
+                   updated_at = CASE
+                       WHEN ($2 AND $3::text IS DISTINCT FROM short_description)
+                         OR ($4 AND $5::text IS DISTINCT FROM description)
+                       THEN $6 ELSE updated_at END
+               WHERE id = $1
+               RETURNING *""",
+            session_id,
+            "short_description" in changes,
+            changes.get("short_description"),
+            "description" in changes,
+            changes.get("description"),
+            now,
         )
         return self._row_to_session(row) if row is not None else None
 
@@ -391,7 +433,23 @@ class PostgresSessionRepository(SessionRepository):
             activity_state_since=activity_state_since,
             turn_started_at=turn_started_at,
             activity_metadata=activity_metadata,
+            **self._description_fields(row),
         )
+
+    @staticmethod
+    def _description_fields(row: asyncpg.Record) -> dict:
+        """Description columns from a row; tolerant of rows predating migration 000089."""
+        stamps = {}
+        for name in ("short_description_updated_at", "description_updated_at"):
+            stamp = row.get(name)
+            if stamp is not None and stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=UTC)
+            stamps[name] = stamp
+        return {
+            "short_description": row.get("short_description"),
+            "description": row.get("description"),
+            **stamps,
+        }
 
     @staticmethod
     def _parse_activity_state(raw: str | None) -> SessionActivityState | None:

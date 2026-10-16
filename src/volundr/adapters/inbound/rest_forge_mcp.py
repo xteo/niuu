@@ -59,7 +59,10 @@ INSTRUCTIONS = (
     "transcripts and notifications, and `notify` a session owner through the "
     "Notifications feed (feed-only; always pass an idempotency_key). Tools that steer "
     "or start/stop other sessions need the caller's permission; with a Forge session "
-    "credential they also need the session's operator grant."
+    "credential they also need the session's operator grant. A session credential "
+    "keeps its own session's `short_description` current with `describe_session`: set "
+    "it when you start, whenever the phase changes, when blocked ('Blocked on …') and "
+    "when done ('Done: …'); use `description` for the fuller status."
 )
 
 

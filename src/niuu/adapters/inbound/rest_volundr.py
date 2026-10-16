@@ -304,6 +304,19 @@ def _upstream_detail(response: httpx.Response) -> str:
     return text or response.reason_phrase
 
 
+def _route_missing(response: httpx.Response) -> bool:
+    """The owning host predates this route (FastAPI's bare 404/405, not a domain 404)."""
+    if response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+        return True
+    if response.status_code != status.HTTP_404_NOT_FOUND:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("detail") == "Not Found"
+
+
 def _ensure_remote_success(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
@@ -3347,6 +3360,35 @@ def create_volundr_router(
             )
         _ensure_remote_success(response)
         return _with_instance(response.json(), owner)
+
+    @router.put("/sessions/{session_id}/description")
+    async def update_session_description(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Set or clear the agent-maintained descriptions on the owning host.
+
+        The body passes through untouched: an explicit ``null`` (clear) must stay
+        distinguishable from an omitted key (unchanged).
+        """
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="PUT",
+            path=f"/sessions/{session_id}/description",
+            json_body=body,
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, "Update this session's Forge host to enable descriptions")
+        _ensure_remote_success(response)
+        payload = response.json()
+        return _with_instance(payload, instance) if isinstance(payload, dict) else {}
 
     @router.put("/sessions/{session_id}")
     async def update_session(

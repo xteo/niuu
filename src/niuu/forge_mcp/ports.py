@@ -70,6 +70,12 @@ class ForgeClient(ABC):
     ) -> dict[str, Any]:
         """``POST /sessions/{id}/notifications``: a feed-only direct submit."""
 
+    @abstractmethod
+    async def update_description(
+        self, session_id: str, changes: dict[str, str | None]
+    ) -> dict[str, Any]:
+        """``PUT /sessions/{id}/description``: sent keys replace, ``None`` clears."""
+
 
 class ForgeMcpHost(ABC):
     """The caller's own context: who is asking, and how its notifications are recorded."""
