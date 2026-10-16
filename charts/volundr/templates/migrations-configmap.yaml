@@ -2293,6 +2293,18 @@ data:
         ON forge_notification_reads (notification_id);
   000086_forge_notification_reads.down.sql: |
     DROP TABLE IF EXISTS forge_notification_reads;
+  000087_session_descriptions.up.sql: |
+    -- Agent-maintained session descriptions. Written only by the targeted description
+    -- update, never by the generic session update, so a stale in-memory copy cannot clobber them.
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS short_description TEXT;
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description TEXT;
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS short_description_updated_at TIMESTAMPTZ;
+    ALTER TABLE sessions ADD COLUMN IF NOT EXISTS description_updated_at TIMESTAMPTZ;
+  000087_session_descriptions.down.sql: |
+    ALTER TABLE sessions DROP COLUMN IF EXISTS description_updated_at;
+    ALTER TABLE sessions DROP COLUMN IF EXISTS short_description_updated_at;
+    ALTER TABLE sessions DROP COLUMN IF EXISTS description;
+    ALTER TABLE sessions DROP COLUMN IF EXISTS short_description;
   lineage-aliases.json: |
     {
       "000050_session_definition.up.sql": [

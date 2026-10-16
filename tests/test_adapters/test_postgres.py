@@ -566,6 +566,10 @@ class TestSessionQueryArity:
         placeholders, args = self._execute_arg_counts("update_coordination")
         assert placeholders == args
 
+    def test_description_arity(self):
+        placeholders, args = self._execute_arg_counts("update_description")
+        assert placeholders == args
+
 
 async def test_assignment_compares_revision_and_returns_persisted_state(
     repository, mock_pool, sample_session, sample_row
@@ -634,3 +638,63 @@ async def test_update_returns_winning_activity_tuple(repository, mock_pool, samp
     assert actual.last_active == since
     sql = mock_pool.fetchrow.call_args.args[0]
     assert sql.count("$27 >= activity_state_since") == 4
+
+
+async def test_generic_update_never_writes_descriptions_and_returns_the_stored_ones(
+    repository, mock_pool, sample_session
+):
+    stamp = datetime(2026, 10, 16, 12)  # naive, as an older driver config may return
+    mock_pool.fetchrow.return_value.update(
+        short_description="Fresh",
+        description=None,
+        short_description_updated_at=stamp,
+        description_updated_at=None,
+    )
+    stale = sample_session.model_copy(update={"short_description": "Stale"})
+    actual = await repository.update(stale)
+    assert actual.short_description == "Fresh"
+    assert actual.short_description_updated_at == stamp.replace(tzinfo=UTC)
+    sql = mock_pool.fetchrow.call_args.args[0]
+    set_clause = sql[: sql.index("RETURNING")]
+    assert "description" not in set_clause
+    assert "short_description_updated_at, description_updated_at" in sql[sql.index("RETURNING") :]
+
+
+async def test_description_write_sends_only_flags_for_sent_keys(
+    repository, mock_pool, sample_session, sample_row
+):
+    now = datetime(2026, 10, 16, 12, tzinfo=UTC)
+    mock_pool.fetchrow.return_value = {
+        **sample_row,
+        "short_description": None,
+        "description": "## s",
+        "short_description_updated_at": None,
+        "description_updated_at": now,
+    }
+    actual = await repository.update_description(sample_session.id, {"description": "## s"}, now)
+    assert actual.description == "## s" and actual.description_updated_at == now
+    sql, *args = mock_pool.fetchrow.call_args.args
+    assert args == [sample_session.id, False, None, True, "## s", now]
+    # A stamp only moves when the sent value differs from the stored one.
+    assert sql.count("IS DISTINCT FROM short_description") == 2
+    assert sql.count("IS DISTINCT FROM description") == 2
+    assert "RETURNING *" in sql
+    mock_pool.fetchrow.return_value = None
+    assert await repository.update_description(sample_session.id, {}, now) is None
+
+
+async def test_create_persists_seeded_descriptions(repository, mock_pool, sample_session):
+    seeded = sample_session.model_copy(
+        update={
+            "short_description": "Seed",
+            "short_description_updated_at": sample_session.created_at,
+        }
+    )
+    await repository.create(seeded)
+    args = mock_pool.execute.call_args.args
+    assert args[-4:] == ("Seed", None, sample_session.created_at, None)
+
+
+def test_rows_before_the_migration_read_as_unset(repository, sample_row):
+    session = repository._row_to_session(sample_row)
+    assert session.short_description is None and session.description_updated_at is None
