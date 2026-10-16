@@ -458,6 +458,12 @@ class ForgeService:
             raise RuntimeError("Session archive service not available")
         return await self._archive_service.get_transcript(session_id)
 
+    async def get_attachments(self, session_id: UUID) -> dict:
+        """The session's document/image index (LEX-1259), from the durable rebuild."""
+        if self._archive_service is None:
+            raise RuntimeError("Session archive service not available")
+        return await self._archive_service.get_attachments(session_id)
+
     async def durable_latest_seq(self, session_id: UUID) -> int:
         """Cheap durable-freshness signal (event-log MAX(seq), 0 when unavailable). Lets the read
         path cache the durable turn count and skip the expensive rebuild while it's unchanged."""

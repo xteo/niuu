@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from niuu.domain.text_projection import projection_revision
 from volundr.domain.models import LocalMountSource
+from volundr.domain.services.attachments_index import (
+    FOLD_EXCLUDED_KINDS,
+    AttachmentsFold,
+    build_attachments_index,
+)
 from volundr.domain.services.transcript_rebuild import rebuild_turns
 from volundr.log_aggregate import aggregate_workspace_logs
 from volundr.session_archive import (
@@ -54,12 +61,23 @@ class SessionArchiveService:
         *,
         chronicle_service: ChronicleService | None = None,
         event_log_repository: SessionEventLogRepository | None = None,
+        attachments_cache_size: int = 256,
+        attachments_page_size: int = 200,
+        attachments_max_pending: int = 50_000,
     ) -> None:
         self._session_service = session_service
         self._storage = storage
         self._archive_store = archive_store
         self._chronicle_service = chronicle_service
         self._event_log_repository = event_log_repository
+        # session id -> (durable head seq, incremental fold, index payload); LRU-bounded.
+        self._attachments_cache: OrderedDict[str, tuple[int, AttachmentsFold, dict[str, Any]]] = (
+            OrderedDict()
+        )
+        self._attachments_cache_size = attachments_cache_size
+        self._attachments_page_size = attachments_page_size
+        self._attachments_max_pending = attachments_max_pending
+        self._attachments_locks: dict[str, asyncio.Lock] = {}
 
     async def resolve_workspace_dir(self, session_id: UUID) -> Path:
         """Resolve the first accessible workspace path for a session."""
@@ -328,6 +346,75 @@ class SessionArchiveService:
                 add_candidate(pvc_path)
 
         return session, candidates
+
+    async def get_attachments(self, session_id: UUID) -> dict[str, Any]:
+        """Every document/image the session delivered, folded from the durable log.
+
+        The durable event log is the source: it is the complete record, including the
+        in-progress tail of a running session (an on-demand archive can predate a resume).
+        The fold is cached per session: an unchanged head seq answers from memory, and a
+        grown log re-reads only the frames after the last settled turn. Per-session
+        single-flight keeps concurrent cold calls to one fold.
+        """
+        sid = str(session_id)
+        lock = self._attachments_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            head = await self.latest_event_seq(session_id)
+            cached = self._attachments_cache.get(sid)
+            if cached is not None and head > 0 and cached[0] == head:
+                self._attachments_cache.move_to_end(sid)
+                return cached[2]
+            if self._event_log_repository is None or head <= 0:
+                return await self._transcript_attachments(session_id)
+            fold = (
+                cached[1]
+                if cached is not None
+                else AttachmentsFold(sid, max_pending=self._attachments_max_pending)
+            )
+            pending: list = []
+            after = fold.resume_after
+            while True:
+                page = await self._event_log_repository.read_after_excluding(
+                    session_id,
+                    after_seq=after,
+                    limit=self._attachments_page_size,
+                    exclude_kinds=FOLD_EXCLUDED_KINDS,
+                )
+                if not page:
+                    break
+                after = page[-1].seq
+                pending = await asyncio.to_thread(fold.settle, [*pending, *page])
+            items, total_turns = await asyncio.to_thread(fold.items, pending)
+            payload = {
+                "session_id": sid,
+                "revision": str(head),
+                "complete": not fold.truncated,
+                "total_turns": total_turns,
+                "items": items,
+            }
+            self._attachments_cache[sid] = (head, fold, payload)
+            self._attachments_cache.move_to_end(sid)
+            while len(self._attachments_cache) > self._attachments_cache_size:
+                evicted, _ = self._attachments_cache.popitem(last=False)
+                self._attachments_locks.pop(evicted, None)
+            return payload
+
+    async def _transcript_attachments(self, session_id: UUID) -> dict[str, Any]:
+        """Sessions with no durable log: index the stored archive/workspace transcript."""
+        sid = str(session_id)
+        try:
+            transcript = await self.get_transcript(session_id)
+        except SessionArchiveNotAvailableError:
+            transcript = {}
+        turns = transcript.get("turns") if isinstance(transcript, dict) else None
+        turns = turns if isinstance(turns, list) else []
+        return {
+            "session_id": sid,
+            "revision": projection_revision(turns),
+            "complete": True,
+            "total_turns": len(turns),
+            "items": await asyncio.to_thread(build_attachments_index, turns, sid),
+        }
 
     async def _load_event_log_transcript(
         self, session_id: UUID, max_frames: int = 50_000
