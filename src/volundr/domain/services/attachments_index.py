@@ -16,6 +16,12 @@ Carriers:
     and last bytes. Image payloads are NEVER decoded here.
 
 Pure: no I/O, no ``skuld`` imports — the same boundary as ``transcript_rebuild``.
+
+``AttachmentsFold`` drives ``rebuild_turns`` incrementally so a session of a million
+frames is folded page by page in bounded memory, and a refresh re-reads only the frames
+after the last settled turn. It relies on the rebuild's own rule: once an assistant
+``conversation.turn`` row exists, raw frames BEFORE it are never reduced (the SDK rows
+are authoritative), so everything up to that row is final.
 """
 
 from __future__ import annotations
@@ -24,9 +30,14 @@ import json
 import mimetypes
 import posixpath
 import re
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from niuu.domain.conversation_timeline import timeline
+from volundr.domain.services.transcript_rebuild import rebuild_turns
+
+if TYPE_CHECKING:
+    from volundr.domain.models import SessionLogEntry
 
 KIND_DOCUMENT = "document"
 KIND_IMAGE = "image"
@@ -51,12 +62,98 @@ _SEND_USER_FILE_RESULT_MAX_CHARS = 64 * 1024
 # either before or after the base64 run, never inside it.
 _ENVELOPE_SCAN_CHARS = 1024
 
+# Top-level ``"type": "image"`` opens the envelope, or closes it when the writer sorted
+# its keys (``{"file": {...}, "type": "image"}``, the shape stored on Thor). The nested
+# ``"type": "image/png"`` never matches because the quote must close right after ``image``.
 _ENVELOPE_HEAD_RE = re.compile(r'^\s*\{\s*"type"\s*:\s*"image"')
+_ENVELOPE_TAIL_RE = re.compile(r'"type"\s*:\s*"image"\s*\}\s*$')
 _ENVELOPE_MIME_RE = re.compile(r'"type"\s*:\s*"(image/[A-Za-z0-9.+-]+)"')
 _ENVELOPE_WIDTH_RE = re.compile(r'"displayWidth"\s*:\s*(\d+)')
 _ENVELOPE_HEIGHT_RE = re.compile(r'"displayHeight"\s*:\s*(\d+)')
 _DATA_URL_RE = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,")
 _IMAGE_BLOCK_TYPES = frozenset({"image", "input_image", "output_image", "image_url", "Image"})
+
+
+TURN_ROW_KIND = "conversation.turn"
+HISTORY_IMPORT_KIND = "history_import"
+FOLD_EXCLUDED_KINDS = frozenset({"terminal_frame", "terminal_snapshot", "claude_hook"})
+"""Frames that never carry a tool block: tmux pane paints and hook notifications.
+
+They are ~95% of a tmux session's log (1.36M of 1.50M frames on Thor's largest), so the
+fold skips them at the query. Only a pane-scraped text turn depends on them, and a text
+turn holds no attachment."""
+
+
+@dataclass
+class AttachmentsFold:
+    """Incremental attachments index over one session's durable log.
+
+    ``resume_after`` is the seq of the last settled row: a refresh reads the rows after
+    it, settles everything up to the newest assistant ``conversation.turn`` (or history
+    import marker), and folds the remainder as the live tail without committing it.
+    """
+
+    session_id: str
+    max_pending: int
+    settled: list[dict[str, Any]] = field(default_factory=list)
+    settled_turns: int = 0
+    resume_after: int = 0
+    truncated: bool = False
+    _keys: set[tuple[str, str]] = field(default_factory=set)
+
+    def settle(self, pending: list[SessionLogEntry]) -> list[SessionLogEntry]:
+        """Settle ``pending`` up to its last boundary row; return the unsettled rest."""
+        boundary = _last_boundary(pending)
+        if boundary < 0:
+            if len(pending) > self.max_pending:
+                # A log with no settling rows (a pure raw-frame session) keeps its
+                # newest frames; older raw work is dropped and the index says so.
+                self.truncated = True
+                return pending[-self.max_pending :]
+            return pending
+        head, rest = pending[: boundary + 1], pending[boundary + 1 :]
+        marker = head[-1]
+        if marker.kind != HISTORY_IMPORT_KIND:
+            # Raw frames before an assistant turn row are covered by the turn rows.
+            head = [row for row in head if row.kind in (TURN_ROW_KIND, HISTORY_IMPORT_KIND)]
+        turns = rebuild_turns(head).turns
+        for item in build_attachments_index(turns, self.session_id):
+            self._add(self.settled, self._keys, item, self.settled_turns)
+        self.settled_turns += len(turns)
+        self.resume_after = marker.seq
+        return rest
+
+    def items(self, pending: list[SessionLogEntry]) -> tuple[list[dict[str, Any]], int]:
+        """``(all items, total turns)``: the settled index plus the folded live tail."""
+        turns = rebuild_turns(pending).turns if pending else []
+        items = list(self.settled)
+        keys = set(self._keys)
+        for item in build_attachments_index(turns, self.session_id):
+            self._add(items, keys, item, self.settled_turns)
+        return items, self.settled_turns + len(turns)
+
+    @staticmethod
+    def _add(
+        items: list[dict[str, Any]], keys: set[tuple[str, str]], item: dict[str, Any], offset: int
+    ) -> None:
+        key = (item["tool_use_id"], str(item.get("file_id") or item["name"]))
+        if key in keys:
+            return
+        keys.add(key)
+        items.append({**item, "turn_seq": item["turn_seq"] + offset})
+
+
+def _last_boundary(rows: list[SessionLogEntry]) -> int:
+    for index in range(len(rows) - 1, -1, -1):
+        row = rows[index]
+        if row.kind == HISTORY_IMPORT_KIND:
+            return index
+        if row.kind != TURN_ROW_KIND or not isinstance(row.payload, dict):
+            continue
+        turn = row.payload.get("turn")
+        if isinstance(turn, dict) and turn.get("role") == "assistant":
+            return index
+    return -1
 
 
 def build_attachments_index(turns: list[Any], session_id: str) -> list[dict[str, Any]]:
@@ -280,10 +377,10 @@ def _image_hint(
 
 
 def _envelope_hint(content: str) -> tuple[str | None, int | None, int | None] | None:
-    if not _ENVELOPE_HEAD_RE.match(content[:_ENVELOPE_SCAN_CHARS]):
-        return None
     head = content[:_ENVELOPE_SCAN_CHARS]
     tail = content[-_ENVELOPE_SCAN_CHARS:]
+    if not (_ENVELOPE_HEAD_RE.match(head) or _ENVELOPE_TAIL_RE.search(tail)):
+        return None
 
     def find(pattern: re.Pattern[str]) -> str | None:
         match = pattern.search(tail) or pattern.search(head)

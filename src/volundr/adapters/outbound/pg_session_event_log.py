@@ -6,6 +6,7 @@ at-least-once without creating duplicates. Reads are cursor-based (seq) so any
 client can resume a full transcript replay.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -362,6 +363,28 @@ class PostgresSessionEventLog(SessionEventLogRepository):
             limit,
         )
         return [self._row_to_entry(r) for r in rows]
+
+    async def read_after_excluding(
+        self,
+        session_id: UUID,
+        after_seq: int = 0,
+        limit: int = 1000,
+        exclude_kinds: frozenset[str] = frozenset(),
+    ) -> list[SessionLogEntry]:
+        rows = await self._pool.fetch(
+            """SELECT session_id, seq, kind, role, request_id, payload, ts
+               FROM session_event_log
+               WHERE session_id = $1 AND seq > $2 AND kind <> ALL($4::text[])
+               ORDER BY seq ASC
+               LIMIT $3""",
+            session_id,
+            after_seq,
+            limit,
+            sorted(exclude_kinds),
+        )
+        # A single turn row can be 100+ MB of JSON (a turn full of images); decode the
+        # page off the event loop so a cold index fold never stalls other requests.
+        return await asyncio.to_thread(lambda: [self._row_to_entry(r) for r in rows])
 
     async def read_seqs(self, session_id: UUID, seqs: list[int]) -> list[SessionLogEntry]:
         if not seqs:
