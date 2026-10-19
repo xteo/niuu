@@ -997,6 +997,22 @@ Typical response shape:
 }
 ```
 
+To read only the newest turns ("what is the session doing?"), pass `tail`:
+
+```http
+GET /api/v1/forge/sessions/{session_id}/conversation?tail=3&detail=shallow
+```
+
+The server reads only the end of the source. A live broker builds just its recent
+page (capped at `conversation_recent_max_turns`, default 15), and a stopped
+session's event-log rebuild reads only the newest frames. The response carries the
+newest turns plus `tail` (the requested count). It has no paging cursors or
+`window_offset`, and it has `total_turns` only when the source counted the whole
+transcript. `tail` cannot be combined with `limit`, `before`, `after`,
+`history_protocol` or `turn_id`. Without `tail`, the response is unchanged. An
+older server ignores the parameter and returns every turn, so check for `tail` in
+the response before trusting it as a tail.
+
 ### Read persisted transcript directly
 
 ```http
