@@ -393,10 +393,10 @@ async def test_rest_tail_slices_an_old_broker_that_returns_everything(monkeypatc
 @pytest.mark.parametrize(
     "extra",
     [
-        {"limit": 5},
         {"before": 1},
         {"after": 2},
-        {"history_protocol": 2},
+        {"after_id": "x"},
+        {"cursor": "abc"},
         {"turn_id": "x"},
     ],
 )
@@ -410,3 +410,26 @@ async def test_rest_tail_rejects_paging_parameters(extra) -> None:
     )
 
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_rest_tail_overrides_a_protocol2_page_request_sent_alongside(monkeypatch) -> None:
+    """Clients send ``history_protocol=2&limit=N`` with ``tail`` so a server without
+    ``tail`` answers with its recent page; a server with it serves the tail."""
+    repository = InMemorySessionRepository()
+    session = await _stopped_session(repository)
+    frames = _exchanges(session.id, 12)
+    event_log = _CountingEventLog(frames)
+    client = _client(event_log, repository, initial_frames=8)
+
+    resp = client.get(
+        _CONV_PATH.format(sid=session.id),
+        params={"tail": 2, "history_protocol": 2, "limit": 2, "detail": "shallow"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["turns"] == rebuild_turns(frames).turns[-2:]
+    assert body["tail"] == 2
+    assert "history_protocol" not in body
+    assert event_log.frames_read < len(frames)

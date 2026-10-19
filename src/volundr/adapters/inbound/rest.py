@@ -3718,7 +3718,9 @@ def create_router(
                 "stopped session's durable-log rebuild reads only the log tail. The response "
                 "echoes `tail`; it is not a paging window (no cursors or window_offset), and "
                 "`total_turns` is present only when the source counted the whole transcript. "
-                "Cannot be combined with the paging parameters."
+                "Overrides `history_protocol` and `limit` (send `history_protocol=2&limit=N` "
+                "too so a server without `tail` answers with its recent page); cannot be "
+                "combined with `cursor`, `before`, `after`, `after_id` or `turn_id`."
             ),
         ),
     ) -> dict:
@@ -3729,10 +3731,14 @@ def create_router(
         and the durable-log rebuild fallback (elided here), so the shape is
         identical regardless of which path served the transcript.
         """
-        if tail and (
-            history_protocol or cursor or limit or before or after >= 0 or after_id or turn_id
-        ):
+        if tail and (cursor or before or after >= 0 or after_id or turn_id):
             raise HTTPException(400, "tail cannot be combined with paging parameters")
+        if tail:
+            # `tail` wins over a protocol-2 recent-page request sent alongside it: a client
+            # adds `history_protocol=2&limit=N` so a server without `tail` still answers
+            # with its (fast) recent page instead of the whole transcript.
+            history_protocol = 0
+            limit = 0
         if cursor and history_protocol != 2:
             raise HTTPException(400, "cursor requires history_protocol=2")
         if history_protocol == 2 and (before or after >= 0 or after_id or turn_id):
