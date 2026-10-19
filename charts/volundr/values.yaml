@@ -1296,6 +1296,10 @@ config:
     dispatch_poll_seconds: 0.05
   conversationRecentMaxTurns: 15
   conversationRecentMaxBytes: 262144
+  # -- First durable event-log window (frames) for a `?tail=N` conversation read
+  conversationTailInitialFrames: 2000
+  # -- Factor by which that window widens until it holds more than N turns
+  conversationTailGrowth: 2
   # -- Timeout (seconds) for the runtime-version health probe against a session's runtime
   runtimeHealthTimeoutSeconds: 3.0
   # -- Log level (debug, info, warning, error)

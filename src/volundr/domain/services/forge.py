@@ -525,9 +525,13 @@ class ForgeService:
             raise ValueError(f"Session {session_id} has no active endpoint")
         return session, broker_base_url(session.chat_endpoint)
 
-    async def get_transcript(self, session_id: UUID) -> dict:
+    async def get_transcript(self, session_id: UUID, *, tail_turns: int = 0) -> dict:
+        """The persisted transcript; ``tail_turns > 0`` lets the durable rebuild read only
+        the newest turns (LEX-1345)."""
         if self._archive_service is None:
             raise RuntimeError("Session archive service not available")
+        if tail_turns > 0:
+            return await self._archive_service.get_transcript(session_id, tail_turns=tail_turns)
         return await self._archive_service.get_transcript(session_id)
 
     async def get_attachments(self, session_id: UUID) -> dict:

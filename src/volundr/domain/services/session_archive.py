@@ -62,6 +62,9 @@ class SessionArchiveService:
         attachments_cache_size: int = 256,
         attachments_page_size: int = 200,
         attachments_max_pending: int = 50_000,
+        tail_initial_frames: int = 2000,
+        tail_growth: int = 2,
+        event_log_page_size: int = 5000,
     ) -> None:
         self._session_service = session_service
         self._storage = storage
@@ -76,6 +79,10 @@ class SessionArchiveService:
         self._attachments_page_size = attachments_page_size
         self._attachments_max_pending = attachments_max_pending
         self._attachments_locks: dict[str, asyncio.Lock] = {}
+        # `tail_turns` rebuild (LEX-1345): first window and per-step growth, in frames.
+        self._tail_initial_frames = tail_initial_frames
+        self._tail_growth = tail_growth
+        self._event_log_page_size = event_log_page_size
 
     async def resolve_workspace_dir(self, session_id: UUID) -> Path:
         """Resolve the first accessible workspace path for a session."""
@@ -100,8 +107,14 @@ class SessionArchiveService:
         except Exception:  # pragma: no cover - a freshness probe must never fail the read
             return 0
 
-    async def get_transcript(self, session_id: UUID) -> dict[str, Any]:
-        """Return the persisted transcript payload for a session."""
+    async def get_transcript(self, session_id: UUID, *, tail_turns: int = 0) -> dict[str, Any]:
+        """Return the persisted transcript payload for a session.
+
+        ``tail_turns > 0`` is a hint that the caller only needs the newest turns:
+        the durable event-log rebuild then reads only the log tail (see
+        :meth:`_load_event_log_tail`). Other sources are single documents and are
+        returned whole; the caller slices them.
+        """
         session_id_str = str(session_id)
         _, candidates = await self._workspace_dir_candidates(session_id)
 
@@ -117,7 +130,10 @@ class SessionArchiveService:
         if _payload_has_turns(archived):
             return archived
 
-        event_log_transcript = await self._load_event_log_transcript(session_id)
+        if tail_turns > 0:
+            event_log_transcript = await self._load_event_log_tail(session_id, tail_turns)
+        else:
+            event_log_transcript = await self._load_event_log_transcript(session_id)
         if event_log_transcript is not None:
             return event_log_transcript
 
@@ -479,6 +495,74 @@ class SessionArchiveService:
             "is_active": False,
             "last_activity": "",
         }
+
+    async def _load_event_log_tail(
+        self, session_id: UUID, tail_turns: int, max_frames: int = 50_000
+    ) -> dict[str, Any] | None:
+        """Rebuild only the newest ``tail_turns`` turns from the durable event log.
+
+        LEX-1345: the full rebuild decodes up to ``max_frames`` frames on every read
+        (0.7-3.7 s on Thor's stopped sessions, 80k-250k frames). Doubling, not a
+        larger factor: on a sparse log (37 turns in 50k frames) the window that first
+        holds the tail is what dominates the cost. A caller asking for the
+        last few turns needs only the end of the log, so read backwards in widening
+        windows (by default 2k, 4k, 8k, ... frames, each step adding only the older
+        frames it lacks) and stop once the reduced window holds MORE than ``tail_turns``
+        turns.
+        The surplus matters: the oldest turn of a window that starts mid-log can be a
+        fragment cut at the boundary, and it is the one sliced away. Every returned
+        turn starts after the cut, so it is complete. The window never grows past
+        ``max_frames``, the same ceiling as the full rebuild.
+
+        The payload marks ``history_tail``: its turns are the newest of the session but
+        carry no absolute index, because the turns before the window were never counted.
+        """
+        if self._event_log_repository is None:
+            return None
+        latest = await self._event_log_repository.latest_seq(session_id)
+        if latest <= 0:
+            return None  # no durable frames: the same answer as the full rebuild
+
+        entries: list = []
+        low = latest  # frames with seq in (low, latest] are loaded
+        window = min(self._tail_initial_frames, max_frames)
+        while True:
+            target_low = max(0, latest - window)
+            entries = [*await self._read_seq_range(session_id, target_low, low), *entries]
+            low = target_low
+            result = rebuild_turns(entries)
+            if low == 0 or len(result.turns) > tail_turns or window >= max_frames:
+                break
+            window = min(window * self._tail_growth, max_frames)
+
+        turns = result.turns[-tail_turns:]
+        if not turns:
+            return None
+        return {
+            "turns": turns,
+            "projection_revision": projection_revision(turns),
+            "is_active": False,
+            "last_activity": "",
+            "history_tail": True,
+        }
+
+    async def _read_seq_range(self, session_id: UUID, after_seq: int, upto_seq: int) -> list:
+        """Durable frames with ``after_seq < seq <= upto_seq``, ordered by seq."""
+        assert self._event_log_repository is not None
+        out: list = []
+        cursor = after_seq
+        while cursor < upto_seq:
+            want = min(self._event_log_page_size, upto_seq - cursor)
+            page = await self._event_log_repository.read_after(
+                session_id, after_seq=cursor, limit=want
+            )
+            if not page:
+                break
+            out.extend(entry for entry in page if int(entry.seq) <= upto_seq)
+            cursor = max(cursor, max(int(entry.seq) for entry in page))
+            if len(page) < want:
+                break
+        return out
 
     def _transcript_artifact_path(
         self,
