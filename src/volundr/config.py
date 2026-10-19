@@ -2729,6 +2729,19 @@ class Settings(BaseSettings):
     )
     conversation_recent_max_turns: int = Field(default=15, gt=0)
     conversation_recent_max_bytes: int = Field(default=256 * 1024, ge=4096)
+    conversation_tail_initial_frames: int = Field(
+        default=2000,
+        gt=0,
+        description=(
+            "First durable event-log window, in frames, read for a `?tail=N` conversation "
+            "of a session without a live broker. Widened until it holds more than N turns."
+        ),
+    )
+    conversation_tail_growth: int = Field(
+        default=2,
+        ge=2,
+        description="Factor by which a `?tail=N` event-log window widens per step.",
+    )
     server_host: str = Field(
         default="127.0.0.1",
         validation_alias=AliasChoices("server_host", "NIUU_SERVER_HOST"),

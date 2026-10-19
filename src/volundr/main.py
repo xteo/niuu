@@ -1474,6 +1474,8 @@ def create_app(
                 archive_store,
                 chronicle_service=chronicle_service,
                 event_log_repository=session_event_log,
+                tail_initial_frames=settings.conversation_tail_initial_frames,
+                tail_growth=settings.conversation_tail_growth,
             )
             app.state.archive_service = archive_service
             app.state.session_event_log = session_event_log
