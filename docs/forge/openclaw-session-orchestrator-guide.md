@@ -1008,10 +1008,12 @@ page (capped at `conversation_recent_max_turns`, default 15), and a stopped
 session's event-log rebuild reads only the newest frames. The response carries the
 newest turns plus `tail` (the requested count). It has no paging cursors or
 `window_offset`, and it has `total_turns` only when the source counted the whole
-transcript. `tail` cannot be combined with `limit`, `before`, `after`,
-`history_protocol` or `turn_id`. Without `tail`, the response is unchanged. An
-older server ignores the parameter and returns every turn, so check for `tail` in
-the response before trusting it as a tail.
+transcript. `tail` cannot be combined with `cursor`, `before`, `after`, `after_id`
+or `turn_id`. It overrides `history_protocol` and `limit`, so a client can send
+`?tail=3&history_protocol=2&limit=3&detail=shallow`: a server without `tail` ignores
+it and answers with its protocol-2 recent page, which is also the newest turns.
+Without `tail`, the response is unchanged. Check for `tail` (or
+`history_protocol: 2`) in the response before trusting it as a tail.
 
 ### Read persisted transcript directly
 
