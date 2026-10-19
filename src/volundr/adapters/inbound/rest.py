@@ -291,6 +291,28 @@ def _workspace_dir_from_session(session: Session) -> FilePath | None:
 # a hit at the same seq skips the rebuild entirely; a new seq (or a short live body) falls back
 # to the exact rebuild. `durable_tail_id` is the id of the rebuild's last non-in-progress turn —
 # the SEGMENTATION-vs-DESYNC discriminator (see the tail-id gate at the decision site).
+# Paging metadata a `tail=N` conversation response drops (LEX-1345): a tail is the newest
+# turns, not a window into the projection, so cursors and offsets would be misleading.
+_TAIL_DROPPED_KEYS = frozenset(
+    {
+        "history_protocol",
+        "history_tail",
+        "window_offset",
+        "window_end",
+        "requested_window_offset",
+        "requested_window_end",
+        "page_kind",
+        "page_complete",
+        "continuation_cursor",
+        "has_more_before",
+        "older_cursor",
+        "refresh_cursor",
+        "recent_window",
+        "total_turns",
+        "projection_revision",
+    }
+)
+
 _DURABLE_COUNT_CACHE: dict[str, tuple[int, int, str | None]] = {}
 _DURABLE_COUNT_CACHE_MAX = 512
 
@@ -3687,6 +3709,18 @@ def create_router(
         history_protocol: int = Query(0),
         cursor: str | None = Query(None),
         turn_id: str | None = Query(None),
+        tail: int = Query(
+            0,
+            ge=0,
+            description=(
+                "LEX-1345: return only the newest N turns, read from the end of the source "
+                "(0 = disabled). A running session's broker builds just that page, and a "
+                "stopped session's durable-log rebuild reads only the log tail. The response "
+                "echoes `tail`; it is not a paging window (no cursors or window_offset), and "
+                "`total_turns` is present only when the source counted the whole transcript. "
+                "Cannot be combined with the paging parameters."
+            ),
+        ),
     ) -> dict:
         """Return conversation history from a live session or stopped-session workspace.
 
@@ -3695,6 +3729,10 @@ def create_router(
         and the durable-log rebuild fallback (elided here), so the shape is
         identical regardless of which path served the transcript.
         """
+        if tail and (
+            history_protocol or cursor or limit or before or after >= 0 or after_id or turn_id
+        ):
+            raise HTTPException(400, "tail cannot be combined with paging parameters")
         if cursor and history_protocol != 2:
             raise HTTPException(400, "cursor requires history_protocol=2")
         if history_protocol == 2 and (before or after >= 0 or after_id or turn_id):
@@ -3716,6 +3754,8 @@ def create_router(
             ~300KB/15 turns). The perf `_prep` block + `[perf]` log make prep-vs-transit visible."""
             if not isinstance(payload, dict) or not isinstance(payload.get("turns"), list):
                 return payload
+            if tail:
+                return _tail_page(payload, fetch_ms)
             all_turns = payload["turns"]
             if turn_id is not None:
                 turn = resolve_timeline_turn(all_turns, turn_id)
@@ -3832,6 +3872,39 @@ def create_router(
             )
             return out
 
+        def _tail_page(payload: dict, fetch_ms: float | None) -> dict:
+            """The newest ``tail`` turns of any source, with its paging metadata dropped.
+
+            A protocol-2 broker page is already the window (its ``total_turns`` counts the
+            whole live transcript); any other source is sliced here. A durable tail rebuild
+            (``history_tail``) never counted the turns before its window, so it reports no
+            total."""
+            windowed = payload.get("history_protocol") == 2
+            source_turns = payload["turns"]
+            total = payload.get("total_turns") if windowed else len(source_turns)
+            if payload.get("history_tail"):
+                total = None
+            turns = json_text_safe(source_turns[-tail:])
+            if shallow:
+                turns = elide_turns(turns)
+            prep = dict(payload.get("_prep") or {})
+            prep.update(timings)
+            if fetch_ms is not None:
+                prep["volundr_fetch_ms"] = round(fetch_ms, 1)
+            out = {key: value for key, value in payload.items() if key not in _TAIL_DROPPED_KEYS}
+            out.update(turns=turns, tail=tail, _prep=prep)
+            if total is not None:
+                out["total_turns"] = total
+            logger.info(
+                "[perf] conversation tail session=%s tail=%d windowed=%s fetch=%sms turns=%d",
+                _sanitize_log(session_id),
+                tail,
+                windowed,
+                (f"{fetch_ms:.1f}" if fetch_ms is not None else "-"),
+                len(turns),
+            )
+            return out
+
         t_sess = time.perf_counter()
         session = await forge.get_session(session_id)
         timings["session_lookup_ms"] = round((time.perf_counter() - t_sess) * 1000.0, 1)
@@ -3870,6 +3943,15 @@ def create_router(
                 # cached client. Give a busy-but-alive broker 20s to answer; a DEAD pod still
                 # fails fast (3s connect).
                 params: dict[str, str | int] = {"detail": detail}
+                if tail:
+                    # The broker builds only the recent page (it caps the turn count at its
+                    # own recent window). An older broker ignores these and answers with the
+                    # whole transcript, which `_tail_page` slices.
+                    params.update(
+                        history_protocol=2,
+                        limit=min(tail, history_max_turns),
+                        max_bytes=history_max_bytes,
+                    )
                 if history_protocol == 2:
                     params.update(history_protocol=2, limit=limit, max_bytes=max_bytes)
                     if cursor:
@@ -4027,6 +4109,8 @@ def create_router(
             )
 
         try:
+            if tail:
+                return _maybe_elide(await forge.get_transcript(session_id, tail_turns=tail))
             return _maybe_elide(await forge.get_transcript(session_id))
         except RuntimeError as e:
             fallback = _fallback_workspace_transcript(session)
@@ -4126,6 +4210,7 @@ def create_router(
             history_protocol=0,
             cursor=None,
             turn_id=turn_id,
+            tail=0,
         )
         listing = await get_conversation(
             request=request,
@@ -4139,6 +4224,7 @@ def create_router(
             history_protocol=0,
             cursor=None,
             turn_id=None,
+            tail=0,
         )
         turns = listing.get("turns") if isinstance(listing, dict) else None
         turns = turns if isinstance(turns, list) else []
