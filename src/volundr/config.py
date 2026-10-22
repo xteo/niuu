@@ -65,6 +65,7 @@ from volundr.domain.notifications import (
     SINK_NAME_PATTERN,
     NotificationRateLimit,
 )
+from volundr.domain.presented_files import validate_public_base_url
 
 __all__ = ["GitHubInstance", "GitLabInstance"]
 
@@ -893,6 +894,49 @@ class NotificationDispatcherConfig(BaseModel):
         if self.send_timeout_seconds >= self.lease_seconds:
             raise ValueError("send_timeout_seconds must be shorter than lease_seconds")
         return self
+
+
+class PresentedFilesConfig(BaseModel):
+    """Durable presented files (control-plane F2).
+
+    Forge keeps its own copy of every file a session presents, so the file still opens
+    after the session stops, and links it by an absolute URL on the host's tailnet name.
+
+    Example YAML::
+
+        presented_files:
+          public_base_url: "http://thor.tail737f2a.ts.net:8380"
+          max_bytes: 52428800
+          store:
+            adapter: "volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore"
+            root: "~/.niuu/presented-files"
+    """
+
+    enabled: bool = Field(default=True, description="Accept and serve durable copies.")
+    public_base_url: str = Field(
+        default="",
+        description=(
+            "Absolute http(s) base URL clients reach this Forge at, on the host's tailnet "
+            "name (never *.xteo.mesh). Empty: presented files keep their relative route."
+        ),
+    )
+    max_bytes: int = Field(
+        default=52_428_800,
+        gt=0,
+        description="Largest durable copy accepted (matches Skuld's max_presented_file_bytes).",
+    )
+    store: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "adapter": "volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore",
+            "root": "~/.niuu/presented-files",
+        },
+        description="Dynamic adapter for the store: 'adapter' class path plus its kwargs.",
+    )
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _tailnet_url(cls, value: str) -> str:
+        return validate_public_base_url(value)
 
 
 class NotificationsConfig(BaseModel):
@@ -2631,6 +2675,7 @@ class Settings(BaseSettings):
     sleipnir: SleipnirConfig = Field(default_factory=SleipnirConfig)
     push: PushNotificationConfig = Field(default_factory=PushNotificationConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    presented_files: PresentedFilesConfig = Field(default_factory=PresentedFilesConfig)
     forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)
