@@ -201,3 +201,23 @@ def test_local_mode_accepts_files_from_the_real_home(tmp_path, monkeypatch, modu
     outside = tmp_path / "elsewhere.txt"
     outside.write_text("x")
     assert client.post("/api/present-file", json={"path": str(outside)}).status_code == 400
+
+
+def test_broker_serves_presented_files_inline_and_sandboxed(client, tmp_path):
+    """Judge R16-1 at the source: the broker's own route (and so every proxy in front of it,
+    /s/{id}/api/... included) sends the sandbox, nosniff and no caching, inline like the
+    durable copy. A PDF keeps nosniff but no sandbox, which would stop Chrome showing it."""
+    html = tmp_path / "page.html"
+    html.write_text("<script>alert(1)</script>")
+    fid = client.post("/api/present-file", json={"path": str(html)}).json()["file_id"]
+    r = client.get(f"/api/files/presented/{fid}")
+    assert r.headers["content-security-policy"] == "sandbox"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["cache-control"] == "private, no-store"
+    assert r.headers["content-disposition"].startswith("inline")
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    fid = client.post("/api/present-file", json={"path": str(pdf)}).json()["file_id"]
+    r = client.get(f"/api/files/presented/{fid}")
+    assert "content-security-policy" not in r.headers
+    assert r.headers["x-content-type-options"] == "nosniff"
