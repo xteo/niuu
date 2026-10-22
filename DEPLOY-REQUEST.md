@@ -1,3 +1,26 @@
+# LEX-1406: persistent project side-quest host/folder defaults
+
+Lane `exp/cp-dev-project-defaults`; implementation and tests independently reviewed; exact landing SHA is in cp-dev's Forge description. **No deployment has been performed. cp-ops deploys exp only.**
+
+Deploy the paired niuu and lexi-frontend changes. Niuu's startup migrator applies `000091_project_side_quest_defaults` from the usual packaged migration set; the root and Helm copies match. This only constrains an optional key in existing `forge_projects.document` JSONB. It adds no table, column, backfill, config setting, credential or secret mount. The exp Forge local mount policy remains the authority for allowed directories.
+
+The app uses its existing project update API, pinned to the served registry UUID:
+
+```http
+PATCH /api/v1/forge/projects/<project UUID>?instance_id=<served registry UUID>
+Content-Type: application/json
+
+{"revision":1,"side_quest_defaults":{"host":"thor-exp","local_path":"/home/exp/workspaces/cp-exercise"}}
+```
+
+Use the current returned revision, not the illustrative `1`. To clear, send `{"revision":<current>,"side_quest_defaults":null}`. Omission leaves the field unchanged. A persisted null suppresses legacy cp.json fallback; a missing key preserves it. The response contains the new revision, and a stale write is 409. Host is the Forge project host identity, not the registry UUID. The folder must already exist, be accessible and writable, and pass local mount prefix policy. Defaults can only be edited on the project's authoritative served host; the facade refuses remote selection before forwarding.
+
+Acceptance after deploy: use a scratch project with no cp.json path, save a permitted exp folder with the current revision, then allow one ordinary CP poll. Project composer and Configuration must show the same saved defaults and side-quest availability. Clear with the next revision, allow one poll, and confirm unavailable; repeat a stale revision and confirm 409/no overwrite. The source test exercises that complete API→poll→view path without live services or an LLM, and additionally proves that an explicit clear cannot restore a legacy configured path.
+
+Rollback: the down migration removes only this new key so an older strict project decoder can read the rows. This discards saved defaults, returning those rows to legacy fallback behavior; it preserves all other document fields and row metadata. Apply rollback only as part of the matching exp release rollback.
+
+Cross-repo test: `CP_PROJECT_DEFAULTS_FIXTURE_COMMAND` is JSON argv for frontend's `node_modules/.bin/tsx` and `control-plane/views/__tests__/project-defaults-consumer.fixture.ts`; run `PYTHONPATH=src python -m pytest -q -m integration tests/test_projects/test_side_quest_defaults_consumer.py --no-cov`. Routine suite: `python -m pytest -q tests/test_projects tests/test_niuu/test_rest_volundr.py tests/test_niuu/test_rest_volundr_forge_session.py --no-cov`. PostgreSQL tests use only a disposable cluster and `FORGE_HISTORY_TEST_DATABASE_URL`, never the exp or production database.
+
 # Config follow-up for exp Forge (cp-platform), from E0 on 2026-10-22
 
 exp Forge `e2208da8` is live and E0 items 1–3 pass (`docs/operator/e0/e0-evidence.json`). One config gap:

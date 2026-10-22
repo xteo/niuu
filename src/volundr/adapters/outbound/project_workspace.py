@@ -9,15 +9,37 @@ import tempfile
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from volundr.domain.mount_policy import ensure_host_path_allowed
 from volundr.domain.project_ports import ProjectWorkspace
 from volundr.domain.projects import ForgeProject, ProjectReceipt, canonical_repository_url
 
 
 class GitProjectWorkspace(ProjectWorkspace):
-    def __init__(self, allowed_prefixes=(), context_bytes=8192, git_timeout=15.0, **_kwargs):
+    def __init__(
+        self,
+        allowed_prefixes=(),
+        context_bytes=8192,
+        git_timeout=15.0,
+        local_mounts_enabled=False,
+        allow_root_mount=False,
+        **_kwargs,
+    ):
         self._prefixes = tuple(Path(p).resolve() for p in allowed_prefixes)
         self._context_bytes = context_bytes
         self._git_timeout = git_timeout
+        self._local_mounts_enabled = local_mounts_enabled
+        self._allow_root_mount = allow_root_mount
+
+    async def validate_local_path(self, local_path: str) -> str:
+        if not self._local_mounts_enabled:
+            raise ValueError("Local mount workspaces are disabled on this host")
+        if not Path(local_path).is_absolute():
+            raise ValueError("Use an absolute side-quest folder path")
+        root = Path(local_path).resolve()
+        ensure_host_path_allowed(str(root), self._prefixes, allow_root_mount=self._allow_root_mount)
+        if not root.is_dir() or not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+            raise ValueError("Side-quest folder must be an existing accessible working directory")
+        return str(root)
 
     def _root(self, project: ForgeProject) -> Path:
         return self._checkout_root(project.workspace_path)

@@ -48,6 +48,10 @@ class ProjectRepository(ABC):
 
 
 class ProjectWorkspace(ABC):
+    async def validate_local_path(self, local_path: str) -> str:
+        """Validate a mountable local working directory and return its canonical path."""
+        raise ValueError("This project workspace adapter does not support local side quests")
+
     @abstractmethod
     async def discover(self, workspace_path: str) -> ForgeProject:
         """Inspect a local Git checkout and recover its stable project identity."""

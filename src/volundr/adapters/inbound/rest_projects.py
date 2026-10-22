@@ -12,6 +12,7 @@ from volundr.domain.projects import (
     PROJECT_BRIEF_MAX_CHARS,
     ForgeProject,
     ProjectReceipt,
+    ProjectSideQuestDefaults,
     SessionReference,
 )
 from volundr.domain.services.projects import UNCHANGED, ProjectNotFoundError, ProjectService
@@ -33,6 +34,7 @@ class ProjectUpdate(BaseModel):
     status: Literal["active", "archived"] | None = None
     repo_url: str | None = Field(default=None, max_length=2048)
     workspace_path: str | None = Field(default=None, max_length=2048)
+    side_quest_defaults: ProjectSideQuestDefaults | None = None
 
 
 class SessionProjectAssignment(BaseModel):
@@ -139,9 +141,10 @@ def create_projects_router(service: ProjectService, principal_for_request) -> AP
     ) -> ForgeProject:
         principal = await principal_for_request(request)
         changes = {
-            key: "" if value is None else value
+            key: "" if value is None and key != "side_quest_defaults" else value
             for key, value in data.model_dump(exclude={"revision"}, exclude_unset=True).items()
-            if value is not None or key in {"description", "brief", "repo_url", "workspace_path"}
+            if value is not None
+            or key in {"description", "brief", "repo_url", "workspace_path", "side_quest_defaults"}
         }
         return await project_result(service.update(project_id, changes, data.revision, principal))
 

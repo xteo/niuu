@@ -20,6 +20,7 @@ from volundr.domain.project_ports import ProjectConflictError, ProjectRepository
 from volundr.domain.projects import (
     ForgeProject,
     ProjectReceipt,
+    ProjectSideQuestDefaults,
     SessionCoordination,
     SessionReference,
     canonical_repository_url,
@@ -124,6 +125,8 @@ class ProjectService:
                 "updated_at": now,
             }
         )
+        if "side_quest_defaults" in project.model_fields_set:
+            project = await self._validate_side_quest_defaults(project)
         # A project needs no checkout. When one is named, it must be a real,
         # bounded checkout so launches and exports on this host can rely on it.
         if project.workspace_path:
@@ -132,10 +135,20 @@ class ProjectService:
 
     async def update(self, project_id: UUID, changes: dict, revision: int, principal):
         project = await self.get(project_id, principal)
-        allowed = {"name", "description", "brief", "status", "workspace_path", "repo_url"}
+        allowed = {
+            "name",
+            "description",
+            "brief",
+            "status",
+            "workspace_path",
+            "repo_url",
+            "side_quest_defaults",
+        }
         if changes.keys() - allowed:
             raise ValueError("Project identity is immutable; update presentation or repository")
         changes = dict(changes)
+        if "side_quest_defaults" in changes and project.revision != revision:
+            raise ProjectConflictError("Project changed; reload before updating")
         if "repo_url" in changes and not changes["repo_url"] and changes.get("workspace_path"):
             raise ValueError("Detaching the repository also removes its checkout")
         if "repo_url" in changes and changes["repo_url"] != project.repo_url:
@@ -160,9 +173,27 @@ class ProjectService:
                 "updated_at": datetime.now(UTC),
             }
         )
+        if "side_quest_defaults" in changes:
+            project = await self._validate_side_quest_defaults(project)
         if changes.get("workspace_path"):
             await self.workspace.context(project)
         return await self.repository.update(project, revision)
+
+    async def _validate_side_quest_defaults(self, project: ForgeProject) -> ForgeProject:
+        if project.home_instance_id:
+            raise ProjectConflictError(
+                "Side-quest defaults must be changed on the project's home host"
+            )
+        defaults = project.side_quest_defaults
+        if defaults is None:
+            return project
+        if defaults.host != self.instance_id:
+            raise ValueError("Side-quest defaults must name this Forge host")
+        local_path = await self.workspace.validate_local_path(defaults.local_path)
+        canonical = ProjectSideQuestDefaults.model_validate(
+            {**defaults.model_dump(), "local_path": local_path}
+        )
+        return project.model_copy(update={"side_quest_defaults": canonical})
 
     async def context(self, project: ForgeProject) -> tuple[str, str]:
         """The project's own brief plus, when this host has a checkout, its bounded context."""

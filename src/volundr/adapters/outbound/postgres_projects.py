@@ -114,7 +114,16 @@ class PostgresProjectRepository(ProjectRepository):
             return self._project(row)
         existing = await self.get(project.id)
         identity = ("owner_id", "tenant_id", "repo_url", "slug", "workspace_path")
-        if existing and all(getattr(existing, key) == getattr(project, key) for key in identity):
+        same_defaults = "side_quest_defaults" not in project.model_fields_set or (
+            existing is not None
+            and "side_quest_defaults" in existing.model_fields_set
+            and existing.side_quest_defaults == project.side_quest_defaults
+        )
+        if (
+            existing
+            and same_defaults
+            and all(getattr(existing, key) == getattr(project, key) for key in identity)
+        ):
             return existing
         raise ProjectConflictError("Project ID already identifies a different registration")
 

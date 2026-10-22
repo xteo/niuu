@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 class SessionReference(BaseModel):
@@ -61,6 +61,25 @@ def canonical_repository_url(remote: str) -> str:
     return urlunsplit(("https", url.netloc.lower(), path, "", ""))
 
 
+class ProjectSideQuestDefaults(BaseModel):
+    """A host-local default for a side quest; never a repository attachment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    host: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
+    local_path: str = Field(min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def absolute_folder(self):
+        if (
+            not self.local_path.startswith("/")
+            or "\\" in self.local_path
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.local_path)
+        ):
+            raise ValueError("Side-quest folder must be an absolute local path without controls")
+        return self
+
+
 class ForgeProject(BaseModel):
     """A named grouping of sessions. A Git repository is optional and replaceable.
 
@@ -79,6 +98,7 @@ class ForgeProject(BaseModel):
     brief: str = Field(default="", max_length=PROJECT_BRIEF_MAX_CHARS)
     repo_url: str = Field(default="", max_length=2048)
     workspace_path: str = Field(default="", max_length=2048)
+    side_quest_defaults: ProjectSideQuestDefaults | None = None
     home_instance_id: str = Field(default="", max_length=100, pattern=r"^[a-zA-Z0-9_.-]*$")
     status: Literal["active", "archived"] = "active"
     owner_id: str = ""
@@ -104,6 +124,18 @@ class ForgeProject(BaseModel):
         binary can still read every project that does not use them."""
         empty = {key for key in ("brief", "home_instance_id") if not getattr(self, key)}
         return self.model_dump_json(exclude=empty)
+
+    @model_serializer(mode="wrap")
+    def preserve_side_quest_default_presence(self, serialize):
+        """Missing means legacy fallback; explicit null means the user cleared it.
+
+        Preserve this distinction in storage, API responses and ordinary project
+        updates without changing serialization of any existing project field.
+        """
+        document = serialize(self)
+        if "side_quest_defaults" not in self.model_fields_set:
+            document.pop("side_quest_defaults", None)
+        return document
 
     @staticmethod
     def slug_for(name: str) -> str:
