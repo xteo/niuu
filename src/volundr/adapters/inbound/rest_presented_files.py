@@ -16,6 +16,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel
 
+from niuu.domain.presented_files import PRESENTED_FILE_NAME_HEADER
 from niuu.domain.services.token_scope import FORGE_NOTIFY_SCOPE, require_scope
 from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.domain.presented_files import (
@@ -29,7 +30,7 @@ from volundr.domain.services.session import SessionAccessDeniedError, SessionSer
 
 logger = logging.getLogger(__name__)
 
-NAME_HEADER = "x-presented-file-name"
+NAME_HEADER = PRESENTED_FILE_NAME_HEADER
 MAX_NAME_CHARS = 255
 
 

@@ -152,6 +152,7 @@ def build_forge_app(
     *,
     tokens: ForgeSessionTokenService | None = None,
     mcp_config: ForgeMcpHttpConfig | None = None,
+    presented_file_store: Any = None,
     **service_kwargs: Any,
 ):
     """The Forge app slice. ``tokens=None`` builds one; pass ``False`` for none."""
@@ -163,6 +164,7 @@ def build_forge_app(
         pod_manager,
         provisioning_initial_delay=0,
         forge_session_tokens=minted,
+        presented_file_store=presented_file_store,
         **service_kwargs,
     )
     store = InMemoryNotificationStore()
@@ -187,8 +189,21 @@ def build_forge_app(
             session_service,
             prefix=PREFIX,
             session_participant_service=make_session_participant_service(session_service),
+            presented_file_store=presented_file_store,
         )
     )
+    if presented_file_store is not None:
+        from volundr.adapters.inbound.rest_presented_files import create_presented_files_router
+
+        app.include_router(
+            create_presented_files_router(
+                presented_file_store,
+                session_service,
+                public_base_url="http://thor.tail737f2a.ts.net:8380",
+                max_bytes=1 << 20,
+                prefix=PREFIX,
+            )
+        )
     app.include_router(
         create_notifications_router(
             notifications, session_service, prefix=PREFIX, default_page_size=20, max_page_size=50
