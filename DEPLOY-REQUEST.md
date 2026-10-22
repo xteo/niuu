@@ -80,3 +80,9 @@ The merge of `exp/cp-forge-state` that carries `0deedaba` (the sha is in this se
 
 Check after the rebuild: delete a throwaway session that presented a file; its folder under the store
 root (`presented_files.store.root`) is gone, and its file URL answers 404.
+
+## Follow-up (2026-10-22, cp-platform R25): the F2 upload through the facade
+
+The merge carrying `beffb6ef` (sha in the session description). No config change: the facade's cap is Forge's
+`presented_files.max_bytes`. Then rerun check 2: a presented file's URL from mini-m6, before and after stop.
+
