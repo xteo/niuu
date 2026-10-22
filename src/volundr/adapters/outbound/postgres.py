@@ -434,7 +434,19 @@ class PostgresSessionRepository(SessionRepository):
             turn_started_at=turn_started_at,
             activity_metadata=activity_metadata,
             **self._description_fields(row),
+            **self._work_fact_fields(row),
         )
+
+    @staticmethod
+    def _work_fact_fields(row: asyncpg.Record) -> dict:
+        """Work-fact columns (G10, F12d); tolerant of rows predating migration 000091."""
+        last_work_at = row.get("last_work_at")
+        if last_work_at is not None and last_work_at.tzinfo is None:
+            last_work_at = last_work_at.replace(tzinfo=UTC)
+        return {
+            "last_work_at": last_work_at,
+            "open_tool_count": max(int(row.get("open_tool_count") or 0), 0),
+        }
 
     @staticmethod
     def _description_fields(row: asyncpg.Record) -> dict:
