@@ -322,6 +322,28 @@ def _ensure_remote_success(response: httpx.Response) -> None:
     raise HTTPException(status_code=response.status_code, detail=_upstream_detail(response)[:1000])
 
 
+def _rejects_unknown_fields(response: httpx.Response, fields: set[str]) -> bool:
+    """True when an older host's request validation refused one of ``fields`` as unknown.
+
+    A host that predates a field answers FastAPI's 422 list with ``extra_forbidden`` at
+    ``["body", <field>]``. A domain refusal is also a 422, but with a message: that one
+    is the host's real answer, not a sign that the host is too old.
+    """
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(detail, list):
+        return False
+    for error in detail:
+        if not isinstance(error, dict) or error.get("type") != "extra_forbidden":
+            continue
+        loc = error.get("loc") or []
+        if len(loc) >= 2 and loc[0] == "body" and loc[1] in fields:
+            return True
+    return False
+
+
 def _ensure_history_success(response: httpx.Response) -> None:
     """Preserve machine-readable history recovery through the aggregate facade."""
     if response.status_code < 400:
@@ -3115,10 +3137,12 @@ def create_volundr_router(
             json_body=forwarded,
             embedded_app=embedded_forge_app,
         )
-        if response.status_code == 422 and set(forwarded) - {"project_id", "expected_revision"}:
+        newer = set(forwarded) - {"project_id", "expected_revision"}
+        if response.status_code == 422 and _rejects_unknown_fields(response, newer):
             raise HTTPException(
                 501, "Update this session's Forge host to set project roles and coordinators"
             )
+        # Any other 422 is the host's own answer (e.g. a parent outside the project): pass it on.
         _ensure_remote_success(response)
         return _with_instance(response.json(), owner)
 

@@ -1,0 +1,39 @@
+check | thor-live@11afe41d | mini-m6-shape
+route GET /api/v1/forge/instance | FAIL absent | ok
+route GET /api/v1/forge/artifact-publications | FAIL absent | ok
+route GET /api/v1/forge/artifact-bursts | FAIL absent | ok
+route GET /api/v1/forge/artifact-bursts/{burst_id} | FAIL absent | ok
+route GET /api/v1/forge/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/description | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/attachments | ok | ok
+route GET /api/v1/forge/projects | ok | ok
+route POST /api/v1/forge/projects | ok | ok
+route GET /api/v1/forge/sessions | ok | ok
+route POST /api/v1/forge/sessions | ok | ok
+route GET /api/v1/forge/sessions/{session_id} | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log/head | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/conversation/turns/{turn_id} | ok | ok
+route POST /api/v1/forge/sessions/{session_id}/messages | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id} | ok | ok
+route GET /api/v1/forge/feature-flags | ok | ok
+GET /health (forge plugins) | n/a | ok (200)
+GET instance | n/a | ok (200)
+GET artifact-publications | n/a | ok (200)
+GET artifact-bursts | n/a | ok (200)
+GET notifications | n/a | ok (200)
+served route DELETE /api/v1/forge/storage/home | ABSENT | ok
+served route GET /api/v1/forge/artifact-bursts | ABSENT | ok
+served route GET /api/v1/forge/artifact-bursts/{burst_id} | ABSENT | ok
+served route GET /api/v1/forge/artifact-publications | ABSENT | ok
+served route GET /api/v1/forge/instance | ABSENT | ok
+served route GET /api/v1/forge/notifications/{notification_id}/image | ok | ABSENT
+served route GET /api/v1/forge/sessions/{session_id}/log/page | ABSENT | ok
+served route GET /api/v1/forge/storage/home | ABSENT | ok
+served route PATCH /api/v1/forge/admin/settings/storage | ABSENT | ok
+served route POST /api/v1/forge/artifact-publications/backfill | ABSENT | ok
+served route POST /api/v1/forge/delivery/{operation} | ABSENT | ok
+NOT ON PAR
