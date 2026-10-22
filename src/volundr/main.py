@@ -68,6 +68,7 @@ from volundr.adapters.inbound.rest_oauth import create_canonical_oauth_router
 from volundr.adapters.inbound.rest_openshell_credentials import (
     create_openshell_credentials_router,
 )
+from volundr.adapters.inbound.rest_presented_files import create_presented_files_router
 from volundr.adapters.inbound.rest_prompts import create_prompts_router
 from volundr.adapters.inbound.rest_resident_a2a import create_resident_a2a_router
 from volundr.adapters.inbound.rest_resident_runtimes import create_resident_runtimes_router
@@ -1611,6 +1612,14 @@ def create_app(
                 )
                 app.state.project_service = project_service
 
+            # Durable presented files (F2): Forge's own copy of every present-file.
+            presented_file_store = None
+            if settings.presented_files.enabled:
+                store_config = dict(settings.presented_files.store)
+                store_cls = import_class(store_config.pop("adapter"))
+                presented_file_store = store_cls(**store_config)
+                app.state.presented_file_store = presented_file_store
+
             # Create and include routers
             forge_router = create_router(
                 session_service,
@@ -1637,6 +1646,7 @@ def create_app(
                 history_max_turns=settings.conversation_recent_max_turns,
                 history_max_bytes=settings.conversation_recent_max_bytes,
                 session_participant_service=session_participant_service,
+                presented_file_store=presented_file_store,
             )
             app.include_router(forge_router)
             app.include_router(
@@ -1653,6 +1663,16 @@ def create_app(
                     reply_timeout_seconds=settings.resident_runtimes.a2a_reply_timeout_seconds,
                 )
             )
+            if presented_file_store is not None:
+                app.include_router(
+                    create_presented_files_router(
+                        presented_file_store,
+                        session_service,
+                        public_base_url=settings.presented_files.public_base_url,
+                        max_bytes=settings.presented_files.max_bytes,
+                        prefix="/api/v1/forge",
+                    )
+                )
             app.state.resident_runtime_service = resident_runtime_service
             app.include_router(create_codex_credentials_router(codex_credential_broker))
             credential_grant_brokers = {

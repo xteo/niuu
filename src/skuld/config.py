@@ -572,6 +572,23 @@ class ActivityHeartbeatConfig(BaseModel):
     )
 
 
+class PresentedDurableConfig(BaseModel):
+    """Uploading present-file copies to Forge's durable store (control-plane F2)."""
+
+    upload_timeout_seconds: float = Field(
+        default=30.0, gt=0, description="Time allowed for one durable upload."
+    )
+    retry_attempts: int = Field(
+        default=6, ge=0, description="Background retries after a failed upload."
+    )
+    retry_backoff_seconds: float = Field(
+        default=2.0, gt=0, description="First retry delay; doubles per attempt."
+    )
+    retry_backoff_max_seconds: float = Field(
+        default=120.0, gt=0, description="Upper bound on the retry delay."
+    )
+
+
 class DeliveryConfig(BaseModel):
     """Durable inbound-message delivery (SRD FR-5 / INV-7).
 
@@ -1030,6 +1047,7 @@ class SkuldSettings(BaseSettings):
         ),
     )
     activity_heartbeat: ActivityHeartbeatConfig = Field(default_factory=ActivityHeartbeatConfig)
+    presented_durable: PresentedDurableConfig = Field(default_factory=PresentedDurableConfig)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     ws_auth: WsAuthConfig = Field(default_factory=WsAuthConfig)
     observation_relay: ObservationRelayConfig = Field(default_factory=ObservationRelayConfig)
