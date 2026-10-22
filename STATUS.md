@@ -26,7 +26,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | E0 on exp stack | done (items 1–3); item 4 pending | exp Forge live at `e2208da8`. (1) `/instance` → host `thor-exp`; (2) all three feeds empty before; (3) Thor's 128 manifest rows appended to exercise session `da8a686a`: **122 publications, 12 keys, 33 bursts** (all backfill, = fixture), **0 notices**; replay #2 adds 0; admin backfill scanned 126, recorded 0, 0 notices. The 25-notice golden needs forced-live timing: offline only (memory + Postgres). (4) a real publish: pending the gated provider key. `docs/operator/e0/` |
 | LEX-1397 comment | done | landing comment posted |
 
-## Package 3 (relayed 2026-10-22): X1 branch sync, then H1
+## Package 3 (relayed 2026-10-22): X1 branch sync, then H1 — **accepted** (standby: judge findings; X1 next 2026-10-26)
 
 ### X1 branch sync: done 2026-10-22 (next due **2026-10-26**, twice a week; also before E1)
 
