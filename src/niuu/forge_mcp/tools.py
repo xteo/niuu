@@ -709,6 +709,8 @@ def _session_summary(raw: dict[str, Any]) -> dict[str, Any]:
         "description": raw.get("description"),
         "short_description_updated_at": raw.get("short_description_updated_at"),
         "description_updated_at": raw.get("description_updated_at"),
+        "last_work_at": raw.get("last_work_at"),
+        "tool_open": raw.get("tool_open") or None,
     }
     return {key: value for key, value in summary.items() if value not in (None, {}, "")}
 

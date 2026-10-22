@@ -56,7 +56,11 @@ from niuu.observability import get_observability
 from niuu.ports.cli import CLITransport
 from niuu.ports.evidence import ArtifactDigestResolver, EvidenceGateVerifier
 from niuu.utils import import_class, resolve_secret_kwargs
-from skuld.activity_reporting import ActivityReportingMixin
+from skuld.activity_reporting import (
+    ActivityReportingMixin,
+    is_idle_prompt_hook,
+    is_turn_boundary_flush,
+)
 from skuld.channels import (
     ChannelRegistry,
     WebSocketChannel,
@@ -666,6 +670,12 @@ class Broker(
         # states and clears only when the turn becomes idle or stops.
         self._turn_started_at: float | None = None
         self._last_activity_report: float = 0.0
+        # G10 (F12b/F12c): monotonic time of the newest transport frame, and whether
+        # the current prompt has produced any work row yet.
+        self._last_transport_row_at: float = time.monotonic()
+        self._prompt_work_seen: bool = True
+        # request_id -> ISO time each open human gate was first reported (F12d).
+        self._control_opened_at: dict[str, str] = {}
         self._activity_report_lock = asyncio.Lock()
         self._activity_report_pending = False
         # Rich context for the CURRENT activity state (e.g. the pending question's
@@ -3437,6 +3447,7 @@ class Broker(
     async def _handle_cli_event(self, data: dict) -> None:
         """Forward a CLI event to all connected channels."""
         event_type = data.get("type", "unknown")
+        self._observe_activity_row(data)
 
         # Use one observation instant for both the durable event row and the
         # live transcript reduction. Replaying the row will then reproduce the
@@ -3570,6 +3581,9 @@ class Broker(
             self._stamp_steering_state_from_frame(data)
         elif event_type == "agent_update":
             self._track_agent_update(data)
+        elif is_idle_prompt_hook(data):
+            # Claude is waiting at its prompt: a stale busy state self-heals (F12b).
+            asyncio.create_task(self._heal_on_idle_prompt())
         elif event_type == "terminal_pane_opened":
             self._track_pane_agent(data, opened=True)
         elif event_type == "terminal_pane_closed":
@@ -3586,7 +3600,10 @@ class Broker(
             # while blocked on a human gate: the answer that unblocks the turn also
             # arrives as a prompt-submit, and we must not clobber awaiting_input
             # before _exit_attention runs.
-            if not self._pending_attention:
+            # A turn-boundary flush (G10, F12a) is NOT a turn start: the transport
+            # emits it after the turn ended, only so a silently absorbed steer's
+            # bubble flips. _activate_user_turn below still flips it.
+            if not self._pending_attention and not is_turn_boundary_flush(data):
                 asyncio.create_task(self._report_activity_state("active"))
         elif event_type in ("result", "error") or (
             event_type == "assistant" and self._assistant_has_content(data)
