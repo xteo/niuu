@@ -1563,13 +1563,37 @@ def create_volundr_router(
             response.headers["X-Forge-Unavailable-Instances"] = ",".join(unavailable)
         return projects
 
+    async def _project_defaults_instance(
+        request: Request, principal: Principal, body: dict[str, Any]
+    ) -> RegisteredInstance:
+        """Local filesystem defaults may never turn a project write into a peer RPC."""
+        local = await _local_session_instance(service, principal, request)
+        for source in (request.query_params.multi_items(), body.items()):
+            for key, value in source:
+                if key in {"instance_id", "instanceId"} and value != local.id:
+                    raise HTTPException(422, "Side-quest defaults can only target this Forge host")
+                if key in {
+                    "instance_name",
+                    "instanceName",
+                    "target_tags",
+                    "targetTags",
+                    "target_match",
+                    "targetMatch",
+                }:
+                    raise HTTPException(422, "Side-quest defaults do not accept remote selectors")
+        return local
+
     @router.post("/projects", status_code=201)
     async def register_project(
         request: Request,
         body: dict[str, Any] = Body(...),
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
-        instance = await _resolve_target_instance(service, principal, body.get("instance_id"))
+        instance = (
+            await _project_defaults_instance(request, principal, body)
+            if "side_quest_defaults" in body
+            else await _resolve_target_instance(service, principal, body.get("instance_id"))
+        )
         response = await _request_remote(
             instance,
             request,
@@ -1639,11 +1663,6 @@ def create_volundr_router(
                 raise HTTPException(422, "Invalid receipt ID") from exc
         if (request.method, operation) not in allowed and not (request.method == "POST" and is_ack):
             raise HTTPException(404, "Unknown project operation")
-        instance = await _resolve_target_instance(
-            service,
-            principal,
-            request.query_params.get("instance_id"),
-        )
         body = await request.body()
         try:
             document = json.loads(body) if body else None
@@ -1651,6 +1670,13 @@ def create_volundr_router(
             raise HTTPException(422, "Project request must contain valid JSON") from exc
         if document is not None and not isinstance(document, dict):
             raise HTTPException(422, "Project request must be a JSON object")
+        if request.method == "PATCH" and document is not None and "side_quest_defaults" in document:
+            instance = await _project_defaults_instance(request, principal, document)
+            document = _strip_instance_hints(document)
+        else:
+            instance = await _resolve_target_instance(
+                service, principal, request.query_params.get("instance_id")
+            )
         response = await _request_remote(
             instance,
             request,

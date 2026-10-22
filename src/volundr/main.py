@@ -1465,6 +1465,8 @@ def create_app(
                 )
                 project_workspace = import_class(project_config.workspace_adapter)(
                     allowed_prefixes=settings.local_mounts.allowed_prefixes,
+                    local_mounts_enabled=settings.local_mounts.enabled,
+                    allow_root_mount=settings.local_mounts.allow_root_mount,
                     context_bytes=project_config.context_bytes,
                     git_timeout=project_config.git_timeout_seconds,
                     **project_config.workspace_kwargs,
