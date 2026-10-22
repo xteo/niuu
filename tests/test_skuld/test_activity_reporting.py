@@ -380,7 +380,9 @@ class TestAttentionAndHeartbeat:
             await test_broker._exit_attention("askq-1")
 
         assert test_broker._pending_attention == {"perm-2": "permission"}
-        mock_report.assert_not_called()
+        # Still blocked: the only report is a forced awaiting_input refresh, so
+        # open_controls (F12d) drops the answered gate without leaving awaiting_input.
+        mock_report.assert_awaited_once_with("awaiting_input", extra_metadata=None, force=True)
 
     @pytest.mark.asyncio
     async def test_ask_user_question_event_enters_awaiting_input(self, test_broker):

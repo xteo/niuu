@@ -6,9 +6,29 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from niuu.domain.work_facts import HOOK_KIND, hook_name, is_work_row
 from skuld.event_log import FORGE_SESSIONS_PATH
 
 logger = logging.getLogger("skuld.broker")
+
+TURN_BOUNDARY_FLUSH_SOURCE = "turn_boundary_flush"
+
+
+def is_turn_boundary_flush(data: dict) -> bool:
+    """A synthetic prompt-consumed frame the transport emits AFTER a turn ended (F12a).
+
+    It exists only to flip a silently absorbed steer's bubble; it is not a turn start.
+    """
+    metadata = data.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("source") == TURN_BOUNDARY_FLUSH_SOURCE
+
+
+def is_idle_prompt_hook(data: dict) -> bool:
+    """Claude's own "waiting at the prompt" Notification hook (``idle_prompt``)."""
+    if data.get("type") != HOOK_KIND or hook_name(data) != "Notification":
+        return False
+    payload = data.get("payload")
+    return isinstance(payload, dict) and payload.get("notification_type") == "idle_prompt"
 
 
 class ActivityReportingMixin:
@@ -74,8 +94,38 @@ class ActivityReportingMixin:
         """
         return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
+    def _open_controls(self, state: str) -> list[dict[str, str]] | None:
+        """The open human gates as ``[{request_id, kind, opened_at}]`` (F12d).
+
+        Served by Forge on the session so the Code tab runs the same derived-state
+        algorithm as the control plane. ``None`` means unknown: awaiting input on a
+        gate with no request id, which a reader must never take as "none open".
+        """
+        opened = getattr(self, "_control_opened_at", None)
+        if opened is None:
+            opened = self._control_opened_at = {}
+        pending = dict(self._pending_attention)
+        for request_id in list(opened):
+            if request_id not in pending:
+                opened.pop(request_id, None)
+        if state == "awaiting_input" and not pending:
+            return None
+        now = datetime.now(UTC).isoformat()
+        return [
+            {
+                "request_id": request_id,
+                "kind": kind,
+                "opened_at": opened.setdefault(request_id, now),
+            }
+            for request_id, kind in pending.items()
+        ]
+
     async def _report_activity_state(
-        self, state: str, *, extra_metadata: dict[str, Any] | None = None
+        self,
+        state: str,
+        *,
+        extra_metadata: dict[str, Any] | None = None,
+        force: bool = False,
     ) -> bool:
         """Report activity state change to Volundr.
 
@@ -89,6 +139,7 @@ class ActivityReportingMixin:
         if (
             state == self._activity_state
             and not extra_metadata
+            and not force
             and not self._activity_report_pending
         ):
             return True
@@ -118,6 +169,7 @@ class ActivityReportingMixin:
             metadata["cli_session_id"] = cli_session_id
         if extra_metadata:
             metadata.update(extra_metadata)
+        metadata["open_controls"] = self._open_controls(state)
 
         # Capture the state and its anchors together BEFORE any await. Another CLI
         # event can advance the broker while credentials or the HTTP request waits.
@@ -244,6 +296,12 @@ class ActivityReportingMixin:
         """
         self._pending_attention.pop(request_id, None)
         if self._pending_attention:
+            # Still waiting on another gate: refresh open_controls (F12d) so readers
+            # see one fewer, without leaving awaiting_input.
+            if self._activity_state == "awaiting_input":
+                await self._report_activity_state(
+                    "awaiting_input", extra_metadata=dict(self._activity_extra) or None, force=True
+                )
             return
         if self._activity_state == "awaiting_input":
             await self._report_activity_state("active")
@@ -268,6 +326,56 @@ class ActivityReportingMixin:
             return f"Permission to run {tool}: {description}"
         return f"Permission to run {tool}"
 
+    def _observe_activity_row(self, data: dict) -> None:
+        """Track the facts the self-heal and the heartbeat guard need (G10, F12b/F12c).
+
+        Every transport frame (terminal frames included) proves the transport is alive;
+        only work rows (``niuu.domain.work_facts``) prove the turn did work. A
+        ``UserPromptSubmit`` starts a prompt whose work is still unproven.
+        """
+        self._last_transport_row_at = time.monotonic()
+        kind = str(data.get("type", ""))
+        if kind == HOOK_KIND and hook_name(data) == "UserPromptSubmit":
+            self._prompt_work_seen = False
+            return
+        if is_work_row(kind, data):
+            self._prompt_work_seen = True
+
+    def _transport_turn_active(self) -> bool:
+        return getattr(self._transport, "is_turn_active", False) is True
+
+    async def _heal_on_idle_prompt(self) -> bool:
+        """Claude says it is idle at its prompt: drop a stale busy state (F12b).
+
+        Applies only while the broker still reports active/tool_executing with no human
+        gate pending, and either the transport has no turn in flight, or the current
+        prompt never produced work (a dead ``UserPromptSubmit``).
+        """
+        if self._activity_state not in self._RUNNING_RAW_STATES or self._pending_attention:
+            return False
+        if self._transport_turn_active() and self._prompt_work_seen:
+            return False
+        await self._report_activity_state("idle", extra_metadata={"healed": "idle_prompt"})
+        return True
+
+    async def _heartbeat_guard(self, state: str) -> bool:
+        """Decide whether a busy heartbeat may re-report ``state`` (F12c).
+
+        A busy state is re-reported only while the transport produced a row within
+        ``stale_output_seconds``. Past that, reconcile with the transport's own turn
+        flag: no turn in flight → report idle; a turn in flight → stay silent, so
+        ``last_active`` stops advancing on a claim nothing supports.
+        """
+        if state not in self._RUNNING_RAW_STATES:
+            return True
+        stale_after = self._settings.activity_heartbeat.stale_output_seconds
+        last_row = getattr(self, "_last_transport_row_at", None)
+        if last_row is not None and time.monotonic() - last_row <= stale_after:
+            return True
+        if not self._transport_turn_active():
+            await self._report_activity_state("idle", extra_metadata={"healed": "heartbeat"})
+        return False
+
     async def _activity_heartbeat_loop(self) -> None:
         """Re-report the current activity state on an interval while busy/blocked.
 
@@ -289,6 +397,8 @@ class ActivityReportingMixin:
                 state not in ("active", "tool_executing", "awaiting_input")
                 and not self._activity_report_pending
             ):
+                continue
+            if not await self._heartbeat_guard(state):
                 continue
             await self._report_activity_state(
                 state,

@@ -1079,6 +1079,25 @@ class SessionResponse(BaseModel):
         default=None,
         description="ISO 8601 time description last changed; null if never set",
     )
+    last_work_at: str | None = Field(
+        default=None,
+        description=(
+            "ISO 8601 source time of the newest work row (assistant output, result, "
+            "content blocks, tool and turn hooks); null when none is known. Never the "
+            "heartbeat (G10, F12d)."
+        ),
+    )
+    tool_open: bool = Field(
+        default=False,
+        description="True while a tool call is open (a PreToolUse without its PostToolUse)",
+    )
+    open_controls: list[dict] | None = Field(
+        default=None,
+        description=(
+            "Open human gates as [{request_id, kind, opened_at}] from the broker's control "
+            "state; null means unknown, never 'none open'"
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -1196,6 +1215,9 @@ class SessionResponse(BaseModel):
                 if session.description_updated_at
                 else None
             ),
+            last_work_at=(session.last_work_at.isoformat() if session.last_work_at else None),
+            tool_open=session.tool_open,
+            open_controls=session.open_controls,
         )
 
 

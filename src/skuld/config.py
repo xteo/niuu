@@ -534,6 +534,16 @@ class ActivityHeartbeatConfig(BaseModel):
             "below Volundr's session liveness stale_after_seconds (default 600)."
         ),
     )
+    stale_output_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            "A busy state is re-reported only while the transport produced a row "
+            "(terminal frames included) within this window. Past it the broker "
+            "reconciles with the transport's turn flag: idle when no turn is in "
+            "flight, otherwise no heartbeat (G10, F12c)."
+        ),
+    )
 
 
 class DeliveryConfig(BaseModel):

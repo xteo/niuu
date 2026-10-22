@@ -39,6 +39,7 @@ def test_up_adds_four_nullable_idempotent_columns_and_down_drops_them():
     assert "NOT NULL" not in up and "DEFAULT" not in up
 
 
-def test_is_the_latest_migration():
+def test_number_is_unique_and_follows_its_predecessor():
     numbers = sorted(p.name[:6] for p in (ROOT / "migrations").glob("*.up.sql"))
-    assert numbers[-1] == NAME[:6]
+    assert numbers.count(NAME[:6]) == 1
+    assert numbers[numbers.index(NAME[:6]) - 1] == "000086"
