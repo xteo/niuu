@@ -187,6 +187,7 @@ class ForgeSessionMixin:
         self._forge_mcp_toolbox_cache = ForgeMcpToolbox(
             client=client,
             host=BrokerForgeMcpHost(self, client),
+            project_more_enabled=cfg.project_more_enabled,
             # Display and gating only: Forge enforces the token's scopes itself.
             grants=effective_grants(cfg.token, cfg.grants),
             limits=ForgeMcpLimits(

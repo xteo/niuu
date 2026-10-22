@@ -690,6 +690,14 @@ class ForgeMcpConfig(BaseModel):
             "the broker's own credential (and offers no grants)."
         ),
     )
+    project_more_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the experimental control-plane project_more read tool "
+            "(SKULD__FORGE_MCP__PROJECT_MORE_ENABLED). Uses the existing scoped session "
+            "token and the fixed exp-only internal CP endpoint; no device key is needed."
+        ),
+    )
     runtime_dir: str = Field(
         default="",
         description=(

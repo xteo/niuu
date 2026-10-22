@@ -16,6 +16,7 @@ from niuu.forge_mcp.credentials import is_forge_session_claims, token_scopes, un
 from niuu.forge_mcp.models import ForgeApiError
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
 from skuld.conversation_models import ConversationTurn
+from skuld.forge_mcp.project_more import read_project_more
 
 if TYPE_CHECKING:
     from skuld.broker import Broker
@@ -125,6 +126,19 @@ class BrokerForgeMcpHost(ForgeMcpHost):
             "instance_id": session.get("instance_id"),
             "forge_reachable": True,
         }
+
+    async def project_more(self, *, section: str, offset: int, sha: str | None) -> dict[str, Any]:
+        cfg = self._broker._settings.forge_mcp
+        if not cfg.project_more_enabled:
+            raise ForgeApiError("project_more is not enabled on this broker", status=503)
+        return await read_project_more(
+            session_id=str(self._broker.session_id),
+            token=cfg.token,
+            timeout_s=cfg.forge_request_timeout_s,
+            section=section,
+            offset=offset,
+            sha=sha,
+        )
 
     async def notify(self, draft: NotificationDraft) -> dict[str, Any]:
         broker = self._broker

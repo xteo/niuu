@@ -103,3 +103,7 @@ class ForgeMcpHost(ABC):
             "report_artifact needs a Forge session's own MCP (it writes that session's log)",
             status=501,
         )
+
+    async def project_more(self, *, section: str, offset: int, sha: str | None) -> dict[str, Any]:
+        """Read a bounded section of the caller's own CP project; other hosts refuse."""
+        raise ForgeApiError("project_more needs an enabled experimental session broker", status=501)

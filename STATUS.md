@@ -1,3 +1,13 @@
+# cp-dev R17 overflow retrieval (LEX-1387)
+
+- done: `exp/cp-dev-r17-overflow`, based on `origin/exp/control-plane` `1bf2cb16`, tested and independently reviewed; exact landing SHA is in cp-dev's Forge description. No deployment or live session was started.
+- implemented: opt-in broker `project_more` MCP read tool. The agent chooses only section/offset/sha; the fixed exp CP endpoint verifies the existing session bearer through exp Forge, derives its project, and applies Private policy. No device credential, new token, secret mount, or caller routing input.
+- R17 counterexample: the real injected stdio MCP and a real Skuld broker process fetched all pages from the frontend's actual CP auth/router/store fixture and recovered a question absent from the capped seed. The test reads the tool hint from the seed. Its sole test transport mapping redirects the fixed internal CP origin to an ephemeral loopback fixture; no production runtime override exists.
+- validation: 211 tests passed across `test_project_more.py`, `test_forge_mcp_tools.py`, `test_forge_mcp_broker.py`, `test_session_env.py`, `test_forge_mcp_injection.py`, and `test_rest_forge_mcp.py`; the cross-repo `test_project_more_consumer_e2e.py` integration passed separately. An additional 133 existing Forge session auth/token/facade tests pass, including invalid/expired credentials, revocation, mini-mode verification and local-only routing. New HTTP adapter statement/branch coverage: 100%. Python 3.13; Ruff and diff whitespace checks passed.
+- review: independent Codex `artifacts_handoff` approved both repos with no remaining blockers. Its CP JWT-parser counterexample is fixed in the companion frontend route, with exact regressions and a final PyJWT compatibility re-check. Real MCP integration and 39 adapter tests were rerun after the final fixture update.
+- deploy-request: niuu landing SHA in cp-dev's Forge description; cp-ops must deploy the matching frontend CP scoped route and enable `SKULD__FORGE_MCP__PROJECT_MORE_ENABLED=true` only on exp Forge, for newly launched brokers. Full instructions in `DEPLOY-REQUEST.md`.
+- D29 reuse: this extends the existing Forge MCP spec/host, scoped session token, broker credential scrubbing, and stdio injection. One small CP HTTP adapter is new because the existing toolbox had no authenticated project retrieval path. Ordinary MCP catalogs remain unchanged unless explicitly enabled.
+
 # forge-artifacts lane (LEX-1397, under LEX-1387): status
 
 Branch `exp/cp-forge-artifacts`, cut from `origin/exp/control-plane` at `33087ca2`.

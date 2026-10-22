@@ -9,10 +9,11 @@ frames.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -95,6 +96,21 @@ class _SessionRef(_Args):
 
 class _NoArgs(_Args):
     pass
+
+
+class _ProjectMoreArgs(_Args):
+    section: Literal[
+        "goal",
+        "coordinators",
+        "questions",
+        "sessions",
+        "quiet",
+        "side_quests",
+        "shipped",
+        "artifacts",
+    ]
+    offset: int = Field(default=0, ge=0, strict=True)
+    sha: str | None = Field(default=None, pattern=r"^[a-f0-9]{12}$")
 
 
 class _NotifyArgs(NotificationDraft):
@@ -741,6 +757,21 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
 
 TOOL_NAMES: tuple[str, ...] = tuple(spec.name for spec in TOOL_SPECS)
 
+# Optional broker-only read tool. Keeping it outside TOOL_SPECS preserves every
+# non-experimental and Forge-hosted HTTP MCP catalog.
+PROJECT_MORE_SPEC = ToolSpec(
+    name="project_more",
+    description=(
+        "Read an omitted section of THIS session's control-plane project. The broker "
+        "authenticates and binds the project; do not supply a project, URL or credential. "
+        "Start at offset=0, then use next_offset and sha from each response until "
+        "next_offset is null. If the section changed, restart at offset=0 without sha. "
+        "Private projects remain unavailable to cloud agents."
+    ),
+    input_schema=_ProjectMoreArgs.model_json_schema(),
+    args_model=_ProjectMoreArgs,
+)
+
 #: ``notify`` as the Forge-hosted HTTP endpoint serves it (direct feed submit).
 FEED_NOTIFY_SPEC = ToolSpec(
     name="notify",
@@ -880,16 +911,20 @@ class ForgeMcpToolbox:
         grants: Iterable[ForgeMcpGrant | str],
         limits: ForgeMcpLimits,
         notify_mode: ForgeMcpNotifyMode = ForgeMcpNotifyMode.TRANSCRIPT,
+        project_more_enabled: bool = False,
     ) -> None:
         self._client = client
         self._host = host
         self._grants = frozenset(ForgeMcpGrant(grant) for grant in grants)
         self._limits = limits
         self._tool_specs = _specs_for(notify_mode)
+        if project_more_enabled and notify_mode is ForgeMcpNotifyMode.TRANSCRIPT:
+            self._tool_specs = (*self._tool_specs, PROJECT_MORE_SPEC)
         self._specs = {spec.name: spec for spec in self._tool_specs}
         notify = self._notify if notify_mode is ForgeMcpNotifyMode.TRANSCRIPT else self._feed_notify
         self._handlers: dict[str, Callable[[Any], Awaitable[ToolResult]]] = {
             "environment": self._environment,
+            "project_more": self._project_more,
             "notify": notify,
             "describe_session": self._describe_session,
             "report_artifact": self._report_artifact,
@@ -951,6 +986,12 @@ class ForgeMcpToolbox:
             if spec.grant is None or spec.grant in self._grants
         ]
         return self._ok(environment)
+
+    async def _project_more(self, args: _ProjectMoreArgs) -> ToolResult:
+        page = await self._host.project_more(**args.model_dump())
+        # CP already bounds pages. Do not truncate the text channel: some engines
+        # ignore structuredContent, and truncation would recreate R17's lost tail.
+        return ToolResult(text=json.dumps(page, ensure_ascii=False), structured=page)
 
     async def _notify(self, args: _NotifyArgs) -> ToolResult:
         draft = NotificationDraft.model_validate(args.model_dump())
