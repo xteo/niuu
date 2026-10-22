@@ -86,3 +86,20 @@ root (`presented_files.store.root`) is gone, and its file URL answers 404.
 The merge carrying `beffb6ef` (sha in the session description). No config change: the facade's cap is Forge's
 `presented_files.max_bytes`. Then rerun check 2: a presented file's URL from mini-m6, before and after stop.
 
+# cp-dev R17: authenticated seed overflow retrieval
+
+Lane: `exp/cp-dev-r17-overflow`; independently reviewed; landing SHA is in cp-dev's Forge description. **cp-ops deploys exp only.**
+
+1. Deploy the companion lexi-frontend CP change serving `GET /v1/cp/forge/project-more?section=&offset=&sha=`. It verifies the existing `forge_session` bearer through exp Forge before deriving the project and enforcing Private policy.
+2. Deploy this niuu landing to exp Forge and set the nonsecret environment variable `SKULD__FORGE_MCP__PROJECT_MORE_ENABLED=true` on the exp-forge container. LocalProcessPodManager passes it to newly launched brokers. The default is false; existing brokers need a normal lifecycle restart to read new settings/code. Do not restart live sessions for this rollout.
+3. The broker always uses `http://10.89.0.21:9600/v1/cp/forge/project-more`, `trust_env=False`, no redirects, and its existing session token. No new credential, secret mount, production change, or proxy permission is needed. `project_more` takes only section/offset/sha, and legacy/non-exp tool catalogs are unchanged.
+4. Verify with an empty-prompt exp side-quest broker's built-in MCP: retrieve an omitted section using its seed's `project_more` hint, follow `next_offset` with the returned `sha`, then stop the scratch session. A Private project and a stopped/restarted session credential must be refused. This deployment acceptance probe is for cp-ops; the implementation tests used only local fixtures and no LLM.
+
+Cross-repo regression command (set paths to the local checkouts):
+
+```sh
+CP_PROJECT_MORE_FIXTURE_COMMAND='["/path/to/lexi-frontend/services/lexi-agent-service/node_modules/.bin/tsx","/path/to/lexi-frontend/services/lexi-agent-service/control-plane/views/__tests__/project-more-consumer.fixture.ts"]' \
+  PYTHONPATH=src python -m pytest -q -m integration tests/test_skuld/test_project_more_consumer_e2e.py --no-cov
+```
+
+This test starts the actual CP fixture, real Skuld broker, and real stdio MCP without a model. Its isolated transport shim maps only the fixed exp origin to the ephemeral fixture. The final omitted question must be recovered through complete text-channel pages; no device key is injected into the agent.
