@@ -21,9 +21,56 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Full app smoke (real lifespan, scratch PG) | done | append → live pub → burst → "Smoke page published" (art-burst:…) after hold → backfill 0 |
 | Full backend suite + coverage gate | done | 26742 passed, coverage 88% (gate 85); the 14 failures (install.sh, Docker, ravn kickoff, release guard) fail identically on the untouched base |
 | Review | done | independent review: no wedge or feed breakage; fixed burst `rev` ordering in emit/settle, suppression recheck under the feed lock, one bad burst no longer stalls the hold (settled `emit_failed` after 5), backfill stops at now − live lag, deadlocks are 503, one report per turn |
-| Merge `exp/control-plane`, land, record sha | done | `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed) |
-| Send sha to cp-platform (RF); E0 on exp stack | blocked | no Forge `message` grant; request in `DEPLOY-REQUEST.md`, needs a relay (same as cp-core) |
+| Merge `exp/control-plane`, land, record sha | done | `dbfcf260` (first `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed)) |
+| Send sha to cp-platform (RF) | relayed | ios-coordinator relayed it: cp-platform round 23 deploys exp-forge at `e2208da8` (F1, F1n, F7, F1t + forge-state) |
+| E0 on exp stack | done (items 1–3); item 4 pending | exp Forge live at `e2208da8`. (1) `/instance` → host `thor-exp`; (2) all three feeds empty before; (3) Thor's 128 manifest rows appended to exercise session `da8a686a`: **122 publications, 12 keys, 33 bursts** (all backfill, = fixture), **0 notices**; replay #2 adds 0; admin backfill scanned 126, recorded 0, 0 notices. The 25-notice golden needs forced-live timing: offline only (memory + Postgres). (4) a real publish: pending the gated provider key. `docs/operator/e0/` |
 | LEX-1397 comment | done | landing comment posted |
+
+## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9
+
+| Row | Repo / branch | State | Evidence |
+|---|---|---|---|
+| RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | re-review | review 1: 2 BLOCKER + 4 MAJOR, all fixed (write mode refuses production ports and needs the scratch id; read mode pinned with `scope=local`; full Forge route-set compare; recorded-OpenAPI mode; the gateway's 422→501 masking fixed). Branch Thor vs m6 shape **ON PAR 39/39**; live Thor `11afe41d` serves one route the branch lacks (notification images, see below). `docs/operator/forge-parity.md`, `docs/operator/f8-parity/` |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | re-review; **needs cp-core B1** | `bbe7470`. 295 control-plane tests + 1 expected-fail; `tsc` clean. The golden gives exactly 26 rows (revisions = distinct provider versions, all 230 publications); R7-8a holds and every view validates; bursts match the reference (thor 33, m6 17), with B1–B9/B1–B6 on the CP side; Forge's burst id and `rev` are used as given. Review 1: 1 BLOCKER (in cp-core's store) + 3 MAJOR, the majors and minors fixed |
+| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | **landed** `a76587ef` on lexi-ios `exp/control-plane` | `notes.py fragment` mints `f-<16 hex>` once, records `{host, session_id}` (host from `PROJECTS__INSTANCE_ID` via `keys.HOST_MAP`; refuses inside Forge without one), step ids `<feature_id>#<i>:<sha8>`; `<N>.md` `features[]` is the one source R1's `ShipUploaded` reads (validates against the frozen schema); duplicate ids refused. Identity cases 8/8; `tools/release` 145 tests (1 known `/bin/zsh` error); `release-check` OK. Two reviews. Swift `ReleaseNotesTests` run on the next train (no Xcode on Thor) |
+
+### C4 file ownership: proposal to cp-core (agreed with changes; see the C4 row)
+
+C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files except two one-line hooks:
+
+- **C4 owns (new files)** in `services/lexi-agent-service/control-plane/`:
+  - `artifacts.ts`: the registry projection (publications → artifacts by `provider_key`, revisions by provider version, project from the producing session's current project) and the CP side of the burst rule (`bursts.py` port; reads Forge's `burst_id`, records `burst` occurrences through `store.recordOccurrence()`). Its tables are created by `artifacts.ts` on the same db (`CREATE TABLE IF NOT EXISTS artifact_*`), so `store.ts`'s schema is untouched.
+  - `artifacts-ingest.ts`: polls exp Forge's `GET /artifact-publications?after=` and `GET /artifact-bursts?after=` (F1a, final) through the same allow-listed exp-Forge base as `ExpForgeIngest`, and hands publication rows to `store.apply` with `feed: 'publications'` (the shape cp-core's `applyPublication` already takes).
+  - `views-artifacts.ts`: `GET /v1/cp/views/artifacts` (scope all/recent/project, `opens: system_browser`) and the `Project.artifacts` top-5 helper.
+  - `__tests__/artifacts.test.ts` and fixtures under `contract/artifacts/`.
+- **One-line hooks in cp-core's files:** `routes.ts` (register the view) and `runtime.ts` (start the artifacts poller next to `ExpForgeIngest`). If cp-core prefers to make those two edits, C4 exports `registerArtifactRoutes(app, deps)` and `startArtifactIngest(deps)`.
+- **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
+
+Until I hear back, C4 work stays in the new files only.
+
+### C4 → cp-core request B1 (please relay)
+
+`recordOccurrence` freezes an occurrence at its first recording, so in the live order (a publication, a poll, then the agent's notice) a burst never becomes "to check", a later attach never scopes it in All updates, and widening pushes no frame. C4 can't fix this in its own files. **The patch is ready:** lexi-frontend `exp/cp-artifacts` `services/lexi-agent-service/control-plane/requests/` (README + a 65-line patch to `store.ts` and `views/headlines.ts`):
+- one ledger row per revision, with revision 0 keeping today's id;
+- the upsert also updates `project_id`/`occurred_at`;
+- a stale `announced_by` join is dropped;
+- headlines read the newest row.
+
+C4's live-order test is `it.fails` until the patch lands. **Ask:** cp-core applies the patch (or its own equivalent) on `exp/control-plane`, and C4 flips the test.
+
+### F8 findings for the coordinator
+
+1. **Release gap blocks parity at P1.** Live Thor (`11afe41d`) serves `GET /api/v1/forge/notifications/{notification_id}/image`; `exp/control-plane` doesn't (the release-only notification images). Before P1, cp-platform's X1 (branch sync) must bring that commit into `exp/control-plane`, or m6 isn't on par and Thor loses the route.
+2. **The m6 attach 501 is not a missing route.** A well-formed attach works through Thor@`11afe41d` → m6@`6c31bfe1`. A 501 is either `PUT /description` (missing at `6c31bfe1`) or a **masked domain refusal**: both revisions' gateways turned any 422 into "update the host" when `role`/`parent` was sent (the CP always sends `role`). Fixed on the branch (`_rejects_unknown_fields`); it takes effect on m6 once m6 runs the branch.
+3. **The probe's read mode is not on the production allow-list** (boot-0: no routes). Running it against production at P1 needs the allow-list's owner to add `/instance`, `/artifact-publications`, `/artifact-bursts`, `/notifications`, `/openapi.json` and `/health` (all statically zero-write).
+
+### Reuse check (VISION §0, D29)
+
+- **F8:** reused the served `/openapi.json`, `/instance` (F7) and the existing facade attach/description routes. New: `scripts/forge_parity_probe.py`, because `scripts/forge_live.py` creates billable sessions and needs httpx (not on m6's system python), and `scripts/extract_openapi.py` builds mocked node routers rather than what a host serves under its mount list. Gateway fix: a 20-line helper in `rest_volundr.py`, no new type.
+- **E0:** reused the test harness (`tests/support/artifacts.manifest_log_rows`) and Forge's own log append and backfill routes; nothing new in `src/`.
+- **R9:** extended `tools/release/notes.py`, `cp_producer.py` and `train.py`; R1's producer now reads the train's `<N>.md` instead of a second builder. New: `test_fragment_ids.py` and the vendored identity fixture.
+- **C4:** reused cp-core's store (`publications`, `sessions`, `notifications`, `ingestBatch`, `recordOccurrence`), the views module (`sessionRef`, `projectRef`, `allArtifacts`, router auth), `schema.ts`, `fetchJson`/`expForgeBase`/`expForgeOrigin`, `identity.ts` `uuid5`/`eventId`, and Forge's `burst_id` and burst feed. New: `artifact_*` tables, because the store has nowhere to keep persisted burst ids, membership, bridges or the bursts-feed cursor (`setCursor` is private, keyed by feed), plus `artifact_file_bases`.
 
 ## Decisions (docs-supported, noted here instead of asking)
 
@@ -52,6 +99,8 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 - **A burst spanning several owners' sessions** (B1 allows it) is visible to, and announced to,
   the seed session's owner. Single-owner hosts today (dev-user); revisit if Forge hosts multiple
   owners.
+- **F8 health:** the probe judges `/health` on the Forge plugins only (volundr, guild, niuu); m6 disables ting, mimir, ravn and observatory on purpose.
+- **F8 read mode** makes no per-session reads (they reach the owner lookup, which writes: `exp/prod-read-allowlist.json`); attach and create are checked in `--write` mode against loopback Forges only.
 - **A live row arriving late** (3–10 min) opens a burst already due, so its hold is short; this
   matches the reference (`due = at + hold`).
 

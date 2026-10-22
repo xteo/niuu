@@ -1,0 +1,31 @@
+check | thor-live@11afe41d | m6-live@6c31bfe1
+route GET /api/v1/forge/instance | FAIL absent | FAIL absent
+route GET /api/v1/forge/artifact-publications | FAIL absent | FAIL absent
+route GET /api/v1/forge/artifact-bursts | FAIL absent | FAIL absent
+route GET /api/v1/forge/artifact-bursts/{burst_id} | FAIL absent | FAIL absent
+route GET /api/v1/forge/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/description | ok | FAIL absent
+route GET /api/v1/forge/sessions/{session_id}/attachments | ok | FAIL absent
+route GET /api/v1/forge/projects | ok | ok
+route POST /api/v1/forge/projects | ok | ok
+route GET /api/v1/forge/sessions | ok | ok
+route POST /api/v1/forge/sessions | ok | ok
+route GET /api/v1/forge/sessions/{session_id} | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log/head | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/conversation/turns/{turn_id} | ok | ok
+route POST /api/v1/forge/sessions/{session_id}/messages | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id} | ok | ok
+route GET /api/v1/forge/feature-flags | ok | ok
+served route DELETE /api/v1/forge/storage/home | ABSENT | ok
+served route GET /api/v1/forge/notifications/{notification_id}/image | ok | ABSENT
+served route GET /api/v1/forge/sessions/{session_id}/attachments | ok | ABSENT
+served route GET /api/v1/forge/sessions/{session_id}/log/page | ABSENT | ok
+served route GET /api/v1/forge/storage/home | ABSENT | ok
+served route PATCH /api/v1/forge/admin/settings/storage | ABSENT | ok
+served route POST /api/v1/forge/delivery/{operation} | ABSENT | ok
+served route PUT /api/v1/forge/sessions/{session_id}/description | ok | ABSENT
+NOT ON PAR

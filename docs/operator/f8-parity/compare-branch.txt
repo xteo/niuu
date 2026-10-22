@@ -1,0 +1,41 @@
+check | thor-shape | mini-m6-shape
+route GET /api/v1/forge/instance | ok | ok
+route GET /api/v1/forge/artifact-publications | ok | ok
+route GET /api/v1/forge/artifact-bursts | ok | ok
+route GET /api/v1/forge/artifact-bursts/{burst_id} | ok | ok
+route GET /api/v1/forge/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/description | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/attachments | ok | ok
+route GET /api/v1/forge/projects | ok | ok
+route POST /api/v1/forge/projects | ok | ok
+route GET /api/v1/forge/sessions | ok | ok
+route POST /api/v1/forge/sessions | ok | ok
+route GET /api/v1/forge/sessions/{session_id} | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/log/head | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/conversation/turns/{turn_id} | ok | ok
+route POST /api/v1/forge/sessions/{session_id}/messages | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id} | ok | ok
+route GET /api/v1/forge/feature-flags | ok | ok
+GET /health (forge plugins) | ok (503) | ok (200)
+GET instance | ok (200) | ok (200)
+GET artifact-publications | ok (200) | ok (200)
+GET artifact-bursts | ok (200) | ok (200)
+GET notifications | ok (200) | ok (200)
+POST projects | ok (201) | ok (201)
+POST sessions coordination+dispatch_id | ok (201) | ok (201)
+create keeps coordination | ok (201) | ok (201)
+dispatch_id replay returns the same session | ok (201) | ok (201)
+GET session project | ok (200) | ok (200)
+PUT session project detach | ok (200) | ok (200)
+PUT session project attach | ok (200) | ok (200)
+PUT session description | ok (200) | ok (200)
+GET attachments | ok (200) | ok (200)
+GET session notifications | ok (200) | ok (200)
+cleanup stop session | ok (200) | ok (200)
+cleanup archive session | ok (200) | ok (200)
+cleanup archive project | ok (200) | ok (200)
+ON PAR

@@ -1,6 +1,22 @@
+# Config follow-up for exp Forge (cp-platform), from E0 on 2026-10-22
+
+exp Forge `e2208da8` is live and E0 items 1–3 pass (`docs/operator/e0/e0-evidence.json`). One config gap:
+`GET /api/v1/forge/instance` answers `tailnet_name: "100.66.123.128"` because `host_identity.tailnet_name` is unset
+and it falls back to `server_public_host`. C4 builds file URLs on the host's tailnet name (wire: never `*.xteo.mesh`,
+phone-reachable). Please add to exp Forge's config, then restart it:
+
+```yaml
+host_identity:
+  tailnet_name: thor.tail737f2a.ts.net
+```
+
+Check: `/instance` → `"tailnet_name": "thor.tail737f2a.ts.net"`. No code change, no migration.
+
+---
+
 # Deploy request: forge-artifacts → exp Forge (RF), for cp-platform
 
-**Sha:** niuu `exp/control-plane` at **`9f145a1a`** (lane commit `cf1b778a`, merged no-ff onto `33087ca2`).
+**Sha:** niuu `exp/control-plane` at **`dbfcf260`** (F1/F1n/F7/F1t `cf1b778a`; migration renumbered to `000089` in `16e0e48d`).
 
 **What it adds to exp Forge:** F1 artifact publications, F1n burst notices (120 s durable hold),
 F7 `GET /instance`, F1t type/marker. Migration `000089_forge_artifact_publications` (also under

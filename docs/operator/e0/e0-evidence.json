@@ -1,0 +1,61 @@
+{
+ "when": "2026-10-22",
+ "target": "exp Forge :8380 (edge 100.66.123.128), revision e2208da89afd85f992f4ac9290c0bb80019e2d34",
+ "instance": {
+  "host": "thor-exp",
+  "tailnet_name": "100.66.123.128 (config gap: host_identity.tailnet_name unset)",
+  "instance_id": "315df5b7-05b2-4258-ae5b-fd86fa44ca95"
+ },
+ "before": {
+  "publications": 0,
+  "bursts": 0,
+  "notifications": 0
+ },
+ "exercise_session": "da8a686a-8866-4224-82e7-6fe5c03174bf (e0-artifact-replay)",
+ "replay_1": {
+  "rows_appended": 128,
+  "statuses": [
+   201,
+   201,
+   201
+  ],
+  "publications": 122,
+  "provider_keys": 12,
+  "publication_origins": {
+   "backfill": 122
+  },
+  "bursts": 33,
+  "burst_origins": {
+   "backfill": 33
+  },
+  "notifications": 0
+ },
+ "replay_2": {
+  "rows_appended": 128,
+  "conflicts": [
+   [],
+   [],
+   []
+  ],
+  "publications_after": 122,
+  "bursts_after": 33,
+  "notifications_after": 0
+ },
+ "backfill": {
+  "scanned_rows": 126,
+  "recorded": 0,
+  "last_session_id": "da8a686a-8866-4224-82e7-6fe5c03174bf",
+  "last_seq": 128,
+  "origin": "backfill",
+  "instance_id": "315df5b7-05b2-4258-ae5b-fd86fa44ca95"
+ },
+ "fixture": {
+  "thor_publications": 122,
+  "thor_keys": 12,
+  "bursts": 33
+ },
+ "not_run_live": [
+  "25 notices: needs forced-live timing over the 14-day window; covered offline on memory and real Postgres (tests)",
+  "item 4: a real publication needs a live provider key (gated in boot-0)"
+ ]
+}

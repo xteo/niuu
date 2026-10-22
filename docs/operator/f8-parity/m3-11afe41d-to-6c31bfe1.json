@@ -1,0 +1,67 @@
+[
+ {
+  "case": "register m6 in Thor's guild",
+  "status": 201,
+  "detail": null
+ },
+ {
+  "case": "Thor project",
+  "status": 201,
+  "detail": null
+ },
+ {
+  "case": "m6 session (direct)",
+  "status": 201,
+  "detail": null
+ },
+ {
+  "case": "second m6 session (direct)",
+  "status": 201,
+  "detail": null
+ },
+ {
+  "case": "Thor session",
+  "status": 201,
+  "detail": null
+ },
+ {
+  "case": "GET project via gateway",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "attach, no role",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "undo (detach)",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "attach with role",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "undo again",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "attach with cross-host parent (Thor coordinator)",
+  "status": 200,
+  "detail": null
+ },
+ {
+  "case": "attach with local parent that is not a project member",
+  "status": 501,
+  "detail": "{\"detail\":\"Update this session's Forge host to set project roles and coordinators\"}"
+ },
+ {
+  "case": "PUT description via gateway",
+  "status": 501,
+  "detail": "Update this session's Forge host to enable descriptions"
+ }
+]
