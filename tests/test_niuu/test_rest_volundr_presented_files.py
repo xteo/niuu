@@ -135,7 +135,12 @@ async def test_the_facade_enforces_the_policy_even_if_the_node_omits_it() -> Non
 
     @node.get("/api/v1/forge/sessions/{sid}/files/presented/{fid}")
     async def bare(sid: str, fid: str):
-        return Response(content=b"<svg onload=alert(1)>", media_type="image/svg+xml")
+        # An old or wrong node: no safety headers, and a cache policy the facade must not trust.
+        return Response(
+            content=b"<svg onload=alert(1)>",
+            media_type="image/svg+xml",
+            headers={"cache-control": "public, max-age=31536000"},
+        )
 
     @node.get("/api/v1/forge/sessions/{sid}")
     async def session_row(sid: str):
@@ -159,3 +164,15 @@ async def test_the_facade_enforces_the_policy_even_if_the_node_omits_it() -> Non
     assert r.headers["content-security-policy"] == "sandbox"
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["cache-control"] == "private, no-store"
+
+
+def test_the_policy_by_type() -> None:
+    from niuu.domain.presented_files import presented_file_safety_headers
+
+    assert presented_file_safety_headers("text/html; charset=utf-8") == {
+        "x-content-type-options": "nosniff",
+        "content-security-policy": "sandbox",
+    }
+    assert presented_file_safety_headers("image/svg+xml")["content-security-policy"] == "sandbox"
+    assert presented_file_safety_headers("application/pdf") == {"x-content-type-options": "nosniff"}
+    assert presented_file_safety_headers(None)["content-security-policy"] == "sandbox"
