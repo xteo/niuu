@@ -19,7 +19,8 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 
-PRESENTED_FILE_ID_PATTERN = r"^pf_[0-9a-f]{32}$"
+from niuu.domain.presented_files import PRESENTED_FILE_ID_PATTERN
+
 _PRESENTED_FILE_ID = re.compile(PRESENTED_FILE_ID_PATTERN)
 _FORBIDDEN_HOST_SUFFIX = ".xteo.mesh"
 

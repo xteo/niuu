@@ -105,6 +105,8 @@ ROUTE_POLICIES: tuple[RoutePolicy, ...] = (
     RoutePolicy("POST", f"{_S}/usage", FORGE_NOTIFY_SCOPE, Binding.OWN),
     # The agent keeps its own session's descriptions current; PUT {_S} stays denied.
     RoutePolicy("PUT", f"{_S}/description", FORGE_NOTIFY_SCOPE, Binding.OWN),
+    # The broker's durable copy of a file its own session presented (F2).
+    RoutePolicy("PUT", f"{_S}/files/presented/{{file_id}}", FORGE_NOTIFY_SCOPE, Binding.OWN),
     # The Forge-hosted MCP. Each tool re-enters this allow-list as a REST call.
     RoutePolicy("POST", f"{FORGE_PREFIX}/mcp", None, Binding.NONE),
 )

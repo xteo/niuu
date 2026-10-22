@@ -63,6 +63,11 @@ from niuu.adapters.outbound.guild_transport import (
 )
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.notifications import notification_visible_to
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_DEFAULT_MAX_BYTES,
+    PRESENTED_FILE_ID_PATTERN,
+    PRESENTED_FILE_NAME_HEADER,
+)
 from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
@@ -928,6 +933,7 @@ def create_volundr_router(
     forge_stream_retry_seconds: float = 5.0,
     forge_stream_keepalive_seconds: float = 15.0,
     forge_stream_queue_maxsize: int = 256,
+    presented_file_max_bytes: int = PRESENTED_FILE_DEFAULT_MAX_BYTES,
 ) -> APIRouter:
     """Create a registry-aware Forge runtime router."""
     router = APIRouter(
@@ -3701,6 +3707,54 @@ def create_volundr_router(
             content=response.content,
             media_type=response.headers.get("content-type", "application/octet-stream"),
             headers=headers,
+        )
+
+    @router.put("/sessions/{session_id}/files/presented/{file_id}")
+    async def store_presented_file(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        file_id: str = Path(pattern=PRESENTED_FILE_ID_PATTERN, description="present-file id"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The broker's durable copy of a presented file (control-plane F2), on the owning node.
+
+        The bytes, their content type and the file-name header pass through unchanged, and
+        Forge's answer comes back as is (404, 409 and 413 included), so the broker can tell
+        a final refusal from a retryable one. The session credential stays local
+        (``_request_remote`` refuses to forward it to another node).
+        """
+        # Bounded before it is buffered: Forge's own cap, refused at the edge.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > presented_file_max_bytes:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > presented_file_max_bytes:
+                raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+            chunks.append(chunk)
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        passthrough = {
+            name: value
+            for name in ("content-type", PRESENTED_FILE_NAME_HEADER, "retry-after")
+            if (value := request.headers.get(name)) is not None
+        }
+        upstream = await _request_remote(
+            instance,
+            request,
+            method="PUT",
+            path=f"/sessions/{session_id}/files/presented/{file_id}",
+            content_body=b"".join(chunks),
+            extra_headers=passthrough,
+            embedded_app=embedded_forge_app,
+        )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
         )
 
     @router.post("/sessions/{session_id}/files/upload")

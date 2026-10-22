@@ -269,6 +269,7 @@ def create_app(
                             loaded_settings.forge_stream_keepalive_seconds
                         ),
                         forge_stream_queue_maxsize=loaded_settings.forge_stream_queue_maxsize,
+                        presented_file_max_bytes=loaded_settings.presented_files.max_bytes,
                     )
                 )
                 app.include_router(
