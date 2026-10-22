@@ -229,3 +229,13 @@ Deferred (noted, not blocking boot 0):
 3. V2 project seed and voice: lexi-frontend, worktree `~/repos/worktrees/exp-cp-seed`, branch
    `exp/cp-seed` (cut from `origin/exp/control-plane` `507deef`); status in that branch's STATUS.md.
 4. C2v-b: after cp-core lands the C2v split.
+
+## Judge R16 (fc519b0c), 22 Oct
+
+| Finding | State | Evidence |
+|---|---|---|
+| **R16-1** F2: the public facade dropped `Content-Security-Policy: sandbox` and `nosniff` | fixed | `40176eff` + follow-up: one policy (`niuu.domain.presented_files.presented_file_safety_headers`: nosniff always, sandbox for all but PDF) on every route that serves a presented file: Forge's durable copy, Forge's live-broker fallback (`private, no-store`), the **public facade** (enforced whatever the node sends; only the two known cache policies pass), and the broker itself (its presented route, inline with the staged name and type, and its SendUserFile route), so `/s/{id}/api/...` inherits it. The judge's counterexample is `test_the_public_get_keeps_the_sandbox` (the public GET equals the node's headers). Review: 0 high, 1 medium (the broker had no policy: fixed), lows fixed. **Note:** a durable file stays in a browser's cache up to a day after a viewer's access ends |
+| **R16-3** B1: a changed `(instance, same uuid)` parent was overwritten | fixed (lexi-frontend `exp/cp-owners`) | see that branch's STATUS |
+| **R16-2** V2: seed overflow links hardcode `:9500` | in progress | |
+| **R16-6** remove `originOf` in `views/project.ts` once cp-core's `session()` parses origin | waiting on cp-core | |
+

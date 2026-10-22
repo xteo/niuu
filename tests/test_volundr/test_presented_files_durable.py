@@ -11,7 +11,9 @@ import os
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import httpx
 import pytest
+import respx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -238,10 +240,16 @@ async def test_durable_copy_serves_after_the_session_stopped(tmp_path):
     assert resp.content == b"%PDF"
     assert resp.headers["content-type"] == "application/pdf"
     assert resp.headers["content-disposition"].startswith("inline")
-    # Agent-supplied content renders but never runs script on Forge's origin.
-    assert resp.headers["content-security-policy"] == "sandbox"
+    # A PDF keeps nosniff; the sandbox would stop Chrome's viewer, and a PDF can't run script here.
+    assert "content-security-policy" not in resp.headers
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert "report.pdf" in resp.headers["content-disposition"]
+    # Agent-supplied HTML renders but never runs script on Forge's origin.
+    html_id = "pf_" + "c" * 32
+    await store.put(session.id, html_id, name="page.html", mime="text/html", data=b"<script>")
+    html = client.get(presented_file_path(session.id, html_id))
+    assert html.headers["content-security-policy"] == "sandbox"
+    assert html.headers["x-content-type-options"] == "nosniff"
 
     # Another session's URL never reaches this copy.
     assert client.get(presented_file_path(uuid4(), FILE_ID)).status_code == 404
@@ -292,3 +300,33 @@ async def test_upload_landing_after_the_session_was_deleted_leaves_nothing(tmp_p
     assert resp.status_code == 404
     assert await store.get(sid, FILE_ID) is None
     assert not (tmp_path / str(sid)).exists()
+
+
+# ------------------------------------------------------- judge R16-1: the safety policy
+
+
+@respx.mock
+async def test_live_broker_fallback_carries_the_same_safety_policy(tmp_path):
+    """No durable copy yet: the live broker's staged copy is proxied, and Forge adds the
+    sandbox and nosniff headers itself (the broker sends none) and never caches it."""
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = Session(
+        id=uuid4(),
+        name="live",
+        model="test",
+        source=GitSource(repo="https://example.test/repo", branch="main"),
+        status=SessionStatus.RUNNING,
+        chat_endpoint="ws://broker.test:8080/session",
+        code_endpoint="http://broker.test:8080/",
+    )
+    await repository.create(session)
+    respx.route(path__regex=r".*/api/files/presented/.*").mock(
+        return_value=httpx.Response(
+            200, content=b"<script>x</script>", headers={"content-type": "text/html"}
+        )
+    )
+    resp = client.get(presented_file_path(session.id, FILE_ID))
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-security-policy"] == "sandbox"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["cache-control"] == "private, no-store"
