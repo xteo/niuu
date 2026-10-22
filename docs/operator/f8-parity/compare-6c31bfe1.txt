@@ -1,0 +1,31 @@
+check | thor-shape | mini-m6-shape@6c31bfe1
+route GET /api/v1/forge/instance | ok | FAIL absent
+route GET /api/v1/forge/artifact-publications | ok | FAIL absent
+route GET /api/v1/forge/artifact-bursts | ok | FAIL absent
+route GET /api/v1/forge/artifact-bursts/{burst_id} | ok | FAIL absent
+route GET /api/v1/forge/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/notifications | ok | ok
+route GET /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/project | ok | ok
+route PUT /api/v1/forge/sessions/{session_id}/description | ok | FAIL absent
+route GET /api/v1/forge/sessions/{session_id}/attachments | ok | FAIL absent
+route GET /api/v1/forge/projects | ok | ok
+route POST /api/v1/forge/projects | ok | ok
+route GET /api/v1/forge/sessions | ok | ok
+route POST /api/v1/forge/sessions | ok | ok
+GET /health (forge plugins) | ok (503) | ok (200)
+GET instance | ok (200) | FAIL expected (200,): Not Found (404)
+GET artifact-publications | ok (200) | FAIL expected (200,): Not Found (404)
+GET artifact-bursts | ok (200) | FAIL expected (200,): Not Found (404)
+GET notifications | ok (200) | ok (200)
+POST projects | ok (201) | ok (201)
+POST sessions coordination+dispatch_id | ok (201) | ok (201)
+create keeps coordination | ok (201) | ok (201)
+dispatch_id replay returns the same session | ok (201) | ok (201)
+GET session project | ok (200) | ok (200)
+PUT session project detach | ok (200) | ok (200)
+PUT session project attach | ok (200) | ok (200)
+PUT session description | ok (200) | FAIL expected (200,): Not Found (404)
+GET attachments | ok (200) | FAIL expected (200,): Not Found (404)
+GET session notifications | ok (200) | ok (200)
+NOT ON PAR

@@ -31,7 +31,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Row | Repo / branch | State | Evidence |
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
-| F8 m6 on par | niuu `exp/cp-forge-artifacts` | doing | a parity probe run against a Thor-shaped and an m6-shaped Forge (native, embedded PG without pgvector/pgcrypto); branch only, m6 production untouched until P1 |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
 | C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
 
@@ -48,6 +48,10 @@ C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files 
 - **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
 
 Until I hear back, C4 work stays in the new files only.
+
+### F8 finding for the coordinator (design §V11/§V12, ux data-needs)
+
+**Attach is not m6's gap at `6c31bfe1`.** Its code, in m6's own config and launch shape, serves `GET`/`PUT /sessions/{id}/project`, takes `coordination` + `dispatch_id` on create (a replay returns the same session), and attaches an m6 session to a Thor project **through Thor's guild gateway**, with and without `role`. The recorded 501 doesn't follow from code or config. If live m6 still answers 501, the cause is live state. P1 should rerun the probe and one attach through Thor's gateway. I didn't probe live m6: its per-session reads write.
 
 ## Decisions (docs-supported, noted here instead of asking)
 
@@ -76,6 +80,8 @@ Until I hear back, C4 work stays in the new files only.
 - **A burst spanning several owners' sessions** (B1 allows it) is visible to, and announced to,
   the seed session's owner. Single-owner hosts today (dev-user); revisit if Forge hosts multiple
   owners.
+- **F8 health:** the probe judges `/health` on the Forge plugins only (volundr, guild, niuu); m6 disables ting, mimir, ravn and observatory on purpose.
+- **F8 read mode** makes no per-session reads (they reach the owner lookup, which writes: `exp/prod-read-allowlist.json`); attach and create are checked in `--write` mode against loopback Forges only.
 - **A live row arriving late** (3–10 min) opens a burst already due, so its hold is short; this
   matches the reference (`due = at + hold`).
 
@@ -114,7 +120,7 @@ install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickof
 | Row | Repo / branch | State | Evidence |
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
-| F8 m6 on par | niuu `exp/cp-forge-artifacts` | doing | a parity probe run against a Thor-shaped and an m6-shaped Forge (native, embedded PG without pgvector/pgcrypto); branch only, m6 production untouched until P1 |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
 | C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
 

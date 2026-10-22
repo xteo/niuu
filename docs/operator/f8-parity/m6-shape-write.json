@@ -1,0 +1,241 @@
+{
+  "label": "mini-m6-shape",
+  "base": "http://127.0.0.1:41180",
+  "mode": "write",
+  "build": "f8-m6-shape",
+  "revision": "288a2fcd1ae0d70df167854ed747746786dbd1df",
+  "checks": [
+    {
+      "name": "route GET /api/v1/forge/instance",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/artifact-publications",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/artifact-bursts",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/artifact-bursts/{burst_id}",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/notifications",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/notifications",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/project",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route PUT /api/v1/forge/sessions/{session_id}/project",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route PUT /api/v1/forge/sessions/{session_id}/description",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/attachments",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/projects",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route POST /api/v1/forge/projects",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route POST /api/v1/forge/sessions",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "GET /health (forge plugins)",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "GET instance",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "host",
+        "tailnet_name",
+        "instance_id"
+      ]
+    },
+    {
+      "name": "GET artifact-publications",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "host",
+        "items",
+        "next_after",
+        "has_more"
+      ]
+    },
+    {
+      "name": "GET artifact-bursts",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "host",
+        "items",
+        "next_after",
+        "has_more"
+      ]
+    },
+    {
+      "name": "GET notifications",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "items",
+        "head_seq",
+        "revision"
+      ]
+    },
+    {
+      "name": "POST projects",
+      "ok": true,
+      "status": 201,
+      "detail": "",
+      "keys": [
+        "id"
+      ]
+    },
+    {
+      "name": "POST sessions coordination+dispatch_id",
+      "ok": true,
+      "status": 201,
+      "detail": "",
+      "keys": [
+        "id"
+      ]
+    },
+    {
+      "name": "create keeps coordination",
+      "ok": true,
+      "status": 201,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "dispatch_id replay returns the same session",
+      "ok": true,
+      "status": 201,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "GET session project",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "revision"
+      ]
+    },
+    {
+      "name": "PUT session project detach",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "revision"
+      ]
+    },
+    {
+      "name": "PUT session project attach",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": [
+        "revision"
+      ]
+    },
+    {
+      "name": "PUT session description",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "GET attachments",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "GET session notifications",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    }
+  ],
+  "on_par_ready": true
+}
