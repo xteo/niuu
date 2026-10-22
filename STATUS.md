@@ -52,7 +52,17 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 
 The sync branches are `exp/cp-x1-sync` in each repo.
 
-**H1 replay harnesses:** building on lexi-frontend `exp/cp-h1`, inside cp-core's `control-plane/` module (its ingest, replay transports, acceptance harness, C4's registry, R1's `cp_producer` for receipts). New: test files and `replay/h1/` corpora only; evidence goes in `replay/h1/coverage-replay.json` for E1's `e1-coverage.json`.
+**H1 replay harnesses: landed** on lexi-frontend `exp/control-plane` **`7e722c4`** (lane `exp/cp-h1` `54d34e1`), after two review rounds. Code: `__tests__/h1-replay.test.ts`, `replay/h1/`, `scripts/cp-build-h1-receipts.py`; no cp-core file changed.
+1. **Two-origin feed:** I1 (one UUID on two hosts = two sessions, `uuid_collisions` flagged), I7 (a parent by instance id; a UUID-only parent on two hosts is unknown in either arrival order, which cp-core fixed in `ed36990` from the H1 request), duplicate ids, a cross-transport row refused, B5 (per-host bursts with `bursts.py` ids), B1, idempotent replay.
+2. **Frozen m6 corpus:** 108 publications, 14 keys, 17 bursts = `bursts.py`.
+3. **Daily receipts:** 68 builds (2305–2372) rebuilt offline from git with lexi-ios's own R1/R9 code: 62 features, 251 steps, 2358 an unverified fold. Each build's fragments come from its own `<N>.md`; posted through `POST /v1/cp/events`; the second replay is all duplicates. The daily product stays `com.xteo.lexi.chat` (`ios-cp` is the CP train's).
+
+Evidence for E1's `e1-coverage.json`: `replay/h1/coverage-replay.json`. Each test asserts its counts against the file. The one remaining gap: 2358's `unverified` vs `none` shows only in `SOURCES.json` until the frozen schema can carry it.
+
+**C4 session names (cp-ios-app's report): fixed by config, guarded by tests** (`fb209ed`, landed with H1).
+- **Cause:** exp Forge stamps its guild id `315df5b7…` on every session. exp-cp R27 ran cp-core's default config (thor-exp self id `thor-exp` only), so exp Forge's sessions were refused as `foreign_instance`, and `sessionRef` fell back to the id.
+- **Fix:** O1a's `config/exp-cp.json` (or R29's stack `cp.json`) lists the guild id.
+- **Tests:** a golden assertion that all 26 replayed rows carry their catalog name; cp-core's own `ExpForgeIngest` with `exp-cp.json` names the row, and with the default config the session is refused.
 
 **Reuse check (X1):** git merges only; the conflict helpers stayed in my scratchpad; nothing new in any repo besides the resolved code and the migration renumber/alias.
 

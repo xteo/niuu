@@ -6,7 +6,9 @@
    - **Optional config:** `notifications.images` (defaults work).
    - **Also in:** F8's gateway fix (`1b8fb72b`).
    - **Check:** `/health` OK; F8's probe `openapi` on the deployed doc shows `GET /api/v1/forge/notifications/{notification_id}/image`.
-2. **exp-cp ← lexi-frontend `exp/control-plane` `8999066`.** `main`'s agent-cli change only; no CP change beyond what's deployed. Rebuild at your next round.
+2. **exp-cp ← lexi-frontend `exp/control-plane` `7e722c4`** (supersedes `8999066`). It contains X1's `main` merge, H1's replay harnesses (tests and corpora only; no runtime change) and C4's session-name tests.
+   - **Mount O1a's `config/exp-cp.json`** as `cp.json` (it lists exp Forge's guild id `315df5b7…` among thor-exp's self ids). Without it, exp Forge's sessions are refused as `foreign_instance`, and the artifact rows show the session id as `session.name` (cp-ios-app's report).
+   - **Check:** `GET /v1/cp/views/artifacts?scope=all` rows from thor-exp have `session.name` ≠ `session.id` (e.g. `e0-artifact-replay`).
 3. **lexi-ios `exp/control-plane` `6282a827`** (build 2372 merged): no deploy. Please have the next Lexi CP train or cp-ios-app build it on mini-m6; Thor can't build Swift.
 
 ---
