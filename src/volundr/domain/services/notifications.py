@@ -342,7 +342,7 @@ class NotificationService(NotificationRecorder):
             engine=context.engine,
             model=context.model,
             correlation_id=draft.correlation_id,
-            metadata=metadata,
+            metadata={**metadata, **draft.question_metadata()},
         )
 
     async def _record(self, candidates: list[NotificationCandidate]) -> list[Notification]:
