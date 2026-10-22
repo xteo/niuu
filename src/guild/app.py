@@ -271,6 +271,7 @@ def create_app(
                         ),
                         forge_stream_queue_maxsize=loaded_settings.forge_stream_queue_maxsize,
                         guild_membership=loaded_settings.guild.membership(),
+                        presented_file_max_bytes=loaded_settings.presented_files.max_bytes,
                     )
                 )
                 app.include_router(
