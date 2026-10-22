@@ -195,6 +195,9 @@ def test_a_dispatch_replay_that_makes_a_second_session_fails():
         "http://127.0.0.1:8380",
         "http://127.0.0.1:9500",
         "http://127.0.0.1:9600",
+        "http://127.0.0.1:8070",  # Thor's nginx in front of production Forge
+        "http://127.0.0.1",
+        "https://localhost",
     ],
 )
 def test_write_mode_refuses_anything_but_a_scratch_port(base):
@@ -390,3 +393,19 @@ def test_main_prints_the_report_and_fails_an_old_host(monkeypatch, capsys):
 
     assert fpp.main(["probe", "--base", "http://m6", "--label", "m6"]) == 1
     assert json.loads(capsys.readouterr().out)["on_par_ready"] is False
+
+
+@pytest.mark.parametrize(
+    "instance_id", ["56499f00-02b3-4d80-8137-09d6d3238056", "e5b9deba-0000-0000-0000-000000000000"]
+)
+def test_write_mode_refuses_a_production_instance_id(instance_id):
+    with pytest.raises(PermissionError, match="production instance"):
+        guard_write(SCRATCH, instance_id)
+
+
+def test_write_mode_refuses_a_scratch_port_that_answers_as_production():
+    forge = FakeForge(instance_id="56499f00-02b3-4d80-8137-09d6d3238056")
+    with pytest.raises(PermissionError, match="production instance"):
+        probe(SCRATCH, "s", write=True, expect_instance_id="scratch-id", client=forge)
+
+    assert {method for method, _, _ in forge.calls} == {"GET"}

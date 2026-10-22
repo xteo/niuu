@@ -28,8 +28,8 @@ and the two artifact feeds and the notification feed, each pinned to the probed 
 - read attachments and the session's notifications;
 - clean up: stop and archive the session, archive the project.
 
-It refuses a host that isn't loopback, any production port, and any Forge whose
-``/instance`` id doesn't equal ``--expect-instance-id``.
+It refuses a host that isn't loopback, any port outside the scratch range 41000-41999, a
+production instance id, and any Forge whose ``/instance`` id isn't ``--expect-instance-id``.
 
 Standard library only, so it runs from any host (m6's system python included).
 """
@@ -53,9 +53,18 @@ FORGE = "/api/v1/forge"
 # exp/prod-read-allowlist.json "transport": timeout_s 10, min_interval_ms 200 (serial here).
 TIMEOUT_S = 10.0
 MIN_INTERVAL_S = 0.2
-# Production and exp ports on Thor (Forge 8080, Work 8280, exp Forge 8380, agent service
-# 9500, exp CP 9600). Write mode never runs against them, even on loopback.
-PRODUCTION_PORTS = frozenset({8080, 8280, 8380, 9500, 9600})
+# Write mode runs only on a scratch port. An allow-list, because production also answers on
+# other loopback ports (Thor's nginx :8070 proxies to Forge :8080).
+SCRATCH_PORTS = range(41000, 42000)
+# Production Forges' own instance ids (Thor; mini-m6 as Thor's guild and as itself): a
+# scratch Forge never has one, so write mode refuses them whatever the port.
+PRODUCTION_INSTANCE_IDS = frozenset(
+    {
+        "56499f00-02b3-4d80-8137-09d6d3238056",
+        "c3d1d72f-14fb-4aca-91ae-c3a40106a27a",
+    }
+)
+PRODUCTION_INSTANCE_PREFIXES = ("e5b9deba",)
 
 # F8 (lanes.md: attach, artifacts, notifications), the session description and attachments
 # index m6 lacks (design §V12), and the Forge-side routes the control plane reads (§V12/§V13).
@@ -337,10 +346,18 @@ def guard_write(base: str, expect_instance_id: str | None) -> None:
     if not _is_loopback(url.hostname or ""):
         raise PermissionError("--write creates rows; it runs only against a loopback Forge")
     port = url.port or (443 if url.scheme == "https" else 80)
-    if port in PRODUCTION_PORTS:
-        raise PermissionError(f"--write refuses port {port}: a production or exp service")
+    if port not in SCRATCH_PORTS:
+        lo, hi = SCRATCH_PORTS.start, SCRATCH_PORTS.stop - 1
+        raise PermissionError(f"--write runs only on a scratch port ({lo}-{hi}), not {port}")
     if not expect_instance_id:
         raise PermissionError("--write needs --expect-instance-id (the scratch Forge's id)")
+    if _is_production_instance(expect_instance_id):
+        raise PermissionError(f"--write refuses production instance {expect_instance_id}")
+
+
+def _is_production_instance(instance_id: str | None) -> bool:
+    value = (instance_id or "").lower()
+    return value in PRODUCTION_INSTANCE_IDS or value.startswith(PRODUCTION_INSTANCE_PREFIXES)
 
 
 def probe(
@@ -358,6 +375,8 @@ def probe(
     routes = forge_routes(client.request("GET", "/openapi.json").body)
     read, instance = safe_checks(client, health)
     checks = route_checks(routes) + read
+    if write and _is_production_instance(instance.get("instance_id")):
+        raise PermissionError(f"--write: {base} is production instance {instance['instance_id']}")
     if write and instance.get("instance_id") != expect_instance_id:
         raise PermissionError(
             f"--write: {base} is instance {instance.get('instance_id')}, "

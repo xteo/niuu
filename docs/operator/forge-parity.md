@@ -37,9 +37,10 @@ python3 scripts/forge_parity_probe.py compare thor.json m6.json [--exclude "GET 
   - **No per-session reads:** they reach the owner lookup, which writes.
 - **Write mode (`--write --expect-instance-id <id>`)** runs the behaviour checks on a scratch
   Forge only.
-  - **Refusals:** a host that isn't loopback, ports 8080, 8280, 8380, 9500 and 9600, and any
-    Forge whose `/instance` id isn't the expected one. Nothing is written before the id
-    matches.
+  - **Refusals:** a host that isn't loopback, any port outside the scratch range 41000–41999
+    (an allow-list: Thor's nginx also serves production Forge on :8070), a production
+    instance id (Thor's and m6's), and any Forge whose `/instance` id isn't the expected one.
+    Nothing is written before the id matches.
   - **Checks:**
     - register a project;
     - create a session with `coordination` and a `dispatch_id`, then replay the create,
