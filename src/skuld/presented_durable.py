@@ -56,6 +56,17 @@ def write_pending_record(staged: Path, *, name: str, mime: str) -> None:
         )
 
 
+def pending_record(staged: Path) -> dict[str, str] | None:
+    """The name and mime recorded at staging (``presented.json``), or ``None``."""
+    try:
+        record = json.loads((staged.parent / PENDING_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not record.get("name") or not record.get("mime"):
+        return None
+    return {"name": str(record["name"]), "mime": str(record["mime"])}
+
+
 def is_refused(staged: Path) -> bool:
     return (staged.parent / REFUSED_MARKER).exists()
 

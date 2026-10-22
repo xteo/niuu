@@ -28,6 +28,7 @@ from niuu.build_identity import build_identity
 from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
+from niuu.domain.presented_files import PRESENTED_FILE_LIVE_CACHE, presented_file_safety_headers
 from niuu.domain.text_projection import projection_revision
 from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for_route
 from skuld.conversation_models import ConversationTurn
@@ -44,6 +45,7 @@ from skuld.path_security import (
 )
 from skuld.presented_durable import (
     SIDECARS,
+    pending_record,
     pending_uploads,
     retry_presented_upload,
     upload_presented_file,
@@ -773,7 +775,13 @@ async def download_send_user_file(tool_use_id: str, file_uuid: str) -> FileRespo
     media_type = str(attachment.get("media_type") or "").strip()
     if not media_type:
         media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-    return FileResponse(resolved, filename=resolved.name, media_type=media_type)
+    # The media type is the agent's own claim: never let it run on the origin (judge R16-1).
+    return FileResponse(
+        resolved,
+        filename=resolved.name,
+        media_type=media_type,
+        headers=presented_file_safety_headers(media_type),
+    )
 
 
 # --- Capabilities API ---
@@ -1211,10 +1219,21 @@ async def download_presented_file(file_id: str) -> FileResponse:
         raise HTTPException(410, "file no longer available") from None
     if safe_path.is_symlink() or not safe_path.is_file():
         raise HTTPException(410, "file no longer available")
+    # The name and type recorded at staging (the staged bytes are always called ``content``).
+    recorded = pending_record(safe_path) or {}
+    name = recorded.get("name") or safe_path.name
+    media_type = recorded.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    # Agent-supplied: rendered inline like Forge's durable copy, never run on the origin
+    # (judge R16-1). Every proxy in front of the broker inherits the policy.
     return FileResponse(
         path=safe_path,
-        filename=safe_path.name,
-        media_type=mimetypes.guess_type(safe_path.name)[0] or "application/octet-stream",
+        filename=name,
+        media_type=media_type,
+        content_disposition_type="inline",
+        headers={
+            "cache-control": PRESENTED_FILE_LIVE_CACHE,
+            **presented_file_safety_headers(media_type),
+        },
     )
 
 

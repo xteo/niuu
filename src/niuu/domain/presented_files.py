@@ -17,7 +17,23 @@ PRESENTED_FILE_SAFETY_HEADERS = {
     "content-security-policy": "sandbox",
 }
 
-#: The durable copy never changes under its id; the live broker's copy is served only while
-#: the session runs, so it is never cached.
+#: Types the sandbox would break and that cannot run script on Forge's origin: Chrome refuses
+#: to show a PDF in its viewer under ``Content-Security-Policy: sandbox``.
+SANDBOX_EXEMPT_TYPES = frozenset({"application/pdf"})
+
+
+def presented_file_safety_headers(media_type: str | None) -> dict[str, str]:
+    """The safety policy for a presented file of ``media_type``: ``nosniff`` always, and the
+    sandbox for every type but the exempt ones (judge R16-1)."""
+    base = (media_type or "").split(";")[0].strip().lower()
+    if base in SANDBOX_EXEMPT_TYPES:
+        return {"x-content-type-options": "nosniff"}
+    return dict(PRESENTED_FILE_SAFETY_HEADERS)
+
+
+#: The durable copy never changes under its id (a different file under the same id is a 409),
+#: so a browser may keep it for a day; a viewer whose access ends keeps it that long. The live
+#: broker's copy is served only while the session runs, so it is never cached.
 PRESENTED_FILE_DURABLE_CACHE = "private, max-age=86400, immutable"
 PRESENTED_FILE_LIVE_CACHE = "private, no-store"
+PRESENTED_FILE_CACHE_POLICIES = frozenset({PRESENTED_FILE_DURABLE_CACHE, PRESENTED_FILE_LIVE_CACHE})

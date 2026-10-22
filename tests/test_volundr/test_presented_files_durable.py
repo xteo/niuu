@@ -240,10 +240,16 @@ async def test_durable_copy_serves_after_the_session_stopped(tmp_path):
     assert resp.content == b"%PDF"
     assert resp.headers["content-type"] == "application/pdf"
     assert resp.headers["content-disposition"].startswith("inline")
-    # Agent-supplied content renders but never runs script on Forge's origin.
-    assert resp.headers["content-security-policy"] == "sandbox"
+    # A PDF keeps nosniff; the sandbox would stop Chrome's viewer, and a PDF can't run script here.
+    assert "content-security-policy" not in resp.headers
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert "report.pdf" in resp.headers["content-disposition"]
+    # Agent-supplied HTML renders but never runs script on Forge's origin.
+    html_id = "pf_" + "c" * 32
+    await store.put(session.id, html_id, name="page.html", mime="text/html", data=b"<script>")
+    html = client.get(presented_file_path(session.id, html_id))
+    assert html.headers["content-security-policy"] == "sandbox"
+    assert html.headers["x-content-type-options"] == "nosniff"
 
     # Another session's URL never reaches this copy.
     assert client.get(presented_file_path(uuid4(), FILE_ID)).status_code == 404
