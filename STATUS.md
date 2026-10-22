@@ -79,7 +79,8 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Review of the branch | done | independent review: 2 high (stored XSS on inline files; F12c idle for transports without a turn flag), 6 medium; all high and medium fixed except the deferred items below |
 | Merge into `exp/control-plane`, record sha | done | `e2208da8` (lane tip `1f3ecf78`) |
 | Send sha to cp-platform; exp Forge redeploy | relayed | ios-coordinator relayed `e2208da8` + overlay: cp-platform round 23 |
-| F2 live proof: URL serves from exp Forge over the tailnet, from mini-m6 | pending | after round 23 is confirmed |
+| Live check 1: session work facts on exp Forge | done | 2026-10-22: `:8380/health` = `e2208da8`; `GET /sessions` rows carry `last_work_at`, `tool_open`, `open_controls` (the E0 session) |
+| F2 live proof: URL serves from exp Forge over the tailnet, from mini-m6 | partly | mini-m6 reaches `thor.tail737f2a.ts.net:8380` (health 200, sessions 200). Checks 2 (a presented file's URL, before and after stop) and 3 (`question` on a notify) need an exercise session on exp Forge. Boot 0 is replay-only, so I'll start one only when ios-coordinator / cp-platform says exercise sessions are allowed (E0 ran `e0-artifact-replay`), or cp-platform runs it |
 | LEX-1398 comment | done | landing comment posted |
 | F2 gap: durable files removed on session delete | done | `d76c1420`, `0deedaba`; `tests/test_volundr/test_presented_files_cleanup.py` (fails without the fix); a PUT that lands after the delete removes what it wrote (404) |
 | F2 gap: uploads resume after a broker restart | done | `presented.json` pending record at staging; `_resume_presented_uploads` at startup, one file at a time; a final 4xx (`refused.json`) is never retried; `tests/test_skuld/test_presented_durable.py` |
