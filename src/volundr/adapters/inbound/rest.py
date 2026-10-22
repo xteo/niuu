@@ -25,7 +25,7 @@ from niuu.domain.notifications import notification_visible_to
 from niuu.domain.presented_files import (
     PRESENTED_FILE_DURABLE_CACHE,
     PRESENTED_FILE_LIVE_CACHE,
-    PRESENTED_FILE_SAFETY_HEADERS,
+    presented_file_safety_headers,
 )
 from niuu.domain.services.token_scope import (
     FORGE_NOTIFY_SCOPE,
@@ -3371,18 +3371,22 @@ def create_router(
                     # origin (HTML or SVG script, sniffed types).
                     headers={
                         "cache-control": PRESENTED_FILE_DURABLE_CACHE,
-                        **PRESENTED_FILE_SAFETY_HEADERS,
+                        **presented_file_safety_headers(record.mime),
                     },
                 )
         response = await _proxy_session_api(request, session_id, *PRESENTED_FILE_ROUTE, file_id)
         # The live broker's staged copy is just as agent-supplied: the same safety policy.
-        headers = {"cache-control": PRESENTED_FILE_LIVE_CACHE, **PRESENTED_FILE_SAFETY_HEADERS}
+        media_type = response.headers.get("content-type", "application/octet-stream")
+        headers = {
+            "cache-control": PRESENTED_FILE_LIVE_CACHE,
+            **presented_file_safety_headers(media_type),
+        }
         disposition = response.headers.get("content-disposition")
         if disposition:
             headers["content-disposition"] = disposition
         return Response(
             content=response.content,
-            media_type=response.headers.get("content-type", "application/octet-stream"),
+            media_type=media_type,
             headers=headers,
         )
 
