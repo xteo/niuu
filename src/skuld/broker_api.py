@@ -1032,7 +1032,10 @@ def _rebuild_presented_registry() -> None:
             files = sorted(
                 item
                 for item in safe_entry.iterdir()
-                if item.is_file() and not item.is_symlink() and item.name not in SIDECARS
+                if item.is_file()
+                and not item.is_symlink()
+                and item.name not in SIDECARS
+                and not item.name.startswith(".")
             )
             preferred = [item for item in files if item.name == "content"]
             if preferred or files:
@@ -1062,10 +1065,21 @@ def _resume_presented_uploads() -> int:
         logger.warning("present-file: cannot scan staging for uploads: %s", repr(exc))
         return 0
     pending = [item for item in pending_uploads(root) if _PRESENTED_ID_RE.fullmatch(item[0])]
-    for file_id, staged, name, mime in pending:
-        _schedule_presented_retry(file_id, staged, name=name, mime=mime)
-    if pending:
-        logger.info("present-file: resuming %d durable uploads", len(pending))
+    if not pending:
+        return 0
+    logger.info("present-file: resuming %d durable uploads", len(pending))
+
+    async def resume_one_by_one() -> None:
+        # One at a time: a restart with many files must not read them all into memory
+        # at once, or send Forge a burst of uploads.
+        for file_id, staged, name, mime in pending:
+            await retry_presented_upload(
+                broker, file_id, staged, name=name, mime=mime, immediate=True
+            )
+
+    task = asyncio.create_task(resume_one_by_one(), name="present-file-durable-resume")
+    _presented_upload_tasks.add(task)
+    task.add_done_callback(_presented_upload_tasks.discard)
     return len(pending)
 
 
@@ -1114,12 +1128,16 @@ async def present_file(body: dict) -> dict:
         dest_dir = _presented_staging_dir() / file_id
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = resolve_contained_path(dest_dir, "content", allow_root=False)
-        shutil.copyfile(safe_source, dest)
+        partial = resolve_contained_path(dest_dir, ".content.partial", allow_root=False)
+        # The pending record first, then the copy under a temporary name made visible
+        # by one rename: a restart resumes every complete copy, never a partial one.
+        write_pending_record(dest, name=name, mime=mime)
+        shutil.copyfile(safe_source, partial)
+        os.replace(partial, dest)
     except (OSError, UnsafePathError) as exc:
         logger.warning("present-file: staging copy failed: %s", repr(exc))
         raise HTTPException(500, "could not stage file") from None
     _presented_registry[file_id] = str(dest)
-    write_pending_record(dest, name=name, mime=mime)
 
     # F2: hand Forge a durable copy so the file outlives this broker; its URL goes in
     # the turn. A failure never fails present-file: it is retried in the background.

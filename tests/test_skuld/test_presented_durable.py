@@ -13,6 +13,7 @@ from skuld.config import PresentedDurableConfig
 from skuld.presented_durable import (
     DURABLE_MARKER,
     PENDING_MARKER,
+    REFUSED_MARKER,
     durable_record,
     pending_uploads,
     retry_presented_upload,
@@ -287,6 +288,69 @@ def test_registry_rebuild_never_serves_the_pending_record(tmp_path, monkeypatch)
     entry = root / ("pf_" + "c" * 32)
     entry.mkdir(parents=True)
     (entry / PENDING_MARKER).write_text('{"name": "n", "mime": "m"}')
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+    api_mod._rebuild_presented_registry()
+    assert entry.name not in api_mod._presented_registry
+
+
+def _status(code):
+    return MagicMock(status_code=code)
+
+
+@pytest.mark.parametrize("code", [403, 404, 409, 413])
+async def test_a_final_refusal_stops_the_retries_for_good(staged, code):
+    broker = _broker(_status(code), retry_attempts=4)
+    write_pending_record(staged, name="n", mime="m")
+    assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
+    assert broker.client.put.await_count == 1
+    assert pending_uploads(staged.parent.parent) == []  # a restart does not resume it
+
+
+@pytest.mark.parametrize("code", [429, 500, 503])
+async def test_transient_answers_keep_retrying(staged, code):
+    broker = _broker(_status(code), retry_attempts=3)
+    assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
+    assert broker.client.put.await_count == 3
+    assert not (staged.parent / REFUSED_MARKER).exists()
+
+
+async def test_resume_uploads_one_file_at_a_time(tmp_path, monkeypatch):
+    import asyncio
+
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    ids = ["pf_" + ch * 32 for ch in "456"]
+    for fid in ids:
+        _stage(root, fid)
+    fake = _broker()
+    in_flight, peak, order = 0, 0, []
+
+    async def put(url, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        order.append(url.rsplit("/", 1)[1])
+        return _ok()
+
+    fake.client.put = put
+    monkeypatch.setattr(api_mod, "broker", fake)
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+    assert api_mod._resume_presented_uploads() == 3
+    await asyncio.gather(*list(api_mod._presented_upload_tasks))
+    assert order == ids and peak == 1
+    assert pending_uploads(root) == []
+
+
+def test_registry_rebuild_never_serves_a_partial_copy(tmp_path, monkeypatch):
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    entry = root / ("pf_" + "d" * 32)
+    entry.mkdir(parents=True)
+    (entry / ".content.partial").write_bytes(b"half")
     monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
     api_mod._rebuild_presented_registry()
     assert entry.name not in api_mod._presented_registry
