@@ -22,8 +22,32 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Full backend suite + coverage gate | done | 26742 passed, coverage 88% (gate 85); the 14 failures (install.sh, Docker, ravn kickoff, release guard) fail identically on the untouched base |
 | Review | done | independent review: no wedge or feed breakage; fixed burst `rev` ordering in emit/settle, suppression recheck under the feed lock, one bad burst no longer stalls the hold (settled `emit_failed` after 5), backfill stops at now − live lag, deadlocks are 503, one report per turn |
 | Merge `exp/control-plane`, land, record sha | done | `dbfcf260` (first `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed)) |
-| Send sha to cp-platform (RF); E0 on exp stack | blocked | no Forge `message` grant; request in `DEPLOY-REQUEST.md`, needs a relay (same as cp-core) |
+| Send sha to cp-platform (RF) | relayed | ios-coordinator relayed it: cp-platform round 23 deploys exp-forge at `e2208da8` (F1, F1n, F7, F1t + forge-state) |
+| E0 on exp stack | waiting | for the round-23 deploy confirmation; checks in `DEPLOY-REQUEST.md` |
 | LEX-1397 comment | done | landing comment posted |
+
+## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9
+
+| Row | Repo / branch | State | Evidence |
+|---|---|---|---|
+| RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | doing | a parity probe run against a Thor-shaped and an m6-shaped Forge (native, embedded PG without pgvector/pgcrypto); branch only, m6 production untouched until P1 |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
+| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
+
+### C4 file ownership: proposal to cp-core (please relay)
+
+C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files except two one-line hooks:
+
+- **C4 owns (new files)** in `services/lexi-agent-service/control-plane/`:
+  - `artifacts.ts`: the registry projection (publications → artifacts by `provider_key`, revisions by provider version, project from the producing session's current project) and the CP side of the burst rule (`bursts.py` port; reads Forge's `burst_id`, records `burst` occurrences through `store.recordOccurrence()`). Its tables are created by `artifacts.ts` on the same db (`CREATE TABLE IF NOT EXISTS artifact_*`), so `store.ts`'s schema is untouched.
+  - `artifacts-ingest.ts`: polls exp Forge's `GET /artifact-publications?after=` and `GET /artifact-bursts?after=` (F1a, final) through the same allow-listed exp-Forge base as `ExpForgeIngest`, and hands publication rows to `store.apply` with `feed: 'publications'` (the shape cp-core's `applyPublication` already takes).
+  - `views-artifacts.ts`: `GET /v1/cp/views/artifacts` (scope all/recent/project, `opens: system_browser`) and the `Project.artifacts` top-5 helper.
+  - `__tests__/artifacts.test.ts` and fixtures under `contract/artifacts/`.
+- **One-line hooks in cp-core's files:** `routes.ts` (register the view) and `runtime.ts` (start the artifacts poller next to `ExpForgeIngest`). If cp-core prefers to make those two edits, C4 exports `registerArtifactRoutes(app, deps)` and `startArtifactIngest(deps)`.
+- **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
+
+Until I hear back, C4 work stays in the new files only.
 
 ## Decisions (docs-supported, noted here instead of asking)
 
@@ -84,6 +108,29 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 
 Full suite: 26,731 pass; the 17 failures are identical on the untouched base (box-specific:
 install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickoff).
+
+## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9
+
+| Row | Repo / branch | State | Evidence |
+|---|---|---|---|
+| RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | doing | a parity probe run against a Thor-shaped and an m6-shaped Forge (native, embedded PG without pgvector/pgcrypto); branch only, m6 production untouched until P1 |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
+| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
+
+### C4 file ownership: proposal to cp-core (please relay)
+
+C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files except two one-line hooks:
+
+- **C4 owns (new files)** in `services/lexi-agent-service/control-plane/`:
+  - `artifacts.ts`: the registry projection (publications → artifacts by `provider_key`, revisions by provider version, project from the producing session's current project) and the CP side of the burst rule (`bursts.py` port; reads Forge's `burst_id`, records `burst` occurrences through `store.recordOccurrence()`). Its tables are created by `artifacts.ts` on the same db (`CREATE TABLE IF NOT EXISTS artifact_*`), so `store.ts`'s schema is untouched.
+  - `artifacts-ingest.ts`: polls exp Forge's `GET /artifact-publications?after=` and `GET /artifact-bursts?after=` (F1a, final) through the same allow-listed exp-Forge base as `ExpForgeIngest`, and hands publication rows to `store.apply` with `feed: 'publications'` (the shape cp-core's `applyPublication` already takes).
+  - `views-artifacts.ts`: `GET /v1/cp/views/artifacts` (scope all/recent/project, `opens: system_browser`) and the `Project.artifacts` top-5 helper.
+  - `__tests__/artifacts.test.ts` and fixtures under `contract/artifacts/`.
+- **One-line hooks in cp-core's files:** `routes.ts` (register the view) and `runtime.ts` (start the artifacts poller next to `ExpForgeIngest`). If cp-core prefers to make those two edits, C4 exports `registerArtifactRoutes(app, deps)` and `startArtifactIngest(deps)`.
+- **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
+
+Until I hear back, C4 work stays in the new files only.
 
 ## Decisions (docs-supported, noted here instead of asking)
 
