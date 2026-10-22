@@ -1,22 +1,25 @@
-# deploy-request: lexi-frontend `exp/control-plane` `3cf3b69` → exp-cp (C4), for cp-platform
+# C4 live checks on exp-cp, for a token holder (cp-platform or ios-coordinator)
 
-C4 (the artifact registry and the `/v1/cp/views/artifacts` lens) has landed. exp-cp runs `6dbdc4f` (round 24), which has no C4: rebuild it at **`3cf3b69`**. exp Forge's tailnet name (round 24) is confirmed.
-- **No new required env.** The artifacts poller uses the same exp-Forge base as cp-core's ingest
-  (`CP_EXP_FORGE_BASE`) and `CP_EXP_FORGE_POLL_MS`.
-- **Optional:** `CP_ARTIFACT_FILE_BASES_FILE`, a JSON `{host: base}` of phone-reachable Forge file bases for
-  hosts other than thor-exp. thor-exp's base comes from the manifest's `app.forge`. A malformed file is
-  logged and skipped.
+exp-cp runs `3cf3b69` (R26, receipt 0a564183) and reports `[cp] ready … ledger seq 839` (682 before C4).
+forge-artifacts can't run these checks: `/v1/cp/views/*` takes the device bearer, `/exp/cp/status` takes the
+operator bearer, and `/etc/lexiexp/secrets` is closed to this session, as it should be. Please run them and put the
+outputs (no tokens) in your STATUS, or grant a read-only token file:
 
-**Checks after the rebuild (forge-artifacts runs these):**
-1. `GET /v1/cp/views/artifacts?scope=recent` → 200, validating as `ArtifactsView`. Every row has
-   `opens: system_browser`.
-2. From the boot-0 replay: 26 claude.ai rows in `scope=all`.
-3. `GET /exp/cp/status` shows `artifacts` (the last poll, the F7 cross-check, skipped and config_errors).
+```bash
+DEV=$(cat <device token file>); OP=$(cat <operator token file>); CP=http://127.0.0.1:9600
+curl -s -H "Authorization: Bearer $DEV" "$CP/v1/cp/views/artifacts?scope=all&limit=200" | jq '{total, rows: (.rows|length), opens: ([.rows[].opens]|unique), ids: ([.rows[].id|select(startswith("artifact:claude_ai:"))]|length)}'
+#   expect: opens ["system_browser"]; 26 claude.ai ids from the boot-0 replay (plus any exp-Forge rows)
+curl -s -H "Authorization: Bearer $DEV" "$CP/v1/cp/views/artifacts?scope=recent" | jq '{total, n: (.rows|length), cursor}'   # n ≤ 10
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $DEV" "$CP/v1/cp/views/artifacts?scope=project"  # 400
+curl -s -H "Authorization: Bearer $OP" "$CP/exp/cp/status" | jq .artifacts   # last poll ok, f7.matches_manifest true, config_errors 0
+```
 
-**Known gap until cp-core applies B1** (`control-plane/requests/` on lexi-frontend `exp/cp-artifacts`): live bursts
-don't become "to check". B1 carries a one-time repair, so no data wipe is needed when it lands.
+After `2077445` (cp-core B1) is deployed, the live "to check" headline check is: a real exp publication, then an
+agent notice linking it, then within one poll the burst is in Activities' "to check" for its project. That needs a
+live provider key (boot-0 gate), the same as E0 item 4.
 
 ---
+
 
 # Optional exp Forge update (cp-platform): niuu `exp/control-plane` `1b8fb72b`
 
