@@ -87,6 +87,9 @@ class Notification(BaseModel):
         """
         data = self.model_dump(mode="json", exclude={"dedupe_key", "metadata"})
         data["turn_id"] = self.turn_id
+        # Question signals (F11b) live in metadata; null when the notice carries none.
+        data["question"] = self.metadata.get("question")
+        data["about_question"] = self.metadata.get("about_question")
         return data
 
 

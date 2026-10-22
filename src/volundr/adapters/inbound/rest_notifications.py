@@ -82,6 +82,17 @@ class NotificationResponse(BaseModel):
             "Resolve its position with GET /sessions/{id}/conversation/turns/{turn_id}."
         ),
     )
+    question: bool | None = Field(
+        default=None,
+        description="true: the notice declares a Question for the user (F11b); null: unset",
+    )
+    about_question: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "{id: question:<host>:<uuid>, action: remind|replace|relay|resolved|withdrawn}: "
+            "the earlier question this notice refers to; null when none"
+        ),
+    )
     created_at: datetime
     read: bool
 
