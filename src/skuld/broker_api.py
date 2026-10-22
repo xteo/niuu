@@ -1,5 +1,6 @@
 """FastAPI composition and HTTP route handlers for the Skuld broker."""
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -40,6 +41,11 @@ from skuld.path_security import (
     UnsafePathError,
     resolve_contained_path,
     resolve_path_in_roots,
+)
+from skuld.presented_durable import (
+    DURABLE_MARKER,
+    retry_presented_upload,
+    upload_presented_file,
 )
 from skuld.room_role_port import RoomRoleResolutionError
 from skuld.service_manager import ServiceCreateRequest, ServiceStatus
@@ -978,6 +984,8 @@ register_forge_mcp_routes(app, lambda: broker, dependencies=_LOOPBACK_GUARD)
 _PRESENTED_ID_RE = re.compile(r"^pf_[0-9a-f]{32}$")
 # file_id -> staged realpath. Rebuilt from the self-describing staging dir on startup.
 _presented_registry: dict[str, str] = {}
+# Background durable-upload retries (F2), held so they are not garbage-collected.
+_presented_upload_tasks: set[asyncio.Task] = set()
 
 
 _PRESENTED_DIR_MODE = 0o700
@@ -1017,11 +1025,16 @@ def _rebuild_presented_registry() -> None:
                 safe_entry = resolve_contained_path(root, entry.name, strict=True)
             except UnsafePathError:
                 continue
-            files = [
-                item for item in safe_entry.iterdir() if item.is_file() and not item.is_symlink()
-            ]
-            if files:
-                _presented_registry[entry.name] = str(files[0])
+            # The staged bytes are always ``content``; skip sidecars such as the
+            # durable receipt (F2) so a rebuild never serves one in their place.
+            files = sorted(
+                item
+                for item in safe_entry.iterdir()
+                if item.is_file() and not item.is_symlink() and item.name != DURABLE_MARKER
+            )
+            preferred = [item for item in files if item.name == "content"]
+            if preferred or files:
+                _presented_registry[entry.name] = str((preferred or files)[0])
     except (OSError, UnsafePathError) as exc:  # pragma: no cover - best-effort recovery
         logger.warning("present-file: registry rebuild failed: %s", repr(exc))
 
@@ -1077,7 +1090,26 @@ async def present_file(body: dict) -> dict:
         raise HTTPException(500, "could not stage file") from None
     _presented_registry[file_id] = str(dest)
 
-    turn = _build_present_file_turn(file_id, name, mime, size, caption)
+    # F2: hand Forge a durable copy so the file outlives this broker; its URL goes in
+    # the turn. A failure never fails present-file: it is retried in the background.
+    receipt = await upload_presented_file(
+        broker,
+        file_id,
+        dest,
+        name=name,
+        mime=mime,
+        timeout=broker._settings.presented_durable.inline_upload_timeout_seconds,
+    )
+    if receipt is None and broker.volundr_api_url:
+        task = asyncio.create_task(
+            retry_presented_upload(broker, file_id, dest, name=name, mime=mime),
+            name=f"present-file-durable-{file_id}",
+        )
+        _presented_upload_tasks.add(task)
+        task.add_done_callback(_presented_upload_tasks.discard)
+    url = (receipt or {}).get("url") or None
+
+    turn = _build_present_file_turn(file_id, name, mime, size, caption, url=url)
     broker._append_turn(turn)
     await broker._channels.broadcast({"type": "conversation.turn", "turn": asdict(turn)})
     logger.info(
@@ -1086,16 +1118,28 @@ async def present_file(body: dict) -> dict:
         size,
         file_id,
     )
-    return {"file_id": file_id, "name": name, "size": size, "mime": mime}
+    result: dict = {"file_id": file_id, "name": name, "size": size, "mime": mime}
+    if url:
+        result["url"] = url
+    result["durable"] = receipt is not None
+    return result
 
 
 def _build_present_file_turn(
-    file_id: str, name: str, mime: str, size: int, caption: str | None
+    file_id: str,
+    name: str,
+    mime: str,
+    size: int,
+    caption: str | None,
+    *,
+    url: str | None = None,
 ) -> ConversationTurn:
     """Build a turn shared by live memory, durable log, and broadcast paths."""
     tool_input: dict = {"file_id": file_id, "name": name, "mime": mime, "size": size}
     if caption:
         tool_input["caption"] = caption
+    if url:
+        tool_input["url"] = url
     part = {"id": file_id, "name": "present_file", "type": "tool_use", "input": tool_input}
     return ConversationTurn(
         id=str(uuid.uuid4()),

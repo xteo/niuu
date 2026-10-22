@@ -99,6 +99,7 @@ from volundr.domain.ports import (
     GitRepoNotFoundError,
     PricingProvider,
 )
+from volundr.domain.presented_files import PresentedFileStore, is_presented_file_id
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.services import (
     ChronicleAccessDeniedError,
@@ -1079,6 +1080,25 @@ class SessionResponse(BaseModel):
         default=None,
         description="ISO 8601 time description last changed; null if never set",
     )
+    last_work_at: str | None = Field(
+        default=None,
+        description=(
+            "ISO 8601 source time of the newest work row (assistant output, result, "
+            "content blocks, tool and turn hooks); null when none is known. Never the "
+            "heartbeat (G10, F12d)."
+        ),
+    )
+    tool_open: bool = Field(
+        default=False,
+        description="True while a tool call is open (a PreToolUse without its PostToolUse)",
+    )
+    open_controls: list[dict] | None = Field(
+        default=None,
+        description=(
+            "Open human gates as [{request_id, kind, opened_at}] from the broker's control "
+            "state; null means unknown, never 'none open'"
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -1196,6 +1216,9 @@ class SessionResponse(BaseModel):
                 if session.description_updated_at
                 else None
             ),
+            last_work_at=(session.last_work_at.isoformat() if session.last_work_at else None),
+            tool_open=session.tool_open,
+            open_controls=session.open_controls,
         )
 
 
@@ -1708,6 +1731,7 @@ def create_router(
     history_max_turns: int = 15,
     history_max_bytes: int = 256 * 1024,
     session_participant_service: SessionParticipantService,
+    presented_file_store: PresentedFileStore | None = None,
 ) -> APIRouter:
     """Create FastAPI router with session, stats, token, repo, and SSE endpoints."""
     router = APIRouter(prefix=prefix)
@@ -3344,7 +3368,39 @@ def create_router(
         session_id: UUID = Path(description="Unique session identifier"),
         file_id: str = Path(description="Opaque presented-file id (present-file command)"),
     ) -> Response:
-        """Download a presented file (present-file command) by opaque id via the owning broker."""
+        """Download a presented file (present-file command) by opaque id.
+
+        Forge's durable copy (F2) is served first, so the file still opens after the
+        session stops; otherwise the owning broker's staged copy, while it runs.
+        """
+        if presented_file_store is not None and is_presented_file_id(file_id):
+            stored = await presented_file_store.get(session_id, file_id)
+            if stored is not None:
+                session = await forge.get_session(session_id)
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Session not found: {session_id}",
+                    )
+                principal = await _optional_principal(request)
+                try:
+                    await forge.ensure_access(session, principal, "read")
+                except SessionAccessDeniedError as exc:
+                    raise HTTPException(403, f"Access denied to session {session_id}") from exc
+                record, path = stored
+                return FileResponse(
+                    path=path,
+                    media_type=record.mime,
+                    filename=record.name,
+                    content_disposition_type="inline",
+                    # The file is agent-supplied: render it, never run it on Forge's
+                    # origin (HTML or SVG script, sniffed types).
+                    headers={
+                        "cache-control": "private, max-age=86400, immutable",
+                        "x-content-type-options": "nosniff",
+                        "content-security-policy": "sandbox",
+                    },
+                )
         response = await _proxy_session_api(request, session_id, "files", "presented", file_id)
         headers = {}
         disposition = response.headers.get("content-disposition")

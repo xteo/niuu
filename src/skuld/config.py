@@ -534,6 +534,41 @@ class ActivityHeartbeatConfig(BaseModel):
             "below Volundr's session liveness stale_after_seconds (default 600)."
         ),
     )
+    stale_output_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        description=(
+            "A busy state is re-reported only while the transport produced a row "
+            "(terminal frames included) within this window. Past it the broker "
+            "reconciles with the transport's turn flag: idle when no turn is in "
+            "flight, otherwise no heartbeat (G10, F12c)."
+        ),
+    )
+
+
+class PresentedDurableConfig(BaseModel):
+    """Uploading present-file copies to Forge's durable store (control-plane F2)."""
+
+    inline_upload_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Time present-file waits for the first upload before answering; a slower "
+            "upload continues as a background retry."
+        ),
+    )
+    upload_timeout_seconds: float = Field(
+        default=60.0, gt=0, description="Time allowed for one background durable upload."
+    )
+    retry_attempts: int = Field(
+        default=6, ge=0, description="Background retries after a failed upload."
+    )
+    retry_backoff_seconds: float = Field(
+        default=2.0, gt=0, description="First retry delay; doubles per attempt."
+    )
+    retry_backoff_max_seconds: float = Field(
+        default=120.0, gt=0, description="Upper bound on the retry delay."
+    )
 
 
 class DeliveryConfig(BaseModel):
@@ -976,6 +1011,7 @@ class SkuldSettings(BaseSettings):
         ),
     )
     activity_heartbeat: ActivityHeartbeatConfig = Field(default_factory=ActivityHeartbeatConfig)
+    presented_durable: PresentedDurableConfig = Field(default_factory=PresentedDurableConfig)
     delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
     ws_auth: WsAuthConfig = Field(default_factory=WsAuthConfig)
     observation_relay: ObservationRelayConfig = Field(default_factory=ObservationRelayConfig)

@@ -34,6 +34,7 @@ from uuid import UUID
 from niuu.domain.artifact_reports import REPORT_ARTIFACT_TOOL_NAME, report_from_turn
 from niuu.domain.notifications import NOTIFICATION_TURN_KIND
 from volundr.domain.models import SessionLogEntry
+from volundr.domain.presented_files import validate_public_base_url
 
 #: Fixed namespaces: ids derived from an occurrence are stable across replays, restarts and
 #: releases. ``NS_BURST`` is the platform reference's (``platform/api/bursts.py``).
@@ -588,6 +589,17 @@ def _from_turn(entry: SessionLogEntry, payload: dict) -> list[PublicationCandida
     return found
 
 
+def _durable_url(value: Any) -> str | None:
+    """A present_file turn's durable URL (F2), only if it is a valid tailnet http(s) URL."""
+    url = _text(value)
+    if not url:
+        return None
+    try:
+        return validate_public_base_url(url) or None
+    except ValueError:
+        return None
+
+
 def _present_file(entry: SessionLogEntry, part: dict, ordinal: int) -> PublicationCandidate | None:
     tool_input = part.get("input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
@@ -602,7 +614,9 @@ def _present_file(entry: SessionLogEntry, part: dict, ordinal: int) -> Publicati
         provider=Provider.FORGE_FILE,
         provider_key=file_id,
         at=_aware(entry.ts),
-        url=f"/api/v1/forge/sessions/{entry.session_id}/files/presented/{file_id}",
+        # F2: the durable, phone-reachable URL the broker recorded, else the route.
+        url=_durable_url(tool_input.get("url"))
+        or f"/api/v1/forge/sessions/{entry.session_id}/files/presented/{file_id}",
         title=_text(tool_input.get("name")),
         tool_use_id=file_id,
         artifact_type=ArtifactType.FILE,
