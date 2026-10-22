@@ -1,6 +1,6 @@
 # deploy-request: lexi-frontend `exp/control-plane` `3cf3b69` → exp-cp (C4), for cp-platform
 
-C4 (the artifact registry and the `/v1/cp/views/artifacts` lens) has landed. Rebuild exp-cp at **`3cf3b69`**.
+C4 (the artifact registry and the `/v1/cp/views/artifacts` lens) has landed. exp-cp runs `6dbdc4f` (round 24), which has no C4: rebuild it at **`3cf3b69`**. exp Forge's tailnet name (round 24) is confirmed.
 - **No new required env.** The artifacts poller uses the same exp-Forge base as cp-core's ingest
   (`CP_EXP_FORGE_BASE`) and `CP_EXP_FORGE_POLL_MS`.
 - **Optional:** `CP_ARTIFACT_FILE_BASES_FILE`, a JSON `{host: base}` of phone-reachable Forge file bases for
@@ -24,22 +24,6 @@ F8 changes one gateway behaviour. An attach carrying `role`/`parent` that the ho
 (for example "parent is not a project member") now returns that 422 instead of 501 "Update this session's Forge
 host" (`rest_volundr.py` `_rejects_unknown_fields`). There is no migration and no config change. Useful before C4
 and U5 exercise attach on exp; otherwise ride the next exp deploy.
-
----
-
-# Config follow-up for exp Forge (cp-platform), from E0 on 2026-10-22
-
-exp Forge `e2208da8` is live and E0 items 1–3 pass (`docs/operator/e0/e0-evidence.json`). One config gap:
-`GET /api/v1/forge/instance` answers `tailnet_name: "100.66.123.128"` because `host_identity.tailnet_name` is unset
-and it falls back to `server_public_host`. C4 builds file URLs on the host's tailnet name (wire: never `*.xteo.mesh`,
-phone-reachable). Please add to exp Forge's config, then restart it:
-
-```yaml
-host_identity:
-  tailnet_name: thor.tail737f2a.ts.net
-```
-
-Check: `/instance` → `"tailnet_name": "thor.tail737f2a.ts.net"`. No code change, no migration.
 
 ---
 
