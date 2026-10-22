@@ -1073,10 +1073,10 @@ class SessionService:
 
         # Run optional resource cleanup after session record is gone
         if deleted:
+            await self._cleanup_presented_files(session_id)
             if self._span_repository is not None:
                 await self._span_repository.delete_by_session(session_id)
             await self._run_targeted_cleanup(session_id, targets)
-            await self._cleanup_presented_files(session_id)
 
         if deleted and self._broadcaster is not None:
             await self._broadcaster.publish_session_deleted(

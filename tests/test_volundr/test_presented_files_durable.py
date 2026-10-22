@@ -245,3 +245,50 @@ async def test_durable_copy_serves_after_the_session_stopped(tmp_path):
 
     # Another session's URL never reaches this copy.
     assert client.get(presented_file_path(uuid4(), FILE_ID)).status_code == 404
+
+
+# ------------------------------------------------------------------ F1 records F2's URL
+
+
+@pytest.mark.parametrize(
+    ("url", "recorded"),
+    [
+        (f"{BASE}/api/v1/forge/sessions/s/files/presented/{FILE_ID}", "durable"),
+        ("http://thor.xteo.mesh:8380/x", "route"),
+        ("javascript:alert(1)", "route"),
+        (None, "route"),
+    ],
+)
+def test_publication_records_the_durable_url(url, recorded):
+    from dataclasses import asdict
+    from datetime import UTC, datetime
+
+    from skuld.broker_api import _build_present_file_turn
+    from tests.support.artifacts import CATALOG
+    from volundr.domain.artifacts import publications_from_entry
+    from volundr.domain.models import SessionLogEntry
+
+    sid = uuid4()
+    turn = asdict(_build_present_file_turn(FILE_ID, "plan.md", "text/markdown", 3, None, url=url))
+    entry = SessionLogEntry(
+        session_id=sid,
+        seq=7,
+        kind="conversation.turn",
+        payload={"type": "conversation.turn", "turn": turn},
+        ts=datetime(2026, 10, 22, tzinfo=UTC),
+    )
+    [pub] = publications_from_entry(entry, CATALOG)
+    route = f"/api/v1/forge/sessions/{sid}/files/presented/{FILE_ID}"
+    assert pub.url == (url if recorded == "durable" else route)
+
+
+async def test_upload_landing_after_the_session_was_deleted_leaves_nothing(tmp_path):
+    """The session is deleted while the body streams: its cleanup already ran, so the
+    PUT removes what it wrote and answers 404 (the broker then stops retrying)."""
+    client, store, service = _upload_client(tmp_path)
+    service.get_session.side_effect = [object(), None]
+    sid = uuid4()
+    resp = client.put(f"/api/v1/forge/sessions/{sid}/files/presented/{FILE_ID}", content=b"x")
+    assert resp.status_code == 404
+    assert await store.get(sid, FILE_ID) is None
+    assert not (tmp_path / str(sid)).exists()

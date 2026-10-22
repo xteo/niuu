@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -94,3 +95,20 @@ async def test_no_store_configured_deletes_as_before(repository, pod_manager):
     service = SessionService(repository=repository, pod_manager=pod_manager)
     session = await _make_session(service)
     assert await service.delete_session(session.id) is True
+
+
+async def test_files_go_even_when_a_later_cleanup_step_fails(repository, pod_manager, store):
+    spans = AsyncMock()
+    spans.delete_by_session.side_effect = RuntimeError("spans down")
+    service = SessionService(
+        repository=repository,
+        pod_manager=pod_manager,
+        presented_file_store=store,
+        span_repository=spans,
+        provisioning_initial_delay=0,
+    )
+    session = await _make_session(service)
+    await store.put(session.id, FID_A, name="r.pdf", mime="application/pdf", data=b"%PDF")
+    with pytest.raises(RuntimeError):
+        await service.delete_session(session.id)
+    assert await store.get(session.id, FID_A) is None
