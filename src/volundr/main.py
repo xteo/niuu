@@ -1132,6 +1132,14 @@ def create_app(
                 execution_credential_service=execution_credential_service,
             )
 
+            # Durable presented files (F2): Forge's own copy of every present-file.
+            presented_file_store = None
+            if settings.presented_files.enabled:
+                store_config = dict(settings.presented_files.store)
+                store_cls = import_class(store_config.pop("adapter"))
+                presented_file_store = store_cls(**store_config)
+                app.state.presented_file_store = presented_file_store
+
             session_service = SessionService(
                 repository,
                 pod_manager,
@@ -1156,6 +1164,7 @@ def create_app(
                 notification_recorder=notification_service,
                 forge_session_tokens=forge_session_tokens,
                 forge_mcp_default_grants=settings.forge_mcp.default_grants,
+                presented_file_store=presented_file_store,
             )
             # Local-process brokers notify the session service when they exit so
             # the DB row is reconciled promptly (pod-status authoritative) rather
@@ -1445,14 +1454,6 @@ def create_app(
                     instance_id=project_config.instance_id or settings.server_public_host,
                 )
                 app.state.project_service = project_service
-
-            # Durable presented files (F2): Forge's own copy of every present-file.
-            presented_file_store = None
-            if settings.presented_files.enabled:
-                store_config = dict(settings.presented_files.store)
-                store_cls = import_class(store_config.pop("adapter"))
-                presented_file_store = store_cls(**store_config)
-                app.state.presented_file_store = presented_file_store
 
             # Create and include routers
             forge_router = create_router(

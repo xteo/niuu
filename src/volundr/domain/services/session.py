@@ -63,6 +63,7 @@ from volundr.domain.ports import (
     SessionSpanRepository,
     StoragePort,
 )
+from volundr.domain.presented_files import PresentedFileStore
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.services.forge_session_launch import (
     ForgeMcpGrantEscalationError,
@@ -179,8 +180,10 @@ class SessionService:
         forge_session_tokens: ForgeSessionTokenService | None = None,
         forge_mcp_default_grants: Iterable[ForgeMcpGrant | str] = (),
         user_integration: UserIntegrationPort | None = None,
+        presented_file_store: PresentedFileStore | None = None,
     ):
         self._repository = repository
+        self._presented_file_store = presented_file_store
         self._pod_manager = pod_manager
         self._git_registry = git_registry
         self._user_integration = user_integration
@@ -1085,6 +1088,7 @@ class SessionService:
             if self._span_repository is not None:
                 await self._span_repository.delete_by_session(session_id)
             await self._run_targeted_cleanup(session_id, targets)
+            await self._cleanup_presented_files(session_id)
 
         if deleted and self._broadcaster is not None:
             await self._broadcaster.publish_session_deleted(
@@ -1113,6 +1117,24 @@ class SessionService:
 
         if CleanupTarget.CHRONICLES in targets:
             await self._cleanup_chronicles(session_id)
+
+    async def _cleanup_presented_files(self, session_id: UUID) -> None:
+        """Drop the session's durable presented files (F2) with the session."""
+        if self._presented_file_store is None:
+            return
+        try:
+            removed = await self._presented_file_store.delete_session(session_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to remove presented files for session %s: %s",
+                _sanitize_log(session_id),
+                _sanitize_log(e),
+            )
+            return
+        if removed:
+            logger.info(
+                "Removed %d presented files for session %s", removed, _sanitize_log(session_id)
+            )
 
     async def _cleanup_workspace_storage(self, session_id: UUID) -> None:
         if self._storage is None:
