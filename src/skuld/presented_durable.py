@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from niuu.domain.presented_files import PRESENTED_FILE_NAME_HEADER
 from skuld.event_log import FORGE_SESSIONS_PATH
 
 logger = logging.getLogger("skuld.broker")
@@ -30,7 +31,7 @@ REFUSED_MARKER = "refused.json"
 SIDECARS = frozenset({DURABLE_MARKER, PENDING_MARKER, REFUSED_MARKER})
 # 4xx answers that a later attempt can succeed past; every other 4xx is final.
 _RETRYABLE_CLIENT_ERRORS = frozenset({408, 425, 429})
-NAME_HEADER = "x-presented-file-name"
+NAME_HEADER = PRESENTED_FILE_NAME_HEADER
 
 
 def durable_record(staged: Path) -> dict[str, Any] | None:

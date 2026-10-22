@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path as FilePath
 from typing import Any, Literal
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 import httpx
@@ -136,6 +136,13 @@ from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
 )
 from volundr.domain.services.session_participants import SessionParticipantService
+from volundr.domain.session_broker import (
+    DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
+    OPENSHELL_SERVICE_HOST_SUFFIX,
+    PRESENTED_FILE_ROUTE,
+    server_side_http_proxy_target,
+    session_proxy_url,
+)
 from volundr.domain.session_participants import SessionParticipant
 from volundr.domain.session_read_state import (
     SessionReadState,
@@ -147,8 +154,6 @@ from volundr.session_archive import load_workspace_transcript
 
 logger = logging.getLogger(__name__)
 WORKFLOW_GATE_INTENT_HEADER = "x-niuu-workflow-gate-intent"
-DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL = "http://openshell.openshell.svc.cluster.local:8080"
-OPENSHELL_SERVICE_HOST_SUFFIX = ".openshell.localhost"
 # How long send_session_message holds the WS open waiting for the broker's
 # correlated delivery ACK before reporting the message as "pending" (the broker's
 # bounded retry then drives it to delivered/failed). Named so it is not a magic
@@ -404,44 +409,8 @@ def _live_body_has_in_progress_turn(payload: object) -> bool:
     return isinstance(metadata, dict) and metadata.get("status") == "in_progress"
 
 
-def _session_proxy_url(base_url: str, *path_segments: str) -> str:
-    """Build a validated session-pod URL from a trusted base and encoded path segments."""
-    parsed = urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Session proxy target must be an absolute http(s) URL")
-
-    segments = [quote(segment, safe="") for segment in path_segments]
-    base_path = parsed.path.rstrip("/")
-    suffix = "/".join(segments)
-    if base_path and suffix:
-        path = f"{base_path}/{suffix}"
-    elif base_path:
-        path = base_path
-    elif suffix:
-        path = f"/{suffix}"
-    else:
-        path = "/"
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-
-
-def _server_side_http_proxy_target(
-    url: str,
-    *,
-    gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
-) -> tuple[str, dict[str, str]]:
-    """Route an OpenShell service URL through the in-cluster gateway."""
-    parsed = urlsplit(url)
-    if not parsed.hostname or not parsed.hostname.endswith(OPENSHELL_SERVICE_HOST_SUFFIX):
-        return url, {}
-
-    gateway = urlsplit(gateway_url)
-    if not gateway.scheme or not gateway.netloc:
-        raise ValueError("OpenShell internal gateway must be an absolute URL")
-
-    routed_url = urlunsplit(
-        (gateway.scheme, gateway.netloc, parsed.path, parsed.query, parsed.fragment)
-    )
-    return routed_url, {"Host": parsed.netloc}
+_session_proxy_url = session_proxy_url
+_server_side_http_proxy_target = server_side_http_proxy_target
 
 
 def _fallback_workspace_logs(
@@ -3401,7 +3370,7 @@ def create_router(
                         "content-security-policy": "sandbox",
                     },
                 )
-        response = await _proxy_session_api(request, session_id, "files", "presented", file_id)
+        response = await _proxy_session_api(request, session_id, *PRESENTED_FILE_ROUTE, file_id)
         headers = {}
         disposition = response.headers.get("content-disposition")
         if disposition:

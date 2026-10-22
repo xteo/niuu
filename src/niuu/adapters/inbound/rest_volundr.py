@@ -62,7 +62,12 @@ from niuu.adapters.outbound.guild_transport import (
     build_guild_httpx_client,
 )
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
-from niuu.domain.notifications import notification_visible_to
+from niuu.domain.notifications import notification_image_url, notification_visible_to
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_DEFAULT_MAX_BYTES,
+    PRESENTED_FILE_ID_PATTERN,
+    PRESENTED_FILE_NAME_HEADER,
+)
 from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
@@ -378,6 +383,13 @@ def _event_visible(name: str, data: Any, principal: Principal) -> bool:
     )
 
 
+def _tag_event(name: str, data: Any, instance: RegisteredInstance) -> Any:
+    """Tag a live event with its node; notifications also get node-routed image URLs."""
+    if name == NOTIFICATION_EVENT:
+        return _tag_notification(data, instance)
+    return _with_instance(data, instance)
+
+
 def _fleet_request(request: Request) -> bool:
     params = request.query_params
     return (
@@ -404,6 +416,35 @@ def _tag_items(payload: Any, instance: RegisteredInstance) -> Any:
     return [_with_instance(item, instance, rebase_chat_endpoint=False) for item in payload]
 
 
+def _tag_notification(item: Any, instance: RegisteredInstance) -> Any:
+    """Tag a notification with its node and route its image URLs to that node.
+
+    A node serves ``/api/v1/forge/notifications/{id}/image``; through this facade the
+    same path needs ``instance_id`` so the request reaches the node holding the image.
+    """
+    tagged = _with_instance(item, instance, rebase_chat_endpoint=False)
+    if not isinstance(tagged, dict):
+        return tagged
+    image = tagged.get("image")
+    notification_id = tagged.get("id")
+    if not isinstance(image, dict) or not isinstance(notification_id, str):
+        return tagged
+    tagged["image"] = {
+        **image,
+        "url": notification_image_url(notification_id, instance_id=instance.id),
+        "thumbnail_url": notification_image_url(
+            notification_id, thumbnail=True, instance_id=instance.id
+        ),
+    }
+    return tagged
+
+
+def _tag_notifications(payload: Any, instance: RegisteredInstance) -> list[Any]:
+    if not isinstance(payload, list):
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unexpected Forge notification response")
+    return [_tag_notification(item, instance) for item in payload]
+
+
 def _instance_page(response: httpx.Response, instance: RegisteredInstance) -> InstancePage | None:
     """Parse one node's feed page, or ``None`` when it is malformed."""
     try:
@@ -420,7 +461,7 @@ def _instance_page(response: httpx.Response, instance: RegisteredInstance) -> In
         return None
     return InstancePage(
         items=[
-            _with_instance(item, instance, rebase_chat_endpoint=False)
+            _tag_notification(item, instance)
             for item in payload["items"]
             if isinstance(item, dict) and type(item.get("seq")) is int
         ],
@@ -928,6 +969,7 @@ def create_volundr_router(
     forge_stream_retry_seconds: float = 5.0,
     forge_stream_keepalive_seconds: float = 15.0,
     forge_stream_queue_maxsize: int = 256,
+    presented_file_max_bytes: int = PRESENTED_FILE_DEFAULT_MAX_BYTES,
 ) -> APIRouter:
     """Create a registry-aware Forge runtime router."""
     router = APIRouter(
@@ -1763,7 +1805,7 @@ def create_volundr_router(
                     # Notifications are the owner's (or an admin's) only.
                     if not _event_visible(event.type.value, event.data, principal):
                         continue
-                    yield event.type.value, _with_instance(event.data, instance)
+                    yield event.type.value, _tag_event(event.type.value, event.data, instance)
             else:
                 url = build_remote_url(instance.base_url, "/api/v1/forge", "/sessions/stream")
                 # A GuildTransportError here (policy refusal or pin mismatch)
@@ -1781,7 +1823,7 @@ def create_volundr_router(
                     # another owner's notification through the fleet stream.
                     if not _event_visible(name, payload, principal):
                         continue
-                    yield name, _with_instance(payload, instance)
+                    yield name, _tag_event(name, payload, instance)
 
         return StreamingResponse(
             merge_events(
@@ -2239,7 +2281,7 @@ def create_volundr_router(
             payload = _remote_json(remote)
             if not isinstance(payload, dict):
                 raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unexpected Forge feed response")
-            payload["items"] = _tag_items(payload.get("items"), instance)
+            payload["items"] = _tag_notifications(payload.get("items"), instance)
             payload["instance_id"] = instance.id
             return payload
 
@@ -2562,6 +2604,30 @@ def create_volundr_router(
             request, principal, method="GET", path="/notifications/sinks"
         )
 
+    @router.get("/notifications/{notification_id}/image")
+    async def get_notification_image(
+        request: Request,
+        notification_id: UUID,
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The stored image from the node that holds the notification (``instance_id``
+        selects it, as for reads; the default node otherwise). The node applies the
+        notification's own read access."""
+        instance = await _notification_target(request, principal)
+        remote = await _proxy_to(
+            instance, request, method="GET", path=f"/notifications/{notification_id}/image"
+        )
+        headers = {
+            name: value
+            for name in ("cache-control", "x-content-type-options")
+            if (value := remote.headers.get(name))
+        }
+        return Response(
+            content=remote.content,
+            media_type=remote.headers.get("content-type"),
+            headers=headers,
+        )
+
     @router.get("/notifications/{notification_id}/deliveries")
     async def list_notification_deliveries(
         request: Request,
@@ -2598,7 +2664,7 @@ def create_volundr_router(
         remote = await _proxy_to(
             instance, request, method="GET", path=f"/sessions/{session_id}/notifications"
         )
-        return _tag_items(_remote_json(remote), instance)
+        return _tag_notifications(_remote_json(remote), instance)
 
     @router.post("/sessions/{session_id}/notifications", status_code=status.HTTP_201_CREATED)
     async def submit_session_notification(
@@ -2618,7 +2684,7 @@ def create_volundr_router(
             path=f"/sessions/{session_id}/notifications",
             body=body,
         )
-        payload = _with_instance(_remote_json(remote), instance, rebase_chat_endpoint=False)
+        payload = _tag_notification(_remote_json(remote), instance)
         return JSONResponse(payload, status_code=remote.status_code)
 
     @router.get("/external-sessions")
@@ -3701,6 +3767,54 @@ def create_volundr_router(
             content=response.content,
             media_type=response.headers.get("content-type", "application/octet-stream"),
             headers=headers,
+        )
+
+    @router.put("/sessions/{session_id}/files/presented/{file_id}")
+    async def store_presented_file(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        file_id: str = Path(pattern=PRESENTED_FILE_ID_PATTERN, description="present-file id"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The broker's durable copy of a presented file (control-plane F2), on the owning node.
+
+        The bytes, their content type and the file-name header pass through unchanged, and
+        Forge's answer comes back as is (404, 409 and 413 included), so the broker can tell
+        a final refusal from a retryable one. The session credential stays local
+        (``_request_remote`` refuses to forward it to another node).
+        """
+        # Bounded before it is buffered: Forge's own cap, refused at the edge.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > presented_file_max_bytes:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > presented_file_max_bytes:
+                raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+            chunks.append(chunk)
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        passthrough = {
+            name: value
+            for name in ("content-type", PRESENTED_FILE_NAME_HEADER, "retry-after")
+            if (value := request.headers.get(name)) is not None
+        }
+        upstream = await _request_remote(
+            instance,
+            request,
+            method="PUT",
+            path=f"/sessions/{session_id}/files/presented/{file_id}",
+            content_body=b"".join(chunks),
+            extra_headers=passthrough,
+            embedded_app=embedded_forge_app,
+        )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
         )
 
     @router.post("/sessions/{session_id}/files/upload")

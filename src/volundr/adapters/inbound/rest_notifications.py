@@ -6,6 +6,8 @@
 * ``/notifications/rules``                   owner-scoped delivery rule CRUD
 * ``GET  /notifications/sinks``              sinks a rule may name
 * ``GET  /notifications/{id}/deliveries``    outbox rows for one notification
+* ``GET  /notifications/{id}/image``         the stored image (``?variant=thumb`` for the
+  thumbnail); readable by exactly those who may read the notification
 * ``GET  /sessions/{id}/notifications``      one session's notifications, ascending
 * ``POST /sessions/{id}/notifications``      direct submit with an idempotency key
 """
@@ -21,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, st
 from pydantic import BaseModel, ConfigDict, Field
 
 from niuu.domain.notifications import (
+    NOTIFICATION_IMAGE_MIME_TYPES,
     NotificationDraft,
     NotificationKind,
     NotificationLink,
@@ -39,6 +42,8 @@ from volundr.domain.notifications import (
     DeliveryStatus,
     Notification,
     NotificationDelivery,
+    NotificationImageState,
+    NotificationImageVariant,
     NotificationNotFoundError,
     NotificationQuery,
     NotificationQuietHours,
@@ -53,6 +58,17 @@ from volundr.domain.services.notifications import NotificationService
 from volundr.domain.services.session import SessionAccessDeniedError, SessionService
 
 MAX_IDEMPOTENCY_KEY_CHARS = 200
+
+
+class NotificationImageResponse(BaseModel):
+    """A stored notification image: where to load it and its shape."""
+
+    url: str = Field(description="Forge-relative URL of the stored image")
+    thumbnail_url: str = Field(description="Forge-relative URL of its thumbnail")
+    mime: str
+    width: int
+    height: int
+    alt: str | None = None
 
 
 class NotificationResponse(BaseModel):
@@ -94,6 +110,20 @@ class NotificationResponse(BaseModel):
         ),
     )
     created_at: datetime
+    image: NotificationImageResponse | None = Field(
+        default=None,
+        description="The stored image; null when none was attached or none is stored (yet).",
+    )
+    image_state: NotificationImageState | None = Field(
+        default=None,
+        description=(
+            "pending (Forge is copying it), ready (stored; see image) or failed (see "
+            "image_error); null when no image was attached."
+        ),
+    )
+    image_error: str | None = Field(
+        default=None, description="Why the attached image could not be stored."
+    )
     read: bool
 
     @classmethod
@@ -219,8 +249,10 @@ def create_notifications_router(
     prefix: str = "/api/v1/forge",
     default_page_size: int,
     max_page_size: int,
+    image_cache_max_age_seconds: int,
 ) -> APIRouter:
-    """Create the notification feed, read-state, rules and submit routes."""
+    """Create the notification feed, read-state, rules, submit and image routes."""
+    image_cache_control = f"private, max-age={image_cache_max_age_seconds}, immutable"
     router = APIRouter(prefix=prefix, tags=["Notifications"])
 
     async def _session_for(session_id: UUID, principal: Principal, action: str) -> Session:
@@ -408,6 +440,41 @@ def create_notifications_router(
         except NotificationNotFoundError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
         return [NotificationDeliveryResponse.build(delivery) for delivery in deliveries]
+
+    @router.get(
+        "/notifications/{notification_id}/image",
+        response_class=Response,
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+        responses={
+            200: {
+                "description": "The stored image bytes",
+                "content": {mime: {} for mime in sorted(NOTIFICATION_IMAGE_MIME_TYPES)},
+            },
+            404: {"description": "No such notification for this reader, or no stored image"},
+        },
+    )
+    async def get_notification_image(
+        notification_id: UUID = Path(description="Notification id"),
+        variant: NotificationImageVariant = Query(
+            default=NotificationImageVariant.ORIGINAL,
+            description="``thumb`` for the thumbnail (long side bounded), else the image",
+        ),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """A notification's stored image, for whoever may read the notification.
+
+        The bytes of a stored image never change, so the response may be cached
+        for a long time; a 404 (not stored yet) is not cacheable.
+        """
+        try:
+            image = await notification_service.image_content(principal, notification_id, variant)
+        except NotificationNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return Response(
+            content=image.content,
+            media_type=image.mime,
+            headers={"Cache-Control": image_cache_control, "X-Content-Type-Options": "nosniff"},
+        )
 
     @router.get(
         "/sessions/{session_id}/notifications",

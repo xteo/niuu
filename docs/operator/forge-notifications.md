@@ -52,6 +52,7 @@ All routes are under `/api/v1/forge`. The Guild facade serves the same paths.
 | `GET/POST /notifications/rules`, `PUT/DELETE /notifications/rules/{id}` | Your own delivery rules. |
 | `GET /notifications/sinks` | Sinks a rule may name: `[{name, label, requires_integration}]` |
 | `GET /notifications/{id}/deliveries` | Outbox rows for a notification you can see. |
+| `GET /notifications/{id}/image[?variant=thumb]` | The notification's stored image or its thumbnail, for whoever can read the notification. `404` when none is stored. See [Images](#images). |
 
 `GET /notifications` accepts these query parameters:
 
@@ -141,7 +142,45 @@ Read state works the same way:
 
 Session routes go to the host that owns the session. Rules and sinks go to the selected
 host (local by default). Deliveries are looked up on the host that holds the
-notification.
+notification. Image URLs on items the facade returns carry `instance_id=<host>`, and
+`GET /notifications/{id}/image?instance_id=<host>` is proxied to that host (the default
+host without it).
+
+## Images
+
+An agent attaches an image with `notify`'s `image` input: `{"file_id": …}` from
+`present-file`, or `{"url": "https://…"}`, plus `alt`. Forge records the notification
+immediately with `image_state: pending`, then copies the image once in the background
+(the image worker) and stores the original plus a thumbnail in
+`forge_notification_images`:
+
+| `image_state` | Meaning | Item |
+|---|---|---|
+| `pending` | Forge has not copied it yet. | `image: null` |
+| `ready` | Stored. | `image: {url, thumbnail_url, mime, width, height, alt}` |
+| `failed` | The copy was refused or failed; the reason is in `image_error`. Not retried. | `image: null` |
+| `null` | No image was attached. | `image: null` |
+
+The live `session_notification` for a notification with an image is sent once its
+image settles, so it carries the same `image` object as the feed.
+
+A `file_id` image is read from the session's broker, so the session must still be
+running when the worker copies it (normally within a second of the notify). A `url`
+image must be https on every redirect hop and, by default, resolve only to public
+addresses; set `notifications.images.allow_private_networks: true` to allow private
+or tailnet hosts. Types: PNG, JPEG, GIF, WebP; at most 10 MiB and 40 megapixels.
+
+| `image_error` | Likely cause |
+|---|---|
+| "session … is not running" / "no longer exists" | The session stopped before the copy; re-send with a `url` or present the file again. |
+| "the session broker answered HTTP 404/410" | Unknown or expired present-file id. |
+| "… sent text/html, not an accepted image type" | The URL is a web page, not an image. |
+| "refusing …: it resolves to a non-public address" | A private or tailnet host; see `allow_private_networks`. |
+| "… larger than 10485760 bytes" / "… more than 40000000 pixels" | Too large; send a smaller rendering. |
+| "fetching the image timed out after …" | Slow source; see `images.fetch_timeout_seconds`. |
+
+Pending copies left by a restart are claimed again after their lease. The worker logs
+under `volundr.domain.services.notification_images`.
 
 ## Delivery rules and the outbox
 
@@ -370,6 +409,18 @@ notifications:
     backoff_jitter_ratio: 0.2
     default_rate_limit: {max_count: 60, window_seconds: 3600}   # null = none
     max_error_chars: 2000
+  images:                    # copying images attached to notifications
+    poll_interval_seconds: 5.0     # recovery poll; a new image wakes the worker at once
+    batch_size: 8
+    lease_seconds: 60
+    fetch_timeout_seconds: 20      # must be shorter than lease_seconds
+    max_concurrent_fetches: 4
+    max_redirects: 3               # url images; every hop is checked
+    allow_private_networks: false  # url images may resolve to private/tailnet addresses
+    thumbnail_max_side: 320
+    thumbnail_jpeg_quality: 85
+    cache_max_age_seconds: 31536000  # Cache-Control on served images (bytes never change)
+    max_error_chars: 300
   integration_sinks:         # integration slug -> NotificationSink class
     telegram: niuu.adapters.notifications.telegram.TelegramNotificationSink
     webhook: niuu.adapters.notifications.webhook.WebhookNotificationSink
@@ -409,7 +460,12 @@ Migration `000084_forge_notifications` creates four tables:
 Migration `000085_forge_notification_delivery_rate_index` adds a partial index on
 `(rule_id, delivered_at) WHERE status = 'delivered'` for the per-rule rate limit.
 
-Both migrations ship in `migrations/`, in the Helm migrations configmap, and in the CLI
+Migration `000072_forge_notification_images` adds `forge_notification_images`: one row
+per notification with an image (cascading from it), holding the reference, the copy
+state (`pending`/`ready`/`failed`, with a lease and attempt fence), and once stored the
+original bytes, the thumbnail, their types and sizes. A partial index covers pending rows.
+
+The migrations ship in `migrations/`, in the Helm migrations configmap, and in the CLI
 bundle (`src/cli/migrations/volundr/`). Mini mode applies them at startup.
 
 To check them, and the dispatcher against a local webhook receiver, on a disposable
