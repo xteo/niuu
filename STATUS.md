@@ -23,14 +23,14 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Review | done | independent review: no wedge or feed breakage; fixed burst `rev` ordering in emit/settle, suppression recheck under the feed lock, one bad burst no longer stalls the hold (settled `emit_failed` after 5), backfill stops at now − live lag, deadlocks are 503, one report per turn |
 | Merge `exp/control-plane`, land, record sha | done | `dbfcf260` (first `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed)) |
 | Send sha to cp-platform (RF) | relayed | ios-coordinator relayed it: cp-platform round 23 deploys exp-forge at `e2208da8` (F1, F1n, F7, F1t + forge-state) |
-| E0 on exp stack | waiting | for the round-23 deploy confirmation; checks in `DEPLOY-REQUEST.md` |
+| E0 on exp stack | done (items 1–3); item 4 pending | exp Forge live at `e2208da8`. (1) `/instance` → host `thor-exp`; (2) all three feeds empty before; (3) Thor's 128 manifest rows appended to exercise session `da8a686a`: **122 publications, 12 keys, 33 bursts** (all backfill, = fixture), **0 notices**; replay #2 adds 0; admin backfill scanned 126, recorded 0, 0 notices. The 25-notice golden needs forced-live timing: offline only (memory + Postgres). (4) a real publish: pending the gated provider key. `docs/operator/e0/` |
 | LEX-1397 comment | done | landing comment posted |
 
 ## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9
 
 | Row | Repo / branch | State | Evidence |
 |---|---|---|---|
-| RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
+| RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
 | C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
@@ -119,7 +119,7 @@ install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickof
 
 | Row | Repo / branch | State | Evidence |
 |---|---|---|---|
-| RF + E0 | niuu, exp Forge | waiting on round 23 | E0 items 1–3 and 5 when live; item 4 (a real publish) pending the gated provider key |
+| RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
 | C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
