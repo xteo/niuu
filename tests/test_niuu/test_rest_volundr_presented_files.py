@@ -37,7 +37,9 @@ async def guild(tmp_path):
     app = FastAPI()
     app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
     app.include_router(
-        create_volundr_router(StubInstanceService([local]), embedded_forge_app=forge.app)
+        create_volundr_router(
+            StubInstanceService([local]), embedded_forge_app=forge.app, presented_file_max_bytes=16
+        )
     )
     session = await forge.session("self")
     credential = await forge.start(session)
@@ -53,12 +55,16 @@ async def test_broker_upload_through_the_facade_then_served_after_stop(guild) ->
     put = client.put(
         _url(session.id),
         content=b"hello durable",
-        headers={**auth, "content-type": "text/plain", PRESENTED_FILE_NAME_HEADER: "notes.txt"},
+        headers={
+            **auth,
+            "content-type": "text/plain",
+            PRESENTED_FILE_NAME_HEADER: "my%20notes.txt",
+        },
     )
     assert put.status_code == 200, put.text
     body = put.json()
     assert body["url"] == f"{BASE}{_url(session.id)}"
-    assert body["name"] == "notes.txt" and body["mime"] == "text/plain"
+    assert body["name"] == "my notes.txt" and body["mime"] == "text/plain"
     record, _ = await store.get(session.id, FID)
     assert record.size == len(b"hello durable")
 
@@ -76,3 +82,26 @@ async def test_forge_refusals_pass_through_unchanged(guild) -> None:
     assert client.put(_url(session.id), content=b"two", headers=auth).status_code == 409
     peer = await forge.session("peer")
     assert client.put(_url(peer.id), content=b"x", headers=auth).status_code == 403
+
+
+async def test_the_facade_bounds_the_body_before_buffering_it(guild) -> None:
+    client, _, session, auth, store = guild
+    assert client.put(_url(session.id), content=b"x" * 17, headers=auth).status_code == 413
+
+    def chunks():
+        yield b"x" * 10
+        yield b"x" * 10
+
+    streamed = client.put(_url(session.id), content=chunks(), headers=auth)  # no content-length
+    assert streamed.status_code == 413
+    assert await store.get(session.id, FID) is None
+
+
+async def test_a_bad_id_or_an_unknown_session_is_refused(guild) -> None:
+    client, _, session, auth, _ = guild
+    assert client.put(
+        _url(session.id, "pf_..%2f..%2fx"), content=b"x", headers=auth
+    ).status_code in (404, 422)
+    assert client.put(_url(session.id, "not-an-id"), content=b"x", headers=auth).status_code == 422
+    unknown = "00000000-0000-4000-8000-000000000099"
+    assert client.put(_url(unknown), content=b"x", headers=auth).status_code in (403, 404)
