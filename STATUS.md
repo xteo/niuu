@@ -21,7 +21,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Full app smoke (real lifespan, scratch PG) | done | append → live pub → burst → "Smoke page published" (art-burst:…) after hold → backfill 0 |
 | Full backend suite + coverage gate | done | 26742 passed, coverage 88% (gate 85); the 14 failures (install.sh, Docker, ravn kickoff, release guard) fail identically on the untouched base |
 | Review | done | independent review: no wedge or feed breakage; fixed burst `rev` ordering in emit/settle, suppression recheck under the feed lock, one bad burst no longer stalls the hold (settled `emit_failed` after 5), backfill stops at now − live lag, deadlocks are 503, one report per turn |
-| Merge `exp/control-plane`, land, record sha | done | `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed) |
+| Merge `exp/control-plane`, land, record sha | done | `dbfcf260` (first `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed)) |
 | Send sha to cp-platform (RF); E0 on exp stack | blocked | no Forge `message` grant; request in `DEPLOY-REQUEST.md`, needs a relay (same as cp-core) |
 | LEX-1397 comment | done | landing comment posted |
 
