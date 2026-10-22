@@ -32,7 +32,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu | **landed** `1b8fb72b` on `exp/control-plane` | `scripts/forge_parity_probe.py` (36 tests): read mode is statically zero-write and pinned to the probed host; write mode runs only on scratch ports 41000–41999 and never against a production instance id; it compares every Forge route. The branch in Thor's and m6's shapes is **ON PAR 39/39**. The gateway's masked-422 fix has 5 tests. Two review rounds. `docs/operator/forge-parity.md`. The m6 rollout itself is at P1 |
-| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | re-review; **needs cp-core B1** | `bbe7470`. 295 control-plane tests + 1 expected-fail; `tsc` clean. The golden gives exactly 26 rows (revisions = distinct provider versions, all 230 publications); R7-8a holds and every view validates; bursts match the reference (thor 33, m6 17), with B1–B9/B1–B6 on the CP side; Forge's burst id and `rev` are used as given. Review 1: 1 BLOCKER (in cp-core's store) + 3 MAJOR, the majors and minors fixed |
+| C4 Artifact registry + lens | lexi-frontend | **landed** `3cf3b69` on `exp/control-plane` (deploy-request: exp-cp) | Lane `7b91eff`, after two review rounds. The golden gives exactly 26 rows (revisions = distinct provider versions, all 230 publications). R7-8a holds and every view validates as `ArtifactsView`. Bursts match the reference (thor 33, m6 17), with B1–B9/B1–B6 on the CP side; Forge's burst id and `rev` are used as given. Whole agent-service suite: 1476 passed + 1 expected-fail. `Project.artifacts` comes from C2v-b's `projectView` over C4's provider. **Open:** cp-core's B1 (below) |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | **landed** `a76587ef` on lexi-ios `exp/control-plane` | `notes.py fragment` mints `f-<16 hex>` once, records `{host, session_id}` (host from `PROJECTS__INSTANCE_ID` via `keys.HOST_MAP`; refuses inside Forge without one), step ids `<feature_id>#<i>:<sha8>`; `<N>.md` `features[]` is the one source R1's `ShipUploaded` reads (validates against the frozen schema); duplicate ids refused. Identity cases 8/8; `tools/release` 145 tests (1 known `/bin/zsh` error); `release-check` OK. Two reviews. Swift `ReleaseNotesTests` run on the next train (no Xcode on Thor) |
 
 ### C4 file ownership: proposal to cp-core (agreed with changes; see the C4 row)
@@ -57,7 +57,7 @@ Until I hear back, C4 work stays in the new files only.
 - a stale `announced_by` join is dropped;
 - headlines read the newest row.
 
-C4's live-order test is `it.fails` until the patch lands. **Ask:** cp-core applies the patch (or its own equivalent) on `exp/control-plane`, and C4 flips the test.
+Revised after a second review: the patch is now 241 lines, with a one-time repair on open (no data wipe needed), "to check" raised once, and a `rev` column instead of a count; it was verified in a scratch copy with 301 tests. C4's live-order test is `it.fails` until the patch lands. **Ask:** cp-core applies the patch (or its own equivalent) on `exp/control-plane`, and C4 flips the test.
 
 ### F8 findings for the coordinator
 

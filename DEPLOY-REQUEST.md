@@ -1,3 +1,23 @@
+# deploy-request: lexi-frontend `exp/control-plane` `3cf3b69` → exp-cp (C4), for cp-platform
+
+C4 (the artifact registry and the `/v1/cp/views/artifacts` lens) has landed. Rebuild exp-cp at **`3cf3b69`**.
+- **No new required env.** The artifacts poller uses the same exp-Forge base as cp-core's ingest
+  (`CP_EXP_FORGE_BASE`) and `CP_EXP_FORGE_POLL_MS`.
+- **Optional:** `CP_ARTIFACT_FILE_BASES_FILE`, a JSON `{host: base}` of phone-reachable Forge file bases for
+  hosts other than thor-exp. thor-exp's base comes from the manifest's `app.forge`. A malformed file is
+  logged and skipped.
+
+**Checks after the rebuild (forge-artifacts runs these):**
+1. `GET /v1/cp/views/artifacts?scope=recent` → 200, validating as `ArtifactsView`. Every row has
+   `opens: system_browser`.
+2. From the boot-0 replay: 26 claude.ai rows in `scope=all`.
+3. `GET /exp/cp/status` shows `artifacts` (the last poll, the F7 cross-check, skipped and config_errors).
+
+**Known gap until cp-core applies B1** (`control-plane/requests/` on lexi-frontend `exp/cp-artifacts`): live bursts
+don't become "to check". B1 carries a one-time repair, so no data wipe is needed when it lands.
+
+---
+
 # Optional exp Forge update (cp-platform): niuu `exp/control-plane` `1b8fb72b`
 
 F8 changes one gateway behaviour. An attach carrying `role`/`parent` that the host refuses for a domain reason
