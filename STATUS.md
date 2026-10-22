@@ -52,6 +52,8 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 
 The sync branches are `exp/cp-x1-sync` in each repo.
 
+**H1 replay harnesses:** building on lexi-frontend `exp/cp-h1`, inside cp-core's `control-plane/` module (its ingest, replay transports, acceptance harness, C4's registry, R1's `cp_producer` for receipts). New: test files and `replay/h1/` corpora only; evidence goes in `replay/h1/coverage-replay.json` for E1's `e1-coverage.json`.
+
 **Reuse check (X1):** git merges only; the conflict helpers stayed in my scratchpad; nothing new in any repo besides the resolved code and the migration renumber/alias.
 
 ## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9 — **done** (every row landed; C4's live checks run by cp-platform in R28, results in plan `platform/STATUS.md` "## C4 live checks (R28)")
