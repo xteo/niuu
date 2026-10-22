@@ -32,7 +32,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
-| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | building | ownership **agreed** (cp-core's answer, relayed): `artifacts.ts`, `artifacts-ingest.ts` (via `store.ingestBatch`, `expForgeBase`/`expForgeOrigin`/`fetchJson`), `views/artifacts.ts` in the shared views module; one-line hooks in `views/router.ts` VIEW_ROUTES and `runtime.ts` start/close |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
 
 ### C4 file ownership: proposal to cp-core (please relay)
@@ -121,7 +121,7 @@ install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickof
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
-| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | waiting on file ownership (below) | — |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | building | ownership **agreed** (cp-core's answer, relayed): `artifacts.ts`, `artifacts-ingest.ts` (via `store.ingestBatch`, `expForgeBase`/`expForgeOrigin`/`fetchJson`), `views/artifacts.ts` in the shared views module; one-line hooks in `views/router.ts` VIEW_ROUTES and `runtime.ts` start/close |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
 
 ### C4 file ownership: proposal to cp-core (please relay)
