@@ -26,6 +26,34 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | E0 on exp stack | done (items 1–3); item 4 pending | exp Forge live at `e2208da8`. (1) `/instance` → host `thor-exp`; (2) all three feeds empty before; (3) Thor's 128 manifest rows appended to exercise session `da8a686a`: **122 publications, 12 keys, 33 bursts** (all backfill, = fixture), **0 notices**; replay #2 adds 0; admin backfill scanned 126, recorded 0, 0 notices. The 25-notice golden needs forced-live timing: offline only (memory + Postgres). (4) a real publish: pending the gated provider key. `docs/operator/e0/` |
 | LEX-1397 comment | done | landing comment posted |
 
+## Package 3 (relayed 2026-10-22): X1 branch sync, then H1
+
+### X1 branch sync: done 2026-10-22 (next due **2026-10-26**, twice a week; also before E1)
+
+| Repo | Production branch merged | `exp/control-plane` | Conflicts and resolution (exp side) |
+|---|---|---|---|
+| niuu | `lexi/dev-api-integration` `33087ca2` (already in exp), and the **Thor release `11afe41d`** | `42188eb1` → **`9463bc2a`** | Two merges. First the notification images (`2a215f30`), then `11afe41d` itself, which only records ancestry: its descriptions/attachments are exp's `3e603dd6`/`a0100520`, and `000087` is byte-identical. **The migration** `000072_forge_notification_images` is **`000090`** here, because exp's `000072` is `startup_schema_history`. It has a lineage alias to the release's `000072` (same sha256) in `migrations/`, the package and the chart, so P1 adopts Thor's applied row. **Code:** question signals (F11b) and image fields kept together (the turn payload is `draft_payload` + question metadata); `main.py` runs both the artifact hold and the image worker; presented-file download keeps F2's durable copy first. **Release tests adapted to exp:** the header identity adapter, the principal-scoped session stream, NotificationService's required image deps. **Also fixed:** `test_mesh_lightweight` now models an old host's refusal as FastAPI's `extra_forbidden` list (F8's rule; it was broken on exp since `1b8fb72b`). Full suite: 27077 passed, 4 known box failures |
+| lexi-frontend | `main` `836aea1` | `63c838a` → **`8999066`** | none (agent-cli diagnostic crumb). agent-service 1556 tests, agent-cli 12, `tsc` clean |
+| lexi-ios | `main` at **build 2372** `cdd737c1` | `d161ceb7` → **`6282a827`** | `AppDelegate.didFinishLaunching`: exp's LEX-1403 misconfiguration guard stays first, and main's LEX-1402 Reply edit-menu install follows. `tools/release` 155 tests (1 known `/bin/zsh`), `release-check` OK. **The Swift build is unverified on Thor** (no Xcode): please have cp-ios-app or the next train build `exp/control-plane` on mini-m6 |
+
+**Lane branches against the synced tips** (merge with `git merge-tree`; rebase of each lane's own commits in a scratch worktree): every lane merges cleanly and rebases cleanly.
+- **niuu:** `exp/cp-forge-artifacts` (5 own commits), `exp/cp-forge-state`.
+- **lexi-frontend:** `exp/cp-artifacts`, `cp-core` (2 own commits), `cp-needs-you`, `cp-o1a`, `cp-owners`, `cp-project-views`, `cp-seed`.
+- **lexi-ios:** `exp/cp-fragment-ids`, `exp/cp-u1`, `exp/cp-u1x` are all already inside `exp/control-plane`, so rebasing them has nothing to apply.
+
+**For cp-ios-app (mini-m6):** merge only, nothing was rebased or force-pushed. `exp/cp-u1`/`exp/cp-u1x` are untouched. The next time you merge `exp/control-plane`, you get build 2372's Reply feature (LEX-1402):
+- `AppDelegate`: the Reply menu install after the LEX-1403 guard;
+- `ChatScreen`/`ChatScreenModel`;
+- `LexiInputBar` (+iOS, +Mac);
+- `ForgeComposerState`, `ForgeSteerComposerBand`, `CodeSessionDetailView+Content`, `CodeSessionLiveModel`;
+- LexiMarkdownKit's `MarkdownReply*`;
+- `QAScenarioRegistry` + `MarkdownReplyQABoard`;
+- `ReleaseNotes/2372.md` and CHANGELOG.
+
+The sync branches are `exp/cp-x1-sync` in each repo.
+
+**Reuse check (X1):** git merges only; the conflict helpers stayed in my scratchpad; nothing new in any repo besides the resolved code and the migration renumber/alias.
+
 ## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9 — **done** (every row landed; C4's live checks run by cp-platform in R28, results in plan `platform/STATUS.md` "## C4 live checks (R28)")
 
 | Row | Repo / branch | State | Evidence |

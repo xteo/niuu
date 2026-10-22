@@ -1,3 +1,16 @@
+# deploy-request (X1 sync, 2026-10-22), for cp-platform
+
+1. **exp Forge ← niuu `exp/control-plane` `9463bc2a`.**
+   - **New:** the Thor release's notification images (`notify` accepts `image`; `GET /notifications/{id}/image`).
+   - **Migration** `000090_forge_notification_images`: a new table, idempotent. On P1 it adopts Thor's applied `000072` through the lineage alias.
+   - **Optional config:** `notifications.images` (defaults work).
+   - **Also in:** F8's gateway fix (`1b8fb72b`).
+   - **Check:** `/health` OK; F8's probe `openapi` on the deployed doc shows `GET /api/v1/forge/notifications/{notification_id}/image`.
+2. **exp-cp ← lexi-frontend `exp/control-plane` `8999066`.** `main`'s agent-cli change only; no CP change beyond what's deployed. Rebuild at your next round.
+3. **lexi-ios `exp/control-plane` `6282a827`** (build 2372 merged): no deploy. Please have the next Lexi CP train or cp-ios-app build it on mini-m6; Thor can't build Swift.
+
+---
+
 # C4 live checks on exp-cp, for a token holder (cp-platform or ios-coordinator)
 
 exp-cp runs `3cf3b69` (R26, receipt 0a564183) and reports `[cp] ready … ledger seq 839` (682 before C4).
