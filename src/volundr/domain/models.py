@@ -587,7 +587,41 @@ class Session(BaseModel):
         description="When description last changed value.",
     )
 
+    last_work_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Newest source time of a work row in the session's log (G10, F12d). Kept at "
+            "log ingest; never a heartbeat, a reconnect handshake or a terminal frame."
+        ),
+    )
+    open_tool_count: int = Field(
+        default=0,
+        ge=0,
+        description="PreToolUse hooks without their PostToolUse (reset by result/Stop).",
+    )
+
     model_config = {"frozen": False}
+
+    @property
+    def tool_open(self) -> bool:
+        """True while a tool call is open (F12d)."""
+        return self.open_tool_count > 0
+
+    @property
+    def open_controls(self) -> list[dict] | None:
+        """The broker's open human gates ``[{request_id, kind, opened_at}]`` (F12d).
+
+        ``None`` means unknown (an older broker, or none reported yet): a reader must
+        never take it as "no control open".
+        """
+        controls = (self.activity_metadata or {}).get("open_controls")
+        if not isinstance(controls, list):
+            return None
+        return [
+            {key: str(c[key]) for key in ("request_id", "kind", "opened_at") if c.get(key)}
+            for c in controls
+            if isinstance(c, dict) and c.get("request_id")
+        ]
 
     @property
     def needs_attention(self) -> bool:

@@ -284,6 +284,10 @@ class InMemoryEventBroadcaster(EventBroadcaster):
                 "description": session.description,
                 "short_description_updated_at": _iso(session.short_description_updated_at),
                 "description_updated_at": _iso(session.description_updated_at),
+                # G10 (F12d): the inputs every reader needs to derive "working" alike.
+                "last_work_at": _iso(session.last_work_at),
+                "tool_open": session.tool_open,
+                "open_controls": session.open_controls,
             },
             timestamp=datetime.now(UTC),
         )
