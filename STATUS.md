@@ -239,3 +239,24 @@ Deferred (noted, not blocking boot 0):
 | **R16-2** V2: seed overflow links hardcode `:9500` | in progress | |
 | **R16-6** remove `originOf` in `views/project.ts` once cp-core's `session()` parses origin | waiting on cp-core | |
 
+
+## Handoff to cp-dev (22 Oct)
+
+**Open items (niuu side):**
+- None blocking. R16-1 landed (`60a53223`), queued for deploy. After deploy, re-check the public GET on exp: `curl -sI http://thor.tail737f2a.ts.net:8380/api/v1/forge/sessions/<sid>/files/presented/<pf_id>` must show `content-security-policy: sandbox` (non-PDF) and `x-content-type-options: nosniff`.
+- Deferred, written up above: a `_put` race between two concurrent writers of one id (only the session's own broker can PUT, with a fresh random id); child/teammate hooks are not filtered from work facts (matches the reference).
+
+**Gotchas:**
+- **Facade vs embedded:** on the platform server `/api/v1/forge/...` is niuu's Guild facade (`src/niuu/adapters/inbound/rest_volundr.py`), which proxies to the embedded Forge (`src/volundr/adapters/inbound/rest.py`). A route must exist in BOTH, and response headers are rebuilt by the facade: test through the facade (`tests/test_niuu/test_rest_volundr_presented_files.py`, built on `tests/support/forge_session.py`), not only the embedded app. That gap hid the F2 405 (R25) and the R16-1 header loss.
+- **Session-token allow-list:** `src/niuu/domain/services/forge_session_policy.py` `ROUTE_POLICIES` is enforced by the facade edge AND Forge's `ForgeSessionAuthMiddleware`. A new broker-called route needs a `RoutePolicy` (the F2 PUT is `OWN`, notify scope).
+- **Broker loopback token:** broker routes (`/api/present-file`, etc.) are loopback-only, owner role; exp sessions run with fake model keys, so an agent can't call them: cp-platform drives shell turns through the broker's loopback token (`docker exec`) on request.
+- **Policy by type:** `niuu.domain.presented_files.presented_file_safety_headers` (PDF exempt from the sandbox on purpose). Every route that serves presented bytes uses it, the broker's included.
+- Tests: `env -u PYTHONPATH uv run --all-extras pytest`. The 17 box-specific failures (install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickoff) fail identically on the base.
+
+**Which tests bind which counterexamples:**
+- R16-1: `test_the_public_get_keeps_the_sandbox`, `test_the_facade_enforces_the_policy_even_if_the_node_omits_it` (niuu facade), `test_live_broker_fallback_carries_the_same_safety_policy` (Forge), `test_broker_serves_presented_files_inline_and_sandboxed` (broker), the SendUserFile route check in `test_send_user_file.py`.
+- F2 R25 (upload through the facade): `test_broker_upload_through_the_facade_then_served_after_stop`, `test_forge_refusals_pass_through_unchanged`, the 413/id tests in the same file.
+- F12: the 20 derived-state goldens (`tests/test_niuu/test_work_facts.py`, `tests/integration/volundr/test_session_work_facts.py`).
+- F11b: `tests/test_niuu/test_question_signals.py` (A1–A27, R7-2b/c).
+
+**Evidence:** LEX-1398 comments (each landing); this file's tables; cp-platform's R27 receipt (F2 check 2 from mini-m6) and round 30 receipt 71b932cd.
