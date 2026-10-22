@@ -32,7 +32,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
 | F8 m6 on par | niuu `exp/cp-forge-artifacts` | re-review | review 1: 2 BLOCKER + 4 MAJOR, all fixed (write mode refuses production ports and needs the scratch id; read mode pinned with `scope=local`; full Forge route-set compare; recorded-OpenAPI mode; the gateway's 422→501 masking fixed). Branch Thor vs m6 shape **ON PAR 39/39**; live Thor `11afe41d` serves one route the branch lacks (notification images, see below). `docs/operator/forge-parity.md`, `docs/operator/f8-parity/` |
-| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | building | ownership **agreed** (cp-core's answer, relayed): `artifacts.ts`, `artifacts-ingest.ts` (via `store.ingestBatch`, `expForgeBase`/`expForgeOrigin`/`fetchJson`), `views/artifacts.ts` in the shared views module; one-line hooks in `views/router.ts` VIEW_ROUTES and `runtime.ts` start/close |
+| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | re-review; **needs cp-core B1** | `bbe7470`. 295 control-plane tests + 1 expected-fail; `tsc` clean. The golden gives exactly 26 rows (revisions = distinct provider versions, all 230 publications); R7-8a holds and every view validates; bursts match the reference (thor 33, m6 17), with B1–B9/B1–B6 on the CP side; Forge's burst id and `rev` are used as given. Review 1: 1 BLOCKER (in cp-core's store) + 3 MAJOR, the majors and minors fixed |
 | R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | **landed** `a76587ef` on lexi-ios `exp/control-plane` | `notes.py fragment` mints `f-<16 hex>` once, records `{host, session_id}` (host from `PROJECTS__INSTANCE_ID` via `keys.HOST_MAP`; refuses inside Forge without one), step ids `<feature_id>#<i>:<sha8>`; `<N>.md` `features[]` is the one source R1's `ShipUploaded` reads (validates against the frozen schema); duplicate ids refused. Identity cases 8/8; `tools/release` 145 tests (1 known `/bin/zsh` error); `release-check` OK. Two reviews. Swift `ReleaseNotesTests` run on the next train (no Xcode on Thor) |
 
 ### C4 file ownership: proposal to cp-core (agreed with changes; see the C4 row)
@@ -48,6 +48,16 @@ C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files 
 - **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
 
 Until I hear back, C4 work stays in the new files only.
+
+### C4 → cp-core request B1 (please relay)
+
+`recordOccurrence` freezes an occurrence at its first recording, so in the live order (a publication, a poll, then the agent's notice) a burst never becomes "to check", a later attach never scopes it in All updates, and widening pushes no frame. C4 can't fix this in its own files. **The patch is ready:** lexi-frontend `exp/cp-artifacts` `services/lexi-agent-service/control-plane/requests/` (README + a 65-line patch to `store.ts` and `views/headlines.ts`):
+- one ledger row per revision, with revision 0 keeping today's id;
+- the upsert also updates `project_id`/`occurred_at`;
+- a stale `announced_by` join is dropped;
+- headlines read the newest row.
+
+C4's live-order test is `it.fails` until the patch lands. **Ask:** cp-core applies the patch (or its own equivalent) on `exp/control-plane`, and C4 flips the test.
 
 ### F8 findings for the coordinator
 
