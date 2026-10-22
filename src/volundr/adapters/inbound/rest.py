@@ -23,6 +23,11 @@ from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
 from niuu.domain.notifications import notification_visible_to
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_DURABLE_CACHE,
+    PRESENTED_FILE_LIVE_CACHE,
+    PRESENTED_FILE_SAFETY_HEADERS,
+)
 from niuu.domain.services.token_scope import (
     FORGE_NOTIFY_SCOPE,
     FORGE_SESSION_LIFECYCLE_SCOPE,
@@ -3528,13 +3533,13 @@ def create_router(
                     # The file is agent-supplied: render it, never run it on Forge's
                     # origin (HTML or SVG script, sniffed types).
                     headers={
-                        "cache-control": "private, max-age=86400, immutable",
-                        "x-content-type-options": "nosniff",
-                        "content-security-policy": "sandbox",
+                        "cache-control": PRESENTED_FILE_DURABLE_CACHE,
+                        **PRESENTED_FILE_SAFETY_HEADERS,
                     },
                 )
         response = await _proxy_session_api(request, session_id, *PRESENTED_FILE_ROUTE, file_id)
-        headers = {}
+        # The live broker's staged copy is just as agent-supplied: the same safety policy.
+        headers = {"cache-control": PRESENTED_FILE_LIVE_CACHE, **PRESENTED_FILE_SAFETY_HEADERS}
         disposition = response.headers.get("content-disposition")
         if disposition:
             headers["content-disposition"] = disposition
