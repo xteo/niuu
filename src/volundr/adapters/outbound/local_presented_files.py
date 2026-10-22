@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,25 @@ class LocalPresentedFileStore(PresentedFileStore):
 
     async def get(self, session_id: UUID, file_id: str) -> tuple[PresentedFile, Path] | None:
         return await asyncio.to_thread(self._get, session_id, file_id)
+
+    async def delete_session(self, session_id: UUID) -> int:
+        return await asyncio.to_thread(self._delete_session, session_id)
+
+    def _delete_session(self, session_id: UUID) -> int:
+        target = self._root / str(UUID(str(session_id)))
+        if target.is_symlink():
+            target.unlink()
+            return 0
+        if not target.is_dir():
+            return 0
+        removed = sum(1 for entry in target.iterdir() if is_presented_file_id(entry.name))
+        try:
+            shutil.rmtree(target)
+        except OSError:
+            # A write landing mid-delete (ENOTEMPTY); its PUT re-checks the session
+            # and deletes again, so one more pass is enough here.
+            shutil.rmtree(target, ignore_errors=True)
+        return removed
 
     def _put(
         self, session_id: UUID, file_id: str, name: str, mime: str, data: bytes
