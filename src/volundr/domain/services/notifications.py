@@ -3,9 +3,11 @@
 Producers never write the feed directly. A notification is *projected* from a
 durable source (a stored session-log row, a needs-input transition, or a direct
 submit carrying an idempotency key) into ``forge_notifications`` together with
-its scheduled deliveries, in one transaction. Only newly inserted rows are then
-broadcast as ``session_notification``, so producer retries never duplicate a row,
-a delivery or a live event.
+its scheduled deliveries (and a pending image copy when it carries an image), in
+one transaction. Only newly inserted rows are then broadcast as
+``session_notification``, so producer retries never duplicate a row, a delivery or
+a live event. A new row with an image is broadcast by the image worker once its
+image settles (:mod:`volundr.domain.services.notification_images`).
 """
 
 from __future__ import annotations
@@ -29,9 +31,11 @@ from niuu.domain.notifications import (
     summarize_reply,
     turn_dedupe_key,
 )
-from volundr.domain.models import EventType, RealtimeEvent, Session, SessionLogEntry
+from volundr.domain.models import Session, SessionLogEntry
 from volundr.domain.notification_ports import (
     NotificationDeliveryRepository,
+    NotificationImageRepository,
+    NotificationImageScheduler,
     NotificationRecorder,
     NotificationRepository,
     NotificationRuleRepository,
@@ -42,6 +46,9 @@ from volundr.domain.notifications import (
     NotificationCandidate,
     NotificationDelivery,
     NotificationFeed,
+    NotificationImageContent,
+    NotificationImageState,
+    NotificationImageVariant,
     NotificationNotFoundError,
     NotificationQuery,
     NotificationReadState,
@@ -52,6 +59,7 @@ from volundr.domain.notifications import (
     NotificationValidationError,
 )
 from volundr.domain.ports import EventBroadcaster, IntegrationRepository
+from volundr.domain.services.notification_images import notification_event
 from volundr.domain.session_read_state import is_final_output
 
 logger = logging.getLogger(__name__)
@@ -123,6 +131,8 @@ class NotificationService(NotificationRecorder):
         rule_repository: NotificationRuleRepository,
         delivery_repository: NotificationDeliveryRepository,
         *,
+        image_repository: NotificationImageRepository,
+        image_scheduler: NotificationImageScheduler,
         broadcaster: EventBroadcaster | None = None,
         reply_ready_enabled: bool,
         reply_title_chars: int,
@@ -138,6 +148,8 @@ class NotificationService(NotificationRecorder):
         self._repository = repository
         self._rules = rule_repository
         self._deliveries = delivery_repository
+        self._images = image_repository
+        self._image_scheduler = image_scheduler
         self._broadcaster = broadcaster
         self._reply_ready_enabled = reply_ready_enabled
         self._reply_title_chars = reply_title_chars
@@ -369,26 +381,32 @@ class NotificationService(NotificationRecorder):
             model=context.model,
             correlation_id=draft.correlation_id,
             metadata={**metadata, **draft.question_metadata()},
+            image=draft.image,
         )
 
     async def _record(self, candidates: list[NotificationCandidate]) -> list[Notification]:
         if not candidates:
             return []
         created = await self._repository.project(candidates)
+        images_pending = False
         for notification in created:
+            if (
+                notification.image is not None
+                and notification.image.state is NotificationImageState.PENDING
+            ):
+                # Announced by the image worker once the image settles, so the live
+                # event carries the stored image (or its failure) like the feed does.
+                images_pending = True
+                continue
             await self._broadcast(notification)
+        if images_pending:
+            self._image_scheduler.wake()
         return created
 
     async def _broadcast(self, notification: Notification) -> None:
         if self._broadcaster is None:
             return
-        await self._broadcaster.publish(
-            RealtimeEvent(
-                type=EventType.SESSION_NOTIFICATION,
-                data=notification.wire(),
-                timestamp=notification.created_at,
-            )
-        )
+        await self._broadcaster.publish(notification_event(notification))
 
     # -- Reading -----------------------------------------------------------
 
@@ -477,6 +495,22 @@ class NotificationService(NotificationRecorder):
             raise NotificationNotFoundError(f"Notification not found: {notification_id}")
         await self._repository.mark_read(principal.user_id, notification_id)
         return await self.get_read_state(principal)
+
+    async def image_content(
+        self,
+        principal: Principal,
+        notification_id: UUID,
+        variant: NotificationImageVariant,
+    ) -> NotificationImageContent:
+        """The stored image bytes, readable by exactly those who may read the item."""
+        notification = await self._repository.get(notification_id)
+        scope = NotificationScope.for_principal(principal)
+        if notification is None or not scope.allows(notification.owner_id, notification.tenant_id):
+            raise NotificationNotFoundError(f"Notification not found: {notification_id}")
+        content = await self._images.get_content(notification_id, variant)
+        if content is None:
+            raise NotificationNotFoundError(f"Notification {notification_id} has no stored image")
+        return content
 
     async def list_deliveries(
         self, principal: Principal, notification_id: UUID

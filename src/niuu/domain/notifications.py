@@ -6,6 +6,10 @@ Forge projects both into its cursor-ordered notification feed. Skuld builds turn
 with :func:`build_notification_turn`; Forge reads them back with
 :func:`draft_from_log_payload`. Keeping both sides here means the turn shape, the
 limits and the deterministic ids cannot drift between producer and projector.
+
+A draft may carry one image reference (:class:`NotificationImageRef`). Forge copies
+the referenced bytes once when it records the notification and serves its own
+durable copy at :data:`NOTIFICATION_IMAGE_PATH`.
 """
 
 from __future__ import annotations
@@ -13,8 +17,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable
 from enum import StrEnum
+from typing import Any
+from urllib.parse import urlencode, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Protocol limits. They bound what a model may persist per notification; they are
 # part of the wire contract shared by Skuld, Forge and clients, not tunables.
@@ -24,6 +30,25 @@ MAX_LINKS = 10
 MAX_LINK_LABEL_CHARS = 200
 MAX_LINK_URL_CHARS = 2048
 MAX_CORRELATION_ID_CHARS = 200
+
+# Image protocol limits: what a producer may attach and what Forge will copy. Like
+# the text limits above they are wire contract, not tunables.
+MAX_IMAGE_ALT_CHARS = 300
+MAX_IMAGE_URL_CHARS = MAX_LINK_URL_CHARS
+#: A present-file id exactly as the Skuld broker issues it (``pf_`` + 32 hex digits).
+PRESENTED_FILE_ID_PATTERN = r"^pf_[0-9a-f]{32}$"
+#: The largest image Forge copies for one notification.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+#: The most pixels Forge decodes for one image (a decompression-bomb bound).
+MAX_IMAGE_PIXELS = 40_000_000
+#: Image types a notification image may have. The fetched bytes must be declared as
+#: one of them AND decode as one of them; Forge stores the decoded type.
+NOTIFICATION_IMAGE_MIME_TYPES: frozenset[str] = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+#: Where Forge serves a notification's stored image; ``?variant=thumb`` is the thumbnail.
+NOTIFICATION_IMAGE_PATH = "/api/v1/forge/notifications/{notification_id}/image"
+NOTIFICATION_IMAGE_THUMB_VARIANT = "thumb"
 
 NOTIFICATION_TOOL_NAME = "forge_notification"
 NOTIFICATION_TURN_KIND = "notification"
@@ -133,6 +158,88 @@ class AboutQuestion(BaseModel):
     action: QuestionAction
 
 
+class NotificationImageSourceKind(StrEnum):
+    FILE_ID = "file_id"
+    URL = "url"
+
+
+class NotificationImageRef(BaseModel):
+    """An image a producer attaches: a present-file id OR an https URL, plus alt text.
+
+    Forge copies the bytes once when it records the notification (through the
+    session's broker for ``file_id``, by HTTP GET for ``url``) and serves its own
+    durable copy; the reference itself is never handed to readers as the image.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    file_id: str | None = Field(default=None, pattern=PRESENTED_FILE_ID_PATTERN)
+    url: str | None = Field(default=None, min_length=1, max_length=MAX_IMAGE_URL_CHARS)
+    alt: str | None = Field(default=None, max_length=MAX_IMAGE_ALT_CHARS)
+
+    @field_validator("url")
+    @classmethod
+    def _https_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("image url must be an absolute https:// URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("image url must not carry credentials")
+        return value
+
+    @field_validator("alt")
+    @classmethod
+    def _normalize_alt(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return " ".join(value.split()) or None
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> NotificationImageRef:
+        if (self.file_id is None) == (self.url is None):
+            raise ValueError("image needs exactly one of file_id (from present-file) or url")
+        return self
+
+    @property
+    def source_kind(self) -> NotificationImageSourceKind:
+        if self.file_id is not None:
+            return NotificationImageSourceKind.FILE_ID
+        return NotificationImageSourceKind.URL
+
+    @property
+    def source_ref(self) -> str:
+        """The file id or URL, whichever this reference carries."""
+        return self.file_id if self.file_id is not None else str(self.url)
+
+    def wire(self) -> dict[str, str]:
+        """The JSON form without absent fields (``{"file_id"}`` or ``{"url"}``, ``alt``)."""
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+def notification_image_url(
+    notification_id: uuid.UUID | str,
+    *,
+    thumbnail: bool = False,
+    instance_id: str | None = None,
+) -> str:
+    """The Forge-relative URL of a notification's stored image (or its thumbnail).
+
+    ``instance_id`` is added only by a Guild facade, so a fleet-wide client reaches
+    the node that holds the image; a single Forge returns the plain URL.
+    """
+    path = NOTIFICATION_IMAGE_PATH.format(notification_id=notification_id)
+    params: list[tuple[str, str]] = []
+    if thumbnail:
+        params.append(("variant", NOTIFICATION_IMAGE_THUMB_VARIANT))
+    if instance_id:
+        params.append(("instance_id", instance_id))
+    if not params:
+        return path
+    return f"{path}?{urlencode(params)}"
+
+
 class NotificationDraft(BaseModel):
     """What a producer asks to publish; Forge adds identity, ownership and order."""
 
@@ -160,6 +267,8 @@ class NotificationDraft(BaseModel):
             out["about_question"] = self.about_question.model_dump(mode="json")
         return out
 
+    image: NotificationImageRef | None = None
+
     @field_validator("title")
     @classmethod
     def _strip_title(cls, value: str) -> str:
@@ -172,6 +281,18 @@ class NotificationDraft(BaseModel):
     @classmethod
     def _strip_body(cls, value: str) -> str:
         return value.strip()
+
+
+def draft_payload(draft: NotificationDraft) -> dict[str, Any]:
+    """The JSON a producer sends for a draft (a turn's notification, a submit body).
+
+    ``image`` appears only when one is attached, so drafts without an image keep the
+    exact shape older producers wrote and older Forge releases read.
+    """
+    payload = draft.model_dump(mode="json", exclude={"image"})
+    if draft.image is not None:
+        payload["image"] = draft.image.wire()
+    return payload
 
 
 #: The role that may read every notification in its own tenant (Forge's admin role).
@@ -223,7 +344,10 @@ def build_notification_turn(
     change the session's unread reply state.
     """
     nid = notification_id(turn_dedupe_key(session_id, turn_id, draft.kind))
-    payload = draft.model_dump(mode="json", exclude=set(QUESTION_FIELDS))
+    payload = draft_payload(draft)
+    # Question signals ride in the turn's metadata form (F11b), never as raw fields.
+    for field in QUESTION_FIELDS:
+        payload.pop(field, None)
     payload.update(draft.question_metadata())
     payload["notification_id"] = str(nid)
     return {

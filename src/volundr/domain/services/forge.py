@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from niuu.domain.session_description import DESCRIPTION_FIELDS, SessionDescriptionPatch
 from niuu.forge_mcp.credentials import normalize_grants
 from volundr.domain.services.forge_session_launch import FORGE_MCP_KEY, GRANTS_KEY
+from volundr.domain.session_broker import broker_base_url
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -522,10 +523,7 @@ class ForgeService:
             raise LookupError(f"Session not found: {session_id}")
         if not session.chat_endpoint:
             raise ValueError(f"Session {session_id} has no active endpoint")
-        base_url = session.chat_endpoint.replace("wss://", "https://").replace("ws://", "http://")
-        if base_url.endswith("/session"):
-            base_url = base_url[: -len("/session")]
-        return session, base_url
+        return session, broker_base_url(session.chat_endpoint)
 
     async def get_transcript(self, session_id: UUID) -> dict:
         if self._archive_service is None:

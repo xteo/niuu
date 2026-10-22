@@ -175,6 +175,9 @@ def test_assignment_forwards_role_parent_and_detach():
     assert client().put(path, json=detach, headers=_headers()).status_code == 200
     assert json.loads(assignment.calls[1].request.content) == detach
     # An old host rejects the new fields; that is an upgrade message, not a crash.
-    assignment.respond(422, json={"detail": "extra fields"})
+    old_host_refusal = {
+        "detail": [{"type": "extra_forbidden", "loc": ["body", "role"], "msg": "Extra inputs"}]
+    }
+    assignment.respond(422, json=old_host_refusal)
     response = client().put(path, json=body, headers=_headers())
     assert response.status_code == 501 and "Update" in response.json()["detail"]

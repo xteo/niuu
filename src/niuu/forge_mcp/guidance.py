@@ -1,5 +1,12 @@
 """Shared authoring guidance for session and feed notification tools and skills."""
 
+from niuu.domain.notifications import MAX_IMAGE_BYTES, NOTIFICATION_IMAGE_MIME_TYPES
+
+_BYTES_PER_MB = 1024 * 1024
+_IMAGE_TYPE_NAMES = ", ".join(
+    sorted(mime.split("/", 1)[1].upper() for mime in NOTIFICATION_IMAGE_MIME_TYPES)
+)
+
 # When to notify. Forge no longer raises an automatic notification when a turn ends, so
 # the agent's own notifications are the only activity signal the user gets. Keep them
 # rare and worth an interruption.
@@ -50,3 +57,13 @@ question; from any other session these are rejected and never applied;
 - any session filed in the same project, on any host, may relay it (action=relay), \
 for example a coordinator passing on a worker's question; relay links, it never copies.
 Always name the host: a bare uuid is refused."""
+
+
+NOTIFICATION_IMAGE_GUIDANCE = f"""\
+Attach an image when a picture shows the outcome better than words (a screenshot of \
+the finished screen, a chart, a rendered diagram): `image: {{"file_id": "<id>"}}` with \
+the file_id present-file returned for the image, or `image: {{"url": "https://..."}}` \
+for an image already online, and add `alt`: a short description of what it shows. \
+One image per notification ({_IMAGE_TYPE_NAMES}, at most \
+{MAX_IMAGE_BYTES // _BYTES_PER_MB} MB). Forge keeps its own copy, so the file may \
+change or go away afterwards."""
