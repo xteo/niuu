@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,9 +12,12 @@ from fastapi.testclient import TestClient
 from skuld.config import PresentedDurableConfig
 from skuld.presented_durable import (
     DURABLE_MARKER,
+    PENDING_MARKER,
     durable_record,
+    pending_uploads,
     retry_presented_upload,
     upload_presented_file,
+    write_pending_record,
 )
 
 URL = "http://thor.tail737f2a.ts.net:8380/api/v1/forge/sessions/s/files/presented/pf_x"
@@ -198,3 +202,91 @@ def test_registry_rebuild_never_serves_the_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
     api_mod._rebuild_presented_registry()
     assert api_mod._presented_registry[entry.name].endswith("/content")
+
+
+def _stage(root, file_id, *, pending=True, durable=False):
+    entry = root / file_id
+    entry.mkdir(parents=True)
+    content = entry / "content"
+    content.write_bytes(b"bytes-" + file_id.encode())
+    if pending:
+        write_pending_record(content, name=f"{file_id}.txt", mime="text/plain")
+    if durable:
+        (entry / DURABLE_MARKER).write_text('{"url": "x"}')
+    return content
+
+
+def test_pending_uploads_lists_only_copies_not_yet_durable(tmp_path):
+    a, b, c = ("pf_" + ch * 32 for ch in "abc")
+    _stage(tmp_path, a)
+    _stage(tmp_path, b, durable=True)
+    _stage(tmp_path, c, pending=False)  # staged before F2: no record, nothing to resume
+    (tmp_path / "pf_bad").mkdir()
+    (tmp_path / "pf_bad" / "content").write_bytes(b"x")
+    (tmp_path / "pf_bad" / PENDING_MARKER).write_text("not json")
+    assert [(fid, name, mime) for fid, _, name, mime in pending_uploads(tmp_path)] == [
+        (a, f"{a}.txt", "text/plain")
+    ]
+    assert pending_uploads(tmp_path / "missing") == []
+
+
+def test_present_file_writes_the_pending_record(client, tmp_path, monkeypatch):
+    from skuld import broker_api as api_mod
+
+    async def no_upload(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(api_mod, "upload_presented_file", no_upload)
+    src = tmp_path / "notes.txt"
+    src.write_bytes(b"hello")
+    file_id = client.post("/api/present-file", json={"path": str(src)}).json()["file_id"]
+    record = json.loads((tmp_path / "staging" / file_id / PENDING_MARKER).read_text())
+    assert record == {"name": "notes.txt", "mime": "text/plain"}
+
+
+async def test_restart_resumes_uploads_that_had_not_landed(tmp_path, monkeypatch):
+    """A broker restart re-queues every staged copy without a receipt, and the retry
+    lands it in Forge; copies already durable are not uploaded again."""
+    import asyncio
+
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    pending_id, done_id = "pf_" + "1" * 32, "pf_" + "2" * 32
+    _stage(root, pending_id)
+    _stage(root, done_id, durable=True)
+    fake = _broker(_ok())
+    monkeypatch.setattr(api_mod, "broker", fake)
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+
+    assert api_mod._resume_presented_uploads() == 1
+    await asyncio.gather(*list(api_mod._presented_upload_tasks))
+
+    fake.client.put.assert_awaited_once()
+    call = fake.client.put.await_args
+    assert call.args[0].endswith(f"/files/presented/{pending_id}")
+    assert call.kwargs["content"] == b"bytes-" + pending_id.encode()
+    assert durable_record(root / pending_id / "content")["url"] == URL
+    assert pending_uploads(root) == []
+
+
+def test_resume_is_off_without_forge(tmp_path, monkeypatch):
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    _stage(root, "pf_" + "3" * 32)
+    monkeypatch.setattr(api_mod, "broker", _broker(api=""))
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+    assert api_mod._resume_presented_uploads() == 0
+
+
+def test_registry_rebuild_never_serves_the_pending_record(tmp_path, monkeypatch):
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    entry = root / ("pf_" + "c" * 32)
+    entry.mkdir(parents=True)
+    (entry / PENDING_MARKER).write_text('{"name": "n", "mime": "m"}')
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+    api_mod._rebuild_presented_registry()
+    assert entry.name not in api_mod._presented_registry

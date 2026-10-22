@@ -22,6 +22,10 @@ from skuld.event_log import FORGE_SESSIONS_PATH
 logger = logging.getLogger("skuld.broker")
 
 DURABLE_MARKER = "durable.json"
+# What the upload needs beyond the bytes (name, mime), written at staging so an upload
+# that has not landed can resume after a broker restart.
+PENDING_MARKER = "presented.json"
+SIDECARS = frozenset({DURABLE_MARKER, PENDING_MARKER})
 NAME_HEADER = "x-presented-file-name"
 
 
@@ -33,6 +37,43 @@ def durable_record(staged: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def write_pending_record(staged: Path, *, name: str, mime: str) -> None:
+    """Record the upload's name and mime beside the staged copy."""
+    try:
+        (staged.parent / PENDING_MARKER).write_text(json.dumps({"name": name, "mime": mime}))
+    except OSError:
+        logger.debug("present-file: could not write pending marker for %s", staged.parent.name)
+
+
+def pending_uploads(root: Path) -> list[tuple[str, Path, str, str]]:
+    """Staged copies whose durable upload has not landed: ``(file_id, path, name, mime)``.
+
+    Only copies with a pending record count; files staged before F2 have none and keep
+    being served by the live broker alone."""
+    out: list[tuple[str, Path, str, str]] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        content = entry / "content"
+        marker = entry / PENDING_MARKER
+        if (entry / DURABLE_MARKER).exists() or content.is_symlink() or not content.is_file():
+            continue
+        if marker.is_symlink():
+            continue
+        try:
+            record = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict) or not record.get("name") or not record.get("mime"):
+            continue
+        out.append((entry.name, content, str(record["name"]), str(record["mime"])))
+    return out
 
 
 async def upload_presented_file(
