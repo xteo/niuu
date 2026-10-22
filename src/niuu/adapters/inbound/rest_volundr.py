@@ -67,7 +67,9 @@ from niuu.domain.notifications import notification_image_url, notification_visib
 from niuu.domain.presented_files import (
     PRESENTED_FILE_DEFAULT_MAX_BYTES,
     PRESENTED_FILE_ID_PATTERN,
+    PRESENTED_FILE_LIVE_CACHE,
     PRESENTED_FILE_NAME_HEADER,
+    PRESENTED_FILE_SAFETY_HEADERS,
 )
 from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
@@ -3894,7 +3896,12 @@ def create_volundr_router(
             path=f"/sessions/{session_id}/files/presented/{file_id}",
         )
         _ensure_remote_success(response)
-        headers: dict[str, str] = {}
+        # Agent-supplied content (judge R16-1): the safety policy is enforced here too, whatever
+        # the node sent, and the node's cache policy is kept (never cached when it sent none).
+        headers: dict[str, str] = {
+            "cache-control": response.headers.get("cache-control") or PRESENTED_FILE_LIVE_CACHE,
+            **PRESENTED_FILE_SAFETY_HEADERS,
+        }
         disposition = response.headers.get("content-disposition")
         if disposition:
             headers["content-disposition"] = disposition
