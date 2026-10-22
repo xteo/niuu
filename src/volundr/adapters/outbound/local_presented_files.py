@@ -59,7 +59,12 @@ class LocalPresentedFileStore(PresentedFileStore):
         if not target.is_dir():
             return 0
         removed = sum(1 for entry in target.iterdir() if is_presented_file_id(entry.name))
-        shutil.rmtree(target)
+        try:
+            shutil.rmtree(target)
+        except OSError:
+            # A write landing mid-delete (ENOTEMPTY); its PUT re-checks the session
+            # and deletes again, so one more pass is enough here.
+            shutil.rmtree(target, ignore_errors=True)
         return removed
 
     def _put(
