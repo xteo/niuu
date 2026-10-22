@@ -49,6 +49,7 @@ from niuu.config_models import (
 from niuu.domain.delivery import AcceptancePolicy
 from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
 from niuu.domain.observability import ObservabilityConfig
+from niuu.domain.presented_files import PRESENTED_FILE_DEFAULT_MAX_BYTES
 from niuu.forge_mcp.models import ForgeMcpGrant
 from ravn.config import LLMConfig, PersonaSourceConfig
 from volundr.compute.config import ComputeConfig
@@ -1166,7 +1167,7 @@ class PresentedFilesConfig(BaseModel):
         ),
     )
     max_bytes: int = Field(
-        default=52_428_800,
+        default=PRESENTED_FILE_DEFAULT_MAX_BYTES,
         gt=0,
         description="Largest durable copy accepted (matches Skuld's max_presented_file_bytes).",
     )
