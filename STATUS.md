@@ -77,10 +77,13 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Oracle (read-only, docs worktree) | done | `validate.py`: derived 20/20, R7-2b/R7-2c pass; `model/acceptance/run.py` 117/117 |
 | F2 durable copy + tailnet URL | done | `c7e93b9c`; `tests/test_volundr/test_presented_files_durable.py`, `tests/test_skuld/test_presented_durable.py` |
 | Review of the branch | done | independent review: 2 high (stored XSS on inline files; F12c idle for transports without a turn flag), 6 medium; all high and medium fixed except the deferred items below |
-| Merge into `exp/control-plane`, record sha | pending | |
-| Send sha to cp-platform; exp Forge redeploy | blocked | no `message` grant (see below) |
-| F2 live proof: URL serves from exp Forge over the tailnet, from mini-m6 | pending | after deploy |
-| LEX-1398 comment | pending | |
+| Merge into `exp/control-plane`, record sha | done | `e2208da8` (lane tip `1f3ecf78`) |
+| Send sha to cp-platform; exp Forge redeploy | relayed | ios-coordinator relayed `e2208da8` + overlay: cp-platform round 23 |
+| F2 live proof: URL serves from exp Forge over the tailnet, from mini-m6 | pending | after round 23 is confirmed |
+| LEX-1398 comment | done | landing comment posted |
+| F2 gap: durable files removed on session delete | done | `d76c1420`, `0deedaba`; `tests/test_volundr/test_presented_files_cleanup.py` (fails without the fix); a PUT that lands after the delete removes what it wrote (404) |
+| F2 gap: uploads resume after a broker restart | done | `presented.json` pending record at staging; `_resume_presented_uploads` at startup, one file at a time; a final 4xx (`refused.json`) is never retried; `tests/test_skuld/test_presented_durable.py` |
+| Review of the gap fixes | done | independent review: 0 high, 2 medium (delete/PUT race; resume burst), 4 low; all fixed except the card URL note below |
 
 Full suite: 26,731 pass; the 17 failures are identical on the untouched base (box-specific:
 install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickoff).
@@ -154,13 +157,22 @@ Fixed:
 Deferred (noted, not blocking boot 0):
 - child/teammate Claude hooks are not filtered from the work facts, matching the reference
   `derived_state.py`, which doesn't filter them either;
-- no cleanup of durable files on session delete;
-- background upload retries are lost if the broker restarts before they succeed, with no rescan;
+- ~~no cleanup of durable files on session delete~~ (done, `d76c1420`);
+- ~~background upload retries are lost if the broker restarts~~ (done, `d76c1420`);
+- a card whose upload lands late (retry or resume) keeps the relative route in its turn, not the
+  absolute URL. It still opens the durable copy: the route serves the durable copy first.
 - two concurrent PUTs of different bytes under one id could interleave (only the session's own
   broker can PUT, with a fresh random id).
 
 ## Blockers
 
-- **No cross-session message grant** (`forge_mcp.grants` lacks `message`). I can't send the sha to
-  cp-platform or agree the boundary with cp-forge-artifacts myself. The coordinator has to relay
-  it, or grant `message`.
+- **No cross-session message grant** (`forge_mcp.grants` lacks `message`). Deploys go through
+  ios-coordinator, which reads this file and the session description (second package, 2026-10-22).
+
+## Next package (2026-10-22, from ios-coordinator)
+
+1. F2 live proof after round 23: pending the deploy confirmation.
+2. F2 gaps: done (above).
+3. V2 project seed and voice: lexi-frontend, worktree `~/repos/worktrees/exp-cp-seed`, branch
+   `exp/cp-seed` (cut from `origin/exp/control-plane` `507deef`); status in that branch's STATUS.md.
+4. C2v-b: after cp-core lands the C2v split.
