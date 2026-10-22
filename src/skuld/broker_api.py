@@ -43,9 +43,11 @@ from skuld.path_security import (
     resolve_path_in_roots,
 )
 from skuld.presented_durable import (
-    DURABLE_MARKER,
+    SIDECARS,
+    pending_uploads,
     retry_presented_upload,
     upload_presented_file,
+    write_pending_record,
 )
 from skuld.room_role_port import RoomRoleResolutionError
 from skuld.service_manager import ServiceCreateRequest, ServiceStatus
@@ -1030,13 +1032,41 @@ def _rebuild_presented_registry() -> None:
             files = sorted(
                 item
                 for item in safe_entry.iterdir()
-                if item.is_file() and not item.is_symlink() and item.name != DURABLE_MARKER
+                if item.is_file() and not item.is_symlink() and item.name not in SIDECARS
             )
             preferred = [item for item in files if item.name == "content"]
             if preferred or files:
                 _presented_registry[entry.name] = str((preferred or files)[0])
     except (OSError, UnsafePathError) as exc:  # pragma: no cover - best-effort recovery
         logger.warning("present-file: registry rebuild failed: %s", repr(exc))
+
+
+def _schedule_presented_retry(file_id: str, staged: Path, *, name: str, mime: str) -> None:
+    task = asyncio.create_task(
+        retry_presented_upload(broker, file_id, staged, name=name, mime=mime),
+        name=f"present-file-durable-{file_id}",
+    )
+    _presented_upload_tasks.add(task)
+    task.add_done_callback(_presented_upload_tasks.discard)
+
+
+def _resume_presented_uploads() -> int:
+    """Re-queue durable uploads that had not landed when the broker last stopped (F2).
+
+    Call from the running event loop, after the registry rebuild."""
+    if not broker.volundr_api_url or not broker.session_id:
+        return 0
+    try:
+        root = _presented_staging_dir()
+    except (OSError, UnsafePathError) as exc:
+        logger.warning("present-file: cannot scan staging for uploads: %s", repr(exc))
+        return 0
+    pending = [item for item in pending_uploads(root) if _PRESENTED_ID_RE.fullmatch(item[0])]
+    for file_id, staged, name, mime in pending:
+        _schedule_presented_retry(file_id, staged, name=name, mime=mime)
+    if pending:
+        logger.info("present-file: resuming %d durable uploads", len(pending))
+    return len(pending)
 
 
 @app.post("/api/present-file", dependencies=_LOOPBACK_GUARD)
@@ -1089,6 +1119,7 @@ async def present_file(body: dict) -> dict:
         logger.warning("present-file: staging copy failed: %s", repr(exc))
         raise HTTPException(500, "could not stage file") from None
     _presented_registry[file_id] = str(dest)
+    write_pending_record(dest, name=name, mime=mime)
 
     # F2: hand Forge a durable copy so the file outlives this broker; its URL goes in
     # the turn. A failure never fails present-file: it is retried in the background.
@@ -1101,12 +1132,7 @@ async def present_file(body: dict) -> dict:
         timeout=broker._settings.presented_durable.inline_upload_timeout_seconds,
     )
     if receipt is None and broker.volundr_api_url:
-        task = asyncio.create_task(
-            retry_presented_upload(broker, file_id, dest, name=name, mime=mime),
-            name=f"present-file-durable-{file_id}",
-        )
-        _presented_upload_tasks.add(task)
-        task.add_done_callback(_presented_upload_tasks.discard)
+        _schedule_presented_retry(file_id, dest, name=name, mime=mime)
     url = (receipt or {}).get("url") or None
 
     turn = _build_present_file_turn(file_id, name, mime, size, caption, url=url)
