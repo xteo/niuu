@@ -22,6 +22,14 @@ from skuld.event_log import FORGE_SESSIONS_PATH
 logger = logging.getLogger("skuld.broker")
 
 DURABLE_MARKER = "durable.json"
+# What the upload needs beyond the bytes (name, mime), written at staging so an upload
+# that has not landed can resume after a broker restart.
+PENDING_MARKER = "presented.json"
+# Forge refused the copy for good (session gone, conflict, too large): never retried.
+REFUSED_MARKER = "refused.json"
+SIDECARS = frozenset({DURABLE_MARKER, PENDING_MARKER, REFUSED_MARKER})
+# 4xx answers that a later attempt can succeed past; every other 4xx is final.
+_RETRYABLE_CLIENT_ERRORS = frozenset({408, 425, 429})
 NAME_HEADER = "x-presented-file-name"
 
 
@@ -33,6 +41,53 @@ def durable_record(staged: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return record if isinstance(record, dict) else None
+
+
+def write_pending_record(staged: Path, *, name: str, mime: str) -> None:
+    """Record the upload's name and mime beside the staged copy."""
+    try:
+        (staged.parent / PENDING_MARKER).write_text(json.dumps({"name": name, "mime": mime}))
+    except OSError as exc:
+        logger.warning(
+            "present-file: no pending record for %s, so a restart cannot resume its upload: %s",
+            staged.parent.name,
+            repr(exc),
+        )
+
+
+def is_refused(staged: Path) -> bool:
+    return (staged.parent / REFUSED_MARKER).exists()
+
+
+def pending_uploads(root: Path) -> list[tuple[str, Path, str, str]]:
+    """Staged copies whose durable upload has not landed: ``(file_id, path, name, mime)``.
+
+    Only copies with a pending record count; files staged before F2 have none and keep
+    being served by the live broker alone."""
+    out: list[tuple[str, Path, str, str]] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        content = entry / "content"
+        marker = entry / PENDING_MARKER
+        if (entry / DURABLE_MARKER).exists() or (entry / REFUSED_MARKER).exists():
+            continue
+        if content.is_symlink() or not content.is_file():
+            continue
+        if marker.is_symlink():
+            continue
+        try:
+            record = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict) or not record.get("name") or not record.get("mime"):
+            continue
+        out.append((entry.name, content, str(record["name"]), str(record["mime"])))
+    return out
 
 
 async def upload_presented_file(
@@ -69,6 +124,10 @@ async def upload_presented_file(
             file_id,
             response.status_code,
         )
+        if 400 <= response.status_code < 500 and response.status_code not in (
+            _RETRYABLE_CLIENT_ERRORS
+        ):
+            _mark_refused(staged, response.status_code)
         return None
     try:
         receipt = response.json()
@@ -83,17 +142,29 @@ async def upload_presented_file(
     return receipt
 
 
+def _mark_refused(staged: Path, status_code: int) -> None:
+    try:
+        (staged.parent / REFUSED_MARKER).write_text(json.dumps({"status": status_code}))
+    except OSError:
+        logger.debug("present-file: could not write refused marker for %s", staged.parent.name)
+
+
 async def retry_presented_upload(
-    broker: Any, file_id: str, staged: Path, *, name: str, mime: str
+    broker: Any, file_id: str, staged: Path, *, name: str, mime: str, immediate: bool = False
 ) -> dict[str, Any] | None:
-    """Retry a failed upload with exponential backoff, bounded by config."""
+    """Retry a failed upload with exponential backoff, bounded by config. ``immediate``
+    makes the first attempt without waiting (a resume after restart). A final refusal
+    from Forge ends the retries."""
     settings = broker._settings.presented_durable
     delay = settings.retry_backoff_seconds
-    for _ in range(settings.retry_attempts):
-        await asyncio.sleep(delay)
+    for attempt in range(settings.retry_attempts):
+        if attempt or not immediate:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, settings.retry_backoff_max_seconds)
         receipt = await upload_presented_file(broker, file_id, staged, name=name, mime=mime)
         if receipt is not None:
             return receipt
-        delay = min(delay * 2, settings.retry_backoff_max_seconds)
+        if is_refused(staged):
+            return None
     logger.warning("present-file: %s is not durable after retries", file_id)
     return None

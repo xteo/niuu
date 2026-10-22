@@ -99,6 +99,11 @@ def create_presented_files_router(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "a different file is stored under this id"
             ) from None
+        # The session may have been deleted while the body streamed: its cleanup has
+        # then already run, so drop what this request wrote rather than orphan it.
+        if await session_service.get_session(session_id) is None:
+            await store.delete_session(session_id)
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session not found: {session_id}")
         logger.info(
             "presented file stored: session=%s file=%s size=%d", session_id, file_id, len(data)
         )

@@ -280,3 +280,15 @@ def test_publication_records_the_durable_url(url, recorded):
     [pub] = publications_from_entry(entry, CATALOG)
     route = f"/api/v1/forge/sessions/{sid}/files/presented/{FILE_ID}"
     assert pub.url == (url if recorded == "durable" else route)
+
+
+async def test_upload_landing_after_the_session_was_deleted_leaves_nothing(tmp_path):
+    """The session is deleted while the body streams: its cleanup already ran, so the
+    PUT removes what it wrote and answers 404 (the broker then stops retrying)."""
+    client, store, service = _upload_client(tmp_path)
+    service.get_session.side_effect = [object(), None]
+    sid = uuid4()
+    resp = client.put(f"/api/v1/forge/sessions/{sid}/files/presented/{FILE_ID}", content=b"x")
+    assert resp.status_code == 404
+    assert await store.get(sid, FILE_ID) is None
+    assert not (tmp_path / str(sid)).exists()

@@ -53,3 +53,14 @@ presented_files:
 2. An exercise session presents a file. From mini-m6, its `url` (on `thor.tail737f2a.ts.net:8380`)
    returns the bytes, and still does after the session is stopped.
 3. A notify with `question: true` lists the `question` field in `GET /notifications`.
+
+## Follow-up (2026-10-22): F2 gaps, no config change
+
+The merge of `exp/cp-forge-state` that carries `0deedaba` (the sha is in this session's description,
+`deploy-request: niuu <sha>`). It can ride the round after 23; nothing in the overlay changes.
+
+- Deleting a session removes its durable presented files.
+- A broker restart resumes uploads that had not landed.
+
+Check after the rebuild: delete a throwaway session that presented a file; its folder under the store
+root (`presented_files.store.root`) is gone, and its file URL answers 404.

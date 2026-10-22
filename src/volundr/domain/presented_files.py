@@ -59,6 +59,10 @@ class PresentedFileStore(ABC):
     async def get(self, session_id: UUID, file_id: str) -> tuple[PresentedFile, Path] | None:
         """The stored record and the path of its bytes, or ``None`` when absent."""
 
+    @abstractmethod
+    async def delete_session(self, session_id: UUID) -> int:
+        """Remove every file stored for a session; return how many were removed."""
+
 
 def validate_public_base_url(value: str) -> str:
     """Normalize the configured base URL; empty means "no absolute URL"."""
