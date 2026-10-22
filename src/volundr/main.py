@@ -46,6 +46,11 @@ from volundr.adapters.inbound.auth import extract_principal
 from volundr.adapters.inbound.forge_session_auth import ForgeSessionAuthMiddleware
 from volundr.adapters.inbound.rest import create_router
 from volundr.adapters.inbound.rest_admin_settings import create_admin_settings_router
+from volundr.adapters.inbound.rest_artifacts import (
+    InstanceIdentity,
+    create_artifacts_router,
+    create_instance_router,
+)
 from volundr.adapters.inbound.rest_audit import (
     create_audit_router,
     create_canonical_audit_router,
@@ -124,6 +129,13 @@ from volundr.adapters.outbound.pricing import HardcodedPricingProvider
 from volundr.adapters.outbound.resident_flock import ResidentFlockAdapter
 from volundr.adapters.outbound.skuld_room import SkuldRoomAdapter
 from volundr.app_shell import build_app_shell
+from volundr.artifact_runtime import (
+    ArtifactHold,
+    create_artifact_service,
+    resolve_host,
+    resolve_tailnet_name,
+    startup_backfill,
+)
 from volundr.catalog import build_catalog
 from volundr.composition_builders import (  # noqa: F401
     _create_archive_store,
@@ -1713,6 +1725,13 @@ def create_app(
             )
             app.include_router(events_router)
 
+            artifact_service = create_artifact_service(
+                settings,
+                pool,
+                notification_service=notification_service,
+                session_service=session_service,
+            )
+            app.state.artifact_service = artifact_service
             # Durable full-fidelity transcript log: ingest (skuld) + cursor replay
             session_log_router = create_session_log_router(
                 session_event_log,
@@ -1720,8 +1739,27 @@ def create_app(
                 prefix="/api/v1/forge",
                 default_show_internal=settings.replay.default_show_internal,
                 notification_service=notification_service,
+                artifact_service=artifact_service,
             )
             app.include_router(session_log_router)
+            if artifact_service is not None:
+                app.include_router(
+                    create_artifacts_router(
+                        artifact_service,
+                        prefix="/api/v1/forge",
+                        default_page_size=settings.artifacts.default_page_size,
+                        max_page_size=settings.artifacts.max_page_size,
+                    )
+                )
+            app.include_router(
+                create_instance_router(
+                    InstanceIdentity(
+                        host=resolve_host(settings),
+                        tailnet_name=resolve_tailnet_name(settings),
+                        instance_id=settings.projects.instance_id,
+                    )
+                )
+            )
             if notification_service is not None:
                 app.include_router(
                     create_notifications_router(
@@ -1842,6 +1880,14 @@ def create_app(
             )
             if notification_delivery is not None:
                 await notification_delivery.start()
+            artifact_hold: ArtifactHold | None = None
+            if artifact_service is not None:
+                artifact_hold = ArtifactHold(
+                    artifact_service,
+                    interval_seconds=settings.artifacts.tick_interval_seconds,
+                    before_first_tick=lambda: startup_backfill(artifact_service, settings),
+                )
+                artifact_hold.start()
             if settings.telegram_ingress.enabled:
                 await telegram_ingress.start()
             else:
@@ -1880,6 +1926,8 @@ def create_app(
                 await telegram_ingress.stop()
                 if notification_delivery is not None:
                     await notification_delivery.stop()
+                if artifact_hold is not None:
+                    await artifact_hold.stop()
                 background_task.cancel()
                 try:
                     await background_task
