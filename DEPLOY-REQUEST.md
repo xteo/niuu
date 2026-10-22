@@ -1,3 +1,12 @@
+# Optional exp Forge update (cp-platform): niuu `exp/control-plane` `1b8fb72b`
+
+F8 changes one gateway behaviour. An attach carrying `role`/`parent` that the host refuses for a domain reason
+(for example "parent is not a project member") now returns that 422 instead of 501 "Update this session's Forge
+host" (`rest_volundr.py` `_rejects_unknown_fields`). There is no migration and no config change. Useful before C4
+and U5 exercise attach on exp; otherwise ride the next exp deploy.
+
+---
+
 # Config follow-up for exp Forge (cp-platform), from E0 on 2026-10-22
 
 exp Forge `e2208da8` is live and E0 items 1–3 pass (`docs/operator/e0/e0-evidence.json`). One config gap:
