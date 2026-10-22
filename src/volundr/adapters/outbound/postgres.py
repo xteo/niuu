@@ -175,7 +175,8 @@ class PostgresSessionRepository(SessionRepository):
                       activity_state, activity_metadata, activity_state_since,
                       turn_started_at, last_active,
                       short_description, description,
-                      short_description_updated_at, description_updated_at
+                      short_description_updated_at, description_updated_at,
+                      last_work_at, open_tool_count
             """,
             session.id,
             session.name,
@@ -223,6 +224,8 @@ class PostgresSessionRepository(SessionRepository):
                 "last_active": row["last_active"],
                 # Never written here: the stored description wins over a stale copy.
                 **self._description_fields(row),
+                # Folded at log ingest (F12d), never by this update: the stored facts win.
+                **self._work_fact_fields(row),
             }
         )
 

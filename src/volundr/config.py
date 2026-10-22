@@ -905,6 +905,7 @@ class PresentedFilesConfig(BaseModel):
     Example YAML::
 
         presented_files:
+          enabled: true
           public_base_url: "http://thor.tail737f2a.ts.net:8380"
           max_bytes: 52428800
           store:
@@ -912,7 +913,13 @@ class PresentedFilesConfig(BaseModel):
             root: "~/.niuu/presented-files"
     """
 
-    enabled: bool = Field(default=True, description="Accept and serve durable copies.")
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Accept and serve durable copies. Off by default: the local store needs a "
+            "persistent, single-writer directory (a mini/local Forge, or a PVC)."
+        ),
+    )
     public_base_url: str = Field(
         default="",
         description=(

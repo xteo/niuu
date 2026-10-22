@@ -148,7 +148,8 @@ def test_present_file_records_the_durable_url(client, tmp_path, monkeypatch):
     from skuld import broker as bmod
     from skuld import broker_api as api_mod
 
-    async def fake_upload(broker, file_id, staged, *, name, mime):
+    async def fake_upload(broker, file_id, staged, *, name, mime, timeout=None):
+        assert timeout == broker._settings.presented_durable.inline_upload_timeout_seconds
         assert staged.read_bytes() == b"hello"
         return {"url": URL}
 
@@ -184,3 +185,16 @@ def test_present_file_still_succeeds_when_forge_is_down(client, tmp_path, monkey
     assert body["durable"] is False and "url" not in body
     assert "url" not in bmod.broker._conversation_turns[-1].parts[0]["input"]
     assert scheduled == [body["file_id"]]
+
+
+def test_registry_rebuild_never_serves_the_receipt(tmp_path, monkeypatch):
+    from skuld import broker_api as api_mod
+
+    root = tmp_path / "staging"
+    entry = root / ("pf_" + "b" * 32)
+    entry.mkdir(parents=True)
+    (entry / DURABLE_MARKER).write_text('{"url": "x"}')
+    (entry / "content").write_bytes(b"bytes")
+    monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
+    api_mod._rebuild_presented_registry()
+    assert api_mod._presented_registry[entry.name].endswith("/content")
