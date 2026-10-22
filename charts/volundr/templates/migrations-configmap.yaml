@@ -2305,7 +2305,7 @@ data:
     ALTER TABLE sessions DROP COLUMN IF EXISTS short_description_updated_at;
     ALTER TABLE sessions DROP COLUMN IF EXISTS description;
     ALTER TABLE sessions DROP COLUMN IF EXISTS short_description;
-  000088_forge_artifact_publications.up.sql: |
+  000089_forge_artifact_publications.up.sql: |
     -- Control plane Slice 0 (F1, F1n): every artifact publication a session makes, and the
     -- bursts that announce them. Publications are keyed by their log occurrence; a burst id is
     -- minted once from its seed publication and never recomputed (model/bursts.md).
@@ -2382,7 +2382,7 @@ data:
     CREATE INDEX IF NOT EXISTS idx_forge_notifications_agent_created
         ON forge_notifications (created_at)
         WHERE source = 'agent';
-  000088_forge_artifact_publications.down.sql: |
+  000089_forge_artifact_publications.down.sql: |
     DROP INDEX IF EXISTS idx_forge_notifications_agent_created;
     DROP TABLE IF EXISTS forge_artifact_burst_publications;
     DROP TABLE IF EXISTS forge_artifact_bursts;

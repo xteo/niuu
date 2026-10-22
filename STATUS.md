@@ -9,7 +9,7 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 |---|---|---|
 | F1 projector at ingest (hook rows, present_file turns, notify links, report_artifact) | done | `volundr/domain/artifacts.py`; `rest_session_log._project_artifacts_isolated`; tests `test_artifacts_extraction.py` (35), `test_rest_session_log_artifacts.py` |
 | F1 internal backfill (SQL replay of `session_event_log`) | done | `PostgresArtifactPublicationRepository.scan_log`; `POST /artifact-publications/backfill` (admin); `artifacts.backfill_on_start` |
-| F1 `forge_artifact_publications` + `GET /artifact-publications` (**F1a**) | done | migration `000088` (dirs `migrations/`, `src/cli/migrations/volundr/`, Helm configmap); `GET /artifact-bursts?after=<rev>` too |
+| F1 `forge_artifact_publications` + `GET /artifact-publications` (**F1a**) | done | migration `000089` (dirs `migrations/`, `src/cli/migrations/volundr/`, Helm configmap); `GET /artifact-bursts?after=<rev>` too |
 | F1 `report_artifact` MCP tool | done | `niuu/domain/artifact_reports.py`, broker host + toolbox; transcript mode only |
 | F1 capture-manifest golden (230 rows, 26 keys; replay inserts 0) | done | memory + real Postgres: thor 122, mini-m6 108, exact occurrence sets, 26 keys, second replay 0 |
 | Codex present-file shape | done | `test_present_file_from_the_brokers_own_producer` (Skuld's producer, the turn Codex writes) |
@@ -21,9 +21,9 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Full app smoke (real lifespan, scratch PG) | done | append → live pub → burst → "Smoke page published" (art-burst:…) after hold → backfill 0 |
 | Full backend suite + coverage gate | done | 26742 passed, coverage 88% (gate 85); the 14 failures (install.sh, Docker, ravn kickoff, release guard) fail identically on the untouched base |
 | Review | done | independent review: no wedge or feed breakage; fixed burst `rev` ordering in emit/settle, suppression recheck under the feed lock, one bad burst no longer stalls the hold (settled `emit_failed` after 5), backfill stops at now − live lag, deadlocks are 503, one report per turn |
-| Merge `exp/control-plane`, land, record sha | pending | |
-| Send sha to cp-platform (RF); E0 on exp stack | pending | |
-| LEX-1397 comment | pending | |
+| Merge `exp/control-plane`, land, record sha | done | `9f145a1a`, then migration renumbered to `000089` (cp-forge-state also adds a `000088`; neither deployed) |
+| Send sha to cp-platform (RF); E0 on exp stack | blocked | no Forge `message` grant; request in `DEPLOY-REQUEST.md`, needs a relay (same as cp-core) |
+| LEX-1397 comment | done | landing comment posted |
 
 ## Decisions (docs-supported, noted here instead of asking)
 
