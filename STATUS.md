@@ -31,11 +31,11 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 | Row | Repo / branch | State | Evidence |
 |---|---|---|---|
 | RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
-| F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
+| F8 m6 on par | niuu `exp/cp-forge-artifacts` | re-review | review 1: 2 BLOCKER + 4 MAJOR, all fixed (write mode refuses production ports and needs the scratch id; read mode pinned with `scope=local`; full Forge route-set compare; recorded-OpenAPI mode; the gateway's 422→501 masking fixed). Branch Thor vs m6 shape **ON PAR 39/39**; live Thor `11afe41d` serves one route the branch lacks (notification images, see below). `docs/operator/forge-parity.md`, `docs/operator/f8-parity/` |
 | C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | building | ownership **agreed** (cp-core's answer, relayed): `artifacts.ts`, `artifacts-ingest.ts` (via `store.ingestBatch`, `expForgeBase`/`expForgeOrigin`/`fetchJson`), `views/artifacts.ts` in the shared views module; one-line hooks in `views/router.ts` VIEW_ROUTES and `runtime.ts` start/close |
-| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
+| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | **landed** `a76587ef` on lexi-ios `exp/control-plane` | `notes.py fragment` mints `f-<16 hex>` once, records `{host, session_id}` (host from `PROJECTS__INSTANCE_ID` via `keys.HOST_MAP`; refuses inside Forge without one), step ids `<feature_id>#<i>:<sha8>`; `<N>.md` `features[]` is the one source R1's `ShipUploaded` reads (validates against the frozen schema); duplicate ids refused. Identity cases 8/8; `tools/release` 145 tests (1 known `/bin/zsh` error); `release-check` OK. Two reviews. Swift `ReleaseNotesTests` run on the next train (no Xcode on Thor) |
 
-### C4 file ownership: proposal to cp-core (please relay)
+### C4 file ownership: proposal to cp-core (agreed with changes; see the C4 row)
 
 C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files except two one-line hooks:
 
@@ -49,9 +49,18 @@ C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files 
 
 Until I hear back, C4 work stays in the new files only.
 
-### F8 finding for the coordinator (design §V11/§V12, ux data-needs)
+### F8 findings for the coordinator
 
-**Attach is not m6's gap at `6c31bfe1`.** Its code, in m6's own config and launch shape, serves `GET`/`PUT /sessions/{id}/project`, takes `coordination` + `dispatch_id` on create (a replay returns the same session), and attaches an m6 session to a Thor project **through Thor's guild gateway**, with and without `role`. The recorded 501 doesn't follow from code or config. If live m6 still answers 501, the cause is live state. P1 should rerun the probe and one attach through Thor's gateway. I didn't probe live m6: its per-session reads write.
+1. **Release gap blocks parity at P1.** Live Thor (`11afe41d`) serves `GET /api/v1/forge/notifications/{notification_id}/image`; `exp/control-plane` doesn't (the release-only notification images). Before P1, cp-platform's X1 (branch sync) must bring that commit into `exp/control-plane`, or m6 isn't on par and Thor loses the route.
+2. **The m6 attach 501 is not a missing route.** A well-formed attach works through Thor@`11afe41d` → m6@`6c31bfe1`. A 501 is either `PUT /description` (missing at `6c31bfe1`) or a **masked domain refusal**: both revisions' gateways turned any 422 into "update the host" when `role`/`parent` was sent (the CP always sends `role`). Fixed on the branch (`_rejects_unknown_fields`); it takes effect on m6 once m6 runs the branch.
+3. **The probe's read mode is not on the production allow-list** (boot-0: no routes). Running it against production at P1 needs the allow-list's owner to add `/instance`, `/artifact-publications`, `/artifact-bursts`, `/notifications`, `/openapi.json` and `/health` (all statically zero-write).
+
+### Reuse check (VISION §0, D29)
+
+- **F8:** reused the served `/openapi.json`, `/instance` (F7) and the existing facade attach/description routes. New: `scripts/forge_parity_probe.py`, because `scripts/forge_live.py` creates billable sessions and needs httpx (not on m6's system python), and `scripts/extract_openapi.py` builds mocked node routers rather than what a host serves under its mount list. Gateway fix: a 20-line helper in `rest_volundr.py`, no new type.
+- **E0:** reused the test harness (`tests/support/artifacts.manifest_log_rows`) and Forge's own log append and backfill routes; nothing new in `src/`.
+- **R9:** extended `tools/release/notes.py`, `cp_producer.py` and `train.py`; R1's producer now reads the train's `<N>.md` instead of a second builder. New: `test_fragment_ids.py` and the vendored identity fixture.
+- **C4:** reused cp-core's store (`publications`, `sessions`, `notifications`, `ingestBatch`, `recordOccurrence`), the views module (`sessionRef`, `projectRef`, `allArtifacts`, router auth), `schema.ts`, `fetchJson`/`expForgeBase`/`expForgeOrigin`, `identity.ts` `uuid5`/`eventId`, and Forge's `burst_id` and burst feed. New: `artifact_*` tables, because the store has nowhere to keep persisted burst ids, membership, bridges or the bursts-feed cursor (`setCursor` is private, keyed by feed), plus `artifact_file_bases`.
 
 ## Decisions (docs-supported, noted here instead of asking)
 
@@ -114,29 +123,6 @@ Lands on niuu `exp/control-plane` (xteo fork). Deploys only through cp-platform 
 
 Full suite: 26,731 pass; the 17 failures are identical on the untouched base (box-specific:
 install_sh, ting turn timeouts, docker_container, api_release_guard, ravn kickoff).
-
-## Package 2 (relayed 2026-10-22): RF+E0, F8, C4, R9
-
-| Row | Repo / branch | State | Evidence |
-|---|---|---|---|
-| RF + E0 | niuu, exp Forge | done (item 4 pending) | see the E0 row above; **config ask:** exp Forge's `/instance` reports `tailnet_name: 100.66.123.128`, not a tailnet name. cp-platform: set `host_identity.tailnet_name: thor.tail737f2a.ts.net` (DEPLOY-REQUEST) |
-| F8 m6 on par | niuu `exp/cp-forge-artifacts` | built, in review | `scripts/forge_parity_probe.py` (+16 tests). Branch in m6's exact launch shape vs Thor's: **ON PAR 29/29** (incl. coordination + `dispatch_id` create and replay, attach/detach, description); m6's `6c31bfe1`: **NOT ON PAR** (no `/instance`, artifact feeds, description, attachments). `docs/operator/forge-parity.md`, evidence `docs/operator/f8-parity/`. m6 production untouched; rollout at P1 with `artifacts.notices_enabled: false` |
-| C4 Artifact registry + lens | lexi-frontend `exp/cp-artifacts` | building | ownership **agreed** (cp-core's answer, relayed): `artifacts.ts`, `artifacts-ingest.ts` (via `store.ingestBatch`, `expForgeBase`/`expForgeOrigin`/`fetchJson`), `views/artifacts.ts` in the shared views module; one-line hooks in `views/router.ts` VIEW_ROUTES and `runtime.ts` start/close |
-| R9 Fragment session and ids | lexi-ios `exp/cp-fragment-ids` | doing | — |
-
-### C4 file ownership: proposal to cp-core (please relay)
-
-C4 builds on cp-core's store at `507deef` and does **not edit** cp-core's files except two one-line hooks:
-
-- **C4 owns (new files)** in `services/lexi-agent-service/control-plane/`:
-  - `artifacts.ts`: the registry projection (publications → artifacts by `provider_key`, revisions by provider version, project from the producing session's current project) and the CP side of the burst rule (`bursts.py` port; reads Forge's `burst_id`, records `burst` occurrences through `store.recordOccurrence()`). Its tables are created by `artifacts.ts` on the same db (`CREATE TABLE IF NOT EXISTS artifact_*`), so `store.ts`'s schema is untouched.
-  - `artifacts-ingest.ts`: polls exp Forge's `GET /artifact-publications?after=` and `GET /artifact-bursts?after=` (F1a, final) through the same allow-listed exp-Forge base as `ExpForgeIngest`, and hands publication rows to `store.apply` with `feed: 'publications'` (the shape cp-core's `applyPublication` already takes).
-  - `views-artifacts.ts`: `GET /v1/cp/views/artifacts` (scope all/recent/project, `opens: system_browser`) and the `Project.artifacts` top-5 helper.
-  - `__tests__/artifacts.test.ts` and fixtures under `contract/artifacts/`.
-- **One-line hooks in cp-core's files:** `routes.ts` (register the view) and `runtime.ts` (start the artifacts poller next to `ExpForgeIngest`). If cp-core prefers to make those two edits, C4 exports `registerArtifactRoutes(app, deps)` and `startArtifactIngest(deps)`.
-- **Ask:** if cp-core already plans publications ingest in `ingest.ts` now that F1a is final, say so and C4 drops `artifacts-ingest.ts`.
-
-Until I hear back, C4 work stays in the new files only.
 
 ## Decisions (docs-supported, noted here instead of asking)
 

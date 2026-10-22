@@ -3,7 +3,123 @@
   "base": "http://127.0.0.1:41181",
   "mode": "write",
   "build": "f8-thor-shape",
-  "revision": "288a2fcd1ae0d70df167854ed747746786dbd1df",
+  "revision": "0b16cde3b8d22cfd0fb5e8778f9ded5392a731fd",
+  "instance": {
+    "host": "thor",
+    "tailnet_name": "127.0.0.1",
+    "instance_id": "bfef85c2-e400-4711-879d-e0d09a1955b6"
+  },
+  "forge_routes": [
+    "DELETE /api/v1/forge/notifications/rules/{rule_id}",
+    "DELETE /api/v1/forge/resident-runtimes/{runtime_id}",
+    "DELETE /api/v1/forge/resident-runtimes/{runtime_id}/sessions/{session_id}",
+    "DELETE /api/v1/forge/sessions/{session_id}",
+    "DELETE /api/v1/forge/sessions/{session_id}/files",
+    "DELETE /api/v1/forge/storage/home",
+    "GET /api/v1/forge/admin/settings",
+    "GET /api/v1/forge/admin/settings/schema",
+    "GET /api/v1/forge/admin/workspaces",
+    "GET /api/v1/forge/artifact-bursts",
+    "GET /api/v1/forge/artifact-bursts/{burst_id}",
+    "GET /api/v1/forge/artifact-publications",
+    "GET /api/v1/forge/chronicles/{session_id}/timeline",
+    "GET /api/v1/forge/cluster/resources",
+    "GET /api/v1/forge/external-sessions",
+    "GET /api/v1/forge/feature-flags",
+    "GET /api/v1/forge/instance",
+    "GET /api/v1/forge/mcp-servers",
+    "GET /api/v1/forge/mcp-servers/{server_name}",
+    "GET /api/v1/forge/notifications",
+    "GET /api/v1/forge/notifications/read-state",
+    "GET /api/v1/forge/notifications/rules",
+    "GET /api/v1/forge/notifications/sinks",
+    "GET /api/v1/forge/notifications/{notification_id}/deliveries",
+    "GET /api/v1/forge/projects",
+    "GET /api/v1/forge/projects/{project_id}",
+    "GET /api/v1/forge/projects/{project_id}/{operation}",
+    "GET /api/v1/forge/resident-profiles",
+    "GET /api/v1/forge/resident-runtimes",
+    "GET /api/v1/forge/resident-runtimes/{runtime_id}",
+    "GET /api/v1/forge/resident-runtimes/{runtime_id}/logs",
+    "GET /api/v1/forge/resident-runtimes/{runtime_id}/sessions",
+    "GET /api/v1/forge/sessions",
+    "GET /api/v1/forge/sessions/stream",
+    "GET /api/v1/forge/sessions/{session_id}",
+    "GET /api/v1/forge/sessions/{session_id}/attachments",
+    "GET /api/v1/forge/sessions/{session_id}/conversation",
+    "GET /api/v1/forge/sessions/{session_id}/conversation/turns/{turn_id}",
+    "GET /api/v1/forge/sessions/{session_id}/files",
+    "GET /api/v1/forge/sessions/{session_id}/files/download",
+    "GET /api/v1/forge/sessions/{session_id}/files/presented/{file_id}",
+    "GET /api/v1/forge/sessions/{session_id}/log",
+    "GET /api/v1/forge/sessions/{session_id}/log/head",
+    "GET /api/v1/forge/sessions/{session_id}/log/page",
+    "GET /api/v1/forge/sessions/{session_id}/logs",
+    "GET /api/v1/forge/sessions/{session_id}/logs/aggregate",
+    "GET /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id}",
+    "GET /api/v1/forge/sessions/{session_id}/notifications",
+    "GET /api/v1/forge/sessions/{session_id}/project",
+    "GET /api/v1/forge/sessions/{session_id}/read-state",
+    "GET /api/v1/forge/sessions/{session_id}/runtime-version",
+    "GET /api/v1/forge/sessions/{session_id}/tool-result/{tool_use_id}",
+    "GET /api/v1/forge/sessions/{session_id}/tool-result/{tool_use_id}/preview",
+    "GET /api/v1/forge/sessions/{session_id}/trace",
+    "GET /api/v1/forge/sessions/{session_id}/trace/summary",
+    "GET /api/v1/forge/sessions/{session_id}/workflow/gates",
+    "GET /api/v1/forge/settings",
+    "GET /api/v1/forge/stats",
+    "GET /api/v1/forge/storage/home",
+    "PATCH /api/v1/forge/admin/settings",
+    "PATCH /api/v1/forge/admin/settings/storage",
+    "PATCH /api/v1/forge/projects/{project_id}",
+    "PATCH /api/v1/forge/sessions/{session_id}/archive",
+    "PATCH /api/v1/forge/sessions/{session_id}/read-state",
+    "PATCH /api/v1/forge/sessions/{session_id}/restore",
+    "POST /api/v1/forge/admin/workspaces/bulk-delete",
+    "POST /api/v1/forge/artifact-publications/backfill",
+    "POST /api/v1/forge/chronicles/{session_id}/timeline",
+    "POST /api/v1/forge/delivery/{operation}",
+    "POST /api/v1/forge/events",
+    "POST /api/v1/forge/mcp",
+    "POST /api/v1/forge/notifications/rules",
+    "POST /api/v1/forge/projects",
+    "POST /api/v1/forge/projects/connect",
+    "POST /api/v1/forge/projects/discover",
+    "POST /api/v1/forge/projects/{project_id}/{operation}",
+    "POST /api/v1/forge/resident-runtimes",
+    "POST /api/v1/forge/resident-runtimes/{runtime_id}/restart",
+    "POST /api/v1/forge/resident-runtimes/{runtime_id}/resume",
+    "POST /api/v1/forge/resident-runtimes/{runtime_id}/sessions",
+    "POST /api/v1/forge/resident-runtimes/{runtime_id}/suspend",
+    "POST /api/v1/forge/resident-runtimes/{runtime_id}/usage",
+    "POST /api/v1/forge/sessions",
+    "POST /api/v1/forge/sessions/archive-stopped",
+    "POST /api/v1/forge/sessions/import",
+    "POST /api/v1/forge/sessions/{session_id}/activity",
+    "POST /api/v1/forge/sessions/{session_id}/files/mkdir",
+    "POST /api/v1/forge/sessions/{session_id}/files/upload",
+    "POST /api/v1/forge/sessions/{session_id}/history/import",
+    "POST /api/v1/forge/sessions/{session_id}/log",
+    "POST /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id}/{operation}",
+    "POST /api/v1/forge/sessions/{session_id}/messages",
+    "POST /api/v1/forge/sessions/{session_id}/notifications",
+    "POST /api/v1/forge/sessions/{session_id}/resume",
+    "POST /api/v1/forge/sessions/{session_id}/start",
+    "POST /api/v1/forge/sessions/{session_id}/stop",
+    "POST /api/v1/forge/sessions/{session_id}/usage",
+    "POST /api/v1/forge/sessions/{session_id}/workflow/gates/{gate_id}/resolve",
+    "POST /api/v1/forge/spans/complete",
+    "POST /api/v1/forge/spans/start",
+    "POST /api/v1/forge/spans/{span_id}/finish",
+    "PUT /api/v1/forge/admin/settings",
+    "PUT /api/v1/forge/notifications/read-state",
+    "PUT /api/v1/forge/notifications/rules/{rule_id}",
+    "PUT /api/v1/forge/notifications/{notification_id}/read",
+    "PUT /api/v1/forge/sessions/{session_id}",
+    "PUT /api/v1/forge/sessions/{session_id}/description",
+    "PUT /api/v1/forge/sessions/{session_id}/files/upload",
+    "PUT /api/v1/forge/sessions/{session_id}/project"
+  ],
   "checks": [
     {
       "name": "route GET /api/v1/forge/instance",
@@ -104,6 +220,55 @@
       "keys": []
     },
     {
+      "name": "route GET /api/v1/forge/sessions/{session_id}",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/log",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/log/head",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/conversation/turns/{turn_id}",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route POST /api/v1/forge/sessions/{session_id}/messages",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/sessions/{session_id}/message-deliveries/{request_id}",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "route GET /api/v1/forge/feature-flags",
+      "ok": true,
+      "status": null,
+      "detail": "",
+      "keys": []
+    },
+    {
       "name": "GET /health (forge plugins)",
       "ok": true,
       "status": 503,
@@ -130,7 +295,8 @@
         "host",
         "items",
         "next_after",
-        "has_more"
+        "has_more",
+        "instance_id"
       ]
     },
     {
@@ -142,7 +308,8 @@
         "host",
         "items",
         "next_after",
-        "has_more"
+        "has_more",
+        "instance_id"
       ]
     },
     {
@@ -153,7 +320,8 @@
       "keys": [
         "items",
         "head_seq",
-        "revision"
+        "revision",
+        "instance_id"
       ]
     },
     {
@@ -231,6 +399,27 @@
     },
     {
       "name": "GET session notifications",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "cleanup stop session",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "cleanup archive session",
+      "ok": true,
+      "status": 200,
+      "detail": "",
+      "keys": []
+    },
+    {
+      "name": "cleanup archive project",
       "ok": true,
       "status": 200,
       "detail": "",
