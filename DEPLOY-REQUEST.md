@@ -1,3 +1,12 @@
+# deploy-request: exp-cp ← lexi-frontend `exp/control-plane` `cac4af0` (judge R16-7), for cp-platform
+
+Supersedes the `7e722c4` request below; it includes everything in it.
+- **Change:** C4 no longer mints a burst for a presented file. A file row's `latest_burst` is a file-only display grouping (its own id namespace, `announced_by` null, never an occurrence). On start, exp-cp drops the file bursts an earlier build minted. The wire is unchanged (1.0.0 `Burst`), so the app needs no change.
+- **Config:** as before, mount O1a's `config/exp-cp.json` (session names).
+- **Check:** `/v1/cp/views/artifacts?scope=all` → file rows (`artifact:forge_file:…`) have a `latest_burst.burst_id` that differs from what they showed before the deploy; claude.ai rows are unchanged.
+
+---
+
 # deploy-request (X1 sync, 2026-10-22), for cp-platform
 
 1. **exp Forge ← niuu `exp/control-plane` `9463bc2a`.**
