@@ -5863,6 +5863,7 @@ from skuld.broker_api import (  # noqa: E402, F401
     restart_service,
     _presented_staging_dir,
     _rebuild_presented_registry,
+    _resume_presented_uploads,
     present_file,
     _build_present_file_turn,
     download_presented_file,
