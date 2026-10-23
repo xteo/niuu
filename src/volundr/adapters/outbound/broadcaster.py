@@ -255,6 +255,7 @@ class InMemoryEventBroadcaster(EventBroadcaster):
                 ),
                 "message_count": session.message_count,
                 "tokens_used": session.tokens_used,
+                "context": session.context.model_dump(),
                 "pod_name": session.pod_name,
                 "error": session.error,
                 "source": session.source.model_dump() if session.source else None,

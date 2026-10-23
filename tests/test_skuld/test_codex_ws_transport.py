@@ -1108,7 +1108,7 @@ class TestEventNormalization:
         assert t._last_usage is not None
         usage = t._last_usage["o4-mini"]
         # Should prefer "last" over "total"
-        assert usage["inputTokens"] == 400
+        assert usage["inputTokens"] == 350  # Codex's input count already includes cached input.
         assert usage["outputTokens"] == 100
         assert usage["cacheReadInputTokens"] == 50
 
