@@ -56,7 +56,21 @@ Later notices refer to it with about_question={id, action}:
 question; from any other session these are rejected and never applied;
 - any session filed in the same project, on any host, may relay it (action=relay), \
 for example a coordinator passing on a worker's question; relay links, it never copies.
-Always name the host: a bare uuid is refused."""
+Always name the host: a bare uuid is refused.
+For one or several concrete questions/actions, also send ask={items:[...]}. Each item \
+has a stable id, kind=question|action and text; optional header and options=[{label, \
+description?}] make choices clear. Use unique item ids and option labels. Omitted \
+multi_select means false; omitted allow_text means true. A question with allow_text=false \
+must offer options. Include at most 8 items and \
+8 options per item, with at most 32768 UTF-8 bytes of compact ask JSON. Keep these \
+items concise instead of hiding a questionnaire in the body. An action asks the user \
+to report done/not done; it never authorizes the app to execute anything. Legacy \
+question=true without ask still works as one free-text question. Sending an answer \
+does not mean the work is resolved: the asking session confirms resolution later.
+Example: question=true, ask={"items":[\
+{"id":"database","kind":"question","text":"Which database?",\
+"options":[{"label":"Postgres"},{"label":"SQLite"}]},\
+{"id":"access","kind":"action","text":"Grant the test account access."}]}"""
 
 
 NOTIFICATION_IMAGE_GUIDANCE = f"""\

@@ -46,7 +46,7 @@ rules — on their phone or chat. It is how a long-running session gets the user
 
 {trigger_guidance}
 
-## Asking the user a question
+## Asking the user questions or actions
 
 {question_guidance}
 

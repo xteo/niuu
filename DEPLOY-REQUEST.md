@@ -1,3 +1,13 @@
+# Deploy request: LEX-1412 structured notify asks → cp-ops (23 Oct 2026)
+
+Deploy this reviewed niuu `exp/cp-dev-structured-questions` landing with the matching frontend CP answer consumer after both merge SHAs are in cp-dev's description. The frontend consumer awaits ios-coordinator's canonical contract 1.1.0 commit; do not treat a lane SHA as its deployment target.
+
+- Rebuild exp-forge via the existing rollout. No new environment, secret, mount, migration or message API behavior. Optional ask uses existing notification metadata JSONB and durable log projection; old notifications retain their old wire.
+- New brokers receive the notify tool's structured question/action schema and generated forge-notify skill. Existing brokers refresh through their ordinary lifecycle. No extra session start, notification or real LLM call is requested as a probe.
+- Validation: 363 focused tests, three real stdio/broker process tests, independent review and Ruff pass. CP's companion uses existing local message idempotency and delivery receipts; see the frontend STATUS Contract for cp-ios-app.
+
+---
+
 # LEX-1406: persistent project side-quest host/folder defaults
 
 Lane `exp/cp-dev-project-defaults`; implementation and tests independently reviewed; exact landing SHA is in cp-dev's Forge description. **No deployment has been performed. cp-ops deploys exp only.**
