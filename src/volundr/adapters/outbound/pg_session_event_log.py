@@ -39,6 +39,7 @@ from volundr.domain.history_import import (
 )
 from volundr.domain.models import SessionLogEntry
 from volundr.domain.ports import SessionEventLogRepository, _log_entries_conflict
+from volundr.domain.session_usage import fold_usage, observation, parse_json, projection_key
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +123,9 @@ _HISTORY_IMPORT_CHROME_KINDS = ("init", "capabilities", "available_commands")
 class PostgresSessionEventLog(SessionEventLogRepository):
     """PostgreSQL adapter for the full-fidelity session event log."""
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(self, pool: asyncpg.Pool, *, usage_model_windows: dict[str, int] | None = None):
         self._pool = pool
+        self._usage_model_windows = dict(usage_model_windows or {})
 
     async def append_projection_repair(
         self, session_id: UUID, marker: dict, *, expected_head: int
@@ -237,9 +239,11 @@ class PostgresSessionEventLog(SessionEventLogRepository):
         # import_history, held until the batch finishes. Stable session ordering
         # avoids deadlocks between multi-session batches, without a global lock.
         # The COUNT guard preserves orphan-log writes (there is deliberately no FK).
-        args = [self._entry_to_args(e) for e in sorted(entries, key=lambda e: str(e.session_id))]
+        entries = sorted(entries, key=lambda e: (str(e.session_id), e.seq))
+        args = [self._entry_to_args(e) for e in entries]
+        has_usage = any(observation(e.payload, seq=e.seq, at=e.ts) is not None for e in entries)
         try:
-            await self._pool.executemany(_INSERT_SQL, args)
+            await self._append_batch(args, entries, has_usage=has_usage)
         except asyncpg.exceptions.UntranslatableCharacterError:
             # Defensive: a frame still carried a character Postgres can't store
             # past the primary scrub. Force-scrub the serialized payloads and retry
@@ -247,8 +251,79 @@ class PostgresSessionEventLog(SessionEventLogRepository):
             # this idempotent if some rows already landed).
             logger.warning("session_event_log insert hit untranslatable char; retrying scrubbed")
             scrubbed = [self._force_scrub_args(a) for a in args]
-            await self._pool.executemany(_INSERT_SQL, scrubbed)
+            await self._append_batch(scrubbed, entries, has_usage=has_usage)
         return len(entries)
+
+    async def _append_batch(
+        self, args: list[tuple], entries: list[SessionLogEntry], *, has_usage: bool
+    ) -> None:
+        if not has_usage:
+            await self._pool.executemany(_INSERT_SQL, args)
+            return
+        # The same session lock protects the durable insert and numeric summary.
+        # A failed projection rolls the batch back; a retry cannot lose usage or
+        # apply it twice. Ordinary frames retain the existing executemany path.
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(_INSERT_SQL, args)
+                by_session: dict[UUID, list[int]] = {}
+                for entry in entries:
+                    by_session.setdefault(entry.session_id, []).append(entry.seq)
+                for sid, seqs in by_session.items():
+                    await self._project_usage(conn, sid, seqs)
+
+    async def _project_usage(self, conn: asyncpg.Connection, sid: UUID, seqs: list[int]) -> None:
+        row = await conn.fetchrow("SELECT session_usage FROM sessions WHERE id=$1 FOR UPDATE", sid)
+        if row is None:
+            return  # Existing orphan-log behavior: no session row means no projection.
+        original = parse_json(row["session_usage"])
+        state = original
+        # Always project the STORED frames, never a conflicting retry payload.
+        rows = await conn.fetch(
+            """SELECT seq, payload, ts FROM session_event_log
+               WHERE session_id=$1 AND seq=ANY($2::bigint[]) AND usage IS NULL ORDER BY seq""",
+            sid,
+            seqs,
+        )
+        for entry in rows:
+            event = observation(parse_json(entry["payload"]), seq=entry["seq"], at=entry["ts"])
+            if event is None:
+                continue
+            key = projection_key(event, state)
+            prior = await conn.fetchrow(
+                """SELECT seq, usage FROM session_event_log
+                   WHERE session_id=$1 AND usage_key=$2
+                   ORDER BY seq DESC LIMIT 1""",
+                sid,
+                key,
+            )
+            previous = parse_json(prior["usage"]) if prior else None
+            state, merged = fold_usage(
+                state, event, previous, model_windows=self._usage_model_windows
+            )
+            packed = dumps_jsonb(merged)
+            await conn.execute(
+                "UPDATE session_event_log SET usage_key=$3, usage=$4::jsonb "
+                "WHERE session_id=$1 AND seq=$2",
+                sid,
+                entry["seq"],
+                key,
+                packed,
+            )
+            # Late lower-seq snapshots also update the identity's newest derived
+            # checkpoint. Raw payload/ts/seq are immutable; only projection data
+            # changes. The next lookup sees all maxima already accounted for.
+            if prior and prior["seq"] > entry["seq"]:
+                await conn.execute(
+                    "UPDATE session_event_log SET usage=$3::jsonb WHERE session_id=$1 AND seq=$2",
+                    sid,
+                    prior["seq"],
+                    packed,
+                )
+        if state != original:
+            await conn.execute(
+                "UPDATE sessions SET session_usage=$2::jsonb WHERE id=$1", sid, dumps_jsonb(state)
+            )
 
     async def import_history(
         self, session_id: UUID, source_id: str, entries: list[SessionLogEntry]

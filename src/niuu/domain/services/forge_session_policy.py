@@ -84,6 +84,7 @@ ROUTE_POLICIES: tuple[RoutePolicy, ...] = (
     # Session reads, owner-scoped.
     RoutePolicy("GET", f"{FORGE_PREFIX}/sessions", _READ, Binding.NONE),
     RoutePolicy("GET", _S, _READ, Binding.OWNED),
+    RoutePolicy("GET", f"{_S}/status", _READ, Binding.OWNED),
     RoutePolicy("GET", f"{_S}/conversation", _READ, Binding.OWNED),
     RoutePolicy("GET", f"{_S}/conversation/turns/{{turn_id}}", _READ, Binding.OWNED),
     RoutePolicy("GET", f"{_S}/log", _READ, Binding.OWNED),

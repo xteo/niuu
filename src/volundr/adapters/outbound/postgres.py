@@ -44,12 +44,12 @@ class PostgresSessionRepository(SessionRepository):
                  activity_state, activity_metadata, activity_state_since,
                  workload_config, turn_started_at,
                  short_description, description,
-                 short_description_updated_at, description_updated_at,
+                 short_description_updated_at, description_updated_at, session_usage,
                  coordination, actor_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
                     $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
-                    $33, $34, $35, $36)
+                    $33, $34, $35, $36, $37)
             """,
             session.id,
             session.name,
@@ -85,6 +85,7 @@ class PostgresSessionRepository(SessionRepository):
             session.description,
             session.short_description_updated_at,
             session.description_updated_at,
+            json.dumps(session.session_usage) if session.session_usage is not None else None,
             session.coordination.model_dump_json() if session.coordination else None,
             session.actor_id,
         )
@@ -178,7 +179,7 @@ class PostgresSessionRepository(SessionRepository):
                       turn_started_at, last_active,
                       short_description, description,
                       short_description_updated_at, description_updated_at,
-                      last_work_at, open_tool_count
+                      last_work_at, open_tool_count, session_usage
             """,
             session.id,
             session.name,
@@ -228,6 +229,8 @@ class PostgresSessionRepository(SessionRepository):
                 **self._description_fields(row),
                 # Folded at log ingest (F12d), never by this update: the stored facts win.
                 **self._work_fact_fields(row),
+                # Projection-owned: an unrelated stale update must preserve newer usage.
+                "session_usage": self._parse_json_dict(row.get("session_usage")) or None,
             }
         )
 
@@ -436,6 +439,7 @@ class PostgresSessionRepository(SessionRepository):
             activity_state_since=activity_state_since,
             turn_started_at=turn_started_at,
             activity_metadata=activity_metadata,
+            session_usage=self._parse_json_dict(row.get("session_usage")) or None,
             **self._description_fields(row),
             **self._work_fact_fields(row),
         )
