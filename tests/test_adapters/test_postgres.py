@@ -692,7 +692,7 @@ async def test_create_persists_seeded_descriptions(repository, mock_pool, sample
     )
     await repository.create(seeded)
     args = mock_pool.execute.call_args.args
-    assert args[-4:] == ("Seed", None, sample_session.created_at, None)
+    assert args[-5:-1] == ("Seed", None, sample_session.created_at, None)
 
 
 def test_rows_before_the_migration_read_as_unset(repository, sample_row):

@@ -185,6 +185,7 @@ class InMemorySessionRepository(SessionRepository):
                 "description": current.description,
                 "short_description_updated_at": current.short_description_updated_at,
                 "description_updated_at": current.description_updated_at,
+                "session_usage": current.session_usage,
             }
         )
         self._sessions[session.id] = updated

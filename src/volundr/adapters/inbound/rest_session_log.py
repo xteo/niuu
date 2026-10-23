@@ -49,6 +49,7 @@ from volundr.domain.notifications import NotificationStoreUnavailableError
 from volundr.domain.ports import SessionEventLogRepository
 from volundr.domain.services.session import SessionAccessDeniedError, SessionService
 from volundr.domain.session_read_state import is_final_output
+from volundr.domain.session_usage import observation
 
 if TYPE_CHECKING:
     from volundr.domain.models import Session
@@ -416,6 +417,12 @@ def create_session_log_router(
             entry.seq not in conflicts and is_final_output(entry.payload) for entry in entries
         ):
             await session_service.notify_read_state_changed(session_id)
+        if session_service is not None and any(
+            entry.seq not in conflicts
+            and observation(entry.payload, seq=entry.seq, at=entry.ts) is not None
+            for entry in entries
+        ):
+            await session_service.notify_usage_changed(session_id)
         latest = await log_repository.latest_seq(session_id)
         return LogAppendResponse(submitted=submitted, latest_seq=latest, conflicts=conflicts)
 
