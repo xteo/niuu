@@ -46,7 +46,12 @@ from niuu.domain.transcript_reducer import TOOL_ENDED_AT
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.codex_auth import CodexAuthProviderError, CodexAuthProviderPort, HostCodexAuthProvider
 from skuld.tool_images import image_payloads
-from skuld.transports.codex import _map_codex_tool, resolve_codex_cli
+from skuld.transports.codex import (
+    _codex_usage_components,
+    _codex_usage_window,
+    _map_codex_tool,
+    resolve_codex_cli,
+)
 from skuld.transports.mcp_config import (
     build_codex_mcp_isolation_overrides,
     build_codex_mcp_overrides,
@@ -476,6 +481,7 @@ class CodexWebSocketTransport(CLITransport):
         self._context_compaction_active = False
         self._context_compaction_starting = False
         self._context_compaction_turn_id: str | None = None
+        self._observed_compaction_item_turn_id: str | None = None
         self._context_retry_attempts: dict[str, int] = {}
 
         # Pending RPC response futures keyed by request id.
@@ -1310,6 +1316,12 @@ class CodexWebSocketTransport(CLITransport):
             self._current_turn_id = None
 
             if self._is_context_compaction_turn(turn):
+                if completed_turn_id:
+                    self._completed_turn_ids.add(completed_turn_id)
+                if turn.get("status") not in {"failed", "interrupted"}:
+                    await self._emit_compaction_boundaries(
+                        turn, completed_turn_id, timestamp=params.get("timestamp")
+                    )
                 await self._complete_context_compaction()
                 return
 
@@ -1365,20 +1377,40 @@ class CodexWebSocketTransport(CLITransport):
         # --- Token usage (arrives before turn/completed) ---
         if method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage", {})
-            total = usage.get("total", {})
-            last = usage.get("last")
-            measured = last if isinstance(last, dict) else total
+            if not isinstance(usage, dict):
+                return
+            total = _codex_usage_components(usage.get("total"), require_complete=True)
+            last = _codex_usage_components(usage.get("last"), require_complete=True)
+            raw_last = usage.get("last")
+            measured = _codex_usage_components(
+                raw_last if isinstance(raw_last, dict) else usage.get("total")
+            )
             model_id = self._turn_model or self._model
-            self._last_usage = {
-                model_id: {
-                    "inputTokens": measured.get("inputTokens", 0),
-                    "outputTokens": measured.get("outputTokens", 0),
-                    "cacheReadInputTokens": measured.get("cachedInputTokens", 0),
-                    "cacheCreationInputTokens": 0,
+            if measured is not None:
+                self._last_usage = {
+                    model_id: {
+                        "inputTokens": measured["input"],
+                        "outputTokens": measured["output"],
+                        "cacheReadInputTokens": measured["cache_read"],
+                        "cacheCreationInputTokens": measured["cache_write"],
+                    }
                 }
-            }
+            await self._emit(
+                {
+                    "type": "session_usage",
+                    "engine": "codex",
+                    "thread_id": event_thread or self._thread_id,
+                    "turn_id": event_turn or self._current_turn_id,
+                    "model": model_id,
+                    "last": last,
+                    "total": total,
+                    "window": _codex_usage_window(usage.get("modelContextWindow")),
+                    "metadata": {"source": "codex_ws"},
+                    **({"timestamp": params["timestamp"]} if "timestamp" in params else {}),
+                }
+            )
             # Emit message_delta so the browser can update token counters live.
-            output_tokens = measured.get("outputTokens", 0)
+            output_tokens = measured["output"] if measured is not None else 0
             if output_tokens:
                 await self._emit(
                     {
@@ -1427,7 +1459,12 @@ class CodexWebSocketTransport(CLITransport):
         if method == "item/completed":
             item = params.get("item", {})
             await self._handle_item_completed(
-                item, text_context={"thread_id": event_thread, "turn_id": event_turn}
+                item,
+                text_context={
+                    "thread_id": event_thread,
+                    "turn_id": event_turn,
+                    "timestamp": params.get("timestamp"),
+                },
             )
             return
 
@@ -2156,6 +2193,16 @@ class CodexWebSocketTransport(CLITransport):
         item_type = item.get("type", "")
         item_id = item.get("id", "")
 
+        if item_type == "contextCompaction":
+            if item.get("status") in {"failed", "interrupted"}:
+                return
+            await self._emit_compaction_boundaries(
+                {"items": [item]},
+                (text_context or {}).get("turn_id") or self._current_turn_id,
+                timestamp=(text_context or {}).get("timestamp"),
+            )
+            return
+
         if item_type == "collabAgentToolCall":
             await self._close_item_block(item_id)
             await self._emit_tool_result(
@@ -2556,6 +2603,39 @@ class CodexWebSocketTransport(CLITransport):
             if isinstance(error, str) and error:
                 return error
         return "Codex ran out of room in the model context window."
+
+    async def _emit_compaction_boundaries(
+        self, turn: dict, turn_id: str | None, *, timestamp: object = None
+    ) -> None:
+        """Keep native compaction identity; durable consumers deduplicate echoes."""
+        items = turn.get("items")
+        identities = []
+        if isinstance(items, list):
+            identities = [
+                item["id"]
+                for item in items
+                if isinstance(item, dict)
+                and item.get("type") == "contextCompaction"
+                and isinstance(item.get("id"), str)
+                and item["id"]
+            ]
+        if identities:
+            self._observed_compaction_item_turn_id = turn_id
+        elif turn_id and turn_id == self._observed_compaction_item_turn_id:
+            return
+        for identity in identities or ([turn_id] if turn_id else []):
+            await self._emit(
+                {
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "engine": "codex",
+                    "thread_id": self._thread_id,
+                    "turn_id": turn_id,
+                    "compaction_id": identity,
+                    "metadata": {"source": "codex_ws"},
+                    **({"timestamp": timestamp} if isinstance(timestamp, str) else {}),
+                }
+            )
 
     def _is_context_compaction_turn(self, turn: object) -> bool:
         if not isinstance(turn, dict):
