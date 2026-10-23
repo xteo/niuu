@@ -1,3 +1,11 @@
+# cp-dev E0 artifact titles
+
+- doing: replay-title fix ready on `exp/cp-dev-artifact-titles`; independent Codex review found no issues and reran all 79 tests. No deployment or live replay was run.
+- cause: the E0 operator script reused `manifest_log_rows`, which invented the title `T` for all 122 Thor manifest publications (12 provider keys). The manifest did not capture their titles. The Forge extractor and storage preserve complete titles.
+- fixed: the existing builder now copies an explicitly captured nonblank title in full and omits unknown titles. It preserves legitimate `T` titles. The original capture manifest and E0 receipt are unchanged. Existing recorded E0 rows need the companion CP projection repair, not another log append.
+- validation: 79 replay-title, extraction, burst and artifact-service tests pass, including the exact `QVimZJxaHtjyQfT1R497Kw` publication at `2026-10-21T01:04:10.334238+00:00`, all 122 capture publications, and legitimate one-character/full titles. Ruff and diff checks pass.
+- D29 reuse: corrected the shared replay builder used by existing tests and the operator script; no new storage, runtime extractor, or metadata source. Operator guidance is in `docs/operator/e0/README.md`.
+
 # cp-dev project side-quest defaults (LEX-1406)
 
 - done: implementation, validation and independent review of `exp/cp-dev-project-defaults`; merge SHA is recorded in cp-dev's Forge description. No deployment has been performed.
