@@ -439,6 +439,14 @@ class SessionService:
             )
         )
 
+    async def notify_usage_changed(self, session_id: UUID) -> None:
+        """Publish the persisted usage summary through the existing session stream."""
+        if self._broadcaster is None:
+            return
+        session = await self._repository.get(session_id)
+        if session is not None:
+            await self._broadcaster.publish_session_updated(session)
+
     async def update_activity(
         self,
         session_id: UUID,

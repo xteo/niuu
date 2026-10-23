@@ -16,7 +16,7 @@ All configuration MUST flow through the Settings class.
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import (
@@ -2551,6 +2551,23 @@ class ObservatoryConfig(BaseModel):
     )
 
 
+class SessionUsageConfig(BaseModel):
+    """Model metadata for status when the native stream omits its raw window.
+
+    Explicit runtime windows take precedence. Unknown models remain unknown;
+    these defaults are the LEX-1421 model contract, not a token heuristic.
+    """
+
+    model_windows: dict[str, Annotated[int, Field(strict=True, gt=0, le=2**53 - 1)]] = Field(
+        default_factory=lambda: {
+            "claude-opus-5-5": 1_000_000,
+            "claude-fable-5-1": 1_000_000,
+            "claude-sonnet-5-5": 1_000_000,
+        },
+        description="Positive context windows representable exactly by JSON number consumers",
+    )
+
+
 class HostIdentityConfig(BaseModel):
     """How this Forge names itself to the control plane (F7, ``GET /instance``).
 
@@ -2825,6 +2842,7 @@ class Settings(BaseSettings):
     push: PushNotificationConfig = Field(default_factory=PushNotificationConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    session_usage: SessionUsageConfig = Field(default_factory=SessionUsageConfig)
     host_identity: HostIdentityConfig = Field(default_factory=HostIdentityConfig)
     presented_files: PresentedFilesConfig = Field(default_factory=PresentedFilesConfig)
     forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)

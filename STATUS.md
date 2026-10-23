@@ -1,3 +1,48 @@
+# cp-dev session status/context (LEX-1421 part A)
+
+- doing: implementation, regression tests and independent review complete on `exp/cp-dev-session-status`; landing SHA and deploy-request are in the Forge description. cp-ops deploys exp only; live exercise verification awaits that deployment.
+- D29 reuse: numeric observations extend the existing SDK/tmux/Codex events, durable `session_event_log`, session row, list serializer and `session_updated` stream. No TTY polling, provider request, new store or new message route. The small private JSONB projection and indexed per-native-response checkpoints make reads constant-time and make retries/restarts idempotent.
+- tested: 496 final API/model/config/log/facade/transport regressions; 10 isolated real-PostgreSQL cases; broader transport suites separately passed 463 Codex and 160 SDK/tmux tests. Some focused cases occur in both groups. Numeric projection coverage is 94.23%, above the 85% gate. Ruff and diff checks pass. All probes were offline or against a disposable Unix-socket PostgreSQL cluster; no production or live provider was used.
+- reviewed: independent Codex reviewers `u11_contract_audit` and `lex1406_review` approved the final reducer/log behavior; each transport was independently reviewed. Root independently reviewed the API/model/persistence/config/migration scaffold. Counterexamples are tests: repeated Claude blocks, noncontiguous/restarted replay, Codex multiple responses in one turn, equal cumulative or alternating context-only replay after compaction, reset/cost replay, old-native windows/regressions, malformed/partial/oversized numeric telemetry, stale session updates, conflict payloads and transactional rollback.
+- migration: `000092_session_usage_status` adds `sessions.session_usage` and nullable derived `session_event_log.usage_key/usage` plus a partial `(session_id, usage_key, seq DESC)` index. Root, CLI and Helm copies match. Raw event payloads, timestamps and sequences remain immutable. Down removes only derived data; forward deployment does not backfill historical SDK logs. New native observations populate the projection; tmux drains its existing main JSONL on authenticated hooks.
+- deploy-request: niuu `exp/control-plane` merge SHA is in the session description. Rebuild exp Forge and its broker artifact through the normal cp-ops rollout; existing broker sessions receive transport changes through their normal lifecycle. No new secret, mount, service, production config or LLM exercise is requested. Optional `session_usage.model_windows` uses native windows first, then explicit model defaults.
+
+## Contract for the iOS lanes
+
+Read `GET /api/v1/forge/sessions/{id}/status` through the same authenticated Forge base as the session list. The facade finds the owning visible instance; `?scope=local` retains the existing served-host constraint. Authentication, session read scope, owner/participant/tenant access and error handling match the existing session GET (401 unauthenticated at the authenticated edge, 403 denied, 404 absent). No new credential or grant is needed for the app.
+
+```json
+{
+  "context": {"tokens": 7546, "window": 1000000, "share": 0.007546},
+  "last_turn": {"input": 12, "cache_read": 7234, "cache_write": 300, "output": 236},
+  "totals": {"input": 42, "cache_read": 14468, "cache_write": 600, "output": 336},
+  "compactions": null,
+  "model": "claude-opus-5-5",
+  "engine": "claude",
+  "host": "<owning registry instance id>",
+  "started_at": "2026-10-23T12:00:00Z",
+  "uptime_s": 60.0,
+  "cost_estimate": null,
+  "usage_available": true,
+  "usage_reason": null,
+  "totals_complete": false
+}
+```
+
+The example is illustrative, not a live exercise receipt. `context.tokens = last_turn.input + cache_read + cache_write`; output is excluded. `last_turn` means the latest model response, not all responses in an agent tool loop. For Codex, native input already includes cached input; the API subtracts it into uncached `input` exactly once. Native raw context windows take precedence; defaults are 1,000,000 for `claude-opus-5-5`, `claude-fable-5-1`, and `claude-sonnet-5-5`. Unknown windows remain null. `share` is the raw fraction and may exceed 1; the UI can clamp its drawing while retaining the measured value.
+
+Every numeric field can be null when unmeasured. Null is never a measured zero. `usage_available:false` and `usage_reason` explain temporary missing current context (for example `compaction_pending_usage`, `reset_pending_usage`, `transcript_catching_up`, `incomplete_record`, `transcript_unreadable`, or `native_counter_regression`). Compaction clears context until fresh post-boundary usage; old replay cannot refill the ring. `totals_complete:false` explicitly means observed lower bounds: an attached/resumed native session may have earlier unseen responses, costs or compactions. The initial release conservatively makes no complete-history claim. `compactions` is null until at least one native boundary is observed, then the deduplicated observed count. Native-reported cost is cumulative USD when available; Codex/tmux without reported pricing returns null. No blended-price heuristic is used.
+
+`started_at` is the first recorded native/runtime init identity (a new native identity can establish a later start); it is not row creation time or a websocket reconnect handshake. `uptime_s` is measured from it while starting/provisioning/running and null for stopped/failed or unmeasured sessions. `model` prefers observed native metadata, then the configured session model; `engine` is `claude` or `codex` once measured. Public facade `host` is the owning registry instance ID; direct embedded Forge uses its configured stable host identity.
+
+List/session rows now include the same `context:{tokens,window,share}`. Existing `session_updated` live events include it at `data.context` after usage commits, including model responses within a tool loop. The ring can update from that existing stream; fetch `/status` for the full card. Private native checkpoints never appear in the API or generic session serialization. Legacy `tokens_used` remains a separate existing aggregate and must not be used as context occupancy.
+
+## Exp acceptance after cp-ops deploys
+
+Use only newly created exp exercise sessions, preserve other lanes' fixtures, and record their IDs here. Drive numeric fixtures through the exercise broker's ordinary durable-log path without sending an LLM prompt. SDK repeated blocks must count once; hook-driven tmux JSONL must count the same main native response once and ignore children; Codex repeated token-count snapshots must retain exact cumulative totals. Check the public status, list and existing live stream together; repeat the fixture after a projector reload, compact, and replay old samples. Stop only the new exercises afterward. The automated real-transport fixtures and real-PostgreSQL API/list/live test already bind these checks; deployment/live receipts remain pending.
+
+---
+
 # cp-dev structured notify questions (LEX-1412)
 
 - done: structured `ask` producer/read-wire support on `exp/cp-dev-structured-questions`; landing SHA is recorded in cp-dev's description. No deployment or live notification. Independent Codex review found no blockers, including the final compatibility tests; reviewer independently reran the eight REST/recovery cases after its earlier 177-test core review.

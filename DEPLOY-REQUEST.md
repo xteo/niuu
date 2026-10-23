@@ -1,3 +1,17 @@
+# Deploy request: LEX-1421 session status/context → cp-ops (23 Oct 2026)
+
+Deploy the niuu `exp/control-plane` merge SHA in cp-dev's Forge description. Source lane: `exp/cp-dev-session-status`. Implementation, tests and independent review are complete; no deployment has been performed by cp-dev.
+
+1. Rebuild the exp Forge service and normal broker artifact. Apply packaged startup migration `000092_session_usage_status`; it adds only nullable derived usage columns and a partial lookup index in the existing session/log tables. Root, CLI and Helm copies are identical. No secret or mount changes, no new provider keys, and no production action.
+2. Existing brokers adopt the transport instrumentation through their ordinary lifecycle; do not restart unrelated sessions for this exercise. API fields are additive and remain null until authoritative observations arrive. SDK resumes can have partial totals; tmux replays its main native JSONL from its own bounded hook-driven reader. Do not use legacy estimated token counts as context.
+3. Create fresh exp exercise sessions and verify the public `/api/v1/forge/sessions/{id}/status`, list `context`, and existing `session_updated.data.context`. Use the numeric fixtures in `tests/test_skuld/test_session_usage_projection.py` and `tests/test_domain/test_session_usage.py`, without a provider prompt. Repeated native response IDs/snapshots must not increase totals; old samples after compaction must not restore the context ring. Stop only these new sessions and report IDs/results through the coordinator so cp-dev can record acceptance.
+
+Validation: final 496-case API/config/log/facade regression run, ten real isolated-PostgreSQL tests (including HTTP ingest → status/list/live, concurrency, retry/restart, malformed telemetry and up/down/up migration), 94.23% numeric-projector coverage; transport suites 463 Codex / 160 Claude SDK+tmux; independent review clear. Exact command/output receipts are in cp-dev evidence, not in a production database.
+
+Rollback: rolling back code can leave the additive columns in place. If explicitly applying the packaged down migration, it removes only derived summary/checkpoints/index and preserves every raw event; replay/backfill is a separate operation, never automatic on status GET. No deployment to production Forge is authorized by this request. iOS wire semantics are in STATUS.md, “Contract for the iOS lanes”.
+
+---
+
 # Deploy request: LEX-1412 structured notify asks → cp-ops (23 Oct 2026)
 
 Deploy this reviewed niuu `exp/cp-dev-structured-questions` landing with the matching frontend CP answer consumer after both merge SHAs are in cp-dev's description. The frontend consumer awaits ios-coordinator's canonical contract 1.1.0 commit; do not treat a lane SHA as its deployment target.
