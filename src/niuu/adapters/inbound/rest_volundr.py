@@ -3235,6 +3235,28 @@ def create_volundr_router(
         payload = response.json()
         return _with_instance(payload, instance) if isinstance(payload, dict) else {}
 
+    @router.get("/sessions/{session_id}/status")
+    async def get_session_status(
+        request: Request,
+        session_id: str,
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/status",
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        payload = _remote_json(response)
+        if not isinstance(payload, dict):
+            raise HTTPException(502, "Unexpected Forge status response")
+        return {**payload, "host": instance.id}
+
     @router.get("/sessions/{session_id}/runtime-version")
     async def get_session_runtime_version(
         request: Request,

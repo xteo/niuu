@@ -394,12 +394,42 @@ SessionSource = Annotated[
 ]
 
 
+class SessionContext(BaseModel):
+    """Last measured context occupancy; unknown is distinct from measured zero."""
+
+    tokens: int | None = Field(default=None, ge=0, strict=True)
+    window: int | None = Field(default=None, gt=0, strict=True)
+    share: float | None = Field(default=None, ge=0, strict=True, allow_inf_nan=False)
+
+
+class UsageTokenCounts(BaseModel):
+    """Measured token components, never inferred from the legacy lifetime sum."""
+
+    input: int | None = Field(default=None, ge=0, strict=True)
+    cache_read: int | None = Field(default=None, ge=0, strict=True)
+    cache_write: int | None = Field(default=None, ge=0, strict=True)
+    output: int | None = Field(default=None, ge=0, strict=True)
+
+
 class Session(BaseModel):
     """A Claude Code coding session."""
 
     coordination: SessionCoordination | None = None
     coordination_revision: int = Field(default=0, ge=0)
     read_state: SessionReadState | None = None
+    session_usage: dict | None = Field(
+        default=None,
+        exclude=True,
+        description="Private durable usage projection, including internal reducer state",
+    )
+
+    @property
+    def context(self) -> SessionContext:
+        """Public context for both REST and SSE; private reducer state never escapes."""
+        context = (self.session_usage or {}).get("context") or {}
+        return SessionContext.model_validate(
+            {name: context.get(name) for name in ("tokens", "window", "share")}
+        )
 
     id: UUID = Field(
         default_factory=uuid4,

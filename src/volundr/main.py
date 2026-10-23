@@ -1508,7 +1508,9 @@ def create_app(
 
             chronicle_repository = PostgresChronicleRepository(pool)
             timeline_repository = PostgresTimelineRepository(pool)
-            session_event_log = PostgresSessionEventLog(pool)
+            session_event_log = PostgresSessionEventLog(
+                pool, usage_model_windows=settings.session_usage.model_windows
+            )
             chronicle_service = ChronicleService(
                 chronicle_repository,
                 session_service,
@@ -1624,6 +1626,7 @@ def create_app(
                 on_device_registered=on_device_registered,
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
+                session_status_host=settings.projects.instance_id or None,
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,
                 preview_cache_dir=preview_cache_root,
                 project_service=project_service,

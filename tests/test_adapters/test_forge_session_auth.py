@@ -58,6 +58,7 @@ class TestPolicyTable:
             ("GET", "/sessions", FORGE_SESSION_READ_SCOPE, Binding.NONE),
             ("GET", "/sessions/S", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
             ("GET", "/sessions/S/conversation", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
+            ("GET", "/sessions/S/status", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
             ("GET", "/sessions/S/log", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
             ("GET", "/sessions/S/transcript", FORGE_SESSION_READ_SCOPE, Binding.OWNED),
             (

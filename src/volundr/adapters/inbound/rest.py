@@ -8,7 +8,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path as FilePath
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -89,9 +89,11 @@ from volundr.domain.models import (
     RealtimeEvent,
     Session,
     SessionActivityState,
+    SessionContext,
     SessionSource,
     SessionStatus,
     TimelineEventType,
+    UsageTokenCounts,
     WorkspaceStatus,
 )
 from volundr.domain.ports import (
@@ -983,6 +985,7 @@ class SessionResponse(BaseModel):
     last_active: str = Field(description="ISO 8601 last activity timestamp")
     message_count: int = Field(description="Total chat messages exchanged")
     tokens_used: int = Field(description="Total tokens consumed")
+    context: SessionContext = Field(default_factory=SessionContext)
     pod_name: str | None = Field(
         description="Kubernetes pod name (null when not running)",
     )
@@ -1188,6 +1191,7 @@ class SessionResponse(BaseModel):
             ),
             message_count=session.message_count,
             tokens_used=session.tokens_used,
+            context=session.context,
             pod_name=session.pod_name,
             error=session.error,
             tracker_issue_id=session.tracker_issue_id,
@@ -1226,6 +1230,92 @@ class SessionResponse(BaseModel):
             tool_open=session.tool_open,
             open_controls=session.open_controls,
         )
+
+
+class SessionStatusResponse(BaseModel):
+    """Cheap persisted usage status; no broker, transcript, or provider call on read."""
+
+    context: SessionContext = Field(default_factory=SessionContext)
+    last_turn: UsageTokenCounts = Field(default_factory=UsageTokenCounts)
+    totals: UsageTokenCounts = Field(default_factory=UsageTokenCounts)
+    compactions: int | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        description="Observed native compaction boundaries; null when the count is unknown",
+    )
+    model: str | None = None
+    engine: str | None = None
+    host: str | None = None
+    started_at: datetime | None = None
+    uptime_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cost_estimate: float | None = Field(
+        default=None,
+        ge=0,
+        strict=True,
+        allow_inf_nan=False,
+        description=(
+            "Reported native cost in USD; null when unavailable, "
+            "possibly partial when totals_complete is false"
+        ),
+    )
+    usage_available: bool | None = Field(
+        default=None,
+        strict=True,
+        description="Whether current context is measured; null means no usage evidence yet",
+    )
+    usage_reason: str | None = None
+    totals_complete: bool | None = Field(
+        default=None,
+        strict=True,
+        description=(
+            "Whether observed accounting covers the runtime history; false means "
+            "totals, compactions and available cost are observed lower bounds"
+        ),
+    )
+
+    @classmethod
+    def from_session(
+        cls,
+        session: Session,
+        *,
+        host: str | None = None,
+        now: datetime | None = None,
+    ) -> "SessionStatusResponse":
+        usage = session.session_usage or {}
+
+        def counts(name: str) -> UsageTokenCounts:
+            measured = usage.get(name) or {}
+            return UsageTokenCounts.model_validate(
+                {key: measured.get(key) for key in ("input", "cache_read", "cache_write", "output")}
+            )
+
+        result = cls(
+            context=session.context,
+            last_turn=counts("last_turn"),
+            totals=counts("totals"),
+            compactions=usage.get("compactions"),
+            model=usage.get("model") or session.model or None,
+            engine=usage.get("engine"),
+            host=host,
+            started_at=usage.get("started_at"),
+            cost_estimate=usage.get("cost_estimate"),
+            usage_available=usage.get("usage_available"),
+            usage_reason=usage.get("usage_reason"),
+            totals_complete=usage.get("totals_complete"),
+        )
+        # A stopped session has no measured end time here. Do not let its uptime
+        # grow after stop, or infer a start/end from unrelated row update times.
+        live = session.status in {
+            SessionStatus.STARTING,
+            SessionStatus.PROVISIONING,
+            SessionStatus.RUNNING,
+        }
+        if live and result.started_at is not None and result.started_at.tzinfo is not None:
+            elapsed = ((now or datetime.now(UTC)) - result.started_at).total_seconds()
+            if elapsed >= 0:
+                result.uptime_s = elapsed
+        return result
 
 
 class SessionRoomInfo(BaseModel):
@@ -1735,6 +1825,7 @@ def create_router(
     durable_transcripts: DurableTranscripts | None = None,
     project_service=None,
     runtime_build: dict | None = None,
+    session_status_host: str | None = None,
     runtime_health_timeout: float = 3.0,
     history_max_turns: int = 15,
     history_max_bytes: int = 256 * 1024,
@@ -2398,6 +2489,25 @@ def create_router(
 
         session = (await forge.with_read_states([session], principal))[0]
         return _session_response(session)
+
+    @router.get(
+        "/sessions/{session_id}/status",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+        response_model=SessionStatusResponse,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def get_session_status(request: Request, session_id: UUID) -> SessionStatusResponse:
+        """Read persisted usage with the same owner/tenant policy as the session."""
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        principal = await _optional_principal(request)
+        try:
+            await forge.ensure_access(session, principal, "read")
+        except SessionAccessDeniedError:
+            raise HTTPException(status_code=403, detail="Access denied") from None
+        return SessionStatusResponse.from_session(session, host=session_status_host)
 
     @router.get(
         "/sessions/{session_id}/room",

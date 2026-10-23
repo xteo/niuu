@@ -201,6 +201,19 @@ class _TmuxResult:
 
 
 @dataclass
+class _NativeUsageTail:
+    session_id: str
+    path: Path
+    identity: tuple[int, int] | None = None
+    offset: int = 0
+    partial: bytes = b""
+    discard_line: bool = False
+    latest: dict | None = None
+    caught_up: bool = False
+    requested: int = 0
+
+
+@dataclass
 class _PaneState:
     pane_id: str
     pane_index: str
@@ -479,6 +492,10 @@ class TmuxInteractiveTransport(CLITransport):
         # dict — that dict is emitted verbatim to clients, and the on-disk path is broker-local
         # detail, not wire contract.
         self._agent_usage = AgentUsageTracker()
+        # Main-conversation metrics reuse authenticated hooks and the configured
+        # native transcript byte bound. No terminal scraping or periodic poll.
+        self._native_usage_tail: _NativeUsageTail | None = None
+        self._native_usage_task: asyncio.Task[None] | None = None
         # Ordered stack of in-flight Task-subagent ids (the Task tool_use_id). A Task tool
         # BLOCKS its parent, so every NON-Task tool hook between a Task PreToolUse and that
         # Task's PostToolUse belongs to the subagent on top. Push in
@@ -768,6 +785,11 @@ class TmuxInteractiveTransport(CLITransport):
     async def stop(self) -> None:
         async with self._lifecycle_lock:
             self._alive = False
+            if self._native_usage_task is not None:
+                self._native_usage_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._native_usage_task
+                self._native_usage_task = None
             if self._pane_watcher_task is not None:
                 self._pane_watcher_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -1281,6 +1303,8 @@ class TmuxInteractiveTransport(CLITransport):
                 "metadata": {"source": "claude_hook"},
             }
         )
+        if event_name != "UserPromptSubmit":
+            self._schedule_native_usage(payload)
 
         if event_name == "UserPromptSubmit":
             if not self._is_child_hook(payload):
@@ -1300,6 +1324,7 @@ class TmuxInteractiveTransport(CLITransport):
                 native = payload.get("session_id")
                 if isinstance(native, str) and native.strip():
                     self._claude_native_session_id = native.strip()
+            self._schedule_native_usage(payload)
             event: dict[str, Any] = {
                 "type": "terminal_prompt_submitted",
                 "event_type": "claude.prompt.submitted",
@@ -1398,6 +1423,204 @@ class TmuxInteractiveTransport(CLITransport):
             return True
 
         return True
+
+    def _schedule_native_usage(self, payload: dict[str, Any]) -> None:
+        """Only a correlated main conversation may supply a transcript location."""
+        native = self._coerce_str(payload.get("session_id"))
+        if self._is_child_hook(payload) or not native or native != self._claude_native_session_id:
+            return
+        try:
+            if str(uuid.UUID(native)) != native:
+                return
+        except ValueError:
+            return
+        path = Path(self._coerce_str(payload.get("transcript_path")))
+        if not path.is_absolute() or path.name != f"{native}.jsonl":
+            return
+        state = self._native_usage_tail
+        if state is None or state.session_id != native:
+            if self._native_usage_task is not None:
+                self._native_usage_task.cancel()
+            state = _NativeUsageTail(session_id=native, path=path)
+            self._native_usage_tail = state
+            self._native_usage_task = None
+        if state.path != path:
+            return  # Do not rebind the same native identity to another path.
+        state.requested += 1
+        if self._native_usage_task is None or self._native_usage_task.done():
+            self._native_usage_task = asyncio.create_task(self._drain_native_usage(state))
+
+    def _read_native_usage_chunk(
+        self, state: _NativeUsageTail
+    ) -> tuple[bytes, tuple[int, int], bool]:
+        fd = os.open(state.path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            stat = os.fstat(stream.fileno())
+            if not S_ISREG(stat.st_mode):
+                raise ValueError("not_regular")
+            identity = (stat.st_dev, stat.st_ino)
+            if state.identity is not None and (
+                identity != state.identity or stat.st_size < state.offset
+            ):
+                return b"", identity, True
+            stream.seek(state.offset)
+            return stream.read(self._question_transcript_max_bytes), identity, False
+
+    async def _native_usage_unavailable(self, state: _NativeUsageTail, reason: str) -> None:
+        state.latest = None
+        state.caught_up = False
+        await self._emit(
+            {
+                "type": "system",
+                "subtype": "claude_usage_unavailable",
+                "session_id": state.session_id,
+                "reason": reason,
+                "metadata": {"source": "claude_native_transcript"},
+            }
+        )
+
+    async def _drain_native_usage(self, state: _NativeUsageTail) -> None:
+        """Drain complete JSONL rows cooperatively; every file read is bounded."""
+        while state is self._native_usage_tail:
+            requested = state.requested
+            try:
+                chunk, identity, replaced = await asyncio.to_thread(
+                    self._read_native_usage_chunk, state
+                )
+            except (OSError, ValueError):
+                await self._native_usage_unavailable(state, "transcript_unreadable")
+                return
+            if replaced:
+                state.identity, state.offset, state.partial = identity, 0, b""
+                state.discard_line = False
+                await self._native_usage_unavailable(state, "transcript_replaced")
+                continue
+            state.identity = identity
+            if not chunk:
+                if requested != state.requested:
+                    continue
+                if state.partial or state.discard_line:
+                    await self._native_usage_unavailable(state, "incomplete_record")
+                elif state.latest is not None and not state.caught_up:
+                    await self._emit({**state.latest, "caught_up": True})
+                    state.caught_up = True
+                if requested != state.requested:
+                    continue
+                return
+            checkpoint = (state.partial, state.discard_line, state.latest, state.caught_up)
+            try:
+                await self._consume_native_usage_chunk(state, chunk)
+            except BaseException:
+                # A failed/cancelled broker callback must not consume unseen rows.
+                # Successfully emitted native IDs may replay; the projector dedupes them.
+                state.partial, state.discard_line, state.latest, state.caught_up = checkpoint
+                raise
+            state.offset += len(chunk)
+            await asyncio.sleep(0)
+
+    async def _consume_native_usage_chunk(self, state: _NativeUsageTail, chunk: bytes) -> None:
+        state.caught_up = False
+        data = state.partial + chunk
+        state.partial = b""
+        if state.discard_line:
+            end = data.find(b"\n")
+            if end < 0:
+                return
+            data = data[end + 1 :]
+            state.discard_line = False
+        lines = data.split(b"\n")
+        state.partial = lines.pop()
+        for line in lines:
+            if len(line) > self._question_transcript_max_bytes:
+                await self._native_usage_unavailable(state, "record_too_large")
+                continue
+            await self._emit_native_usage_row(state, line)
+        if len(state.partial) > self._question_transcript_max_bytes:
+            state.partial = b""
+            state.discard_line = True
+            await self._native_usage_unavailable(state, "record_too_large")
+
+    async def _emit_native_usage_row(self, state: _NativeUsageTail, line: bytes) -> None:
+        if not line.strip():
+            return
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            await self._native_usage_unavailable(state, "invalid_record")
+            return
+        if not isinstance(row, dict):
+            return
+        if (
+            row.get("sessionId", row.get("session_id")) != state.session_id
+            or row.get("isSidechain")
+            or row.get("is_sidechain")
+            or row.get("agentId")
+            or row.get("agent_id")
+            or row.get("parent_tool_use_id")
+        ):
+            return
+        event: dict[str, Any] = {
+            "type": "system",
+            "session_id": state.session_id,
+            "metadata": {"source": "claude_native_transcript"},
+        }
+        for key in ("uuid", "timestamp"):
+            if isinstance(row.get(key), str):
+                event[key] = row[key]
+        if row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+            event["subtype"] = "compact_boundary"
+            metadata = row.get("compact_metadata", row.get("compactMetadata"))
+            if isinstance(metadata, dict):
+                event["compact_metadata"] = {
+                    key: value
+                    for key, value in metadata.items()
+                    if key in {"trigger", "pre_tokens", "preTokens", "post_tokens", "postTokens"}
+                    and (
+                        type(value) is int
+                        or (
+                            key == "trigger"
+                            and isinstance(value, str)
+                            and value in {"auto", "manual"}
+                        )
+                    )
+                }
+            state.latest = None
+            await self._emit(event)
+            return
+        message = row.get("message")
+        if row.get("type") != "assistant" or not isinstance(message, dict):
+            return
+        usage = message.get("usage")
+        if (
+            not isinstance(message.get("id"), str)
+            or not message["id"]
+            or not isinstance(usage, dict)
+        ):
+            return
+        numeric = {
+            key: value
+            for key, value in usage.items()
+            if key
+            in {
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            }
+            and type(value) is int
+            and value >= 0
+        }
+        if not numeric:
+            return
+        event.update(
+            subtype="claude_usage",
+            caught_up=False,
+            message={"id": message["id"], "usage": numeric, "content": []},
+        )
+        if isinstance(message.get("model"), str):
+            event["message"]["model"] = message["model"]
+        state.latest = event
+        await self._emit(event)
 
     @staticmethod
     def _hook_event_name(payload: dict[str, Any]) -> str:

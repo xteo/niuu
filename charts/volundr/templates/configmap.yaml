@@ -40,6 +40,8 @@ data:
     server_port: {{ .Values.service.targetPort | default 8080 }}
     projects:
       {{- .Values.config.projects | toYaml | nindent 6 }}
+    session_usage:
+      {{- .Values.sessionUsage | toYaml | nindent 6 }}
     conversation_recent_max_turns: {{ .Values.config.conversationRecentMaxTurns | default 15 }}
     conversation_recent_max_bytes: {{ .Values.config.conversationRecentMaxBytes | default 262144 }}
     conversation_tail_initial_frames: {{ .Values.config.conversationTailInitialFrames | default 2000 }}
