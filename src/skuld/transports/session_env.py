@@ -30,6 +30,7 @@ from collections.abc import Mapping
 
 BROKER_CREDENTIAL_VARS: frozenset[str] = frozenset(
     {
+        "FORGE_EXP_CAPTURE_SECRET",
         "SKULD__EXTERNAL_API_TOKEN",
         "VOLUNDR_EXTERNAL_API_TOKEN",
         "SKULD__FORGE_MCP__TOKEN",
