@@ -1,3 +1,18 @@
+# Deploy request: restore Claude notify discovery after R34 → cp-ops
+
+Deploy niuu `exp/control-plane` at the no-ff merge SHA in cp-dev's session description (lane `exp/cp-dev-notify-redeploy`). Independent review and tests are complete.
+
+The cause is selective native schema rejection, not a disconnected Forge MCP transport: Claude 2.1.309 omits notify when its root schema has the `allOf` conditional introduced with structured asks. The fix removes only that advertised root conditional; server-side strict `ask`/`question:true` validation and the nested item schema are unchanged.
+
+- Rebuild exp Forge and its broker artifact through the ordinary rollout. No migration, config, credential, mount, network or production change.
+- Claude caches its accepted tools and Forge advertises `listChanged:false`. Refresh the two authorized exercise broker/CLI processes through their normal lifecycle after deployment; do not restart unrelated sessions. The known exercise IDs are coordinator `2d0ae16e-58b7-4bd8-84d0-c0371b8cf52b` and build `79f6e58d-e67b-4fb7-9f18-b3419dc58ff4` in project `375b6772-fb1d-414a-9dc5-069f7841db13`. Preserve the existing stopped docs session and all fixture/question history.
+- Acceptance must inspect native Claude's accepted tool list and find `notify`, not merely a connected status or raw MCP tools/list. The isolated catalog-only regression test uses SDK initialize/get_mcp_status and no model query; its exact test is `tests/test_skuld/test_forge_mcp_native_catalog.py`, opt in with `FORGE_LIVE_CLI=1` and `-m live_cli`. A new question/provider prompt is unnecessary for this proof; leave operational question creation to the coordinator unless separately authorized.
+- Report the deployed SHA and native catalog result through the coordinator. R34's failed notify evidence remains valid history. Part A status acceptance is already complete and the build view remains a separate, unimplemented C3b item.
+
+Validation: 270 regressions, three real broker process tests, one native CLI catalog test covering transcript and feed; 95.97% changed-module coverage. Independent review approved and proved the native test fails when the historical root conditional is restored in memory. Normal rollback returns the old discovery defect; no data/schema rollback is needed.
+
+---
+
 # Deploy request: LEX-1421 session status/context → cp-ops (23 Oct 2026)
 
 Deploy the niuu `exp/control-plane` merge SHA in cp-dev's Forge description. Source lane: `exp/cp-dev-session-status`. Implementation, tests and independent review are complete; no deployment has been performed by cp-dev.
