@@ -1,5 +1,6 @@
 """E0 item 3: append Thor's capture-manifest hook rows (plus the filter's noise rows) to one
 exercise session on exp Forge, in time order, with their original timestamps (all backfill).
+Unknown manifest titles are omitted; see README.md for the historical E0 title defect.
 
 Usage: PYTHONPATH=src:. python docs/operator/e0/replay.py <forge api base> <session id> <out.json>
 """
