@@ -15,6 +15,7 @@ from skuld.transports.session_env import (
 )
 
 BROKER_SECRETS = {
+    "FORGE_EXP_CAPTURE_SECRET": "test-only-capture-hmac",
     "SKULD__EXTERNAL_API_TOKEN": "svc-token",
     "VOLUNDR_EXTERNAL_API_TOKEN": "legacy-token",
     "SKULD__FORGE_MCP__TOKEN": "mcp-token",
@@ -59,9 +60,18 @@ class TestClassifier:
         assert not is_broker_credential(name)
 
     def test_scrub_is_a_copy(self) -> None:
-        env = {"DATABASE__PASSWORD": "x", "PATH": "/bin"}
-        assert scrub_broker_credentials(env) == {"PATH": "/bin"}
-        assert env == {"DATABASE__PASSWORD": "x", "PATH": "/bin"}
+        env = {
+            "DATABASE__PASSWORD": "x",
+            "FORGE_EXP_CAPTURE_SECRET": "test-only-capture-hmac",
+            "OPENAI_API_KEY": "test-only-engine-auth",
+            "PATH": "/bin",
+        }
+        before = dict(env)
+        assert scrub_broker_credentials(env) == {
+            "OPENAI_API_KEY": "test-only-engine-auth",
+            "PATH": "/bin",
+        }
+        assert env == before
 
     def test_session_process_env_reads_the_live_environment(self, broker_env: None) -> None:
         env = session_process_env()
