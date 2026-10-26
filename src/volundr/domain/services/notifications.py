@@ -613,7 +613,7 @@ class NotificationService(NotificationRecorder):
             engine=context.engine,
             model=context.model,
             correlation_id=draft.correlation_id,
-            metadata={**metadata, **context.anchor},
+            metadata={**metadata, **context.anchor, **draft.question_metadata()},
             image=draft.image,
         )
 

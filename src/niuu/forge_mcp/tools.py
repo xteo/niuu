@@ -28,11 +28,13 @@ from niuu.domain.notifications import (
     MAX_LINKS,
     MAX_TITLE_CHARS,
     PRESENTED_FILE_ID_PATTERN,
+    QUESTION_REF_PATTERN,
     NotificationDraft,
     NotificationKind,
     NotificationLinkKind,
     NotificationSeverity,
     NotificationSource,
+    QuestionAction,
 )
 from niuu.domain.session_description import (
     DESCRIPTION_FIELDS,
@@ -43,6 +45,7 @@ from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
     NOTIFICATION_IMAGE_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
+    QUESTION_GUIDANCE,
 )
 from niuu.forge_mcp.models import (
     FlockError,
@@ -253,8 +256,9 @@ _NOTIFY_SCHEMA = _object(
             "enum": sorted(kind.value for kind in AGENT_KINDS),
             "description": (
                 "milestone = meaningful work finished; decision = a significant choice you "
-                "made; attention = blocked or need the user's input; error = a failure the "
-                "user must know about; info = a brief FYI."
+                "made (FYI, not a request); attention = an alert: blocked or need the user; "
+                "error = a failure the user must know about; info = a brief FYI. When the "
+                "user must answer, also set question=true."
             ),
         },
         "severity": {
@@ -330,6 +334,34 @@ _NOTIFY_SCHEMA = _object(
                 "(from present-file) or url, plus alt text. Forge keeps its own copy."
             ),
         },
+        "question": {
+            "type": "boolean",
+            "description": (
+                "true: this notice asks the user a Question they must answer. It stays "
+                "open in their Needs-you list until resolved. Omit it for announcements."
+            ),
+        },
+        "about_question": _object(
+            {
+                "id": {
+                    "type": "string",
+                    "pattern": QUESTION_REF_PATTERN,
+                    "description": (
+                        "The host-qualified question ref question:<host>:<notification_id>, "
+                        "e.g. question:thor:<uuid>. A bare uuid is refused."
+                    ),
+                },
+                "action": {
+                    "type": "string",
+                    "enum": [action.value for action in QuestionAction],
+                    "description": (
+                        "remind, replace, resolved, withdrawn: only the session that asked; "
+                        "relay: any session filed in the same project, on any host."
+                    ),
+                },
+            },
+            required=("id", "action"),
+        ),
     },
     required=("kind", "title"),
 )
@@ -349,6 +381,8 @@ and will reach Forge automatically when Forge is reachable — do not resend it.
 _NOTIFY_DESCRIPTION += (
     "\n\n"
     + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\n"
+    + QUESTION_GUIDANCE
     + "\n\n"
     + COMPACT_NOTIFICATION_GUIDANCE
     + "\n\n"
@@ -394,6 +428,8 @@ already recorded. Returns {notification_id, seq, session_id, state}."""
 _FEED_NOTIFY_DESCRIPTION += (
     "\n\n"
     + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\n"
+    + QUESTION_GUIDANCE
     + "\n\n"
     + COMPACT_NOTIFICATION_GUIDANCE
     + "\n\n"
