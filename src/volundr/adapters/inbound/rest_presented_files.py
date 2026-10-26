@@ -81,9 +81,14 @@ def create_presented_files_router(
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > max_bytes:
             raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
-        data = await request.body()
-        if len(data) > max_bytes:
-            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > max_bytes:
+                raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "file exceeds max_bytes")
+            chunks.append(chunk)
+        data = b"".join(chunks)
         name = " ".join(unquote(request.headers.get(NAME_HEADER, "")).split())[:MAX_NAME_CHARS]
         name = name.replace("/", "_").replace("\\", "_") or file_id
         mime = (request.headers.get("content-type") or "").split(";")[0].strip()
