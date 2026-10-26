@@ -431,6 +431,15 @@ class Session(BaseModel):
             {name: context.get(name) for name in ("tokens", "window", "share")}
         )
 
+    @property
+    def effective_model(self) -> str:
+        """The model the runtime last reported in effect, else the launch model.
+
+        ``model`` stays the launch record (restart and launch config read it);
+        readers that show who is talking use this.
+        """
+        return (self.session_usage or {}).get("model") or self.model
+
     id: UUID = Field(
         default_factory=uuid4,
         description="Unique session identifier",

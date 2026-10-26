@@ -240,7 +240,7 @@ class InMemoryEventBroadcaster(EventBroadcaster):
             data={
                 "id": str(session.id),
                 "name": session.name,
-                "model": session.model,
+                "model": session.effective_model,
                 "repo": session.repo,
                 "branch": session.branch,
                 "status": session.status.value,

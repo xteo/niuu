@@ -31,7 +31,7 @@ from stat import S_ISREG
 from typing import Any
 
 from niuu.build_info import build_info
-from niuu.domain.reasoning import MODEL_EFFORTS, validate_effort
+from niuu.domain.reasoning import MODEL_EFFORTS, preferred_effort, validate_effort
 from niuu.ports.cli import CLITransport, TransportCapabilities
 from skuld.agent_usage import AgentUsageTracker
 from skuld.claude_permission import (
@@ -200,6 +200,10 @@ class _TmuxResult:
     stderr: str = ""
 
 
+# Claude Code's acknowledgement of /model ("Set model to …", or "Kept model as …").
+_MODEL_ACK = re.compile(r"^.*(?:Set model to|Kept model as) .*$", re.MULTILINE)
+
+
 @dataclass
 class _NativeUsageTail:
     session_id: str
@@ -279,6 +283,7 @@ class TmuxInteractiveTransport(CLITransport):
         self.workspace_dir = workspace_dir
         self._session_tools = session_tools
         self._model = model
+        self._launch_model = model
         self._model_gateway_url = model_gateway_url
         self._model_gateway_token = model_gateway_token
         self._reasoning_effort = (
@@ -558,6 +563,9 @@ class TmuxInteractiveTransport(CLITransport):
             terminal_keys=True,
             terminal_resize=True,
             terminal_panes=True,
+            # Behind a model gateway the CLI's models are the gateway's, not this catalog.
+            set_model=not self._model_gateway_url,
+            runtime_options=not self._model_gateway_url,
         )
 
     @property
@@ -1163,12 +1171,107 @@ class TmuxInteractiveTransport(CLITransport):
                         return
                     await asyncio.sleep(self._pane_poll_interval_s)
 
+    async def get_runtime_options(self, *, refresh: bool = False) -> dict:
+        """The Claude models the effort vocabulary knows, and the model in effect.
+
+        Claude Code publishes no model catalog, so the choices are the product's
+        Claude entries in ``MODEL_EFFORTS``; ``current.model`` follows the native
+        transcript, so a ``/model`` typed in the terminal shows here too.
+        """
+        if self._model_gateway_url:
+            raise RuntimeError("Runtime options are not offered behind a model gateway")
+        models = []
+        for model, levels in MODEL_EFFORTS.items():
+            if not model.startswith("claude-"):
+                continue
+            models.append(
+                {
+                    "id": model,
+                    "model": model,
+                    "name": model,
+                    "description": "",
+                    "default": model == self._launch_model,
+                    "hidden": False,
+                    "effort_levels": list(levels),
+                    "default_effort": preferred_effort(levels),
+                    "service_tiers": [],
+                    "default_service_tier": None,
+                    "input_modalities": [],
+                }
+            )
+        return {
+            "source": "catalog",
+            "applies_to": "next_turn",
+            "models": models,
+            "current": {
+                "model": self._model,
+                "effort": self._reasoning_effort,
+                "service_tier": None,
+            },
+            "active_turn": {"id": None, "model": self._model} if self._turn_active else None,
+        }
+
+    async def _set_runtime_options(self, options: object) -> None:
+        """Type ``/model`` (and ``/effort``) exactly as the slash passthrough would."""
+        if not isinstance(options, dict) or not options:
+            raise ValueError("Provide at least one runtime option")
+        if options.keys() - {"model", "effort", "service_tier"}:
+            raise ValueError("Unsupported runtime option; only model, effort and service_tier")
+        if options.get("service_tier") is not None:
+            raise ValueError("Claude Code offers no service tiers")
+        model = options.get("model") or self._model
+        if "model" in options:
+            state = await self.get_runtime_options()
+            if not any(entry["model"] == model for entry in state["models"]):
+                raise ValueError("The requested model is not in the Claude model catalog")
+        effort = options.get("effort")
+        if effort is not None:
+            if not isinstance(effort, str):
+                raise ValueError("Effort must be a string")
+            # Effort alone is validated exactly as /effort is, for any launch model.
+            validate_effort(effort, MODEL_EFFORTS.get(model, ()))
+        if model != self._model:
+            await self._set_model(model)
+        if effort is not None:
+            await self._set_effort(effort)
+
+    async def _set_model(self, model: str) -> None:
+        if self._turn_active:
+            raise ValueError("Claude is working. Change /model after this turn finishes.")
+        async with self._send_lock:
+            await self._wait_for_repl_ready()
+            before = _MODEL_ACK.findall(await self._capture_pane_text())
+            await self._send_slash_command("model", arguments=model)
+            try:
+                async with asyncio.timeout(self._effort_control_timeout):
+                    while True:
+                        # The CLI names the model by display name, so the proof is
+                        # a new acknowledgement line, never the echoed command.
+                        after = _MODEL_ACK.findall(await self._capture_pane_text())
+                        if after and after != before:
+                            self._model = model
+                            return
+                        await asyncio.sleep(self._pane_poll_interval_s)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "Claude did not acknowledge /model within effort_control_timeout_s; "
+                    "raise it if the CLI is slow to answer"
+                ) from exc
+
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         if not self.is_alive:
             await self.start()
 
         if subtype == "set_effort":
             await self._set_effort(str(kwargs.get("effort") or ""))
+            return
+
+        if subtype == "set_model":
+            await self._set_runtime_options({"model": kwargs.get("model")})
+            return
+
+        if subtype == "set_runtime_options":
+            await self._set_runtime_options(kwargs.get("options"))
             return
 
         if subtype == "interrupt":
@@ -1619,6 +1722,11 @@ class TmuxInteractiveTransport(CLITransport):
         )
         if isinstance(message.get("model"), str):
             event["message"]["model"] = message["model"]
+            # The transcript is the ground truth for the model in effect: a /model
+            # typed in the terminal shows up on the next response. Claude writes
+            # ``<synthetic>`` on rows it produced itself, which name no model.
+            if message["model"] and not message["model"].startswith("<"):
+                self._model = message["model"]
         state.latest = event
         await self._emit(event)
 

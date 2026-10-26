@@ -51,6 +51,12 @@ def _text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _model(value: object) -> str | None:
+    """A runtime model id; Claude's locally written rows name ``<synthetic>``."""
+    text = _text(value)
+    return None if text is None or text.startswith("<") else text
+
+
 def _instant(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -83,7 +89,7 @@ def observation(payload: dict, *, seq: int, at: datetime) -> dict | None:
                 **base,
                 "key": f"start:{identity}",
                 "kind": "start",
-                "model": _text(payload.get("model")),
+                "model": _model(payload.get("model")),
                 "engine": _text(payload.get("engine")),
             }
     message = payload.get("message")
@@ -99,7 +105,7 @@ def observation(payload: dict, *, seq: int, at: datetime) -> dict | None:
             "key": f"claude:{native or ''}:{identity}",
             "kind": "response",
             "engine": "claude",
-            "model": _text(message.get("model")),
+            "model": _model(message.get("model")),
             "counts": counts,
             "last": counts,
             "caught_up": payload.get("caught_up", True) is not False,
@@ -121,7 +127,7 @@ def observation(payload: dict, *, seq: int, at: datetime) -> dict | None:
                 "key": f"context:{native}:{fingerprint}",
                 "kind": "context",
                 "engine": "codex",
-                "model": _text(payload.get("model")),
+                "model": _model(payload.get("model")),
                 "last": last,
                 "window": window if window else None,
             }
@@ -130,7 +136,7 @@ def observation(payload: dict, *, seq: int, at: datetime) -> dict | None:
             "key": f"codex:{native}" if total is not None else f"codex:{native}:{identity}",
             "kind": "cumulative" if total is not None else "response",
             "engine": "codex",
-            "model": _text(payload.get("model")),
+            "model": _model(payload.get("model")),
             "counts": total if total is not None else delta,
             "last": last,
             "window": window if window else None,
@@ -172,6 +178,15 @@ def observation(payload: dict, *, seq: int, at: datetime) -> dict | None:
         identity = _text(payload.get("new_conversation_id")) or _text(payload.get("uuid"))
         if identity:
             return {**base, "key": f"reset:{identity}", "kind": "reset", "epoch": identity}
+    if kind == "runtime_options":
+        # Only a harness-acknowledged change made between turns counts: reads repeat
+        # the current choice, and a change during a turn applies to the next one,
+        # whose first response confirms it.
+        current = payload.get("current")
+        model = _model(current.get("model")) if isinstance(current, dict) else None
+        if model and payload.get("applied") is True and payload.get("active_turn") is None:
+            return {**base, "key": f"model:{seq}", "kind": "model", "model": model}
+        return None
     if kind == "system" and subtype == "claude_usage_unavailable":
         return {
             **base,
@@ -216,6 +231,13 @@ def fold_usage(
                 result["model"] = event["model"]
             if event.get("engine"):
                 result["engine"] = event["engine"]
+        return result, merged
+    if kind == "model":
+        # Advance the order so an older response replayed later cannot revert it.
+        if newest and result.get("model") != event["model"]:
+            result["model"] = event["model"]
+            internal["last_order"] = event_order
+            internal.pop("last_key", None)
         return result, merged
     if kind == "unavailable":
         if newest:
@@ -316,6 +338,9 @@ def fold_usage(
         or order[0] < internal.get("boundary_at", "")
     ):
         return result, merged
+    # The newest response names the model even while the transcript catches up:
+    # a later row may name none (Claude's ``<synthetic>`` rows).
+    result["model"] = event.get("model") or result.get("model")
     if event.get("caught_up") is False:
         result["context"] = {"tokens": None, "window": None, "share": None}
         result["usage_available"] = False
@@ -334,7 +359,6 @@ def fold_usage(
         return result, merged
     if kind == "response" and last is not None:
         last = counts
-    result["model"] = event.get("model") or result.get("model")
     result["engine"] = event["engine"]
     result["last_turn"] = last
     window = (
