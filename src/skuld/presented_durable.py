@@ -178,5 +178,11 @@ async def retry_presented_upload(
             return receipt
         if is_refused(staged):
             return None
-    logger.warning("present-file: %s is not durable after retries", file_id)
+    logger.error(
+        "present-file: %s is not durable after %d uploads "
+        "(presented_durable.retry_attempts); the live broker still serves it and the "
+        "upload resumes when the broker restarts",
+        file_id,
+        settings.retry_attempts,
+    )
     return None

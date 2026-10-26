@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -111,10 +112,17 @@ async def test_retry_until_forge_accepts(staged):
     assert broker.client.put.await_count == 2
 
 
-async def test_retry_gives_up_after_the_configured_attempts(staged):
+async def test_retry_gives_up_after_the_configured_attempts(staged, caplog):
     broker = _broker(exc=OSError("down"), retry_attempts=3)
-    assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
+    with caplog.at_level(logging.ERROR, logger="skuld.broker"):
+        assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
     assert broker.client.put.await_count == 3
+    # Exhausting the retries is loud and names the knob.
+    assert any(
+        record.levelno == logging.ERROR
+        and "presented_durable.retry_attempts" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_durable_record_tolerates_garbage(tmp_path):
