@@ -670,3 +670,224 @@ worktree (2026-09-23..28), saved as `origin/lexi/web-themes-raw-20260928` (e5c24
 
 Port note: `:5173` is occupied on Thor (nginx), so Playwright ran on `:5273` through an
 uncommitted local config override (`reuseExistingServer: false`).
+
+---
+
+# B1c — structured asks, question signals, notify catalog repair (LEX-1486, 2026-10-26)
+
+Branch `lexi/b1c-asks`. Upstream `dev` had moved one commit since B1b (b3e760b6f →
+**22d393937**, `fix(ravn): close the resident notification outbox on every exit`; no
+migration; it touches `tests/conftest.py` and `test_resident_notification_relay.py`,
+which we also touch, but the rebase was clean). `lexi/dev-api-integration` (c7c807294,
+B1b + the web-themes lane) was rebased onto it (47 commits; rebased tip **acb4850bb**),
+then B1c was built on top. The previous tip c7c807294 is kept as
+`backup/dev-api-integration-pre-b1c`. Patch-id check (`git cherry`): none of the three
+source commits was on the branch.
+
+## B1c.1 Taken
+
+| New | Source (`exp/control-plane`) | What |
+|---|---|---|
+| 18a9d0963 | 776666546 (F11b) | `question` and `about_question {id, action}` on `NotificationDraft`, both notify tools, the forge-notify skill and the read wire; vendored cp-model ask cases (`tests/fixtures/control_plane/model/{asks.json,reference.py}`, scanned: no credentials) replayed through Forge's real path |
+| 0f1edcc76 | 93dc04f64 (LEX-1412) | `ask: {items: [...]}` (questions with options, actions) on the draft, both notify schemas, direct submit, the read wire and the live event |
+| 49882fa48 | f65d3b8f6 | the notify input schema's root stays a plain object (no `allOf`), so native Claude keeps `notify` in its tool catalog; opt-in native catalog test |
+| 3715a6f30 | (new) | `input_request` on system attention items (reconciliation, B1c.2.4) + contract §12 and operator guide |
+| b4846b4fb | (new) | real-PG test: the ask and `input_request` survive JSONB storage and the delivery outbox |
+
+Not taken: the STATUS/DEPLOY-REQUEST notes of all three; `project_more` / R17
+(a44c1c661, sits between 776666546 and 93dc04f64 on exp), and the native catalog test's
+`project_more_enabled=True` argument; no migration was in the exp diff.
+
+## B1c.2 Adapted (behaviour notes)
+
+1. **Beside images and residents.** F11b predates notification images on exp, so every
+   hunk was a union with our image and resident-anchor fields. A candidate's metadata is
+   `metadata + resident anchor + question signals` (`NotificationService._candidate`),
+   so agent turns, direct submits **and** resident notifies all carry them.
+2. **Absent when unset.** `draft_payload` (upstream's "older producers' exact shape"
+   rule, written for `image`) now leaves `question`, `about_question` and `ask` out
+   unless set; exp's final emitted `"question": null` etc. into every turn and submit
+   body. `build_notification_turn` reuses `draft_payload` (exp popped and re-added).
+   One test of ours (`test_payload_omits_an_absent_image`) pins the shape.
+3. **Outbox and live event.** No new write path: the signals ride in
+   `forge_notifications.metadata`, inserted in the same transaction as the scheduled
+   deliveries, and `notification_event(notification, instance_fields)` builds the live
+   `session_notification` from `Notification.wire()`, so it carries the ask together
+   with `instance_id/_name/_slug`. The Guild facade passes items through as dicts. The
+   push payload (APNs, 4 KB) carries `notification_id` and `request_id` as before, never
+   the ask (up to 32 KB): the app reads the ask from the feed or the live event. The
+   resident outbox stores `draft.model_dump()` and the relay re-validates it; the strict
+   ask round-trips (test).
+4. **One shape for "needs you", two answer paths (reconciliation).** Upstream had no
+   question/action notion on the wire, but it does record a system `attention` item when
+   a session or resident blocks on AskUserQuestion, a confirmation or a permission, with
+   `input_kind` and `request_id` hidden in metadata. **Exp's shape won for notice
+   questions** (`question`/`about_question`/`ask`): it is the frozen cp-api contract
+   the app already renders from the mock fleet, and upstream had nothing competing.
+   Upstream's attention item was **not** folded into it: the control-plane model itself
+   keeps runtime controls (`ask_user_question`, answered in the session) apart from
+   notice questions (answered by a delivered message), the card's options and
+   answerability (incl. "not restored after a native restart") live on the session, and
+   converting AskUserQuestion into `ask` would put strict ask bounds in the activity
+   path. Instead the wire now names the request: `input_request: {kind, request_id}` on
+   system attention items, `null` elsewhere. Its answer stays the question card's path
+   (`ask_user_answer` on the session socket); no new answer route exists.
+5. **Session-token allow-list.** No new route; the feed reads and the session
+   notification submit were already on it.
+6. **Native catalog.** Re-proved here with Claude Code **2.1.310**: the test passes, and
+   with the root `allOf` restored in place `notify` vanishes from both catalogs and it
+   fails. The nested item-level `allOf` (`allow_text: false` needs `options`) is kept,
+   as on exp; it does not affect discovery.
+
+## B1c.3 Shapes iOS reads
+
+Every notification item (`GET /api/v1/forge/notifications`, `GET
+/sessions/{id}/notifications`, the live `session_notification`, the Guild facade) now
+has four more keys, all `null` when absent:
+
+```json
+{"question": true,
+ "about_question": {"id": "question:thor:6f1c…-uuid", "action": "relay"},
+ "ask": {"items": [
+   {"id": "database", "kind": "question", "text": "Which database?",
+    "header": "Storage",
+    "options": [{"label": "Postgres", "description": "the shared cluster"},
+                {"label": "SQLite"}],
+    "multi_select": false, "allow_text": false},
+   {"id": "access", "kind": "action", "text": "Grant the test account access."}]},
+ "input_request": null}
+```
+
+- **Question** (`ask.items[].kind == "question"`): `id` (1–64, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`,
+  unique), `text` (1–2000), optional `header` (1–80), optional `options` (1–8, each
+  `label` 1–120 unique within the item, optional `description` ≤ 500), optional
+  `multi_select` (**omitted = false**), optional `allow_text` (**omitted = true**; when
+  false, `options` is present). Optional keys are omitted, never `null`.
+- **Action** (`kind == "action"`): `id`, `text` (the label to show), optional `header`;
+  the user reports done / not done. There is **no executable target**: an action never
+  authorises the app to run anything (contract wording, exp and here).
+- `ask` only appears with `question: true`; `question: true` without `ask` is the legacy
+  single free-text question. At most 8 items, 32768 UTF-8 bytes.
+- `about_question.action`: `remind | replace | relay | resolved | withdrawn`; `id` is
+  `question:<host>:<notification uuid>`.
+- **Runtime request** (system `attention`, not a notice question):
+  `"input_request": {"kind": "question|confirmation|permission", "request_id": "toolu_…"|null}`,
+  with `question`/`ask` null. Answer it in the session's card (below).
+
+**Answer envelopes (unchanged routes).**
+
+- Notice question → a message to the asking session:
+  `POST /api/v1/forge/sessions/{session_id}/messages` (Guild facade: add
+  `?scope=local` to pin the session's node), body `{"content": "<answer text>",
+  "request_id": "<stable client id>"}`. 200 `delivered`, 202 `pending` (broker retrying),
+  409 for the same `request_id` with different content (`request_id_conflict`) or an
+  unreachable pod; `GET …/sessions/{session_id}/message-deliveries/{request_id}` reports
+  delivery. The content format of
+  a structured answer (which option per item, done/not done per action) is the app's
+  (cp contract 1.1.0); Forge carries it as text. Delivery is not resolution: the asking
+  session later sends `about_question: {id, action: "resolved"}`.
+- Runtime request → the session WebSocket the transcript card uses:
+  `{"type": "ask_user_answer", "request_id": "<input_request.request_id>", "answers": [...]}`
+  (permissions: the existing permission response). The attention item is marked read when
+  the session stops waiting.
+
+**`notify` tool, new arguments** (both the transcript tool and the Forge-hosted feed
+tool): `question` (boolean), `about_question` (`{id, action}`, both required), `ask`
+(`{items: [...]}`, item fields as above; requires `question: true`, enforced by
+`NotificationDraft` before anything is written, not by the advertised schema). The tool
+description and the generated `forge-notify` skill (“Asking the user questions or
+actions”) explain them; `kind=decision` is reworded as an FYI about a choice made.
+
+## B1c.4 Migrations
+
+None in the exp diff and none added. The runner's inputs (`migrations/`,
+`lineage-aliases.json`, `cli.resources`) are byte-identical to the B1b tip that was
+dry-run (B1b.5), and the ledgers are unchanged since (read-only counts, 2026-10-26:
+Thor `volundr-pg` 83 rows, m6 embedded PG 129 rows), so nothing new applies on either
+host; no export or scratch restore was needed this time.
+
+## B1c.5 Validation (2026-10-26, Thor, clean `env -i` allow-list, `uv --frozen`)
+
+| Gate | B1c | B1b |
+|---|---|---|
+| `make lint` | pass | pass |
+| full backend suite (`-n 16`, cov gate 85) | **28888 passed**, 16 skipped, 1 xfailed, **14 failed**, coverage **89.02 %** | 28777 / 14, 89.01 % |
+| `make test-forge` | **9470 passed**, 3 skipped, 1 xfailed, **2 failed**, Skuld coverage 87.72 % | 9453 / 4 |
+| `make test-forge-tmux` | **60 passed** | 60 |
+| `make test-forge-database` (scratch PG 16, 127.0.0.1) | **137 passed** (+1 asks real-PG) | 136 |
+| native Claude catalog (`FORGE_LIVE_CLI=1 -m live_cli`, Claude Code 2.1.310) | pass; fails with the root `allOf` restored | — |
+| web-next | no change (`git diff acb4850bb..HEAD -- web-next` empty); not rebuilt | no change |
+
+The 14 full-suite reds are B0's box-specific set, unchanged: `test_install_sh*` (10),
+`test_docker_container` recovery, `test_terminal_docker` workspace mount,
+`test_workflow_kickoff[/workspace]`, `test_api_release_guard`. The forge lane's
+2 reds are the docker-container and release-guard tests of that set; B0's two
+`test_resident_notification_relay` GC-under-`-W error` reds are gone, fixed upstream by
+22d393937 (the outbox's SQLite connection is now closed).
+Scratch Postgres container removed.
+
+## B1c.6 Open questions
+
+1. **Structured answer content.** Forge carries the answer as message text; if the app
+   wants Forge (or the asking agent) to see a typed answer (`{item id: option labels |
+   done}`), that is a message-format decision for cp contract 1.1.0, not a Forge route.
+2. **AskUserQuestion options in Needs you.** `input_request` names the pending request
+   but does not copy its questions/options; the app shows them from the session's card.
+   If Needs you must render them without opening the session, a follow-up could serve
+   the broker's pending controls through Forge.
+3. **Resident notify tool.** Ravn's own `notify` tool schema does not advertise
+   `question`/`ask` (Forge accepts them from a resident draft). Whether residents should
+   ask structured questions is a Ravn decision.
+
+---
+
+# Phase B summary (B0–B1c, for B3 / LEX-1489)
+
+`lexi/dev-api-integration` on xteo/niuu = upstream `niuulabs/niuu` `dev`
+(**22d393937**) + our work, linear. Backups on the fork:
+`backup/dev-api-integration-20261026` (pre-B0, 33087ca2e),
+`backup/dev-api-integration-pre-b1b` (f25619345), `backup/dev-api-integration-pre-b1c`
+(c7c807294).
+
+## What Phase B brought
+
+| Lift | Ticket | What |
+|---|---|---|
+| B0 | LEX-1483 | Consolidation onto upstream `dev`: attachments index; agent-maintained session descriptions (000089, alias 000087); notification images with durable copies, thumbnails and Guild-facade URLs (000090, alias 000072); `conversation?tail=N`; Forge capture secret kept out of child envs; isolated Claude subscription auth; Codex native-agent research docs. Dropped: the `forge/ux-*` public-image pipeline (upstream ci/* owns it) |
+| B1a | LEX-1484 | Session work facts (`last_work_at`, `open_tool_count`, broker `open_controls`; 000091) and the stale-active fixes in Skuld; native usage/context projection for Claude SDK, tmux and Codex with `GET /sessions/{id}/status` and `context` on the session row (000092) |
+| B1b | LEX-1485 | Durable presented files with tailnet URLs (dynamic-adapter store, CSP sandbox + nosniff everywhere they are served, resumable broker uploads); artifact publications and bursts with one notice per burst, `report_artifact` MCP tool, `GET /instance`, one configured host name (000093); chart values for `artifacts`, `presented_files`, `host_identity` |
+| (web) | — | midnight-blue default and deep-/dark-blue colour themes (web-themes lane, on the branch since c7c807294) |
+| B1c | LEX-1486 | Notice questions (`question`, `about_question`, structured `ask`) through notify, submit, storage, outbox, live event and facade; `input_request` on runtime-request attention items; `notify` kept in native Claude discovery |
+
+Migrations on the branch beyond upstream: 000089, 000090 (both with aliases for Thor's
+old numbers), 000091, 000092, 000093. Dry runs on Thor and m6 ledger exports: B0/B1a/B1b
+sections; B1c adds none.
+
+## Open questions, gathered
+
+1. **Conversation `tail` reads vs `DurableTranscripts`** (§3.2/§7.1): tail reads bypass
+   it. Leave, or route them through it?
+2. **`activity_heartbeat.stale_output_seconds`** (Skuld, default 600) is config-only; the
+   Skuld session config template does not render it (B1a.6.3).
+3. **Durable presented files: retention and quota.** No TTL or total quota (50 MiB per
+   file); disk grows until sessions are deleted. Keep "until delete", or add a knob in
+   B3? (B1b.7.1)
+4. **Publication feed filter.** Cursor feed, oldest first, no `session_id`/`project_id`
+   filter; "latest per session" means paging from `after=0`. Add a filtered read if
+   LEX-1465/1476 need it? (B1b.7.2)
+5. **Publications after session delete.** They outlive the session, and the deleted
+   session's `present_file` URL then answers 404. Keep, or delete with the session?
+   (B1b.7.3)
+6. **m6 host identity.** m6's `projects.instance_id` is unknown here; set
+   `host_identity.host: mini-m6` explicitly there (and `presented_files` on both hosts).
+   (B1b.7.4)
+7. **Structured answer content, AskUserQuestion options in Needs you, resident asks**
+   (B1c.6).
+8. **B3, Thor:** keep `~/.config/niuu-forge-thor/start_platform.py` (its Ting tables are
+   unledgered; native external mode fails at `ting/000025`) and rebuild the web UI from
+   this branch (it serves a `forge/ux-cleanup` static build today). (§4 hazard, §7.2)
+9. **B3, m6:** still runs forge-m6-6c31bfe1 (1895f5fc5 staged, never cut over); its
+   promotion is the first time it gets descriptions, attachments, images, work facts,
+   usage, presented files and publications (Volundr 000087–000093, `ting/000047`).
+10. **Public Forge image:** if still wanted, rebuild it on upstream's ci/* pipeline
+    rather than reviving `forge/ux-*` (§7.4).
