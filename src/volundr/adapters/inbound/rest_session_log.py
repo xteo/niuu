@@ -273,7 +273,7 @@ async def _project_notifications_before_ack(
         ) from exc
 
 
-async def _project_artifacts_isolated(
+async def _project_artifacts_before_ack(
     artifact_service: ArtifactService,
     log_repository: SessionEventLogRepository,
     session: Session,
@@ -284,9 +284,11 @@ async def _project_artifacts_isolated(
 ) -> None:
     """Record the batch's artifact publications (F1) from the STORED rows.
 
-    Like notifications: a store outage answers 503 so the producer retries the
-    idempotent batch; any other failure is logged and the append still succeeds (the
-    internal backfill can recover a missed row later).
+    Like notifications, the append is acknowledged only if this succeeds: a store
+    outage answers 503 and any other failure propagates as a 500. The frames are
+    already stored and recording is idempotent, so the producer's retry records them
+    then; a defect holds the session's log back rather than silently dropping its
+    publications.
     """
     excluded = set(conflicts)
     seqs = [
@@ -309,10 +311,6 @@ async def _project_artifacts_isolated(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Artifact store unavailable; retry the batch",
         ) from exc
-    except Exception:
-        logger.exception(
-            "artifact projection failed for session %s; transcript append kept", session.id
-        )
 
 
 def create_session_log_router(
@@ -406,7 +404,7 @@ def create_session_log_router(
                 notification_service, log_repository, session, entries, conflicts
             )
         if artifact_service is not None:
-            await _project_artifacts_isolated(
+            await _project_artifacts_before_ack(
                 artifact_service, log_repository, session, entries, conflicts, seen_at=now
             )
         # Projection is committed atomically with the durable insert; this is only a refresh hint.

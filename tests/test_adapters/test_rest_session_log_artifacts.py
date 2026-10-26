@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -126,23 +124,26 @@ async def test_store_outage_asks_the_producer_to_retry():
     assert [r.session_seq for r in await _rows(repo)] == [3]
 
 
-async def test_projection_defect_is_logged_and_append_kept(caplog):
+async def test_projection_defect_fails_the_append_and_the_retry_records():
+    """A projection defect is a 500, not an acknowledged append missing its publication."""
     client, log, repo, artifacts, sessions = _app()
     session = await _session(sessions)
+    url = f"/api/v1/forge/sessions/{session.id}/log"
+    original = artifacts.project_log_entries
 
     async def broken(*args, **kwargs):
         raise RuntimeError("boom")
 
     artifacts.project_log_entries = broken
-    with caplog.at_level(logging.ERROR):
-        response = client.post(
-            f"/api/v1/forge/sessions/{session.id}/log",
-            json={"entries": [_hook_frame(4)]},
-            headers=HEADERS,
-        )
-    assert response.status_code == 201
-    assert "artifact projection failed" in caplog.text
+    failing = TestClient(client.app, raise_server_exceptions=False)
+    response = failing.post(url, json={"entries": [_hook_frame(4)]}, headers=HEADERS)
+    assert response.status_code == 500
+    assert await log.latest_seq(session.id) == 4  # the transcript frame is kept
     assert await _rows(repo) == []
+
+    artifacts.project_log_entries = original
+    assert client.post(url, json={"entries": [_hook_frame(4)]}, headers=HEADERS).status_code == 201
+    assert [r.session_seq for r in await _rows(repo)] == [4]
 
 
 async def test_without_artifact_service_nothing_is_read_back():
