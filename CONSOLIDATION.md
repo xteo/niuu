@@ -841,7 +841,120 @@ Scratch Postgres container removed.
 
 ---
 
-# Phase B summary (B0–B1c, for B3 / LEX-1489)
+# B1d — a session's model follows the live model (LEX-1493, 2026-10-26)
+
+Branch `lexi/b1d-model` on `lexi/dev-api-integration` (a96d0697b); upstream `dev`
+unchanged (**22d393937**). No exp source: nothing on `exp/control-plane` touched this, so
+there was no upstream/exp shape disagreement. No migration.
+
+## B1d.1 What upstream already did (verified, kept)
+
+| Path | Upstream on 22d393937 |
+|---|---|
+| `/model` in the tmux slash list | yes, `_BUILT_IN_SLASH_COMMANDS` (`src/skuld/transports/tmux_interactive.py`) |
+| `set_model` control | broker routes it through `handle_runtime_options` when the transport advertises `runtime_options` (Codex), else `send_control("set_model")` (SDK, pi, opencode, muse). **tmux had no handler: it was silently dropped** |
+| `update_session(model=…)` | `PUT /sessions/{id}` writes the stored model and publishes `session_updated`, but **nothing calls it on a model change** (Skuld never reports one) |
+| `get_runtime_options` | Codex only (`source: "native"`, `thread/settings/update`); tmux Claude: 409 |
+| model in effect | the usage projection already folds the newest reply's `message.model` into `sessions.session_usage.model`, and `GET /sessions/{id}/status` serves `usage.model or session.model`. List, session GET and `session_updated` served the **launch** model, which is the reported bug |
+
+## B1d.2 Added
+
+1. **`Session.effective_model`** = `session_usage.model or model`. Served as `model` by
+   `SessionResponse` (list, GET), the `session_updated`/`session_created` event payload,
+   `/status` (unchanged value) and notification context. `sessions.model` stays the launch
+   record: restart, launch config (`contributors/core`) and chronicles still read it, so
+   no default and no launch behaviour changes. Writing the column instead would have made
+   restart pick up the switched model and races the generic `update()` row rewrite.
+2. **Projection** (`volundr/domain/session_usage.py`):
+   * Claude's `<synthetic>` rows name no model (they were becoming `usage.model`);
+   * the newest reply's model is kept while the transcript catches up (before, only the
+     caught-up re-emit of the last row set it, so a trailing synthetic row left it unknown);
+   * a `runtime_options` frame with `applied: true` and `active_turn: null` is a model
+     observation (`kind: "model"`, key `model:<seq>`), advancing the order so an older
+     reply replayed later cannot revert it; an unchanged model leaves state untouched.
+   Change mid-turn → not observed; the next turn's first reply confirms it.
+3. **Skuld broker**: the `runtime_options` frame gains `applied` (true only when it
+   acknowledges a set, false on reads), so reads never count as changes.
+4. **tmux Claude transport**: `runtime_options`/`set_model` capabilities (off behind a model
+   gateway); `get_runtime_options` with the Claude catalog; `set_model` /
+   `set_runtime_options` type `/model <id>` (and `/effort`) between turns and wait for the
+   CLI's acknowledgement line (`effort_control_timeout_s`, description now covers model);
+   the transcript tail sets the model in effect from each main-session reply.
+
+Paths, end to end: **terminal-typed `/model`** → next reply's transcript row → tmux
+`claude_usage` frame (`message.model`) → event log → projection → `session_updated`.
+**App `/model …` via slash passthrough** → the same (it is typed into the pane).
+**App `set_model` / `set_runtime_options`** → ack → `runtime_options{applied:true}` →
+projection → `session_updated` at once; the next reply confirms. One `session_updated`
+per log batch that carries an observation (the existing usage refresh), so a change
+costs no extra event.
+
+## B1d.3 Shapes
+
+Session (list, `GET /api/v1/forge/sessions/{id}`) and `session_updated.data`: unchanged
+field, new meaning — `"model": "claude-opus-5-5"` = model in effect, else launch model.
+
+Choices: Skuld `GET /s/{id}/api/runtime-options` (and WS `get_runtime_options` →
+`runtime_options` frame), Codex shape kept:
+
+```json
+{"source": "catalog", "applies_to": "next_turn",
+ "models": [{"id": "claude-opus-5-5", "model": "claude-opus-5-5", "name": "claude-opus-5-5",
+             "description": "", "default": false, "hidden": false,
+             "effort_levels": ["low","medium","high","xhigh","max"], "default_effort": "xhigh",
+             "service_tiers": [], "default_service_tier": null, "input_modalities": []}, …],
+ "current": {"model": "claude-fable-5-1", "effort": "high", "service_tier": null},
+ "active_turn": null}
+```
+
+Differences from Codex: `source: "catalog"` (Claude Code publishes no catalog; the list is
+the `claude-*` entries of `niuu.domain.reasoning.MODEL_EFFORTS`), `name` is the id (no
+display names), `default` marks the launch model, no tiers, `active_turn.id` is null.
+Set: `POST /s/{id}/api/runtime-options` `{"options": {"model": "claude-opus-5-5"}}` or WS
+`set_model`; 400 while Claude is working, for a model outside the catalog or any tier;
+502 when the CLI does not acknowledge. Documented in
+`docs/forge/codex-ios-runtime-handoff.md`.
+
+## B1d.4 Tests
+
+`tests/test_skuld/transports/test_tmux_model.py` (18: typed `/model` + transcript change,
+synthetic rows, catalog, gateway, set/ack/timeout/validation, broker frame → observation),
+`tests/test_skuld/test_forge_model.py` (2, real tmux + fake CLI that now writes a native
+transcript and acknowledges `/model`), `tests/test_volundr/test_session_effective_model.py`
+(9: projection, readers, one `session_updated`), real-PG HTTP ingest test in
+`test_session_usage_postgres_integration.py` (list/GET/status/event follow; stored model
+unchanged).
+
+## B1d.5 Validation (2026-10-26, Thor, clean `env -i` allow-list, `uv --frozen`)
+
+| Gate | B1d | B1c |
+|---|---|---|
+| `make lint` | pass | pass |
+| full backend suite (`-n 16`, cov gate 85) | **28915 passed**, 16 skipped, 1 xfailed, **14 failed**, coverage **89.03 %** | 28888 / 14, 89.02 % |
+| `make test-forge` | **9497 passed**, 3 skipped, 1 xfailed, **2 failed**, Skuld coverage 87.77 % | 9470 / 2 |
+| `make test-forge-tmux` | **62 passed** | 60 |
+| `make test-forge-database` (scratch PG 16, 127.0.0.1) | **138 passed** | 137 |
+
+Reds = B0's box-specific set, unchanged. Scratch Postgres container removed.
+
+## B1d.6 Open questions
+
+1. **`/model` saves the CLI default.** Claude Code answers `/model` with "Set model to …
+   and saved as your default for new sessions". In a session without its own
+   `CLAUDE_CONFIG_DIR` (native local-process Forge on Thor/m6), that writes the box
+   user's `~/.claude/settings.json` — true of a typed `/model` and the slash passthrough
+   upstream already had, and now of the app picker. Isolate the session config dir, or
+   accept?
+2. **Display names.** The Claude choices carry ids as `name`; the app maps ids to labels
+   ("Opus 5.5") as it already does for `session.model`. A display name in the catalog
+   would need a product list (Bifrost catalog) wired into Skuld.
+3. **Restart model.** Restart still launches the stored launch model (Volundr), while the
+   broker's own restore and the CLI's saved default may hold the switched one. Should
+   restart adopt the model in effect? That would be a launch-behaviour change, so not here.
+
+---
+
+# Phase B summary (B0–B1d, for B3 / LEX-1489)
 
 `lexi/dev-api-integration` on xteo/niuu = upstream `niuulabs/niuu` `dev`
 (**22d393937**) + our work, linear. Backups on the fork:
@@ -858,10 +971,11 @@ Scratch Postgres container removed.
 | B1b | LEX-1485 | Durable presented files with tailnet URLs (dynamic-adapter store, CSP sandbox + nosniff everywhere they are served, resumable broker uploads); artifact publications and bursts with one notice per burst, `report_artifact` MCP tool, `GET /instance`, one configured host name (000093); chart values for `artifacts`, `presented_files`, `host_identity` |
 | (web) | — | midnight-blue default and deep-/dark-blue colour themes (web-themes lane, on the branch since c7c807294) |
 | B1c | LEX-1486 | Notice questions (`question`, `about_question`, structured `ask`) through notify, submit, storage, outbox, live event and facade; `input_request` on runtime-request attention items; `notify` kept in native Claude discovery |
+| B1d | LEX-1493 | `session.model` (list, GET, `session_updated`) = model in effect from the transcript or an acknowledged change, launch model kept; Claude tmux runtime options (catalog choices, `/model` set); `<synthetic>` ignored in usage |
 
 Migrations on the branch beyond upstream: 000089, 000090 (both with aliases for Thor's
 old numbers), 000091, 000092, 000093. Dry runs on Thor and m6 ledger exports: B0/B1a/B1b
-sections; B1c adds none.
+sections; B1c and B1d add none.
 
 ## Open questions, gathered
 
@@ -891,3 +1005,6 @@ sections; B1c adds none.
    usage, presented files and publications (Volundr 000087–000093, `ting/000047`).
 10. **Public Forge image:** if still wanted, rebuild it on upstream's ci/* pipeline
     rather than reviving `forge/ux-*` (§7.4).
+11. **`/model` writes the CLI's saved default** in sessions without their own
+    `CLAUDE_CONFIG_DIR`; Claude choice display names; whether restart adopts the model in
+    effect (B1d.6).
