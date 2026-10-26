@@ -2672,6 +2672,81 @@ class SessionUsageConfig(BaseModel):
     )
 
 
+class HostIdentityConfig(BaseModel):
+    """How this Forge names itself to the control plane (F7, ``GET /instance``).
+
+    ``host`` is the control plane's host-map key (``thor``, ``mini-m6``, ``thor-exp``);
+    empty falls back to ``projects.instance_id``, then ``local``. ``tailnet_name`` is
+    the phone-reachable name (``thor.tail737f2a.ts.net``); empty falls back to
+    ``server_public_host``.
+    """
+
+    host: str = Field(default="", max_length=100, pattern=r"^[a-zA-Z0-9_.-]*$")
+    tailnet_name: str = Field(default="", max_length=253)
+
+
+def _default_artifact_type_urls() -> dict[str, str]:
+    # The claude.ai Artifact types seen in the capture corpus (F1t); a new type also
+    # classifies by its instructions' front-matter name (``artifacts.type_names``).
+    return {
+        "https://claude.ai/artifact/8jTsAFQMFDb2oA8MsPJ2eL": "deck",
+        "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd": "design",
+        "https://claude.ai/artifact/Rp9naXUCj2xozpUkyQy19W": "doc",
+        "https://claude.ai/artifact/5M7UeXXcx16TP3vzVFNDzd": "design_system",
+    }
+
+
+def _default_artifact_type_names() -> dict[str, str]:
+    return {
+        "slides": "deck",
+        "design": "design",
+        "pages": "doc",
+        "docs": "doc",
+        "design-system": "design_system",
+        "design_system": "design_system",
+    }
+
+
+class ArtifactsConfig(BaseModel):
+    """Artifact publications (F1) and their burst notices (F1n): model/bursts.md."""
+
+    enabled: bool = Field(default=True, description="Record publications and serve their read.")
+    notices_enabled: bool = Field(
+        default=True,
+        description="Announce each live burst with one notice after the hold (F1n).",
+    )
+    burst_window_seconds: float = Field(
+        default=1800.0, gt=0, description="A burst's sliding window on each side."
+    )
+    hold_seconds: float = Field(
+        default=120.0, ge=0, description="Durable hold before a live burst's notice."
+    )
+    live_lag_seconds: float = Field(
+        default=600.0,
+        ge=0,
+        description="A row ingested within this lag of its timestamp is live; else backfill.",
+    )
+    tick_interval_seconds: float = Field(
+        default=5.0, gt=0, description="How often the hold looks for due bursts."
+    )
+    emit_batch_size: int = Field(default=100, ge=1)
+    max_emit_failures: int = Field(
+        default=5, ge=1, description="Failed emissions before a burst is settled silently."
+    )
+    backfill_page_size: int = Field(default=500, ge=1)
+    default_page_size: int = Field(default=200, ge=1)
+    max_page_size: int = Field(default=1000, ge=1)
+    backfill_on_start: bool = Field(
+        default=False,
+        description="Replay the durable log into publications at start (always silent).",
+    )
+    backfill_since_days: float | None = Field(
+        default=None, gt=0, description="Bound the start-up backfill to recent rows."
+    )
+    type_urls: dict[str, str] = Field(default_factory=_default_artifact_type_urls)
+    type_names: dict[str, str] = Field(default_factory=_default_artifact_type_names)
+
+
 class ProjectsConfig(BaseModel):
     """Storage adapters and bounded checkpoint limits; workflows live in agent skills."""
 
@@ -2900,6 +2975,8 @@ class Settings(BaseSettings):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     session_usage: SessionUsageConfig = Field(default_factory=SessionUsageConfig)
     presented_files: PresentedFilesConfig = Field(default_factory=PresentedFilesConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    host_identity: HostIdentityConfig = Field(default_factory=HostIdentityConfig)
     forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     authorization: AuthorizationConfig = Field(default_factory=AuthorizationConfig)

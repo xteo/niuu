@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from niuu.domain.artifact_reports import ARTIFACT_REPORT_TYPES, ArtifactReport
 from niuu.domain.notifications import (
     AGENT_KINDS,
     MAX_BODY_CHARS,
@@ -430,6 +431,49 @@ _DESCRIBE_SESSION_SCHEMA = _object(
     }
 )
 
+
+class _ReportArtifactArgs(_Args):
+    url: str
+    title: str
+    provider_version: str | None = None
+    version_label: str | None = None
+    type: str | None = None
+
+
+_REPORT_ARTIFACT_DESCRIPTION = (
+    "Report a claude.ai artifact this session made or updated, when Forge cannot see "
+    "the publish itself (it was published another way, or your engine has no Artifact "
+    "tool). Publishes made with the claude.ai Artifact tool, and files you present with "
+    "present-file, are recorded automatically: do not report those. The report appears "
+    "in the control plane's Artifacts list with this session as its producer. It is not "
+    "a notification; use `notify` to tell the user about it. Reporting the same version "
+    "again is harmless."
+)
+
+_REPORT_ARTIFACT_SCHEMA = _object(
+    {
+        "url": {
+            "type": "string",
+            "description": "The artifact's durable URL: https://claude.ai/artifact/<id>.",
+        },
+        "title": {"type": "string", "description": "The artifact's title, one line."},
+        "provider_version": {
+            "type": ["string", "null"],
+            "description": "The provider's version string, when the publish returned one.",
+        },
+        "version_label": {
+            "type": ["string", "null"],
+            "description": "A human label for this version (e.g. 'v21'), if you use one.",
+        },
+        "type": {
+            "type": ["string", "null"],
+            "enum": [*ARTIFACT_REPORT_TYPES, None],
+            "description": "What kind of artifact it is, when you know.",
+        },
+    },
+    required=("url", "title"),
+)
+
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="environment",
@@ -447,6 +491,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=_NOTIFY_DESCRIPTION,
         input_schema=_NOTIFY_SCHEMA,
         args_model=_NotifyArgs,
+    ),
+    ToolSpec(
+        name="report_artifact",
+        description=_REPORT_ARTIFACT_DESCRIPTION,
+        input_schema=_REPORT_ARTIFACT_SCHEMA,
+        args_model=_ReportArtifactArgs,
     ),
     ToolSpec(
         name="describe_session",
@@ -664,10 +714,19 @@ FEED_NOTIFY_SPEC = ToolSpec(
 )
 
 
+#: Tools that write the caller's own durable transcript, so only a session's own broker
+#: (transcript mode) can serve them.
+TRANSCRIPT_ONLY_TOOLS = frozenset({"report_artifact"})
+
+
 def _specs_for(mode: ForgeMcpNotifyMode) -> tuple[ToolSpec, ...]:
     if mode is ForgeMcpNotifyMode.TRANSCRIPT:
         return TOOL_SPECS
-    return tuple(FEED_NOTIFY_SPEC if spec.name == "notify" else spec for spec in TOOL_SPECS)
+    return tuple(
+        FEED_NOTIFY_SPEC if spec.name == "notify" else spec
+        for spec in TOOL_SPECS
+        if spec.name not in TRANSCRIPT_ONLY_TOOLS
+    )
 
 
 # --------------------------------------------------------------------------- projections
@@ -797,6 +856,7 @@ class ForgeMcpToolbox:
             "environment": self._environment,
             "notify": notify,
             "describe_session": self._describe_session,
+            "report_artifact": self._report_artifact,
             "list_notifications": self._list_notifications,
             "list_sessions": self._list_sessions,
             "get_session": self._get_session,
@@ -885,6 +945,13 @@ class ForgeMcpToolbox:
                 "state": "committed",
             }
         )
+
+    async def _report_artifact(self, args: _ReportArtifactArgs) -> ToolResult:
+        try:
+            report = ArtifactReport.model_validate(args.model_dump())
+        except ValidationError as exc:
+            return ToolResult.error(_validation_text("report_artifact", exc))
+        return self._ok(await self._host.report_artifact(report))
 
     async def _describe_session(self, args: _DescribeSessionArgs) -> ToolResult:
         session_id = self._host.session_id

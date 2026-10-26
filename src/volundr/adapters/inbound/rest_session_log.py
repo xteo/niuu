@@ -43,6 +43,7 @@ from niuu.domain.services.token_scope import (
 from niuu.domain.transcript_reducer import is_read_path_excluded
 from skuld.channels import filter_internal_blocks
 from volundr.adapters.inbound.forge_session_auth import require_bound_session
+from volundr.domain.artifact_ports import ArtifactStoreUnavailableError
 from volundr.domain.models import SessionLogEntry
 from volundr.domain.notifications import NotificationStoreUnavailableError
 from volundr.domain.ports import SessionEventLogRepository
@@ -52,6 +53,7 @@ from volundr.domain.session_usage import observation
 
 if TYPE_CHECKING:
     from volundr.domain.models import Session
+    from volundr.domain.services.artifacts import ArtifactService
     from volundr.domain.services.notifications import NotificationService
 
 logger = logging.getLogger(__name__)
@@ -271,6 +273,48 @@ async def _project_notifications_before_ack(
         ) from exc
 
 
+async def _project_artifacts_isolated(
+    artifact_service: ArtifactService,
+    log_repository: SessionEventLogRepository,
+    session: Session,
+    entries: list[SessionLogEntry],
+    conflicts: list[int],
+    *,
+    seen_at: datetime,
+) -> None:
+    """Record the batch's artifact publications (F1) from the STORED rows.
+
+    Like notifications: a store outage answers 503 so the producer retries the
+    idempotent batch; any other failure is logged and the append still succeeds (the
+    internal backfill can recover a missed row later).
+    """
+    excluded = set(conflicts)
+    seqs = [
+        entry.seq
+        for entry in entries
+        if entry.seq not in excluded and artifact_service.is_projectable(entry.payload)
+    ]
+    if not seqs:
+        return
+    try:
+        stored = await log_repository.read_seqs(session.id, seqs)
+        await artifact_service.project_log_entries(session, stored, seen_at=seen_at)
+    except ArtifactStoreUnavailableError as exc:
+        logger.warning(
+            "artifact projection unavailable for session %s; asking producer to retry: %s",
+            session.id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Artifact store unavailable; retry the batch",
+        ) from exc
+    except Exception:
+        logger.exception(
+            "artifact projection failed for session %s; transcript append kept", session.id
+        )
+
+
 def create_session_log_router(
     log_repository: SessionEventLogRepository,
     session_service: SessionService | None = None,
@@ -278,6 +322,7 @@ def create_session_log_router(
     prefix: str = "/api/v1/forge",
     default_show_internal: bool = DEFAULT_SHOW_INTERNAL,
     notification_service: NotificationService | None = None,
+    artifact_service: ArtifactService | None = None,
 ) -> APIRouter:
     """Create the FastAPI router for the durable session event log.
 
@@ -359,6 +404,10 @@ def create_session_log_router(
         if notification_service is not None:
             await _project_notifications_before_ack(
                 notification_service, log_repository, session, entries, conflicts
+            )
+        if artifact_service is not None:
+            await _project_artifacts_isolated(
+                artifact_service, log_repository, session, entries, conflicts, seen_at=now
             )
         # Projection is committed atomically with the durable insert; this is only a refresh hint.
         if session_service is not None and any(
