@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import timedelta
 
@@ -212,7 +213,7 @@ async def test_backfill_leaves_rows_younger_than_the_live_lag_to_ingest():
     assert live.origin is Origin.LIVE
 
 
-async def test_a_failing_burst_does_not_stall_the_others_and_is_settled():
+async def test_a_failing_burst_does_not_stall_the_others_and_is_settled(caplog):
     repository = InMemoryArtifactPublicationRepository()
     notices = FakeNotices()
 
@@ -237,7 +238,13 @@ async def test_a_failing_burst_does_not_stall_the_others_and_is_settled():
     await svc.record([(bad, Origin.LIVE), (candidate("Good", "good", 1, T0), Origin.LIVE)])
     first = await svc.emit_due(T0 + timedelta(minutes=5))
     assert [r.outcome for r in first] == [EmitOutcome.EMITTED]
-    second = await svc.emit_due(T0 + timedelta(minutes=6))
+    with caplog.at_level(logging.ERROR):
+        second = await svc.emit_due(T0 + timedelta(minutes=6))
     assert [r.outcome for r in second] == [EmitOutcome.SETTLED]
+    # Hitting the cap is loud: an error naming the knob, not only the per-try traces.
+    assert any(
+        record.levelno == logging.ERROR and "artifacts.max_emit_failures" in record.getMessage()
+        for record in caplog.records
+    )
     assert {b.provider_key: b.suppress_reason for b in repository.bursts}["Bad"] == "emit_failed"
     assert len(notices.broadcast) == 1
