@@ -24,6 +24,8 @@ using the same append path as present-file.
   never sets `final_output`.
 - The draft may carry one `image` reference (§11). It appears in `input` only when
   set, so turns without an image keep their earlier shape.
+- The question signals `question`, `about_question` and `ask` (§12) follow the same
+  rule: present in `input` only when set.
 
 Notification id: `notification_id(turn_dedupe_key(session_id, turn.id, kind))`,
 where `session_id` is the Forge session UUID string.
@@ -113,6 +115,8 @@ The notification JSON (`NotificationResponse`):
           "thumbnail_url":"/api/v1/forge/notifications/{id}/image?variant=thumb",
           "mime":"image/png","width":1200,"height":800,"alt":"…|null"}|null,
  "image_state":"pending|ready|failed|null","image_error":"…|null",
+ "question":true|false|null,"about_question":{"id":"question:<host>:<uuid>","action":"relay"}|null,
+ "ask":{"items":[…]}|null,"input_request":{"kind":"question","request_id":"…|null"}|null,
  "created_at":"ISO-8601","read":false,"instance_id":"<added by the Guild facade>"}
 ```
 `image` is present only when Forge holds a stored copy (§11); `image_state` is null
@@ -359,4 +363,50 @@ Replays never copy twice (the image row is keyed by the deterministic notificati
 and `X-Content-Type-Options: nosniff`. It requires exactly what reading the item
 requires (`forge:session:read` for scoped tokens, then owner or tenant admin); 404
 otherwise and whenever no image is stored.
+
+## 12. Questions, asks and runtime requests (shared)
+
+Two kinds of "needs you" items share the feed. They stay distinct because they are
+answered differently.
+
+**Notice questions (agent `notify`, direct submit, resident notify).** `question: true`
+declares a question the user must answer; a notice that sets `question` (true or false)
+is never inferred to be one. Its reference is `question:<host>:<notification_id>`.
+Later notices refer to it with `about_question: {id, action}`, `action` one of
+`remind|replace|relay|resolved|withdrawn` (only the asking session may do anything but
+`relay`; the control plane enforces that). `ask: {items: [...]}` (only with
+`question: true`) structures it:
+
+| Item field | Rule |
+|---|---|
+| `id` | 1–64 chars, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, unique in the ask |
+| `kind` | `question` or `action` (an action asks the user to report done/not done; it never executes anything) |
+| `text` | 1–2000 chars, nonblank |
+| `header` | optional, 1–80 chars |
+| `options` | optional, 1–8 `{label, description?}`; labels 1–120 chars, unique per item; descriptions ≤ 500 |
+| `multi_select` | optional boolean; omitted means false |
+| `allow_text` | optional boolean; omitted means true; a question with `false` must offer options |
+
+At most 8 items and 32768 UTF-8 bytes of compact ask JSON; optional fields are omitted,
+never null; NUL is refused. The fields live in the notification's `metadata` and are
+served on the read wire and the live event exactly as sent. The answer is an ordinary
+message to the asking session: `POST /sessions/{id}/messages` with a stable
+`request_id` (through the Guild facade, `?scope=local` pins the session's node): 200
+delivered, 202 pending, the same id with different content 409 (`request_id_conflict`;
+409 also when the pod is unreachable). Delivery is not resolution: the asking session confirms it later with
+`about_question` (`resolved`).
+
+**Runtime requests (Forge's system `attention` item).** When a session (or resident)
+blocks on AskUserQuestion, a confirmation or a permission, Forge records an
+`attention`/`system` item. `input_request: {kind: question|confirmation|permission,
+request_id}` names the pending request (`request_id` null when the runtime reported
+none). It is answered where the transcript's card answers it, on the session socket
+(`ask_user_answer` with that `request_id`, or the permission response), never through
+the notification; the item is marked read when the session stops waiting. Such an item
+carries no `question`/`ask`.
+
+**`notify` schema.** The advertised input schema's root stays a plain object (no
+`allOf`/`if`): Claude Code drops a tool whose root schema has a conditional from its
+catalog while the server stays connected. `ask` → `question: true` is enforced by
+`NotificationDraft` before anything is written.
 

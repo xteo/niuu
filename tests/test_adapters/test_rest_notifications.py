@@ -421,6 +421,22 @@ class TestStructuredQuestions:
         assert response.status_code == 422
         assert not store.notifications
 
+    async def test_attention_item_serves_its_runtime_request(self, env):
+        client, service, _, sessions = env
+        session = await _seed(service, sessions, count=0)
+        await service.record_attention(
+            session,
+            state_since=datetime(2026, 10, 26, 9, tzinfo=UTC),
+            kind="question",
+            prompt="Which DB?",
+            request_id="toolu_01",
+        )
+
+        [item] = client.get(f"{PREFIX}/notifications", headers=headers()).json()["items"]
+
+        assert item["input_request"] == {"kind": "question", "request_id": "toolu_01"}
+        assert item["question"] is None and item["ask"] is None
+
 
 class TestIndividualReads:
     async def test_exact_read_receipt_feed_session_list_and_unread_filter(self, env):
