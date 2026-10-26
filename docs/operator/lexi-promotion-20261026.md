@@ -31,13 +31,15 @@ session on that host.
 ```bash
 cd ~/repos/worktrees/niuu-consolidation     # any checkout of xteo/niuu
 git fetch origin
-git rev-parse origin/lexi/dev-api-integration   # must print 59c974c8afc73cd8af0e9c3065ec32ac170bb3a5
-git rev-list --left-right --count upstream/dev...origin/lexi/dev-api-integration   # 0 55 at prep time
+git merge-base --is-ancestor 59c974c8afc73cd8af0e9c3065ec32ac170bb3a5 origin/lexi/dev-api-integration && echo on-branch
+git diff --stat 59c974c8a origin/lexi/dev-api-integration -- . ':!docs' ':!CONSOLIDATION.md'
+#   empty: everything after 59c974c8a is documentation (at prep time, only this runbook, ee08ea5ac)
 ```
 
-Promote **59c974c8a** and nothing else. If the branch has moved, stop: anything
-added after 59c974c8a has not been through this runbook's dry runs. Either re-run
-§3's dry run on the new tip, or pin 59c974c8a explicitly.
+Build the release from **59c974c8a** exactly, not from the branch tip. If the
+diff above is not empty, code has landed after the sha that this runbook's dry
+runs covered. In that case stop, or re-run §3's dry run on the new tip and update
+this document.
 
 Release from committed heads only. The live release directory must be clean, or
 the cutover drops someone's uncommitted fix:
