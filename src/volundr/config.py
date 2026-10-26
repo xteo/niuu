@@ -1079,7 +1079,9 @@ class PresentedFilesConfig(BaseModel):
         default="",
         description=(
             "Absolute http(s) base URL clients reach this Forge at, on the host's tailnet "
-            "name (never *.xteo.mesh). Empty: presented files keep their relative route."
+            "(a *.ts.net MagicDNS name or a Tailscale address; anything else, public or "
+            "*.xteo.mesh, is refused at start). Empty: presented files keep their "
+            "relative route."
         ),
     )
     max_bytes: int = Field(

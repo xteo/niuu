@@ -6,11 +6,13 @@ its own durable copy of every presented file, keyed by ``(session_id, file_id)``
 serves it whether or not the session is still running.
 
 Each copy has an absolute URL on the host's tailnet name (``Artifact.url``: http(s),
-never ``*.xteo.mesh``), so a phone on the tailnet opens it in Safari.
+a ``*.ts.net`` MagicDNS name or a Tailscale address, never ``*.xteo.mesh`` or anything
+public), so a phone on the tailnet opens it in Safari and nothing else can.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -22,7 +24,13 @@ from uuid import UUID
 from niuu.domain.presented_files import PRESENTED_FILE_ID_PATTERN
 
 _PRESENTED_FILE_ID = re.compile(PRESENTED_FILE_ID_PATTERN)
-_FORBIDDEN_HOST_SUFFIX = ".xteo.mesh"
+#: Durable presented files are user content: their URLs may only name a Tailscale host,
+#: so a link never resolves to anything public.
+_TAILNET_NAME_SUFFIX = ".ts.net"
+_TAILNET_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+)
 
 
 class PresentedFileConflictError(ValueError):
@@ -65,6 +73,16 @@ class PresentedFileStore(ABC):
         """Remove every file stored for a session; return how many were removed."""
 
 
+def is_tailnet_host(host: str) -> bool:
+    """A ``*.ts.net`` MagicDNS name, or an address in Tailscale's ranges."""
+    host = host.lower().rstrip(".")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.endswith(_TAILNET_NAME_SUFFIX) and len(host) > len(_TAILNET_NAME_SUFFIX)
+    return any(address in network for network in _TAILNET_NETWORKS)
+
+
 def validate_public_base_url(value: str) -> str:
     """Normalize the configured base URL; empty means "no absolute URL"."""
     value = (value or "").strip().rstrip("/")
@@ -73,10 +91,11 @@ def validate_public_base_url(value: str) -> str:
     parts = urlsplit(value)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("presented_files.public_base_url must be an http(s) URL with a host")
-    host = parts.hostname.lower()
-    if host.endswith(_FORBIDDEN_HOST_SUFFIX) or host == _FORBIDDEN_HOST_SUFFIX.lstrip("."):
+    if not is_tailnet_host(parts.hostname):
         raise ValueError(
-            "presented_files.public_base_url must use the host's tailnet name, not *.xteo.mesh"
+            "presented_files.public_base_url must name this host on the tailnet (a *.ts.net "
+            "MagicDNS name or a 100.64.0.0/10 / fd7a:115c:a1e0::/48 address), never a public "
+            f"or *.xteo.mesh name; got {parts.hostname!r}"
         )
     if parts.query or parts.fragment:
         raise ValueError("presented_files.public_base_url must not carry a query or fragment")
