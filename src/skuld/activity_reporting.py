@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from niuu.domain.work_facts import HOOK_KIND, hook_name, is_work_row
+from niuu.ports.cli import CLITransport
 from skuld.event_log import FORGE_SESSIONS_PATH
 
 logger = logging.getLogger("skuld.broker")
@@ -323,8 +324,13 @@ class ActivityReportingMixin:
             # Still waiting on another gate: refresh open_controls (F12d) so readers
             # see one fewer, without leaving awaiting_input.
             if self._activity_state == "awaiting_input":
+                extra = dict(self._activity_extra)
+                if extra.get("request_id") == request_id:
+                    # The detail named the gate just answered: point it at one still open.
+                    remaining_id, remaining_kind = next(iter(self._pending_attention.items()))
+                    extra = {"kind": remaining_kind, "request_id": remaining_id}
                 await self._report_activity_state(
-                    "awaiting_input", extra_metadata=dict(self._activity_extra) or None, force=True
+                    "awaiting_input", extra_metadata=extra or None, force=True
                 )
             return
         if self._activity_state == "awaiting_input":
@@ -368,6 +374,18 @@ class ActivityReportingMixin:
     def _transport_turn_active(self) -> bool:
         return getattr(self._transport, "is_turn_active", False) is True
 
+    def _transport_tracks_turns(self) -> bool:
+        """Whether the transport reports its own turn flag (not the port's default).
+
+        A transport that inherits ``CLITransport.is_turn_active`` always says False,
+        which is "unknown", not "no turn in flight".
+        """
+        transport = self._transport
+        if transport is None:
+            return False
+        prop = getattr(type(transport), "is_turn_active", None)
+        return prop is not None and prop is not CLITransport.is_turn_active
+
     async def _heal_on_idle_prompt(self) -> bool:
         """Claude says it is idle at its prompt: drop a stale busy state (F12b).
 
@@ -387,8 +405,9 @@ class ActivityReportingMixin:
 
         A busy state is re-reported only while the transport produced a row within
         ``stale_output_seconds``. Past that, reconcile with the transport's own turn
-        flag: no turn in flight → report idle; a turn in flight → stay silent, so
-        ``last_active`` stops advancing on a claim nothing supports.
+        flag: no turn in flight → report idle; a turn in flight, or a transport that
+        does not track turns → stay silent, so ``last_active`` stops advancing on a
+        claim nothing supports (never a guessed idle).
         """
         if state not in self._RUNNING_RAW_STATES:
             return True
@@ -396,7 +415,7 @@ class ActivityReportingMixin:
         last_row = getattr(self, "_last_transport_row_at", None)
         if last_row is not None and time.monotonic() - last_row <= stale_after:
             return True
-        if not self._transport_turn_active():
+        if self._transport_tracks_turns() and not self._transport_turn_active():
             await self._report_activity_state("idle", extra_metadata={"healed": "heartbeat"})
         return False
 

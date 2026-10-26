@@ -112,3 +112,46 @@ async def test_generic_session_update_does_not_clobber_work_facts(txn_pool):
     stored = await repo.get(session.id)
     assert stored.name == "renamed"
     assert stored.last_work_at == at and stored.tool_open is True
+
+
+async def test_update_returns_the_stored_facts_not_the_callers_copy(txn_pool):
+    repo, log = PostgresSessionRepository(txn_pool), PostgresSessionEventLog(txn_pool)
+    session = await _session(repo)
+    stale = await repo.get(session.id)
+    at = datetime(2026, 10, 21, 10, 0, tzinfo=UTC)
+    await log.append(
+        [
+            SessionLogEntry(
+                session_id=session.id,
+                seq=1,
+                kind="claude_hook",
+                payload={"type": "claude_hook", "hook_event_name": "PreToolUse"},
+                ts=at,
+            )
+        ]
+    )
+    returned = await repo.update(stale)
+    assert returned.last_work_at == at and returned.tool_open is True
+
+
+async def test_frames_that_change_nothing_do_not_write_the_session(txn_pool):
+    repo, log = PostgresSessionRepository(txn_pool), PostgresSessionEventLog(txn_pool)
+    session = await _session(repo)
+    new = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)
+    old = datetime(2026, 10, 21, 9, 0, tzinfo=UTC)
+
+    def entry(seq, kind, ts, hook=None):
+        payload = {"type": kind}
+        if hook:
+            payload["hook_event_name"] = hook
+        return SessionLogEntry(session_id=session.id, seq=seq, kind=kind, payload=payload, ts=ts)
+
+    await log.append([entry(1, "assistant", new)])
+    ctid = await txn_pool.fetchval("SELECT ctid::text FROM sessions WHERE id = $1", session.id)
+    # An older work row and a close with nothing open change nothing: no new row version.
+    await log.append([entry(2, "assistant", old), entry(3, "claude_hook", old, "PostToolUse")])
+    assert (
+        await txn_pool.fetchval("SELECT ctid::text FROM sessions WHERE id = $1", session.id) == ctid
+    )
+    stored = await repo.get(session.id)
+    assert stored.last_work_at == new and stored.tool_open is False
