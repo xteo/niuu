@@ -192,7 +192,9 @@ def test_both_tool_schemas_and_source_skill_describe_structured_questions(feed):
         payload["idempotency_key"] = "question-1"
     validator = Draft202012Validator(schema)
     assert list(validator.iter_errors(payload)) == []
-    assert list(validator.iter_errors({**payload, "question": False}))
+    # Cross-field validation belongs to the typed handler: a root conditional
+    # makes native Claude silently omit notify from its connected MCP catalog.
+    assert "requires question=true" in schema["properties"]["ask"]["description"]
     assert schema["properties"]["ask"]["properties"]["items"]["maxItems"] == 8
     assert QUESTION_GUIDANCE in spec["description"]
     skill = forge_notify_skill_markdown("forge")
@@ -225,6 +227,24 @@ async def test_tool_validation_refuses_before_host_or_submit():
         assert client.calls == []
         if len(values) == 3:
             assert values[2].drafts == []
+
+
+@pytest.mark.parametrize("feed", [False, True])
+@pytest.mark.parametrize("question", [None, False, 0, 1, "true", "omitted"])
+async def test_mcp_compatible_schema_keeps_strict_question_gate_before_side_effects(feed, question):
+    values = (_feed_toolbox if feed else _toolbox)()
+    toolbox, client = values[:2]
+    args = {**draft_payload(draft()), "question": question}
+    if question == "omitted":
+        args.pop("question")
+    if feed:
+        args["idempotency_key"] = "must-not-publish"
+    result = await toolbox.call("notify", args)
+    assert result.is_error
+    assert "requires question=true" in result.text
+    assert client.calls == []
+    if not feed:
+        assert values[2].drafts == []
 
 
 async def test_rest_client_carries_the_ask_unchanged():
