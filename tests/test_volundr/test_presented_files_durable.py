@@ -62,6 +62,15 @@ def test_durable_url_is_absolute_on_the_tailnet_name():
         "ftp://thor.tail737f2a.ts.net",
         "thor.tail737f2a.ts.net:8380",
         "http://thor.tail737f2a.ts.net:8380/?x=1",
+        "https://forge.example.com",
+        "http://thor:8080",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://192.168.1.20:8080",
+        "http://8.8.8.8",
+        "http://ts.net",
+        "http://evil.ts.net.example.com",
+        "http://[2001:db8::1]:8080",
     ],
 )
 def test_base_url_refuses_mesh_names_and_non_http(bad):
@@ -69,6 +78,21 @@ def test_base_url_refuses_mesh_names_and_non_http(bad):
         validate_public_base_url(bad)
     with pytest.raises(ValueError):
         PresentedFilesConfig(public_base_url=bad)
+
+
+@pytest.mark.parametrize(
+    "good",
+    [
+        "http://thor.tail737f2a.ts.net:8080",
+        "https://THOR.tail737f2a.ts.net",
+        "http://100.66.123.128:8080",
+        "http://100.127.255.254",
+        "http://[fd7a:115c:a1e0::1]:8080",
+    ],
+)
+def test_base_url_accepts_only_tailnet_hosts(good):
+    assert validate_public_base_url(good) == good
+    assert PresentedFilesConfig(public_base_url=good).public_base_url == good
 
 
 def test_config_defaults():
