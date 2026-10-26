@@ -50,8 +50,9 @@ def _sql_list(values: Iterable[str]) -> str:
 
 # The final-reply projection (latest_final_*) and the work facts (G10, F12d:
 # last_work_at, open_tool_count) are folded in ONE update per inserted row, so the
-# session row is written once per frame. Only newly inserted rows fold (ON CONFLICT
-# DO NOTHING), which keeps producer retries idempotent. Which rows count as work is
+# session row is written at most once per frame, and not at all when the frame
+# changes nothing. Only newly inserted rows fold (ON CONFLICT DO NOTHING), which keeps
+# producer retries idempotent. Which rows count as work is
 # niuu.domain.work_facts, the same predicate Skuld and the control plane use.
 _FINAL_OUTPUT_SQL = """i.kind = 'conversation.turn' AND i.payload->>'type' = 'conversation.turn'
            AND i.payload->'turn'->>'role' = 'assistant'
@@ -102,7 +103,13 @@ _INSERT_SQL = f"""WITH locked_session AS MATERIALIZED (
                ELSE s.open_tool_count END
        FROM facts f
        WHERE s.id = f.session_id
-           AND ((f.is_final AND f.seq > s.latest_final_seq) OR f.is_work)"""
+           AND ((f.is_final AND f.seq > s.latest_final_seq)
+                OR (f.is_work AND (
+                    s.last_work_at IS NULL OR f.ts > s.last_work_at
+                    OR f.hook = '{TOOL_OPEN_HOOK}'
+                    OR (s.open_tool_count > 0 AND (
+                        f.hook IN ({_sql_list(TOOL_CLOSE_HOOKS)})
+                        OR f.kind = '{TURN_END_KIND}' OR f.hook = '{TURN_END_HOOK}')))))"""
 
 _IMPORT_INSERT_SQL = """INSERT INTO session_event_log
        (session_id, seq, kind, role, request_id, payload, ts)
