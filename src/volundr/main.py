@@ -148,6 +148,7 @@ from volundr.adapters.outbound.skuld_room import SkuldRoomAdapter
 from volundr.app_shell import build_app_shell
 from volundr.artifact_runtime import (
     ArtifactHold,
+    configured_host,
     create_artifact_service,
     resolve_host,
     resolve_tailnet_name,
@@ -1648,7 +1649,7 @@ def create_app(
                 on_device_registered=on_device_registered,
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
-                session_status_host=settings.projects.instance_id or None,
+                session_status_host=configured_host(settings),
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,
                 preview_cache_dir=preview_cache_root,
                 project_service=project_service,

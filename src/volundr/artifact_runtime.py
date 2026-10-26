@@ -27,13 +27,17 @@ logger = logging.getLogger(__name__)
 FALLBACK_HOST = "local"
 
 
+def configured_host(settings: Settings) -> str | None:
+    """This Forge's configured host name: ``host_identity.host``, else
+    ``projects.instance_id``; ``None`` when neither is set. The session status card
+    reports it as ``host``."""
+    return settings.host_identity.host.strip() or settings.projects.instance_id.strip() or None
+
+
 def resolve_host(settings: Settings) -> str:
-    """The control plane's host key for this Forge (``host_identity.host``)."""
-    return (
-        settings.host_identity.host.strip()
-        or settings.projects.instance_id.strip()
-        or FALLBACK_HOST
-    )
+    """The host key publications and bursts are stored under: the configured host, or
+    ``local`` on a Forge that names none (a key, never shown as a measured host)."""
+    return configured_host(settings) or FALLBACK_HOST
 
 
 def resolve_tailnet_name(settings: Settings) -> str:
