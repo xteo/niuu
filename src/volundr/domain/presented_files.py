@@ -28,10 +28,6 @@ class PresentedFileConflictError(ValueError):
     """A different file was already stored under this ``(session_id, file_id)``."""
 
 
-class PresentedFileTooLargeError(ValueError):
-    """The file exceeds the configured size limit."""
-
-
 def is_presented_file_id(value: str) -> bool:
     return bool(_PRESENTED_FILE_ID.fullmatch(value or ""))
 

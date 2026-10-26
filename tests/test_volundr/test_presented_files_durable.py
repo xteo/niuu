@@ -71,7 +71,7 @@ def test_base_url_refuses_mesh_names_and_non_http(bad):
 
 def test_config_defaults():
     config = PresentedFilesConfig()
-    assert config.enabled and config.public_base_url == ""
+    assert config.enabled is False and config.public_base_url == ""
     assert config.store["adapter"].endswith("LocalPresentedFileStore")
     assert PresentedFilesConfig(public_base_url=BASE + "/").public_base_url == BASE
 
@@ -168,6 +168,17 @@ def test_upload_limits(tmp_path):
     assert client.put(url, content=b"1").status_code == 404
 
 
+def test_chunked_upload_over_the_limit_is_refused(tmp_path):
+    client, _, _ = _upload_client(tmp_path, max_bytes=4)
+
+    def body():
+        yield b"123"
+        yield b"456"
+
+    resp = client.put(f"/api/v1/forge/sessions/{uuid4()}/files/presented/{FILE_ID}", content=body())
+    assert resp.status_code == 413
+
+
 def test_upload_name_cannot_carry_a_path(tmp_path):
     client, _, _ = _upload_client(tmp_path)
     resp = client.put(
@@ -227,6 +238,9 @@ async def test_durable_copy_serves_after_the_session_stopped(tmp_path):
     assert resp.content == b"%PDF"
     assert resp.headers["content-type"] == "application/pdf"
     assert resp.headers["content-disposition"].startswith("inline")
+    # Agent-supplied content renders but never runs script on Forge's origin.
+    assert resp.headers["content-security-policy"] == "sandbox"
+    assert resp.headers["x-content-type-options"] == "nosniff"
     assert "report.pdf" in resp.headers["content-disposition"]
 
     # Another session's URL never reaches this copy.

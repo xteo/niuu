@@ -42,7 +42,11 @@ from skuld.path_security import (
     resolve_contained_path,
     resolve_path_in_roots,
 )
-from skuld.presented_durable import retry_presented_upload, upload_presented_file
+from skuld.presented_durable import (
+    DURABLE_MARKER,
+    retry_presented_upload,
+    upload_presented_file,
+)
 from skuld.room_role_port import RoomRoleResolutionError
 from skuld.service_manager import ServiceCreateRequest, ServiceStatus
 from volundr.log_aggregate import aggregate_workspace_logs
@@ -1021,11 +1025,16 @@ def _rebuild_presented_registry() -> None:
                 safe_entry = resolve_contained_path(root, entry.name, strict=True)
             except UnsafePathError:
                 continue
-            files = [
-                item for item in safe_entry.iterdir() if item.is_file() and not item.is_symlink()
-            ]
-            if files:
-                _presented_registry[entry.name] = str(files[0])
+            # The staged bytes are always ``content``; skip sidecars such as the
+            # durable receipt (F2) so a rebuild never serves one in their place.
+            files = sorted(
+                item
+                for item in safe_entry.iterdir()
+                if item.is_file() and not item.is_symlink() and item.name != DURABLE_MARKER
+            )
+            preferred = [item for item in files if item.name == "content"]
+            if preferred or files:
+                _presented_registry[entry.name] = str((preferred or files)[0])
     except (OSError, UnsafePathError) as exc:  # pragma: no cover - best-effort recovery
         logger.warning("present-file: registry rebuild failed: %s", repr(exc))
 
@@ -1083,7 +1092,14 @@ async def present_file(body: dict) -> dict:
 
     # F2: hand Forge a durable copy so the file outlives this broker; its URL goes in
     # the turn. A failure never fails present-file: it is retried in the background.
-    receipt = await upload_presented_file(broker, file_id, dest, name=name, mime=mime)
+    receipt = await upload_presented_file(
+        broker,
+        file_id,
+        dest,
+        name=name,
+        mime=mime,
+        timeout=broker._settings.presented_durable.inline_upload_timeout_seconds,
+    )
     if receipt is None and broker.volundr_api_url:
         task = asyncio.create_task(
             retry_presented_upload(broker, file_id, dest, name=name, mime=mime),
