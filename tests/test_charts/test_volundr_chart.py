@@ -620,6 +620,44 @@ class TestConfigMapTemplate:
         assert configured.a2a_public_base_url == "https://guild.example"
         assert configured.a2a_reply_timeout_seconds == 20
 
+    def test_artifact_and_presented_file_sections_render_into_config(self):
+        from volundr.config import ArtifactsConfig, HostIdentityConfig, PresentedFilesConfig
+
+        def render(*extra: str) -> dict:
+            result = subprocess.run(
+                ["helm", "template", "test", str(CHART_DIR), *extra],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+            configmap = next(
+                doc
+                for doc in documents
+                if doc.get("kind") == "ConfigMap"
+                and doc.get("metadata", {}).get("name") == "test-volundr"
+            )
+            return yaml.safe_load(configmap["data"]["config.yaml"])
+
+        default = render()
+        assert not {"artifacts", "presented_files", "host_identity"} & set(default)
+        config = render(
+            "--set-json",
+            'artifacts={"hold_seconds":60,"backfill_on_start":true}',
+            "--set-json",
+            'presentedFiles={"enabled":true,"public_base_url":"http://forge.t.ts.net:8080",'
+            '"store":{"adapter":"volundr.adapters.outbound.local_presented_files.'
+            'LocalPresentedFileStore","root":"/data/presented-files"}}',
+            "--set-json",
+            'hostIdentity={"host":"thor","tailnet_name":"thor.t.ts.net"}',
+        )
+        artifacts = ArtifactsConfig.model_validate(config["artifacts"])
+        assert (artifacts.hold_seconds, artifacts.backfill_on_start) == (60, True)
+        files = PresentedFilesConfig.model_validate(config["presented_files"])
+        assert files.enabled and files.public_base_url == "http://forge.t.ts.net:8080"
+        assert files.store["root"] == "/data/presented-files"
+        assert HostIdentityConfig.model_validate(config["host_identity"]).host == "thor"
+
     def test_notifications_section_renders_into_config(self):
         from volundr.config import NotificationsConfig
 

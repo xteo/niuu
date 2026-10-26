@@ -575,6 +575,39 @@ sleipnir:
 #             audiences: [niuu-ravn]
 notifications: {}
 
+# Artifact publications (F1) and their burst notices (F1n): every claude.ai Artifact
+# publish, present-file, notify artifact link and report_artifact is recorded at log
+# ingest and served at /api/v1/forge/artifact-publications and /artifact-bursts.
+# Rendered verbatim as config.yaml's `artifacts:` section (snake_case keys; see
+# ArtifactsConfig). Empty keeps the defaults: on, one notice per live burst after a
+# 120 s hold (needs notifications), 30 min burst window, no start-up backfill. Example:
+#   artifacts:
+#     hold_seconds: 120
+#     burst_window_seconds: 1800
+#     backfill_on_start: false
+artifacts: {}
+
+# Durable presented files (F2): Forge keeps its own copy of every file a session
+# presents, so it still opens after the session stops. Off by default: the local store
+# needs a persistent, single-writer directory (mount one, e.g. a PVC, at `store.root`).
+# `public_base_url` must name this Forge on the tailnet (*.ts.net or a Tailscale
+# address); anything else is refused at start. Rendered as `presented_files:`
+# (snake_case keys; see PresentedFilesConfig). Example:
+#   presentedFiles:
+#     enabled: true
+#     public_base_url: http://forge.tailnet-name.ts.net:8080
+#     max_bytes: 52428800
+#     store:
+#       adapter: volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore
+#       root: /data/presented-files
+presentedFiles: {}
+
+# How this Forge names itself (GET /api/v1/forge/instance, the host of its artifact
+# publications and of the session status card). Empty: projects.instance_id names it.
+# Rendered as `host_identity:` (see HostIdentityConfig). Example:
+#   hostIdentity: {host: thor, tailnet_name: thor.tailnet-name.ts.net}
+hostIdentity: {}
+
 # Push to the devices owners register (POST /api/v1/forge/devices), and the
 # needs-input push. `adapter` + `kwargs` build the channel push sinks deliver through
 # (the default only logs). With `enabled`, every session that needs its owner is
