@@ -378,3 +378,221 @@ alone and in the final run.
    different host-map key (F7 `host_identity`), that lands with whichever lift brings F7.
 3. `activity_heartbeat.stale_output_seconds` (Skuld, default 600) is config-only like the
    rest of `activity_heartbeat`; the Skuld session config template does not render it.
+
+---
+
+# B1b — durable presented files + artifact publications (LEX-1485, 2026-10-26)
+
+Branch `lexi/b1b-artifacts`. Upstream `dev` had moved 7 commits since B1a (6c606cb27 →
+**b3e760b6f**: Ravn resident starvation/queue fixes, unclosed aiohttp sessions, no
+continuation char caps, outcome timestamps; no migrations, no file overlap with ours), so
+`lexi/dev-api-integration` was first rebased onto it (clean, 27 commits; rebased B1a tip
+**b266b3dc4**), then B1b was built on top. The previous tip f25619345 is kept as
+`backup/dev-api-integration-pre-b1b`. Patch-id check (`git cherry`): none of the source
+commits was on the branch.
+
+## B1b.1 Taken
+
+| New | Source (`exp/control-plane`) | What |
+|---|---|---|
+| 88460c155 | c7e93b9c5 | F2: durable presented files. The broker uploads every `present-file` copy to Forge (`PUT …/files/presented/{file_id}`), Forge keeps it in a dynamic-adapter store and answers with the absolute tailnet URL, which goes into the `present_file` turn; `GET` of the same path serves the durable copy first, the live broker second |
+| d8ad51eb8 | cf1b778ae | F1/F1n/F1t/F7: artifact publications, bursts, one notice per live burst after a durable hold, `report_artifact` MCP tool, `GET /instance`; fixtures `tests/fixtures/control_plane/{capture-manifest-v1,model-bursts,platform-bursts,slice0-burst-replay}.json` (scanned: no credentials) |
+| da87aa37a | 1f3ecf78b (presented-file part; its work-facts part is B1a) | CSP sandbox + nosniff on served files, registry rebuild skips the receipt, store off by default, streamed PUT size limit, inline upload wait capped |
+| cb7f4caf5, 63cad73fa | d76c14205, 0deedaba6 | delete cleanup of a session's files; broker resumes pending uploads after a restart; review races closed |
+| ad856100a, 3833d1890 | beffb6eff, 7236f2254 | the broker's PUT through the Guild facade (bounded, id validated); `forge_session` allow-list entry for that PUT (`Binding.OWN`) |
+| 3d96cf9f3, 7a2263143 | 40176eff2, 358b83c0e | the sandbox/nosniff policy on every route that serves a presented file (facade and broker too; PDFs exempt from the sandbox only) |
+| 34a6f0d56 | 064c2f9e9 (tests only) | replay builder keeps unknown titles unknown; its `docs/operator/e0` replay script is exp-only, not taken |
+| 6b54d7245 | merge e2208da89 | the publication of a `present_file` records the turn's durable tailnet URL (resolution content of the exp merge, not of a feature commit) |
+
+Not taken, per the brief: structured asks / question signals / notify catalog (B1c),
+`project_more`/R17 exp-seed reads, the F8 probe, side-quest defaults, the cp store,
+STATUS/DEPLOY-REQUEST docs, 16e0e48de (exp renumber, superseded by 000093).
+
+## B1b.2 Adapted (behaviour notes)
+
+1. **Migration single source.** `000093_forge_artifact_publications` (exp 000088, then
+   000089); chart configmap and `src/cli/migrations` copies dropped; no alias (never
+   applied to a production ledger).
+2. **Notification outbox.** The burst notice is inserted in the hold's own emission
+   transaction together with its scheduled deliveries
+   (`PostgresNotificationRepository._schedule_deliveries`), so committed ⇒ scheduled, as
+   for every other notification. No image is attached to a burst notice.
+3. **Guild instance fields.** The notice is broadcast post-commit through
+   `NotificationService.broadcast_created` → `notification_event(notification, instance_fields)`,
+   so its live `session_notification` carries `instance_id/_name/_slug` like the rest of
+   the feed (test added, 751acd454).
+4. **Projection before the ack (behaviour).** Upstream now projects notifications before
+   an append is acknowledged (a defect is a 500 and the producer retries). The lifted
+   artifact projection logged and swallowed every non-outage failure. It now follows
+   upstream: outage 503, defect 500, Skuld retries, recording is idempotent (f18b3481a).
+   Trade-off kept from upstream: a projection defect holds the session's log back
+   rather than silently dropping its publications.
+5. **Session-token allow-list.** `GET /artifact-publications`, `/artifact-bursts`,
+   `/artifact-bursts/{burst_id}` (owner-scoped, `forge:session:read`) joined the list
+   (`Binding.NONE`, like the notification feed); backfill (admin) and `/instance` stay
+   closed to session tokens. The broker's `PUT …/files/presented/{file_id}` was already
+   added by beffb6eff (`forge:notify`, `Binding.OWN`).
+6. **Tailnet-only URLs (new, 6a28b4d91).** `presented_files.public_base_url` and any URL a
+   `present_file` turn records must name a Tailscale host: `*.ts.net` or an address in
+   100.64.0.0/10 / fd7a:115c:a1e0::/48. Public names, LAN/loopback addresses and
+   `*.xteo.mesh` are refused at start (config) or recorded as the relative route (ingest).
+7. **One host name (closes B1a open question 2).** `configured_host` =
+   `host_identity.host`, else `projects.instance_id`, else none. The status card's `host`,
+   publications' `host` and `GET /instance` use it; publications store `local` when no host
+   is named (a storage key; the status card then still says `null`).
+8. **Loud caps.** A burst settled after `artifacts.max_emit_failures` failed emissions and
+   a presented file still not durable after `presented_durable.retry_attempts` uploads now
+   log an error naming the knob (83e7c34bb, 090a341bc).
+9. **Chart.** `artifacts`, `presentedFiles`, `hostIdentity` values render verbatim as
+   `artifacts:`, `presented_files:`, `host_identity:` (d2693a693).
+
+## B1b.3 Storage layout, retention, cleanup
+
+- **Store:** `presented_files.store` (dynamic adapter), default
+  `LocalPresentedFileStore(root="~/.niuu/presented-files")`; layout
+  `{root}/{session_id}/{file_id}/content` + `meta.json` (name, mime, size, sha256,
+  stored_at), directories 0700, atomic write-then-rename; one file at most
+  `presented_files.max_bytes` (50 MiB, = Skuld's limit). Same id + same bytes is a no-op,
+  different bytes is a 409.
+- **Off by default** (`presented_files.enabled: false`): the store needs a persistent,
+  single-writer directory. Until B3 sets it, nothing changes on either host.
+- **Thor (B3 config):** `presented_files.enabled: true`,
+  `public_base_url: http://thor.tail737f2a.ts.net:8080` (Forge's tailnet bind
+  100.66.123.128:8080), root → `/home/thor/.niuu/presented-files` (Forge service user's
+  home; on the system disk, not in the release dir, so promotions keep it).
+- **m6 (B3 config):** `public_base_url: http://mini-m6.tail737f2a.ts.net:8080`
+  (100.92.69.62:8080), root → `/Users/xteo/.niuu/presented-files` (outside
+  `~/.local/share/niuu/releases`).
+- **Broker side:** staged copies stay under the broker's staging dir with sidecars
+  `presented.json` (pending upload), `durable.json` (Forge receipt), `refused.json` (final
+  4xx). Inline upload waits `presented_durable.inline_upload_timeout_seconds` (5 s), then
+  retries in the background (`retry_attempts` 6, backoff 2 s doubling to 120 s); a broker
+  restart resumes every pending upload.
+- **Retention:** no TTL. Files survive stop, restart, archive and Forge restarts; they are
+  removed with the session on **delete** (`{root}/{session_id}` is removed after the
+  session row; a PUT landing mid-delete removes what it wrote and answers 404). A failed
+  cleanup is logged and leaves the directory. Publication rows are kept after a delete;
+  a present-file publication's URL then answers 404.
+- **Serving:** `GET /api/v1/forge/sessions/{id}/files/presented/{file_id}` — same read
+  access as the session; durable copy: `cache-control: private, max-age=86400, immutable`;
+  live broker copy: `private, no-store`; both `x-content-type-options: nosniff` and
+  `content-security-policy: sandbox` (PDF: nosniff only), `content-disposition: inline`.
+
+**Tailnet URL shape:**
+`http://<host>.tail737f2a.ts.net:8080/api/v1/forge/sessions/{session_id}/files/presented/pf_<32 hex>`.
+Without `public_base_url` the turn carries no `url` and publications keep the relative
+route `/api/v1/forge/sessions/{session_id}/files/presented/{file_id}`.
+
+## B1b.4 Shapes iOS reads
+
+**Presented file in the transcript** — the `present_file` part of an assistant turn
+(conversation, log, live stream):
+
+```json
+{"id": "pf_…", "name": "present_file", "type": "tool_use",
+ "input": {"file_id": "pf_…", "name": "plan.md", "mime": "text/markdown", "size": 1234,
+           "caption": "optional", "url": "http://thor.tail737f2a.ts.net:8080/api/v1/forge/sessions/…/files/presented/pf_…"}}
+```
+
+`url` is present once the durable copy landed within the inline wait; otherwise only the
+relative route works (and serves the durable copy as soon as it lands).
+
+**Publication feed** — `GET /api/v1/forge/artifact-publications?after=<seq>&limit=<n>`
+(default 200, max 1000; oldest first; owner-scoped like notifications):
+
+```json
+{"host": "thor",
+ "items": [{"publication_id": "uuid", "seq": 41, "host": "thor",
+   "session_id": "uuid", "session_seq": 20276, "ordinal": 0,
+   "occurrence": ["thor", "log", "uuid", 20276],
+   "source": "artifact_tool|report_artifact|present_file|notify_link",
+   "provider": "claude_ai|forge_file", "provider_key": "QVimZJxaHtjyQfT1R497Kw",
+   "provider_version": "1792544649-ca7f", "provider_seq": 5, "revision_id": "…",
+   "title": "Week-1 lanes" , "url": "https://claude.ai/artifact/… | tailnet file URL",
+   "at": "2026-10-21T01:04:10.334238+00:00", "origin": "live|backfill",
+   "tool_use_id": "…", "type": "deck|design|doc|design_system|page|file|unknown",
+   "marker": "deck|design|doc|file|null", "type_url": null, "mime": null,
+   "subagent": false, "version_label": null, "burst_id": "uuid|null",
+   "created_at": "…"}],
+ "next_after": 41, "has_more": false}
+```
+
+Group by `session_id`; "latest" = greatest `at` (or `seq`). `title` may be null (never
+invented). `present_file` and `notify_link` publications have no burst (`burst_id` null).
+
+**Bursts** — `GET /api/v1/forge/artifact-bursts?after=<rev>&limit=<n>` (change order;
+`rev` advances on every change), `GET /api/v1/forge/artifact-bursts/{burst_id}` (+ `items`):
+
+```json
+{"rev": 12, "burst_id": "uuid", "host": "thor", "provider_key": "…",
+ "origin": "live|backfill", "started_at": "…", "last_at": "…", "publications": 3,
+ "due_at": "…|null", "notification_id": "uuid|null", "suppressed_by": "uuid|null",
+ "suppress_reason": "null|emit_failed|session_gone|…"}
+```
+
+**The one event per burst** is a normal notification, not a new event type: a row in
+`GET /api/v1/forge/notifications` and a live `session_notification` on the session SSE
+stream, `kind: milestone`, `severity: info`, `source: system`, `title: "<title> published"`,
+`body: <session name>`, one link `{kind: "artifact", url, label}`,
+`correlation_id: "art-burst:<burst_id>"` (the join key to `/artifact-bursts`), plus the
+Guild instance fields. It is emitted `artifacts.hold_seconds` (120 s) after a live burst
+opens, at most once (restart-safe), and not at all when an agent `notify` already linked
+the artifact (`suppressed_by` = that notice) or for backfill bursts.
+
+Through the Guild facade the same reads exist with `instance_id` added (`scope=local` pins
+the local node). `GET /api/v1/forge/instance` → `{host, tailnet_name, instance_id, service}`
+(facade adds `slug`, `name`).
+
+## B1b.5 Migration dry run (2026-10-26)
+
+Fresh read-only exports (schema-only `pg_dump` + `volundr_schema_history` rows): Thor's
+`volundr-pg` (PG 16, 83 ledger rows) and m6's embedded PG 17 `volundr` database over its
+local socket (129 rows, Volundr + `ting/`). Restored into scratch containers on
+127.0.0.1 (PG 16 / 17), migrated with the consolidated runner first to the rebased
+integration base b266b3dc4 (Thor 31 new ledger rows incl. 12 aliases; m6 6 + 1 `ting/`:
+the B0/B1a result), then to the B1b tip:
+
+- **Thor:** executed exactly `000093_forge_artifact_publications`; nothing adopted.
+- **m6:** executed exactly `000093_forge_artifact_publications`; `ting/` 0 to run.
+- Second run: no-op on both. The three tables and six indexes exist afterwards.
+
+Containers and dumps removed.
+
+## B1b.6 Validation (2026-10-26, Thor, clean `env -i` allow-list, `uv --frozen`)
+
+| Gate | B1b | B1a |
+|---|---|---|
+| `make lint` | pass | pass |
+| full backend suite (`-n 16`, cov gate 85) | **28777 passed**, 16 skipped, 1 xfailed, **14 failed**, coverage **89.01 %** | 28506 / 14, 88.90 % |
+| `make test-forge` | **9453 passed**, 3 skipped, 1 xfailed, **4 failed**, Skuld coverage 87.71 % | 9244 / 4 |
+| `make test-forge-tmux` | **60 passed** | 60 |
+| `make test-forge-database` (scratch PG 16, 127.0.0.1) | **136 passed** (+21 artifact real-PG) | 115 |
+| `helm lint charts/volundr` + `helm template` | pass; renders 000093 and the three new sections when set | pass |
+| migration dry run on Thor + m6 exports (B1b.5) | only 000093 executes; second run a no-op | |
+| web-next | no change in B1b (`git diff b266b3dc4..HEAD -- web-next` empty); not rebuilt | pass |
+
+The reds are B0's box-specific set, unchanged (§6): full suite 14 = `test_install_sh*` (10),
+`test_docker_container` recovery, `test_terminal_docker` workspace mount,
+`test_workflow_kickoff[/workspace]`, `test_api_release_guard`; forge lane 4 =
+docker-container, release-guard and two `test_resident_notification_relay`
+GC-under-`-W error` cases. The 22 warnings are the same sqlite `ResourceWarning`s in
+Ravn/relay tests. Database-lane note: the history-import tests
+(`FORGE_HISTORY_TEST_DATABASE_URL`) need a database separate from `TEST_DATABASE_NAME`;
+sharing one makes the integration conftest's migrations fail.
+
+## B1b.7 Open questions
+
+1. **Retention:** durable files have no TTL or total quota (only 50 MiB per file); disk
+   use grows until sessions are deleted. Is "until delete" the policy, or should B3 add a
+   retention/quota knob?
+2. **iOS reads:** the publication feed is a cursor feed (oldest first) with no
+   `session_id`/`project_id` filter, so "latest per session/project" means paging from
+   `after=0` and folding client-side. A filtered or latest-per-session read would be a
+   small follow-up if LEX-1465/1476 need it.
+3. Publications outlive a deleted session; a deleted session's `present_file` URL then
+   answers 404. Keep, or delete publications with the session?
+4. **B3:** set `presented_files` (enabled, `public_base_url`, root) on Thor and m6 (B1b.3);
+   m6's `projects.instance_id` is unknown here, so set `host_identity.host: mini-m6`
+   explicitly there.
+5. Still open from earlier: conversation `tail` vs `DurableTranscripts` (§7.1);
+   `activity_heartbeat.stale_output_seconds` not rendered by the Skuld template (B1a.6.3).
