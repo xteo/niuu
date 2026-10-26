@@ -373,7 +373,11 @@ async def run_golden(make: RepoFactory, add_notice: AddNotice) -> tuple[int, int
 
 def manifest_log_rows(manifest: dict, host: str) -> list[SessionLogEntry]:
     """The durable hook rows behind ``host``'s manifest publications, plus the rows the
-    filter must reject (an asset upload, a failure, a refusal, a non-publish action)."""
+    filter must reject (an asset upload, a failure, a refusal, a non-publish action).
+
+    E0's operator replay also uses this builder. A manifest without titles cannot
+    supply one: synthetic labels would replace real artifact metadata after ingest.
+    """
     rows: list[SessionLogEntry] = []
     for pub in manifest["publications"]:
         if pub["host"] != host:
@@ -381,8 +385,10 @@ def manifest_log_rows(manifest: dict, host: str) -> list[SessionLogEntry]:
         response: dict[str, Any] = {
             "url": pub["url"],
             "version": pub["provider_version"],
-            "title": "T",
         }
+        title = pub.get("title")
+        if isinstance(title, str) and title.strip():
+            response["title"] = title
         if pub["provider_seq"] is not None:
             response["seq"] = pub["provider_seq"]
         inner: dict[str, Any] = {
