@@ -67,6 +67,9 @@ class TestPolicyTable:
                 FORGE_SESSION_READ_SCOPE,
                 Binding.OWNED,
             ),
+            ("GET", "/artifact-publications", FORGE_SESSION_READ_SCOPE, Binding.NONE),
+            ("GET", "/artifact-bursts", FORGE_SESSION_READ_SCOPE, Binding.NONE),
+            ("GET", "/artifact-bursts/b-1", FORGE_SESSION_READ_SCOPE, Binding.NONE),
             ("POST", "/sessions/S/messages", FORGE_SESSION_MESSAGE_SCOPE, Binding.PEER),
             ("POST", "/sessions", FORGE_SESSION_LIFECYCLE_SCOPE, Binding.NONE),
             ("POST", "/sessions/S/start", FORGE_SESSION_LIFECYCLE_SCOPE, Binding.PEER),
@@ -75,6 +78,7 @@ class TestPolicyTable:
             ("POST", "/sessions/S/activity", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("POST", "/sessions/S/usage", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("PUT", "/sessions/S/description", FORGE_NOTIFY_SCOPE, Binding.OWN),
+            ("PUT", f"/sessions/S/files/presented/pf_{'a' * 32}", FORGE_NOTIFY_SCOPE, Binding.OWN),
             ("POST", "/mcp", None, Binding.NONE),
         ],
     )
@@ -107,6 +111,9 @@ class TestPolicyTable:
             ("POST", "/sessions/import"),
             ("POST", "/sessions/archive-stopped"),
             ("GET", "/sessions/"),
+            ("POST", "/artifact-publications/backfill"),
+            ("GET", "/instance"),
+            ("GET", f"/sessions/S/files/presented/pf_{'a' * 32}"),
         ],
     )
     def test_everything_else_is_denied(self, method, path) -> None:
