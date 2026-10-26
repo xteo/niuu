@@ -117,7 +117,7 @@ Styling in `web-next/` uses **Tailwind CSS** mapped to our design tokens.
 - **Tailwind config reads from tokens** — `tailwind.config.ts` in each package
   pulls from `tokens.css` via `theme.extend`. Never hard-code hex or px in a class
   (`bg-[#09090b]` is a bug — use `bg-bg-primary` mapped to `var(--color-bg-primary)`).
-- **Single brand theme policy** — default is `ice`. `[data-theme]` on `<html>` swaps
+- **Single brand theme policy** — default is `midnight-blue`. `[data-theme]` on `<html>` swaps
   token values; Tailwind classes don't change.
 - **Each plugin package publishes its own pre-compiled CSS.** Consumers install the
   plugin and import its `styles.css`. They do **not** need Tailwind in their build.

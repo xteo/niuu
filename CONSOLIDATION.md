@@ -596,3 +596,77 @@ sharing one makes the integration conftest's migrations fail.
    explicitly there.
 5. Still open from earlier: conversation `tail` vs `DurableTranscripts` (§7.1);
    `activity_heartbeat.stale_output_seconds` not rendered by the Skuld template (B1a.6.3).
+
+---
+
+# Web — colour themes (LEX-1495, 2026-10-26)
+
+Source: the raw, previously uncommitted web-next work from the `forge/ux-cleanup`
+worktree (2026-09-23..28), saved as `origin/lexi/web-themes-raw-20260928` (e5c248f35,
+35 files, +1453/−230). Ported by content onto this branch, next to upstream's
+`light` theme (36b215784, 2026-09-30) and upstream's popover theme picker. Raw base
+31906a0a3; upstream web-next has moved since then.
+
+## W.1 Taken (theme work)
+
+- **Palettes** (`design-tokens/src/tokens.css`): `midnight-blue`, `deep-blue` and `dark-blue`
+  (from LexiDesignKit `MacBluePalette.swift`) inherit the xteo layout and text ramp and
+  override surfaces and accents. The derived brand ramp uses `color-mix`.
+- **Default `midnight-blue`**: `ThemeProvider` default, plugin-sdk config schema default,
+  `config.json` and `config.live.json` (`ice`/`xteo` → `midnight-blue`; theme key only, no
+  other change, no secrets), `<html data-theme="midnight-blue">`,
+  `<meta name="theme-color" content="#101216">`, and `web-next/CLAUDE.md`.
+- **One picker, one persistence**: the three themes join upstream's popover picker
+  (Midnight Blue, Deep Blue, Dark Blue, blue, Native dark, Amber, Spring, Light). The raw
+  commit edited the old `<select>`, which no longer exists. The choice is stored in
+  `niuu.theme`, as before. `ThemeProvider` validates stored names against one list and
+  paints `meta[name=theme-color]` with the active `--color-bg-primary`.
+- **Themed surfaces**: every `[data-theme='xteo']` surface rule (Shell, SessionsPage,
+  SessionResources, chat input/messages/markdown/tool blocks, Dialog, Popover, and
+  upstream's newer Ting Work/Workflows sidebars) now applies to the blue family through
+  `:is(...)`. The xteo+light rules in Shell.css stayed flat.
+- **No white page on a phone**: `html, body, #root` get the theme surface, a full height,
+  `overflow: hidden` and `overscroll-behavior: none`. The default `color-scheme` is dark,
+  and Light overrides it. The shell is `100dvh` / `width: 100%`.
+- **Compact composer** (ChatInput/SessionChat CSS+TSX): upstream had not touched these
+  files since the raw base, so they were taken as-is. The input and actions share one
+  row. The textarea grows to its content up to the CSS 200px max, re-measures when its
+  width changes (ResizeObserver), and the request list scrolls within 45dvh. A unit test
+  was added.
+
+## W.2 Dropped from the raw commit, and why
+
+| Raw change | Why dropped |
+|---|---|
+| `InputRequestForm.tsx` (+test), `useSkuldChat.ts` (+test), `useWebSocket.ts`, `types.ts`, `LiveSessionDetailPage.tsx` (09-24 question form) | This branch already has its own, later version: 95dca159d (answer questions from the Forge session page, card returns on rejection) and 677e26dbb (answerable:false read-only cards, `free_text`). **Not carried over (follow-up if wanted):** multi-select questions (`multiSelect`, which Muse emits), per-option descriptions, question `id`/`header` passthrough, and the inline submit error / "Waiting for confirmation…" state. |
+| `SessionsPage.tsx` (+test) pinned sessions follow the state filter | Upstream deliberately keeps pins above every filter, and its unit and e2e tests assert that. Reversing it is a product decision, not theme work. |
+| Unused request-choice/error CSS (`.niuu-chat-request-choice*`, `-error`) | It only styled the dropped form. The `-question`/`-input` rules that upstream's form uses were kept. |
+| Raw e2e: pin-filter test, `Claude questions remain actionable…` test, history `pageSize` tweak | Tied to the dropped behaviour above (the history test already passes as written). |
+
+## W.3 Tests
+
+- Unit: `ThemeProvider` (default, every theme round-trips through storage, an unknown
+  stored name is ignored, browser theme-color), config schema (default + each theme),
+  Shell picker (each new theme + Light persists), ChatInput autosize/re-measure.
+- e2e `forge-ux-parity`: the fixture now uses `midnight-blue`. Added three tests:
+  every palette styles the whole session and keeps drafts (xteo/midnight/deep/dark/light,
+  survives reload); the compact composer; and midnight as default with no white page
+  on a phone (midnight, deep and light). Five existing tests were already red on this
+  branch before the port: they drove the removed `<select>` picker, and one expected
+  "Active" where upstream now says "Working". They now use the popover picker.
+  `light-theme.spec.ts` lists the new options.
+
+## W.4 Validation (Thor, `web-next/`, Node 22.22.1, pnpm, Playwright 1.64.1 chromium installed under the worktree)
+
+| Gate | Result |
+|---|---|
+| `pnpm install --frozen-lockfile` | pass |
+| `pnpm lint` / `pnpm format:check` / `pnpm typecheck` | pass / pass / pass |
+| `pnpm test` (coverage gate 85) | **566 files, 7721 tests passed**; statements 93.07 %, branches 86.39 %, functions 92.29 %, lines 94.6 % |
+| `pnpm build` | pass |
+| e2e theme specs (`light-theme` + `forge-ux-parity`, chromium) | **28/28 passed** (5 of the existing ones failed on the branch tip before the port) |
+| full chromium e2e, mine vs the branch tip side by side (6 workers) | 172 passed / 165 failed vs 163 / 168. The failures are pre-existing (setup redirects and timeouts under load in this environment). The 10 that failed only on mine passed on rerun, or failed the same way on the tip with 1 worker (2× `command-palette` 53/62 on both). |
+| Proof screenshots | `docs/forge/web-themes-20261026/` (3 themes × desktop, phone list, phone session) |
+
+Port note: `:5173` is occupied on Thor (nginx), so Playwright ran on `:5273` through an
+uncommitted local config override (`reuseExistingServer: false`).
