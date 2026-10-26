@@ -3525,7 +3525,13 @@ def create_router(
                     media_type=record.mime,
                     filename=record.name,
                     content_disposition_type="inline",
-                    headers={"cache-control": "private, max-age=86400, immutable"},
+                    # The file is agent-supplied: render it, never run it on Forge's
+                    # origin (HTML or SVG script, sniffed types).
+                    headers={
+                        "cache-control": "private, max-age=86400, immutable",
+                        "x-content-type-options": "nosniff",
+                        "content-security-policy": "sandbox",
+                    },
                 )
         response = await _proxy_session_api(request, session_id, *PRESENTED_FILE_ROUTE, file_id)
         headers = {}

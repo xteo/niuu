@@ -36,7 +36,13 @@ def durable_record(staged: Path) -> dict[str, Any] | None:
 
 
 async def upload_presented_file(
-    broker: Any, file_id: str, staged: Path, *, name: str, mime: str
+    broker: Any,
+    file_id: str,
+    staged: Path,
+    *,
+    name: str,
+    mime: str,
+    timeout: float | None = None,
 ) -> dict[str, Any] | None:
     """Upload one staged copy; return Forge's receipt (``url``, ``path``…) or ``None``."""
     if not broker.volundr_api_url or not broker.session_id:
@@ -52,7 +58,7 @@ async def upload_presented_file(
             f"{FORGE_SESSIONS_PATH}/{broker.session_id}/files/presented/{file_id}",
             content=data,
             headers={"content-type": mime, NAME_HEADER: quote(name, safe="")},
-            timeout=settings.upload_timeout_seconds,
+            timeout=timeout or settings.upload_timeout_seconds,
         )
     except Exception as exc:  # network, auth refresh or file errors: retry later
         logger.warning("present-file: durable upload of %s failed: %s", file_id, repr(exc))

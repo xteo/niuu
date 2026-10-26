@@ -575,8 +575,16 @@ class ActivityHeartbeatConfig(BaseModel):
 class PresentedDurableConfig(BaseModel):
     """Uploading present-file copies to Forge's durable store (control-plane F2)."""
 
+    inline_upload_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Time present-file waits for the first upload before answering; a slower "
+            "upload continues as a background retry."
+        ),
+    )
     upload_timeout_seconds: float = Field(
-        default=30.0, gt=0, description="Time allowed for one durable upload."
+        default=60.0, gt=0, description="Time allowed for one background durable upload."
     )
     retry_attempts: int = Field(
         default=6, ge=0, description="Background retries after a failed upload."
