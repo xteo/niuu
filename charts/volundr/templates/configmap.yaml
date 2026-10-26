@@ -107,6 +107,18 @@ data:
 
     notifications: {{ toJson . }}
     {{- end }}
+    {{- with .Values.artifacts }}
+
+    artifacts: {{ toJson . }}
+    {{- end }}
+    {{- with .Values.presentedFiles }}
+
+    presented_files: {{ toJson . }}
+    {{- end }}
+    {{- with .Values.hostIdentity }}
+
+    host_identity: {{ toJson . }}
+    {{- end }}
 
     push:
       enabled: {{ .Values.push.enabled }}
