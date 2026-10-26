@@ -92,6 +92,10 @@ ROUTE_POLICIES: tuple[RoutePolicy, ...] = (
     RoutePolicy("GET", f"{_S}/transcript", _READ, Binding.OWNED),
     RoutePolicy("GET", f"{_S}/transcript/download", _READ, Binding.OWNED),
     RoutePolicy("GET", f"{_S}/message-deliveries/{{request_id}}", _READ, Binding.OWNED),
+    # Artifact publications and their bursts (F1/F1n), owner-scoped like the feed.
+    RoutePolicy("GET", f"{FORGE_PREFIX}/artifact-publications", _READ, Binding.NONE),
+    RoutePolicy("GET", f"{FORGE_PREFIX}/artifact-bursts", _READ, Binding.NONE),
+    RoutePolicy("GET", f"{FORGE_PREFIX}/artifact-bursts/{{burst_id}}", _READ, Binding.NONE),
     # Steering another session needs the `message` grant; never the session itself.
     RoutePolicy("POST", f"{_S}/messages", FORGE_SESSION_MESSAGE_SCOPE, Binding.PEER),
     # Lifecycle needs the `lifecycle` grant: create, start/resume and stop. No

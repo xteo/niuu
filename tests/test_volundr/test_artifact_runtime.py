@@ -14,6 +14,7 @@ from volundr.adapters.outbound.postgres_artifacts import PostgresArtifactPublica
 from volundr.artifact_runtime import (
     ArtifactHold,
     burst_policy,
+    configured_host,
     create_artifact_service,
     resolve_host,
     resolve_tailnet_name,
@@ -39,6 +40,15 @@ def _settings(
 )
 def test_resolve_host_precedence(host, instance_id, expected):
     assert resolve_host(_settings(host=host, instance_id=instance_id)) == expected
+
+
+@pytest.mark.parametrize(
+    "host,instance_id,expected",
+    [("thor", "thor-exp", "thor"), ("", "thor-exp", "thor-exp"), ("", " ", None)],
+)
+def test_status_host_is_the_configured_host_or_unknown(host, instance_id, expected):
+    # The session status card reports this; an unnamed Forge is unknown, never "local".
+    assert configured_host(_settings(host=host, instance_id=instance_id)) == expected
 
 
 def test_resolve_tailnet_name_falls_back_to_the_public_host():
