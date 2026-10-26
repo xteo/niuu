@@ -195,3 +195,186 @@ required rather than optional (no fallbacks).
    and images.
 4. `forge/ux-cleanup` / `forge/ux-improvement` dropped: if a public Forge image is still
    wanted, it should be rebuilt on upstream's ci/* pipeline rather than revived.
+
+---
+
+# B1a — session work facts + usage status (LEX-1484, 2026-10-26)
+
+Branch `lexi/b1a-work-facts` from `lexi/dev-api-integration` 20c639ee0 (upstream `dev`
+re-fetched 2026-10-26, still 6c606cb27, so no rebase was needed), fast-forwarded onto
+`lexi/dev-api-integration`. Patch-id check (`git cherry`): neither source commit was on
+the branch.
+
+## B1a.1 Taken
+
+| New | Source (`exp/control-plane`) | What |
+|---|---|---|
+| c1bde8848 | b24c6d586 | G10/F12: stale-active fixes in Skuld (F12a turn-boundary flush is not a turn start, F12b `idle_prompt` heals a stale busy state, F12c heartbeat re-reports busy only while the transport produced a row within `activity_heartbeat.stale_output_seconds`), work facts folded at log ingest (`last_work_at`, `open_tool_count`), the broker's `open_controls`, the shared predicate `niuu.domain.work_facts`, the 20 vendored derived-state goldens (`tests/fixtures/control_plane`, ruff-excluded so they stay byte-identical) |
+| 5f6a9efa9 | 1f3ecf78b (work-facts part only) | review fixes: no guessed idle for a transport without its own turn flag, `update()` returns the stored facts, no session write for frames that change no fact, hook-name lookup matches the ingest SQL, the refreshed attention detail names the gate still open. The commit's presented-file changes (CSP/nosniff, durable store, upload timeouts) are left for B1b |
+| 4352e6ea1 | 43ce88cb4 (LEX-1421) | native usage projection: Claude SDK, tmux JSONL and Codex (app-server + exec) usage events from `src/skuld/transports`, deduplicated per native response and projected once at durable log ingest (`volundr.domain.session_usage`), `GET /sessions/{id}/status`, `context` on the session row and on `session_updated`, the Guild facade route. Its STATUS/DEPLOY-REQUEST docs are not taken |
+| 99e23570d | (new) | database lane runs the usage real-PG test; history-import test fixtures and the append-order test brought up to the lift |
+
+Not taken (other lifts / dropped for good, per the brief): presented files and
+publications (B1b), structured asks and the notify catalog (B1c, incl. 93dc04f64,
+776666546, f65d3b8f6), live model (B1d), side-quest defaults, the cp store, R16/R17
+exp-seed reads (a44c1c661), the F8 probe, and the control-plane `HostIdentityConfig`
+(F7) that 43ce88cb4's `main.py` read.
+
+## B1a.2 Adapted
+
+1. **Migrations single-source.** Upstream reads `migrations/` only, so the CLI copies
+   (`src/cli/migrations/volundr/`) and the chart configmap hunks from both commits were
+   dropped; the chart picks the files up through its `migrations/` glob. The exp
+   "three copies match" tests became single-source tests (number unique, follows its
+   predecessor, idempotent up / reversing down).
+2. **Session INSERT and `actor_id`.** Upstream's 000087 added `coordination, actor_id`
+   at the end of the INSERT; `session_usage` is inserted before them so `actor_id`
+   stays last (as for descriptions in B0). Tests indexing the argument tail follow.
+3. **Status `host` on an embedded Forge** comes from `projects.instance_id` (Thor sets
+   `PROJECTS__INSTANCE_ID=thor`); exp read `host_identity.host` first, which is F7 and
+   not part of this lift. Through the Guild facade `host` is the owning instance id,
+   unchanged.
+4. **Workload delegation / session credentials.** `GET /api/v1/forge/sessions/{id}/status`
+   carries `require_scope(forge:session:read)`, so it joins upstream's `forge_session`
+   allow-list as an owner-scoped read (`Binding.OWNED`, like `GET /sessions/{id}`);
+   without it a session broker's token would get 403 at the edge while the route
+   advertised the read scope. Human callers are unaffected.
+5. **Append order (behaviour, both sides kept).** Upstream sorts an append batch by
+   session (stable, for deadlock-free row locks) and kept the caller's order within a
+   session; the usage commit sorts by `(session, seq)`. Kept the session order and the
+   seq order within a session, because the open-tool count and the usage checkpoints
+   are order-sensitive folds. Upstream's `test_append_uses_same_session_lock_in_stable_session_order`
+   now asserts seq order within the session. The exp branch had left that test failing.
+6. **Notification outbox.** Nothing in B1a writes notifications; usage and work facts
+   reach clients through the existing `session_updated` stream only, so the lift does
+   not meet upstream's notification outbox.
+7. The B0 open question on conversation `tail` reads vs `DurableTranscripts` (§7.1) is
+   untouched by this lift and **remains open**.
+
+## B1a.3 Migrations
+
+| File | exp name | What |
+|---|---|---|
+| `000091_session_work_facts` | `000088_session_work_facts` | `sessions.last_work_at TIMESTAMPTZ`, `sessions.open_tool_count INTEGER NOT NULL DEFAULT 0` |
+| `000092_session_usage_status` | `000092_session_usage_status` (same number) | `sessions.session_usage JSONB` (private projection), `session_event_log.usage_key TEXT`, `session_event_log.usage JSONB`, partial index `idx_session_event_log_usage_key` |
+
+No lineage alias: neither exp file was ever applied to a production ledger.
+
+**Dry run on production ledger exports (2026-10-26, read-only exports, scratch PG 16/17
+on 127.0.0.1, removed afterwards).** Thor's and m6's schema-only dumps + their
+`volundr_schema_history` rows were restored, migrated to the integration tip
+(20c639ee0, the B0 baseline) and then to the B1a tip. Step two on both hosts:
+**executed exactly `000091_session_work_facts` and `000092_session_usage_status`**,
+adopted nothing, `ting/` stream unchanged (m6: 44 applied, 0 to run); a second run was a
+no-op; the five columns and the index exist afterwards.
+
+Correction to §4: Thor's ledger already holds `000050_session_definition`,
+`000051_device_tokens` and `000052_session_activity_state_since` under their canonical
+names (applied 2026-09-09), so the runner counts them as applied, not adopted by alias.
+
+## B1a.4 API shape the iOS client sees
+
+All new fields are additive; every one can be null (or false) until a broker running
+this code reports, and null is never a measured zero.
+
+**Session row** — `GET /api/v1/forge/sessions`, `GET /api/v1/forge/sessions/{id}` (the
+Guild facade serves the same paths and passes the fields through, adding its instance
+fields):
+
+```json
+{
+  "last_work_at": "2026-10-26T12:00:03.120000+00:00",
+  "tool_open": false,
+  "open_controls": [
+    {"request_id": "req-1", "kind": "question", "opened_at": "2026-10-26T12:00:01+00:00"}
+  ],
+  "context": {"tokens": 7546, "window": 1000000, "share": 0.007546}
+}
+```
+
+- `last_work_at` (ISO 8601 or null): source time of the newest *work* row (assistant
+  output, result, content blocks, tool and turn hooks). Never a heartbeat, reconnect
+  handshake or terminal frame.
+- `tool_open` (bool): a `PreToolUse` without its `PostToolUse`/`PostToolUseFailure`
+  (reset by `result`/`Stop`).
+- `open_controls` (list or null): the broker's open human gates. `[]` = none open;
+  **null = unknown** (older broker, nothing reported yet, or awaiting input on a gate
+  without a request id) and must not be read as "none open". `kind` is the gate kind
+  (`permission`, `question`, …).
+- `context` (`{tokens, window, share}`, each int/int/float or null): last measured
+  context occupancy; `tokens = input + cache_read + cache_write` of the latest model
+  response (output excluded); `share` is the raw fraction and may exceed 1. Legacy
+  `tokens_used` is a different aggregate; do not use it for context.
+
+**Live event** — the existing `session_updated` on the session SSE stream carries the
+same four fields in `data` (`data.last_work_at`, `data.tool_open`, `data.open_controls`,
+`data.context`). It is published after each usage commit (including responses inside a
+tool loop) and on every session update; no new event type.
+
+**Status card** — `GET /api/v1/forge/sessions/{id}/status` (same auth, read scope and
+owner/participant/tenant policy as the session GET: 401 / 403 / 404). Persisted only: no
+broker, transcript or provider call on read.
+
+```json
+{
+  "context": {"tokens": 7546, "window": 1000000, "share": 0.007546},
+  "last_turn": {"input": 12, "cache_read": 7234, "cache_write": 300, "output": 236},
+  "totals": {"input": 42, "cache_read": 14468, "cache_write": 600, "output": 336},
+  "compactions": null,
+  "model": "claude-opus-5-5",
+  "engine": "claude",
+  "host": "thor",
+  "started_at": "2026-10-23T12:00:00Z",
+  "uptime_s": 60.0,
+  "cost_estimate": null,
+  "usage_available": true,
+  "usage_reason": null,
+  "totals_complete": false
+}
+```
+
+- `last_turn` = latest model response, `totals` = observed sums; each component int or
+  null. Codex native input includes cached input; the API subtracts it once.
+- `compactions`: null until a native compaction boundary is observed, then the
+  deduplicated count. `cost_estimate`: native-reported cumulative USD or null (Codex and
+  tmux report none); no price heuristic.
+- `usage_available: false` + `usage_reason` explain missing current context
+  (`compaction_pending_usage`, `reset_pending_usage`, `transcript_catching_up`,
+  `incomplete_record`, `transcript_unreadable`, `native_counter_regression`).
+- `totals_complete: false` means totals/compactions/cost are observed lower bounds
+  (resumed sessions may have unseen earlier responses); this release never claims true.
+- `started_at`: first native/runtime init identity; `uptime_s` only while
+  starting/provisioning/running, else null. `engine`: `claude` | `codex` once measured.
+- Context windows: native raw windows win; otherwise `volundr.session_usage.model_windows`
+  (defaults 1,000,000 for `claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`;
+  chart `sessionUsage.model_windows`); unknown models keep `window`/`share` null.
+
+## B1a.5 Validation (2026-10-26, Thor, clean `env -i` allow-list, `uv --frozen`)
+
+| Gate | B1a | B0 |
+|---|---|---|
+| `make lint` | pass | pass |
+| full backend suite (`-n 16`, cov gate 85) | **28506 passed**, 16 skipped, 1 xfailed, **14 failed**, coverage **88.90 %** | 28315 / 14, 88.89 % |
+| `make test-forge` | **9244 passed**, 3 skipped, 1 xfailed, **4 failed**, Skuld coverage 87.69 % | 9095 / 4 |
+| `make test-forge-tmux` | **60 passed** | 60 |
+| `make test-forge-database` (scratch PG 16, 127.0.0.1) | **115 passed** (now incl. work-facts and usage real-PG tests) | 88 |
+| `helm lint charts/volundr` + `helm template` | pass; renders 000091/000092 and `session_usage.model_windows` | pass |
+| migration dry run on Thor + m6 ledger exports (B1a.3) | only 000091 + 000092 execute; second run a no-op | |
+| pre-push web-next build | run by the push hook (no `web-next` change) | |
+
+The failures are exactly B0's box-specific set, each reproduced on pure upstream `dev`
+(§6): 14 = `test_install_sh*` (10), `test_docker_container` recovery,
+`test_terminal_docker` workspace mount, `test_workflow_kickoff[/workspace]`,
+`test_api_release_guard`; forge lane 4 = docker-container, release-guard and two
+`test_resident_notification_relay` GC-under-`-W error` cases. One earlier full run also
+failed `test_ting_queue_trigger::test_run_survives_poll_exception` (a 50 ms sleep
+waiting for three 10 ms polls under `-n 16` load; Ravn, untouched here); it passed 3/3
+alone and in the final run.
+
+## B1a.6 Open questions
+
+1. Conversation `tail` reads vs `DurableTranscripts` (§7.1): still open, untouched.
+2. Embedded status `host` uses `projects.instance_id`; if the control plane needs a
+   different host-map key (F7 `host_identity`), that lands with whichever lift brings F7.
+3. `activity_heartbeat.stale_output_seconds` (Skuld, default 600) is config-only like the
+   rest of `activity_heartbeat`; the Skuld session config template does not render it.
