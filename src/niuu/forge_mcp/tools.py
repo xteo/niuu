@@ -436,12 +436,10 @@ _NOTIFY_SCHEMA = _object(
     },
     required=("kind", "title"),
 )
-_NOTIFY_SCHEMA["allOf"] = [
-    {
-        "if": {"required": ["ask"]},
-        "then": {"required": ["question"], "properties": {"question": {"const": True}}},
-    }
-]
+# Keep the root an ordinary object schema: Claude Code 2.1.309 silently drops
+# this whole tool from its catalog when the root includes an allOf conditional.
+# NotificationDraft still enforces ask -> question=true before any side effect;
+# the ask description advertises that constraint to every MCP client.
 
 _NOTIFY_DESCRIPTION = """\
 Notify the user about THIS session. The notification appears inline in the \
