@@ -227,3 +227,79 @@ async def test_noncontiguous_context_only_replay_survives_projector_restart(isol
     restarted = PostgresSessionEventLog(isolated_pool)
     await restarted.append([entry(session, 4, first), entry(session, 5, second)])
     assert (await repo.get(session.id)).context.tokens is None
+
+
+async def test_session_model_follows_the_runtime_through_http_ingest(isolated_pool):
+    """B1d: list, GET and session_updated carry the model in effect; launch stays stored."""
+    repo, session, log = await seed(isolated_pool)
+    await isolated_pool.execute(
+        "UPDATE sessions SET model='claude-fable-5-1' WHERE id=$1", session.id
+    )
+    broadcaster = InMemoryEventBroadcaster()
+    service = SessionService(repo, MockPodManager(), broadcaster=broadcaster)
+    app = FastAPI()
+    app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
+    app.include_router(
+        create_router(
+            service,
+            session_status_host="thor-exp",
+            session_participant_service=make_session_participant_service(service),
+        )
+    )
+    app.include_router(create_session_log_router(log, session_service=service))
+    fable, opus = claude("one"), claude("two")
+    fable["message"]["model"] = "claude-fable-5-1"
+    synthetic = claude("three")
+    synthetic["message"]["model"] = "<synthetic>"
+    picked = {
+        "type": "runtime_options",
+        "applied": True,
+        "active_turn": None,
+        "current": {"model": "claude-fable-5-1", "effort": "high", "service_tier": None},
+    }
+    stream = broadcaster.subscribe()
+
+    async def post(client, seq, payload):
+        waiting = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        response = await client.post(
+            f"/api/v1/forge/sessions/{session.id}/log",
+            json={
+                "entries": [
+                    {
+                        "seq": seq,
+                        "kind": payload["type"],
+                        "payload": payload,
+                        "ts": (AT + timedelta(seconds=seq)).isoformat(),
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 201, response.text
+        return await asyncio.wait_for(waiting, timeout=2)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            event = await post(client, 1, fable)
+            assert event.data["model"] == "claude-fable-5-1"
+            # /model typed in the terminal; the next response is on Opus 5.5.
+            event = await post(client, 2, opus)
+            assert event.type.value == "session_updated"
+            assert event.data["model"] == "claude-opus-5-5"
+            got = (await client.get(f"/api/v1/forge/sessions/{session.id}")).json()
+            listed = (await client.get("/api/v1/forge/sessions")).json()[0]
+            status = (await client.get(f"/api/v1/forge/sessions/{session.id}/status")).json()
+            assert got["model"] == listed["model"] == status["model"] == "claude-opus-5-5"
+            # A synthetic row names no model.
+            event = await post(client, 3, synthetic)
+            assert event.data["model"] == "claude-opus-5-5"
+            # The app picked Fable 5.1 between turns; the acknowledgement moves it at once.
+            event = await post(client, 4, picked)
+            assert event.data["model"] == "claude-fable-5-1"
+    finally:
+        await stream.aclose()
+    stored = await isolated_pool.fetchrow("SELECT model FROM sessions WHERE id=$1", session.id)
+    assert stored["model"] == "claude-fable-5-1"  # the launch record, which restart reads
+    assert (await repo.get(session.id)).effective_model == "claude-fable-5-1"

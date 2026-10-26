@@ -539,7 +539,7 @@ class NotificationService(NotificationRecorder):
             tenant_id=session.tenant_id,
             project_id=str(coordination.project_id) if coordination else None,
             engine=self._engine_resolver(session) if self._engine_resolver else None,
-            model=session.model or None,
+            model=session.effective_model or None,
         )
 
     @staticmethod
