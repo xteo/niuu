@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from niuu.domain.notifications import (
     NOTIFICATION_IMAGE_MIME_TYPES,
+    NotificationAsk,
     NotificationDraft,
     NotificationKind,
     NotificationLink,
@@ -137,6 +138,10 @@ class NotificationResponse(BaseModel):
             "{id: question:<host>:<uuid>, action: remind|replace|relay|resolved|withdrawn}: "
             "the earlier question this notice refers to; null when none"
         ),
+    )
+    ask: NotificationAsk | None = Field(
+        default=None,
+        description="Structured question/action items when question=true; null for legacy notices.",
     )
     created_at: datetime
     image: NotificationImageResponse | None = Field(

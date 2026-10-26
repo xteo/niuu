@@ -189,12 +189,13 @@ class Notification(BaseModel):
         data["resident_session_id"] = self.resident_session_id
         data["odin_review_id"] = self.odin_review_id
         data["odin_review_decide_path"] = self.odin_review_decide_path
-        data["image"] = self.image.wire(self.id) if self.image is not None else None
-        data["image_state"] = self.image.state.value if self.image is not None else None
-        data["image_error"] = self.image.error if self.image is not None else None
         # Question signals (F11b) live in metadata; null when the notice carries none.
         data["question"] = self.metadata.get("question")
         data["about_question"] = self.metadata.get("about_question")
+        data["ask"] = self.metadata.get("ask")
+        data["image"] = self.image.wire(self.id) if self.image is not None else None
+        data["image_state"] = self.image.state.value if self.image is not None else None
+        data["image_error"] = self.image.error if self.image is not None else None
         return data
 
 

@@ -350,6 +350,78 @@ class TestSessionRoutes:
         assert client.post(url, json=body, headers=headers("owner-b")).status_code == 403
 
 
+class TestStructuredQuestions:
+    @pytest.mark.parametrize("structured", [False, True], ids=["legacy", "structured"])
+    async def test_submit_retry_and_feed_reads_preserve_question(self, env, structured):
+        client, service, store, sessions = env
+        session = await _seed(service, sessions, count=0)
+        url = f"{PREFIX}/sessions/{session.id}/notifications"
+        ask = {
+            "items": [
+                {
+                    "id": "database",
+                    "kind": "question",
+                    "text": "Which database?",
+                    "options": [{"label": "Postgres"}, {"label": "SQLite"}],
+                    "allow_text": False,
+                },
+                {"id": "access", "kind": "action", "text": "Grant the test account access."},
+            ]
+        }
+        body = {
+            "kind": "attention",
+            "title": "Input needed",
+            "question": True,
+            "idempotency_key": "structured-question-1",
+            **({"ask": ask} if structured else {}),
+        }
+        created = client.post(url, json=body, headers=headers())
+        assert created.status_code == 201
+        retry = client.post(url, json=body, headers=headers())
+        assert retry.status_code == 200
+        assert retry.json() == created.json()
+        [session_notice] = client.get(url, headers=headers()).json()
+        [feed_notice] = client.get(f"{PREFIX}/notifications", headers=headers()).json()["items"]
+        assert session_notice == feed_notice == created.json()
+        assert feed_notice["question"] is True
+        assert feed_notice["ask"] == (ask if structured else None)
+        assert len(store.notifications) == 1
+        assert client.get(url, headers=headers("owner-b")).status_code == 403
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"question": False, "ask": {"items": [{"id": "q", "kind": "question", "text": "Q"}]}},
+            {"question": True, "ask": {"items": []}},
+            {
+                "question": True,
+                "ask": {
+                    "items": [{"id": "q", "kind": "question", "text": "Q", "allow_text": False}]
+                },
+            },
+            {
+                "question": True,
+                "ask": {
+                    "items": [
+                        {"id": f"q{i}", "kind": "question", "text": "😀" * 2000} for i in range(5)
+                    ]
+                },
+            },
+        ],
+        ids=["ask-without-question", "empty-items", "unanswerable", "utf8-size-limit"],
+    )
+    async def test_invalid_ask_is_422_before_persistence(self, env, fields):
+        client, service, store, sessions = env
+        session = await _seed(service, sessions, count=0)
+        response = client.post(
+            f"{PREFIX}/sessions/{session.id}/notifications",
+            json={"kind": "attention", "title": "Input", "idempotency_key": "bad-ask", **fields},
+            headers=headers(),
+        )
+        assert response.status_code == 422
+        assert not store.notifications
+
+
 class TestIndividualReads:
     async def test_exact_read_receipt_feed_session_list_and_unread_filter(self, env):
         client, service, _, sessions = env

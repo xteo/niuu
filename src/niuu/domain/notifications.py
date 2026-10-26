@@ -14,13 +14,21 @@ durable copy at :data:`NOTIFICATION_IMAGE_PATH`.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterable
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 # Protocol limits. They bound what a model may persist per notification; they are
 # part of the wire contract shared by Skuld, Forge and clients, not tunables.
@@ -30,6 +38,17 @@ MAX_LINKS = 10
 MAX_LINK_LABEL_CHARS = 200
 MAX_LINK_URL_CHARS = 2048
 MAX_CORRELATION_ID_CHARS = 200
+
+# Structured-question protocol limits (LEX-1412), shared by producers and readers.
+MAX_ASK_ITEMS = 8
+MAX_ASK_ITEM_ID_CHARS = 64
+ASK_ITEM_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+MAX_ASK_TEXT_CHARS = 2000
+MAX_ASK_HEADER_CHARS = 80
+MAX_ASK_OPTIONS = 8
+MAX_ASK_OPTION_LABEL_CHARS = 120
+MAX_ASK_OPTION_DESCRIPTION_CHARS = 500
+MAX_ASK_BYTES = 32 * 1024
 
 # Image protocol limits: what a producer may attach and what Forge will copy. Like
 # the text limits above they are wire contract, not tunables.
@@ -124,6 +143,133 @@ class NotificationLink(BaseModel):
     file_id: str | None = Field(default=None, max_length=MAX_LINK_LABEL_CHARS)
 
 
+#: The host-qualified question reference ``question:<host>:<notification uuid>``
+#: (control-plane identity §5b). A bare uuid is refused: a coordinator on one host
+#: relays another host's question by naming that host.
+QUESTION_REF_PATTERN = r"^question:[^:]+:[0-9a-f-]{36}$"
+
+#: The notice fields that carry question signals (F11b), stored in the notification's
+#: ``metadata`` and served on the read wire.
+QUESTION_FIELDS = ("question", "about_question", "ask")
+
+
+class QuestionAction(StrEnum):
+    """What a notice does to an earlier question (F11b, cp-api ``NotifyQuestionFields``).
+
+    Only the asking session may remind, replace, resolve or withdraw its question; any
+    session filed in the same project may relay it. The control plane enforces that and
+    records anything else as an error, never applied.
+    """
+
+    REMIND = "remind"
+    REPLACE = "replace"
+    RELAY = "relay"
+    RESOLVED = "resolved"
+    WITHDRAWN = "withdrawn"
+
+
+class AboutQuestion(BaseModel):
+    """The question a notice refers to, and what it does to it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=QUESTION_REF_PATTERN)
+    action: QuestionAction
+
+
+class AskOption(BaseModel):
+    """One user-visible choice; labels identify selections within their item."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    label: str = Field(min_length=1, max_length=MAX_ASK_OPTION_LABEL_CHARS)
+    description: str | None = Field(default=None, max_length=MAX_ASK_OPTION_DESCRIPTION_CHARS)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _description_string(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and "\x00" in value):
+            raise ValueError("option description must be a string containing no NUL")
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def _nonblank_label(cls, value: str) -> str:
+        if not value.strip() or "\x00" in value:
+            raise ValueError("option label must be nonblank and contain no NUL")
+        return value
+
+
+class AskItem(BaseModel):
+    """An answerable question or an action the user reports completing; never executable."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str = Field(min_length=1, max_length=MAX_ASK_ITEM_ID_CHARS, pattern=ASK_ITEM_ID_PATTERN)
+    kind: Literal["question", "action"]
+    text: str = Field(min_length=1, max_length=MAX_ASK_TEXT_CHARS)
+    header: str | None = Field(default=None, min_length=1, max_length=MAX_ASK_HEADER_CHARS)
+    options: list[AskOption] | None = Field(default=None, min_length=1, max_length=MAX_ASK_OPTIONS)
+    multi_select: bool | None = None
+    allow_text: bool | None = None
+
+    @field_validator("header", "options", "multi_select", "allow_text", mode="before")
+    @classmethod
+    def _supplied_fields_are_not_null(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("omit optional item fields instead of setting null")
+        return value
+
+    @field_validator("text", "header")
+    @classmethod
+    def _nonblank_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip() or "\x00" in value:
+            raise ValueError("item text and header must be nonblank and contain no NUL")
+        return value
+
+    @model_validator(mode="after")
+    def _unique_options(self) -> AskItem:
+        labels = [option.label for option in self.options or []]
+        if len(labels) != len(set(labels)):
+            raise ValueError("option labels must be unique within each item")
+        if self.kind == "question" and self.allow_text is False and not self.options:
+            raise ValueError("question items must allow text or provide options")
+        return self
+
+
+class NotificationAsk(BaseModel):
+    """Optional structured items on one ordinary F11b Question notification."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: list[AskItem] = Field(min_length=1, max_length=MAX_ASK_ITEMS)
+
+    def wire(self) -> dict[str, Any]:
+        # Omitted flags stay omitted: clients use multi_select=false, allow_text=true.
+        return self.model_dump(mode="json")
+
+    @model_serializer
+    def _serialize(self) -> dict[str, Any]:
+        return {
+            "items": [
+                item.model_dump(mode="json", exclude_none=True, exclude_unset=True)
+                for item in self.items
+            ]
+        }
+
+    @model_validator(mode="after")
+    def _bounded_unique_items(self) -> NotificationAsk:
+        ids = [item.id for item in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("ask item ids must be unique")
+        encoded = json.dumps(self.wire(), ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_ASK_BYTES:
+            raise ValueError(f"ask must be at most {MAX_ASK_BYTES} UTF-8 bytes")
+        return self
+
+
 class NotificationImageSourceKind(StrEnum):
     FILE_ID = "file_id"
     URL = "url"
@@ -206,40 +352,6 @@ def notification_image_url(
     return f"{path}?{urlencode(params)}"
 
 
-#: The host-qualified question reference ``question:<host>:<notification uuid>``
-#: (control-plane identity §5b). A bare uuid is refused: a coordinator on one host
-#: relays another host's question by naming that host.
-QUESTION_REF_PATTERN = r"^question:[^:]+:[0-9a-f-]{36}$"
-
-#: The notice fields that carry question signals (F11b), stored in the notification's
-#: ``metadata`` and served on the read wire.
-QUESTION_FIELDS = ("question", "about_question")
-
-
-class QuestionAction(StrEnum):
-    """What a notice does to an earlier question (F11b, cp-api ``NotifyQuestionFields``).
-
-    Only the asking session may remind, replace, resolve or withdraw its question; any
-    session filed in the same project may relay it. The control plane enforces that and
-    records anything else as an error, never applied.
-    """
-
-    REMIND = "remind"
-    REPLACE = "replace"
-    RELAY = "relay"
-    RESOLVED = "resolved"
-    WITHDRAWN = "withdrawn"
-
-
-class AboutQuestion(BaseModel):
-    """The question a notice refers to, and what it does to it."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str = Field(pattern=QUESTION_REF_PATTERN)
-    action: QuestionAction
-
-
 class NotificationDraft(BaseModel):
     """What a producer asks to publish; Forge adds identity, ownership and order."""
 
@@ -249,7 +361,6 @@ class NotificationDraft(BaseModel):
     body: str = Field(default="", max_length=MAX_BODY_CHARS)
     links: list[NotificationLink] = Field(default_factory=list, max_length=MAX_LINKS)
     correlation_id: str | None = Field(default=None, max_length=MAX_CORRELATION_ID_CHARS)
-    image: NotificationImageRef | None = None
     question: bool | None = Field(
         default=None,
         description=(
@@ -258,6 +369,18 @@ class NotificationDraft(BaseModel):
         ),
     )
     about_question: AboutQuestion | None = None
+    ask: NotificationAsk | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ask_requires_question(cls, value: Any) -> Any:
+        if (
+            isinstance(value, dict)
+            and value.get("ask") is not None
+            and value.get("question") is not True
+        ):
+            raise ValueError("ask requires question=true")
+        return value
 
     def question_metadata(self) -> dict:
         """The question signals this draft carries, for ``metadata`` (only those set)."""
@@ -266,7 +389,11 @@ class NotificationDraft(BaseModel):
             out["question"] = self.question
         if self.about_question is not None:
             out["about_question"] = self.about_question.model_dump(mode="json")
+        if self.ask is not None:
+            out["ask"] = self.ask.wire()
         return out
+
+    image: NotificationImageRef | None = None
 
     @field_validator("title")
     @classmethod
