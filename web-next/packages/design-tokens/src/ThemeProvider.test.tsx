@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
-import { ThemeProvider, useTheme } from './ThemeProvider';
+import { render, screen, cleanup, fireEvent } from '@testing-library/react';
+import { ThemeProvider, useTheme, type ThemeName } from './ThemeProvider';
 
 function ThemeReader() {
   const { theme } = useTheme();
@@ -10,17 +10,18 @@ function ThemeReader() {
 describe('ThemeProvider', () => {
   afterEach(() => {
     cleanup();
+    localStorage.removeItem('niuu.theme');
     delete document.documentElement.dataset.theme;
   });
 
-  it('defaults to ice and sets data-theme on documentElement', () => {
+  it('defaults to midnight blue and sets data-theme on documentElement', () => {
     render(
       <ThemeProvider>
         <ThemeReader />
       </ThemeProvider>,
     );
-    expect(screen.getByTestId('theme').textContent).toBe('ice');
-    expect(document.documentElement.dataset.theme).toBe('ice');
+    expect(screen.getByTestId('theme').textContent).toBe('midnight-blue');
+    expect(document.documentElement.dataset.theme).toBe('midnight-blue');
   });
 
   it('respects initial theme prop', () => {
@@ -31,6 +32,31 @@ describe('ThemeProvider', () => {
     );
     expect(document.documentElement.dataset.theme).toBe('amber');
   });
+
+  it.each<ThemeName>(['xteo', 'midnight-blue', 'deep-blue', 'dark-blue'])(
+    'switches to %s and restores it after remounting',
+    (next) => {
+      function ChooseTheme() {
+        const { setTheme } = useTheme();
+        return <button onClick={() => setTheme(next)}>Choose</button>;
+      }
+      const view = render(
+        <ThemeProvider>
+          <ChooseTheme />
+        </ThemeProvider>,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Choose' }));
+      expect(document.documentElement.dataset.theme).toBe(next);
+      expect(localStorage.getItem('niuu.theme')).toBe(next);
+      view.unmount();
+      render(
+        <ThemeProvider>
+          <ThemeReader />
+        </ThemeProvider>,
+      );
+      expect(screen.getByTestId('theme')).toHaveTextContent(next);
+    },
+  );
 
   it('throws when useTheme is used outside the provider', () => {
     const originalError = console.error;

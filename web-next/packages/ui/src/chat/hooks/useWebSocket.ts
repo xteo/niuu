@@ -14,7 +14,7 @@ interface UseWebSocketOptions {
 }
 
 interface UseWebSocketReturn {
-  sendJson: (data: unknown) => void;
+  sendJson: (data: unknown) => boolean;
 }
 
 export function useWebSocket(
@@ -186,7 +186,9 @@ export function useWebSocket(
   const sendJson = useCallback((data: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data));
+      return true;
     }
+    return false;
   }, []);
 
   return { sendJson };

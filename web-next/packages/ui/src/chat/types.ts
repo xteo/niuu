@@ -151,11 +151,27 @@ export interface PermissionRequest {
 
 export type PermissionBehavior = 'allow_once' | 'allow_always' | 'deny';
 
+export interface InputAnswer {
+  answer: string | string[];
+  question?: string;
+  question_id?: string;
+  header?: string;
+  option_indexes?: number[];
+  free_text?: string;
+}
+
 export interface InputRequest {
   requestId: string;
+  submitting?: boolean;
+  error?: string;
+  answerable?: boolean;
   questions: Array<{
+    id?: string;
+    header?: string;
     prompt: string;
     choices: string[];
+    descriptions?: string[];
+    multiSelect?: boolean;
   }>;
 }
 

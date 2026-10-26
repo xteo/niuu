@@ -1185,12 +1185,19 @@ page_path: council/demo/opinion-b.md
       {
         requestId: 'input-1',
         questions: [
-          { prompt: 'Choose the target environment', choices: ['Staging', 'Production'] },
-          { prompt: 'Which region?', choices: ['Canada', 'Europe'] },
+          {
+            prompt: 'Choose the target environment',
+            choices: ['Staging', 'Production'],
+            descriptions: ['', ''],
+          },
+          { prompt: 'Which region?', choices: ['Canada', 'Europe'], descriptions: ['', ''] },
         ],
       },
     ]);
 
+    act(() => {
+      wsHandlers.onOpen?.();
+    });
     act(() => {
       result.current.respondToInput('input-1', ['Staging', 'Canada']);
     });
@@ -1198,9 +1205,165 @@ page_path: council/demo/opinion-b.md
     expect(sendJson).toHaveBeenCalledWith({
       type: 'ask_user_answer',
       request_id: 'input-1',
-      answers: [{ answer: 'Staging' }, { answer: 'Canada' }],
+      answers: [
+        { answer: 'Staging', question: 'Choose the target environment', option_indexes: [0] },
+        { answer: 'Canada', question: 'Which region?', option_indexes: [0] },
+      ],
+    });
+    expect(result.current.pendingInputRequests[0]?.submitting).toBe(true);
+    act(() => {
+      wsHandlers.onMessage?.(
+        JSON.stringify({ type: 'ask_user_resolved', request_id: 'input-1', accepted: true }),
+      );
     });
     expect(result.current.pendingInputRequests).toHaveLength(0);
+  });
+
+  it('keeps rejected questions visible, blocks duplicate sends and retries only after rejection', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    const question = {
+      type: 'ask_user_question',
+      request_id: 'q-retry',
+      questions: [
+        {
+          id: 'hosts',
+          header: 'Hosts',
+          question: 'Which hosts?',
+          multiSelect: true,
+          options: [
+            { label: 'Thor', description: 'Local' },
+            { label: 'Bro', description: 'Remote' },
+          ],
+        },
+      ],
+    };
+    const receive = (event: object) => act(() => wsHandlers.onMessage?.(JSON.stringify(event)));
+    receive(question);
+    expect(result.current.pendingInputRequests[0]?.questions[0]).toMatchObject({
+      id: 'hosts',
+      header: 'Hosts',
+      multiSelect: true,
+      descriptions: ['Local', 'Remote'],
+    });
+    act(() => result.current.respondToInput('q-retry', ['Thor']));
+    expect(sendJson).not.toHaveBeenCalled();
+    act(() => wsHandlers.onOpen?.());
+    const answers = [
+      {
+        question_id: 'hosts',
+        question: 'Which hosts?',
+        answer: ['Thor', 'Spark'],
+        option_indexes: [0],
+        free_text: 'Spark',
+      },
+    ];
+    act(() => {
+      result.current.respondToInput('q-retry', answers);
+      result.current.respondToInput('q-retry', answers);
+    });
+    expect(sendJson).toHaveBeenCalledTimes(1);
+    expect(sendJson).toHaveBeenLastCalledWith({
+      type: 'ask_user_answer',
+      request_id: 'q-retry',
+      answers,
+    });
+    receive(question);
+    receive({ type: 'ask_user_resolved', request_id: 'other-question', accepted: true });
+    expect(result.current.pendingInputRequests[0]?.submitting).toBe(true);
+    receive({
+      type: 'error',
+      code: 'question_answer_rejected',
+      request_id: 'q-retry',
+      error: 'Menu is not ready',
+    });
+    expect(result.current.pendingInputRequests[0]).toMatchObject({
+      submitting: false,
+      error: 'Menu is not ready',
+    });
+    act(() => result.current.respondToInput('q-retry', answers));
+    expect(sendJson).toHaveBeenCalledTimes(2);
+    act(() => wsHandlers.onClose?.());
+    expect(result.current.pendingInputRequests[0]).toMatchObject({
+      submitting: true,
+      error: expect.stringContaining('Connection lost'),
+    });
+    act(() => wsHandlers.onOpen?.());
+    receive(question);
+    act(() => result.current.respondToInput('q-retry', answers));
+    expect(sendJson).toHaveBeenCalledTimes(2);
+    receive({ type: 'ask_user_resolved', request_id: 'q-retry', accepted: true });
+    expect(result.current.pendingInputRequests).toEqual([]);
+  });
+
+  it('allows retry after an unsent answer and disables native recovery questions', async () => {
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    act(() => {
+      wsHandlers.onOpen?.();
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'ask_user_question',
+          request_id: 'q',
+          questions: [{ question: 'Name?', options: [] }],
+        }),
+      );
+    });
+    sendJson.mockReturnValueOnce(false);
+    act(() => result.current.respondToInput('q', ['release']));
+    expect(result.current.pendingInputRequests[0]).toMatchObject({
+      submitting: false,
+      error: expect.stringContaining('not sent'),
+    });
+    act(() => result.current.respondToInput('q', ['release']));
+    expect(sendJson).toHaveBeenCalledTimes(2);
+    act(() =>
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'error',
+          code: 'question_recovery_required',
+          request_id: 'q',
+          error: 'Inspect native session',
+        }),
+      ),
+    );
+    act(() => result.current.respondToInput('q', ['release']));
+    expect(sendJson).toHaveBeenCalledTimes(2);
+    expect(result.current.pendingInputRequests[0]).toMatchObject({
+      answerable: false,
+      error: 'Inspect native session',
+    });
+  });
+
+  it('reconciles a lost resolution after reconnect without resending the answer', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => ({
+      ok: true,
+      json: async () =>
+        String(input).endsWith('/api/control-state') ? { questions: [] } : { turns: [] },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { result } = renderHook(() => useSkuldChat('ws://localhost:8080/s/test/session'));
+    await waitFor(() => expect(result.current.historyLoaded).toBe(true));
+    act(() => {
+      wsHandlers.onOpen?.();
+      wsHandlers.onMessage?.(
+        JSON.stringify({
+          type: 'ask_user_question',
+          request_id: 'lost',
+          questions: [{ question: 'Name?', options: [] }],
+        }),
+      );
+    });
+    act(() => result.current.respondToInput('lost', ['release']));
+    act(() => wsHandlers.onClose?.());
+    act(() => wsHandlers.onOpen?.());
+    await waitFor(() => expect(result.current.pendingInputRequests).toEqual([]));
+    expect(sendJson).toHaveBeenCalledTimes(1);
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => String(url) === `${window.location.origin}/s/test/api/control-state`,
+      ),
+    ).toBe(true);
   });
 
   it('ignores malformed clarification requests and clears pending input', async () => {
@@ -1230,7 +1393,7 @@ page_path: council/demo/opinion-b.md
     expect(result.current.pendingInputRequests).toEqual([
       {
         requestId: 'input-clear',
-        questions: [{ prompt: 'Provide a release note', choices: [] }],
+        questions: [{ prompt: 'Provide a release note', choices: [], descriptions: [] }],
       },
     ]);
 

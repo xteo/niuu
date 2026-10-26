@@ -231,51 +231,55 @@ describe('SessionsPage', () => {
     );
   });
 
-  it('keeps pinned sessions above every grouping and state filter without duplicate rows', async () => {
-    const sessions = [
-      makeSession({
-        id: 'active-pin',
-        name: 'active-review',
-        personaName: 'dev',
-        state: 'running',
-      }),
-      makeSession({ id: 'idle-pin', name: 'idle-review', personaName: 'dev', state: 'idle' }),
-      makeSession({
-        id: 'archived-pin',
-        name: 'archived-review',
-        personaName: 'dev',
-        state: 'archived',
-      }),
-      makeSession({ id: 'other', name: 'other-review', personaName: 'dev', state: 'running' }),
-    ];
-    localStorage.setItem(
-      'niuu.forge.pinnedSessions',
-      '["idle-pin","active-pin","archived-pin","missing"]',
+  it('keeps matching pins first while respecting every state filter and grouping', async () => {
+    const states = [
+      ['active-pin', 'running'],
+      ['idle-pin', 'idle'],
+      ['stopped-pin', 'terminated'],
+      ['archived-pin', 'archived'],
+    ] as const;
+    const sessions = states.map(([id, state]) =>
+      makeSession({ id, name: id, personaName: 'dev', state }),
     );
+    sessions.push(
+      makeSession({ id: 'other', name: 'other', personaName: 'dev', state: 'running' }),
+    );
+    const pins = ['idle-pin', 'active-pin', 'stopped-pin', 'archived-pin', 'missing'];
+    localStorage.setItem('niuu.forge.pinnedSessions', JSON.stringify(pins));
     wrap(createSessionStoreWithSessions(sessions));
-    const pinned = await screen.findByTestId('pod-group-pinned');
-    expect(
-      within(pinned)
-        .getAllByTestId(/^pod-entry-[^-]+-pin$/)
-        .map((row) => row.dataset.testid),
-    ).toEqual(['pod-entry-idle-pin', 'pod-entry-active-pin', 'pod-entry-archived-pin']);
+    await screen.findByTestId('pod-group-pinned');
+    const expected: Record<string, string[]> = {
+      live: ['idle-pin', 'active-pin'],
+      active: ['active-pin'],
+      idle: ['idle-pin'],
+      attention: [],
+      stopped: ['stopped-pin'],
+      failed: [],
+      all: ['idle-pin', 'active-pin', 'stopped-pin', 'archived-pin'],
+      archived: ['archived-pin'],
+    };
     for (const mode of ['state', 'repo', 'forge', 'project']) {
       fireEvent.click(screen.getByTestId(`pod-group-mode-${mode}`));
-      for (const filter of [
-        'live',
-        'active',
-        'idle',
-        'attention',
-        'stopped',
-        'failed',
-        'all',
-        'archived',
-      ]) {
+      for (const [filter, visible] of Object.entries(expected)) {
         fireEvent.click(screen.getByTestId(`session-filter-${filter}`));
-        expect(screen.getAllByTestId('pod-entry-active-pin')).toHaveLength(1);
-        expect(within(pinned).getByTestId('pod-entry-archived-pin')).toBeInTheDocument();
+        const group = screen.queryByTestId('pod-group-pinned');
+        if (!visible.length) expect(group).not.toBeInTheDocument();
+        for (const [id] of states) {
+          expect(screen.queryAllByTestId(`pod-entry-${id}`)).toHaveLength(
+            visible.includes(id) ? 1 : 0,
+          );
+        }
+        if (group)
+          expect(
+            within(group)
+              .getAllByTestId(/^pod-entry-[^-]+-pin$/)
+              .map((row) => row.dataset.testid),
+          ).toEqual(visible.map((id) => `pod-entry-${id}`));
       }
     }
+    expect(JSON.parse(localStorage.getItem('niuu.forge.pinnedSessions')!)).toEqual(pins);
+    fireEvent.click(screen.getByTestId('session-filter-live'));
+    const pinned = screen.getByTestId('pod-group-pinned');
     fireEvent.click(within(pinned).getByRole('button', { name: /^Pinned/ }));
     expect(within(pinned).queryByTestId('pod-entry-active-pin')).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId('pod-group-mode-state'));

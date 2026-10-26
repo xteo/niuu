@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ChatMessagePart,
   ContentBlock,
+  InputAnswer,
   InputRequest,
   MeshEvent,
   MeshOutcomeEvent,
@@ -138,9 +139,14 @@ type CliStreamEvent = {
   request_id?: string;
   code?: string;
   questions?: Array<{
+    id?: string;
+    header?: string;
+    multiSelect?: boolean;
     question?: string;
-    options?: Array<{ label?: string } | unknown>;
+    options?: Array<{ label?: string; description?: string } | unknown>;
   }>;
+  answerable?: boolean;
+  recovery_required?: boolean;
   tool?: string;
   input?: Record<string, unknown>;
   participant?: WireParticipant;
@@ -239,7 +245,7 @@ interface UseSkuldChatResult {
   publishEvent: (target: AgentEventTarget, text: string) => void;
   sendResendPrompt: () => void;
   respondToPermission: (requestId: string, behavior: PermissionBehavior) => void;
-  respondToInput: (requestId: string, values: string[]) => void;
+  respondToInput: (requestId: string, values: (string | InputAnswer)[]) => void;
   sendInterrupt: () => void;
   sendSetModel: (model: string) => void;
   sendSetThinkingTokens: (tokens: number) => void;
@@ -756,6 +762,7 @@ export function useSkuldChat(
   );
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingInputRequests, setPendingInputRequests] = useState<InputRequest[]>([]);
+  const submittingInputRequestsRef = useRef(new Set<string>());
   const [availableCommandsState, setAvailableCommandsState] = useState<{
     url: string | null;
     commands: SlashCommand[];
@@ -1786,6 +1793,8 @@ export function useSkuldChat(
               }
             }
             finalizeStreaming(event.is_error ? 'error' : 'done', event.result ?? undefined);
+            submittingInputRequestsRef.current.clear();
+            setPendingInputRequests([]);
             break;
           }
           case 'error': {
@@ -1795,6 +1804,24 @@ export function useSkuldChat(
                 : (event.error?.message ??
                   (typeof event.content === 'string' ? event.content : 'Unknown error'));
             if (event.code && event.request_id) {
+              if (event.code.startsWith('question_')) {
+                submittingInputRequestsRef.current.delete(event.request_id);
+                setPendingInputRequests((previous) =>
+                  previous.map((request) =>
+                    request.requestId === event.request_id
+                      ? {
+                          ...request,
+                          submitting: false,
+                          error: errorMessage,
+                          ...(event.code === 'question_recovery_required'
+                            ? { answerable: false }
+                            : {}),
+                        }
+                      : request,
+                  ),
+                );
+                break;
+              }
               optimisticUserMessagesRef.current.delete(event.request_id);
               setMessages((previous) => [
                 ...previous.map((message) =>
@@ -2007,6 +2034,9 @@ export function useSkuldChat(
               return [
                 {
                   prompt,
+                  ...(typeof question.id === 'string' ? { id: question.id } : {}),
+                  ...(typeof question.header === 'string' ? { header: question.header } : {}),
+                  ...(question.multiSelect ? { multiSelect: true } : {}),
                   choices: options
                     .map((option) =>
                       option &&
@@ -2017,6 +2047,19 @@ export function useSkuldChat(
                         : '',
                     )
                     .filter(Boolean),
+                  descriptions: options.flatMap((option) =>
+                    option &&
+                    typeof option === 'object' &&
+                    'label' in option &&
+                    typeof option.label === 'string' &&
+                    option.label
+                      ? [
+                          'description' in option && typeof option.description === 'string'
+                            ? option.description
+                            : '',
+                        ]
+                      : [],
+                  ),
                 },
               ];
             });
@@ -2024,15 +2067,25 @@ export function useSkuldChat(
             const inputRequest: InputRequest = {
               requestId: event.request_id,
               questions: normalizedQuestions,
+              ...(event.answerable === false ||
+              event.recovery_required ||
+              event.metadata?.answerable === false ||
+              event.metadata?.recovery_required
+                ? { answerable: false }
+                : {}),
             };
-            setPendingInputRequests((prev) => [
-              ...prev.filter((request) => request.requestId !== inputRequest.requestId),
-              inputRequest,
-            ]);
+            setPendingInputRequests((prev) => {
+              const previous = prev.find((request) => request.requestId === inputRequest.requestId);
+              return [
+                ...prev.filter((request) => request.requestId !== inputRequest.requestId),
+                { ...previous, ...inputRequest },
+              ];
+            });
             break;
           }
           case 'ask_user_resolved': {
             if (!event.request_id) break;
+            submittingInputRequestsRef.current.delete(event.request_id);
             setPendingInputRequests((prev) =>
               prev.filter((request) => request.requestId !== event.request_id),
             );
@@ -2339,10 +2392,51 @@ export function useSkuldChat(
     onMessage: handleMessage,
     onClose: () => {
       setConnected(false);
+      setPendingInputRequests((previous) =>
+        previous.map((request) =>
+          request.submitting
+            ? {
+                ...request,
+                error:
+                  'Connection lost before confirmation. Waiting for the session to confirm; check its terminal if this persists.',
+              }
+            : request,
+        ),
+      );
       finalizeStreaming();
     },
     onError: () => setConnected(false),
   });
+
+  useEffect(() => {
+    // A resolution frame can be lost with the socket. Reconcile only submissions
+    // from the previous connection against the authoritative live control list;
+    // never resend native input or infer that an absent question was accepted.
+    if (!connected || connectionVersion < 2 || !url) return;
+    const requestIds = new Set(submittingInputRequestsRef.current);
+    const base = wsUrlToHttpBase(url);
+    if (!requestIds.size || !base) return;
+    const controller = new AbortController();
+    const endpoint = new URL('api/control-state', base.endsWith('/') ? base : `${base}/`);
+    void fetch(endpoint, { headers: getAuthHeaders(), signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const state = await response.json();
+        if (controller.signal.aborted || !Array.isArray(state.questions)) return;
+        const pendingIds = new Set(
+          state.questions.map((question: { request_id?: string }) => question?.request_id),
+        );
+        const resolvedIds = new Set([...requestIds].filter((id) => !pendingIds.has(id)));
+        for (const id of resolvedIds) submittingInputRequestsRef.current.delete(id);
+        setPendingInputRequests((previous) =>
+          previous.filter((request) => !resolvedIds.has(request.requestId)),
+        );
+      })
+      .catch(() => {
+        // Keep unconfirmed controls visible; failure is not evidence of delivery.
+      });
+    return () => controller.abort();
+  }, [connected, connectionVersion, url]);
 
   useEffect(() => {
     if (!connected || !capabilities.slash_commands) return;
@@ -2541,15 +2635,76 @@ export function useSkuldChat(
   );
 
   const respondToInput = useCallback(
-    (requestId: string, values: string[]) => {
-      sendJson({
-        type: 'ask_user_answer',
-        request_id: requestId,
-        answers: values.map((answer) => ({ answer })),
-      });
-      setPendingInputRequests((prev) => prev.filter((request) => request.requestId !== requestId));
+    (requestId: string, values: (string | InputAnswer)[]) => {
+      const request = pendingInputRequests.find((item) => item.requestId === requestId);
+      if (
+        !request ||
+        request.answerable === false ||
+        submittingInputRequestsRef.current.has(requestId)
+      )
+        return;
+      if (!connected) {
+        setPendingInputRequests((previous) =>
+          previous.map((item) =>
+            item.requestId === requestId
+              ? { ...item, error: 'Reconnect before sending your answer.' }
+              : item,
+          ),
+        );
+        return;
+      }
+      submittingInputRequestsRef.current.add(requestId);
+      setPendingInputRequests((previous) =>
+        previous.map((item) =>
+          item.requestId === requestId ? { ...item, submitting: true, error: undefined } : item,
+        ),
+      );
+      try {
+        const sent = sendJson({
+          type: 'ask_user_answer',
+          request_id: requestId,
+          answers: values.map((answer, index) => {
+            if (typeof answer !== 'string') return answer;
+            const question = request.questions[index];
+            const optionIndex = question?.choices.indexOf(answer) ?? -1;
+            return {
+              answer,
+              question: question?.prompt,
+              ...(question?.id ? { question_id: question.id } : {}),
+              ...(optionIndex < 0 ? { free_text: answer } : { option_indexes: [optionIndex] }),
+            };
+          }),
+        });
+        if (sent === false) {
+          submittingInputRequestsRef.current.delete(requestId);
+          setPendingInputRequests((previous) =>
+            previous.map((item) =>
+              item.requestId === requestId
+                ? {
+                    ...item,
+                    submitting: false,
+                    error: 'Answer was not sent. Reconnect and try again.',
+                  }
+                : item,
+            ),
+          );
+        }
+      } catch {
+        // An interrupted write may have reached Claude; never automatically resend.
+        setPendingInputRequests((previous) =>
+          previous.map((item) =>
+            item.requestId === requestId
+              ? {
+                  ...item,
+                  error:
+                    'Answer delivery is uncertain. Waiting for confirmation; check the session terminal if this persists.',
+                }
+              : item,
+          ),
+        );
+      }
     },
-    [sendJson],
+    [connected, pendingInputRequests, sendJson],
   );
 
   const clearMessages = useCallback(() => {
@@ -2558,6 +2713,7 @@ export function useSkuldChat(
     setAgentEvents(new Map());
     setPendingPermissions([]);
     setPendingInputRequests([]);
+    submittingInputRequestsRef.current.clear();
     internalStreamsRef.current.clear();
     resetStreaming();
   }, [resetStreaming]);

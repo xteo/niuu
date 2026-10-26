@@ -657,17 +657,17 @@ export function SessionsPage() {
         s.clusterId?.toLowerCase().includes(q),
     );
   }, [allSessions, searchQuery]);
-  const pinnedSessions = useMemo(() => {
-    const byId = new Map(searchedSessions.map((session) => [session.id, session]));
-    return pinnedIds.flatMap((id) => {
-      const session = byId.get(id);
-      return session ? [session] : [];
-    });
-  }, [searchedSessions, pinnedIds]);
   const filteredSessions = useMemo(
     () => searchedSessions.filter((session) => matchesSessionFilter(session, filter)),
     [searchedSessions, filter],
   );
+  const pinnedSessions = useMemo(() => {
+    const byId = new Map(filteredSessions.map((session) => [session.id, session]));
+    return pinnedIds.flatMap((id) => {
+      const session = byId.get(id);
+      return session ? [session] : [];
+    });
+  }, [filteredSessions, pinnedIds]);
   const unpinnedSessions = useMemo(
     () => filteredSessions.filter((session) => !pinned.has(session.id)),
     [filteredSessions, pinned],

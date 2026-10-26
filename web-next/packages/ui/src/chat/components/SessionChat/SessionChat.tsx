@@ -5,7 +5,6 @@ import {
   useRef,
   useEffect,
   useLayoutEffect,
-  type FormEvent,
   type ReactNode,
 } from 'react';
 import {
@@ -40,6 +39,7 @@ import { MeshSidebar } from '../MeshSidebar';
 import { AgentDetailPanel } from '../AgentDetailPanel';
 import { ChatInput } from '../ChatInput';
 import { SessionEmptyChat } from '../ChatEmptyStates';
+import { InputRequestForm } from './InputRequestForm';
 import { MarkdownContent } from '../MarkdownContent';
 import { extractOutcomeBlock } from '../OutcomeCard';
 import { Dialog, DialogContent } from '../../../primitives/Dialog';
@@ -48,6 +48,7 @@ import type {
   AgentEventTarget,
   ChatMessage,
   ChatMessagePart,
+  InputAnswer,
   InputRequest,
   RoomParticipant,
   MeshEvent,
@@ -182,80 +183,6 @@ function DefaultPermissionRequests({
   );
 }
 
-function InputRequestForm({
-  request,
-  onRespond,
-}: {
-  request: InputRequest;
-  onRespond: (requestId: string, values: string[]) => void;
-}) {
-  const [values, setValues] = useState(() => request.questions.map(() => ''));
-  const submit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const responses = values.map((value) => value.trim());
-    if (responses.some((value) => !value)) return;
-    onRespond(request.requestId, responses);
-  };
-
-  return (
-    <section className="niuu-chat-request">
-      <form className="niuu-chat-request-copy" onSubmit={submit}>
-        <strong className="niuu-chat-request-title">Input required</strong>
-        {request.questions.map((question, index) => {
-          const inputId = `input-request-${request.requestId}-${index}`;
-          return (
-            <div className="niuu-chat-request-question" key={inputId}>
-              <label className="niuu-chat-request-prompt" htmlFor={inputId}>
-                {question.prompt}
-              </label>
-              {question.choices.length > 0 && (
-                <div className="niuu-chat-request-choices" aria-label="Suggested responses">
-                  {question.choices.map((choice) => (
-                    <button
-                      type="button"
-                      className="niuu-chat-request-button"
-                      key={choice}
-                      onClick={() =>
-                        setValues((current) =>
-                          current.map((value, valueIndex) =>
-                            valueIndex === index ? choice : value,
-                          ),
-                        )
-                      }
-                    >
-                      {choice}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <input
-                id={inputId}
-                className="niuu-chat-request-input"
-                value={values[index] ?? ''}
-                onChange={(event) =>
-                  setValues((current) =>
-                    current.map((value, valueIndex) =>
-                      valueIndex === index ? event.target.value : value,
-                    ),
-                  )
-                }
-                placeholder="Type a response"
-              />
-            </div>
-          );
-        })}
-        <button
-          type="submit"
-          className="niuu-chat-request-button niuu-chat-request-button--primary"
-          disabled={values.some((value) => !value.trim())}
-        >
-          Submit
-        </button>
-      </form>
-    </section>
-  );
-}
-
 export interface SessionChatProps {
   /** All completed messages */
   messages: readonly ChatMessage[];
@@ -340,7 +267,7 @@ export interface SessionChatProps {
   onRegenerate?: (messageId: string) => void;
   onBookmark?: (messageId: string, bookmarked: boolean) => void;
   onPermissionRespond?: (requestId: string, behavior: PermissionBehavior) => void;
-  onInputRespond?: (requestId: string, values: string[]) => void;
+  onInputRespond?: (requestId: string, values: (string | InputAnswer)[]) => void;
   onFetchFiles?: (path: string, apiBase: string) => Promise<FileEntry[]>;
   onMessageCountChange?: (count: number) => void;
 
@@ -865,7 +792,7 @@ export function SessionChat({
   );
 
   const handleInputRespond = useCallback(
-    (requestId: string, values: string[]) => {
+    (requestId: string, values: (string | InputAnswer)[]) => {
       onInputRespond?.(requestId, values);
     },
     [onInputRespond],
@@ -1337,6 +1264,7 @@ export function SessionChat({
                   <InputRequestForm
                     key={request.requestId}
                     request={request}
+                    disabled={!connected}
                     onRespond={handleInputRespond}
                   />
                 ))}

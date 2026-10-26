@@ -4132,6 +4132,7 @@ function LiveSessionDetailPageInner({
                     meshEvents={chat.meshEvents}
                     agentEvents={chat.agentEvents}
                     pendingPermissions={chat.pendingPermissions}
+                    pendingInputRequests={chat.pendingInputRequests}
                     availableCommands={chat.availableCommands}
                     capabilities={chat.capabilities}
                     chatEndpoint={chatEndpoint}
@@ -4146,6 +4147,7 @@ function LiveSessionDetailPageInner({
                     onSetThinkingTokens={chat.sendSetThinkingTokens}
                     onRewindFiles={chat.sendRewindFiles}
                     onPermissionRespond={chat.respondToPermission}
+                    onInputRespond={chat.respondToInput}
                     onFetchFiles={fetchSessionMentionFiles}
                     onMessageCountChange={setVisibleMessageCount}
                     renderPermissions={permissionRenderer}

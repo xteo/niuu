@@ -577,6 +577,8 @@ function mockChatState(overrides: Partial<ReturnType<typeof chatHooks.useSkuldCh
     meshEvents: [],
     agentEvents: new Map(),
     pendingPermissions: [],
+    pendingInputRequests: [],
+    respondToInput: vi.fn(),
     capabilities: {},
     sendMessage: vi.fn(),
     sendDirectedMessages: vi.fn(),
@@ -726,6 +728,36 @@ describe('LiveSessionDetailPage', () => {
     await waitFor(() => {
       expect(screen.queryByText('Human Gate Requested')).not.toBeInTheDocument();
     });
+  });
+
+  it('surfaces a Claude question in Forge and sends the selected answer', async () => {
+    const respondToInput = vi.fn();
+    mockChatState({
+      pendingInputRequests: [
+        {
+          requestId: 'claude-question',
+          questions: [
+            {
+              prompt: 'Which host should run this?',
+              choices: ['Thor', 'Build Bro'],
+              descriptions: ['Local host', 'Remote builder'],
+            },
+          ],
+        },
+      ],
+      respondToInput,
+    });
+    wrap('test-session-id-1234');
+    await screen.findByTestId('live-session-detail-page');
+    fireEvent.click(await screen.findByRole('button', { name: 'Build Bro' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Submit', exact: true }));
+    expect(respondToInput).toHaveBeenCalledWith('claude-question', [
+      {
+        question: 'Which host should run this?',
+        answer: 'Build Bro',
+        option_indexes: [1],
+      },
+    ]);
   });
 
   it('hides the gate card once the latest gate verdict is already resolved', async () => {

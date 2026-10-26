@@ -78,7 +78,7 @@ async function fixture(page: Page, rich = false) {
     route.fulfill({
       json: {
         ...baseConfig,
-        theme: 'xteo',
+        theme: 'midnight-blue',
         services: {
           ...baseConfig.services,
           setup: { mode: 'http', baseUrl: '/api/v1/niuu/setup' },
@@ -251,7 +251,7 @@ test('renames from the title and sidebar, persisting through a reload', async ({
   ]);
 });
 
-test('pins from the title and sidebar above every grouping and state, remembering collapse and pins', async ({
+test('pins above every grouping while respecting filters and remembering collapse', async ({
   page,
 }, testInfo) => {
   const mutations = await fixture(page);
@@ -276,15 +276,17 @@ test('pins from the title and sidebar above every grouping and state, rememberin
   await expect(page.getByTestId('pod-group-lexi').getByTestId('pod-entry-idle')).toBeVisible();
   for (const state of ['active', 'idle', 'attention', 'stopped', 'failed', 'all', 'archived']) {
     await page.getByTestId(`session-filter-${state}`).click();
-    await expect(pinned.getByTestId('pod-entry-review')).toBeVisible();
+    if (['active', 'all'].includes(state))
+      await expect(pinned.getByTestId('pod-entry-review')).toBeVisible();
+    else await expect(pinned.getByTestId('pod-entry-review')).toHaveCount(0);
   }
   const archived = page.getByTestId('pod-entry-archived').locator('..');
   await archived.hover();
   await archived.getByRole('button', { name: 'Pin Earlier iteration' }).click();
   await page.getByTestId('session-filter-live').click();
-  await expect(pinned.getByTestId('pod-entry-archived')).toBeVisible();
+  await expect(pinned.getByTestId('pod-entry-archived')).toHaveCount(0);
   await expect(pinned.getByTestId('pod-entry-review')).toBeVisible();
-  await expect(page.getByTestId('pod-entry-archived')).toHaveCount(1);
+  await expect(page.getByTestId('pod-entry-archived')).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath('pinned-sessions.png'),
     animations: 'disabled',
@@ -297,10 +299,12 @@ test('pins from the title and sidebar above every grouping and state, rememberin
   );
   await pinned.getByRole('button', { name: /^Pinned/ }).click();
   await expect(pinned.getByTestId('pod-entry-review')).toBeVisible();
+  await page.getByTestId('session-filter-archived').click();
   await page.getByTestId('pod-search').fill('Earlier');
   await expect(pinned.getByTestId('pod-entry-review')).toHaveCount(0);
   await expect(pinned.getByTestId('pod-entry-archived')).toBeVisible();
   await page.getByTestId('pod-search').clear();
+  await page.getByTestId('session-filter-live').click();
   await title.getByRole('button', { name: 'Unpin Forge UX review' }).click();
   await expect(page.getByTestId('pod-group-lexi').getByTestId('pod-entry-review')).toBeVisible();
   await expect(pinned.getByTestId('pod-entry-review')).toHaveCount(0);
@@ -523,7 +527,7 @@ test('sidebar prioritizes live filters, settings, project trees and searchable i
   const sidebar = page.getByRole('navigation', { name: 'Session list' });
   await expect(sidebar.locator('[data-filter]')).toHaveText([
     'Live3',
-    'Active1',
+    'Working1',
     'Idle1',
     'Needs you1',
     'Stopped1',
@@ -910,10 +914,11 @@ test('delayed history has one clean loading surface and reveals a long conversat
   });
   await page.route('**/api/v1/forge/sessions/review/conversation?*', async (route) => {
     await historyReady;
+    const pageSize = Number(new URL(route.request().url()).searchParams.get('limit'));
     await route.fulfill({
       json: {
-        turns: Array.from({ length: 50 }, (_, index) => {
-          const i = index + 50;
+        turns: Array.from({ length: pageSize }, (_, index) => {
+          const i = index + 100 - pageSize;
           return {
             id: `long-${i}`,
             role: 'assistant',
@@ -1047,4 +1052,219 @@ test('centers top-level navigation and keeps compact account controls clear at e
         animations: 'disabled',
       });
   }
+});
+
+test('compact composer grows with dictation, caps its height and shrinks after sending', async ({
+  page,
+}, testInfo) => {
+  await fixture(page);
+  await page.goto('/volundr/sessions/review');
+  const input = page.getByRole('textbox', { name: 'Message', exact: true });
+  const composer = page.getByTestId('chat-input');
+  const send = page.getByRole('button', { name: 'Send message', exact: true });
+  await expect(input).toBeEnabled();
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await input.fill('');
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeLessThanOrEqual(56);
+    const inputBox = (await input.boundingBox())!;
+    const sendBox = (await send.boundingBox())!;
+    expect(
+      Math.abs(inputBox.y + inputBox.height / 2 - sendBox.y - sendBox.height / 2),
+    ).toBeLessThan(2);
+    await expect(page.locator('.niuu-chat-input-area-outer')).toHaveCSS('border-top-width', '0px');
+    await composer.locator('input[type=file]').setInputFiles({
+      name: 'note.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('Review attachment'),
+    });
+    await expect(page.getByRole('button', { name: 'Remove note.txt' })).toBeVisible();
+    await page.getByRole('button', { name: 'Remove note.txt' }).click();
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeLessThanOrEqual(56);
+    await input.fill('A short voice note');
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeLessThanOrEqual(56);
+    await input.fill('A longer dictated note with enough words to wrap naturally. '.repeat(5));
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeGreaterThan(56);
+    await input.fill('Another line of the dictated note.\n'.repeat(30));
+    await expect.poll(async () => (await input.boundingBox())!.height).toBe(200);
+    expect(await input.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+    await input.fill('');
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeLessThanOrEqual(56);
+    await input.fill('Ready to continue.');
+    await send.click();
+    await expect(input).toHaveValue('');
+    await expect.poll(async () => (await composer.boundingBox())!.height).toBeLessThanOrEqual(56);
+    await page.screenshot({ path: testInfo.outputPath(`compact-composer-${width}.png`) });
+  }
+  // Resizing a sidebar/window must reflow an existing draft without another keystroke.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await input.fill('A draft that should reflow as the viewport narrows. '.repeat(3));
+  const wideHeight = (await input.boundingBox())!.height;
+  await page.setViewportSize({ width: 390, height: 900 });
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeGreaterThan(wideHeight);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect.poll(async () => (await input.boundingBox())!.height).toBe(wideHeight);
+});
+
+test('Lexi blue themes style the whole session, retain drafts and survive reloads', async ({
+  page,
+}, testInfo) => {
+  await fixture(page);
+  await page.goto('/volundr/sessions/review');
+  const input = page.getByRole('textbox', { name: 'Message', exact: true });
+  await expect(input).toBeEnabled();
+  await input.fill('Keep this draft while comparing blues.');
+  const picker = page.getByRole('combobox', { name: 'Color theme' });
+  for (const [theme, background, panel] of [
+    ['xteo', 'rgb(10, 14, 26)', 'rgb(12, 17, 30)'],
+    ['midnight-blue', 'rgb(16, 18, 22)', 'rgb(15, 18, 23)'],
+    ['deep-blue', 'rgb(13, 19, 32)', 'rgb(12, 21, 36)'],
+    ['dark-blue', 'rgb(12, 16, 24)', 'rgb(10, 16, 27)'],
+  ]) {
+    await picker.selectOption(theme);
+    await expect(input).toHaveValue('Keep this draft while comparing blues.');
+    await expect(page.locator('.niuu-shell')).toHaveCSS('background-color', background);
+    await expect(page.getByTestId('chat-input')).toHaveCSS('background-color', panel);
+    await expect(page.locator('.forge-session-list')).toHaveCSS('background-color', panel);
+    await expect(page.getByTestId('chat-input')).toHaveCSS('box-shadow', 'none');
+    expect(await page.evaluate(() => localStorage.getItem('niuu.theme'))).toBe(theme);
+    await page.screenshot({
+      path: testInfo.outputPath(`palette-${theme}.png`),
+      animations: 'disabled',
+    });
+  }
+  await page.reload();
+  await expect(picker).toHaveValue('dark-blue');
+  await expect(page.getByTestId('chat-input')).toHaveCSS('background-color', 'rgb(10, 16, 27)');
+  await picker.selectOption('ice');
+  await expect(page.locator('.niuu-shell')).toHaveCSS('background-color', 'rgb(9, 9, 11)');
+});
+
+test('Claude questions remain actionable through rejection and disappear only on confirmation', async ({
+  page,
+}, testInfo) => {
+  await fixture(page);
+  const answers: Record<string, unknown>[] = [];
+  let socket: import('@playwright/test').WebSocketRoute | undefined;
+  await page.routeWebSocket('ws://forge-ux-fixture.invalid/**', (ws) => {
+    socket = ws;
+    ws.onMessage((raw) => {
+      const frame = JSON.parse(String(raw));
+      if (frame.type === 'ask_user_answer') answers.push(frame);
+    });
+    ws.send(
+      JSON.stringify({
+        type: 'ask_user_question',
+        request_id: 'tty-live-question',
+        questions: [
+          {
+            header: 'Host',
+            question: 'Where should the build run?',
+            options: [
+              { label: 'Thor', description: 'Current workstation' },
+              { label: 'Build Bro', description: 'Remote builder' },
+            ],
+            multiSelect: false,
+          },
+        ],
+      }),
+    );
+  });
+  await page.goto('/volundr/sessions/review');
+  const card = page.getByRole('region', { name: 'Pending input requests' });
+  await expect(card).toBeVisible();
+  await card.getByRole('button', { name: 'Build Bro' }).click();
+  await card.getByRole('button', { name: 'Submit', exact: true }).click();
+  await expect.poll(() => answers.length).toBe(1);
+  expect(answers[0]).toMatchObject({
+    request_id: 'tty-live-question',
+    answers: [
+      {
+        question: 'Where should the build run?',
+        header: 'Host',
+        answer: 'Build Bro',
+        option_indexes: [1],
+      },
+    ],
+  });
+  await expect(card.getByRole('button', { name: 'Waiting for confirmation…' })).toBeDisabled();
+  socket!.send(
+    JSON.stringify({
+      type: 'error',
+      code: 'question_answer_rejected',
+      request_id: 'tty-live-question',
+      error: 'Menu is still rendering. Try again.',
+    }),
+  );
+  await expect(card.getByRole('alert')).toContainText('Menu is still rendering');
+  await expect(card.getByRole('button', { name: 'Build Bro' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await page.screenshot({
+    path: testInfo.outputPath('claude-question-desktop.png'),
+    animations: 'disabled',
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(card.getByRole('button', { name: 'Submit', exact: true })).toBeInViewport();
+  await page.screenshot({
+    path: testInfo.outputPath('claude-question-phone.png'),
+    animations: 'disabled',
+  });
+  await card.getByRole('button', { name: 'Submit', exact: true }).click();
+  await expect.poll(() => answers.length).toBe(2);
+  socket!.send(
+    JSON.stringify({
+      type: 'ask_user_resolved',
+      request_id: 'tty-live-question',
+      decision: 'Build Bro',
+      accepted: true,
+    }),
+  );
+  await expect(card).toHaveCount(0);
+});
+
+test('midnight is the default and the phone viewport cannot scroll into a white page', async ({
+  page,
+}, testInfo) => {
+  await fixture(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/volundr/sessions/review');
+  await expect(page.getByLabel('Color theme')).toHaveValue('midnight-blue');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'midnight-blue');
+  const metrics = await page.evaluate(() => {
+    const root = document.documentElement;
+    const body = document.body;
+    const surface = getComputedStyle(root).getPropertyValue('--color-bg-primary').trim();
+    window.scrollTo(0, 1000);
+    return {
+      surface,
+      rootBackground: getComputedStyle(root).backgroundColor,
+      bodyBackground: getComputedStyle(body).backgroundColor,
+      overscroll: getComputedStyle(root).overscrollBehaviorY,
+      bodyOverflow: getComputedStyle(body).overflowY,
+      scrollY: window.scrollY,
+      contentHeight: root.scrollHeight,
+      viewport: window.innerHeight,
+      shell: document.querySelector('.niuu-shell')!.getBoundingClientRect().height,
+      browserColor: document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content,
+    };
+  });
+  expect(metrics.rootBackground).toBe('rgb(16, 18, 22)');
+  expect(metrics.bodyBackground).toBe(metrics.rootBackground);
+  expect(metrics.overscroll).toBe('none');
+  expect(metrics.bodyOverflow).toBe('hidden');
+  expect(metrics.scrollY).toBe(0);
+  expect(metrics.contentHeight).toBeLessThanOrEqual(metrics.viewport);
+  expect(metrics.shell).toBe(metrics.viewport);
+  expect(metrics.browserColor).toBe(metrics.surface);
+  await page.setViewportSize({ width: 390, height: 600 });
+  await expect(page.locator('.niuu-shell')).toHaveCSS('height', '600px');
+  await page.getByLabel('Color theme').selectOption('deep-blue');
+  await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(13, 19, 32)');
+  await page.getByLabel('Color theme').selectOption('midnight-blue');
+  await page.screenshot({
+    path: testInfo.outputPath('midnight-phone.png'),
+    animations: 'disabled',
+  });
 });

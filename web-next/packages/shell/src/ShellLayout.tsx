@@ -235,6 +235,9 @@ export function ShellLayout() {
               onChange={(event) => setTheme(event.target.value as ThemeName)}
             >
               <option value="xteo">blue</option>
+              <option value="midnight-blue">Midnight Blue</option>
+              <option value="deep-blue">Deep Blue</option>
+              <option value="dark-blue">Dark Blue</option>
               <option value="ice">Native dark</option>
               <option value="amber">Amber</option>
               <option value="spring">Spring</option>

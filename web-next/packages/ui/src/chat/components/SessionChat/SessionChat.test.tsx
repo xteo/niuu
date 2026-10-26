@@ -722,6 +722,7 @@ describe('SessionChat', () => {
       <SessionChat
         {...defaultProps}
         pendingInputRequests={requests}
+        connected
         onInputRespond={onInputRespond}
       />,
     );
@@ -730,7 +731,13 @@ describe('SessionChat', () => {
     expect(screen.getByLabelText('Which environment should be deployed?')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Production' }));
     fireEvent.click(screen.getByRole('button', { name: 'Submit' }));
-    expect(onInputRespond).toHaveBeenCalledWith('input-1', ['Production']);
+    expect(onInputRespond).toHaveBeenCalledWith('input-1', [
+      {
+        question: 'Which environment should be deployed?',
+        answer: 'Production',
+        option_indexes: [1],
+      },
+    ]);
   });
 
   it('submits trimmed free-text clarification responses and rejects blank input', () => {
@@ -744,6 +751,7 @@ describe('SessionChat', () => {
             questions: [{ prompt: 'Name the release', choices: [] }],
           },
         ]}
+        connected
         onInputRespond={onInputRespond}
       />,
     );
@@ -755,7 +763,14 @@ describe('SessionChat', () => {
     fireEvent.change(input, { target: { value: '  July release  ' } });
     expect(submit).toBeEnabled();
     fireEvent.submit(input.closest('form')!);
-    expect(onInputRespond).toHaveBeenCalledWith('input-2', ['July release']);
+    expect(onInputRespond).toHaveBeenCalledWith('input-2', [
+      {
+        question: 'Name the release',
+        answer: 'July release',
+        free_text: 'July release',
+        option_indexes: [],
+      },
+    ]);
   });
 
   /* ── Room mode / MeshSidebar ── */

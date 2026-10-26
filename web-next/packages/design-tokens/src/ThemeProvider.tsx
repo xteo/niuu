@@ -8,7 +8,20 @@ import {
   type ReactNode,
 } from 'react';
 
-export type ThemeName = 'ice' | 'amber' | 'spring' | 'xteo';
+const THEME_NAMES = [
+  'ice',
+  'amber',
+  'spring',
+  'xteo',
+  'midnight-blue',
+  'deep-blue',
+  'dark-blue',
+] as const;
+export type ThemeName = (typeof THEME_NAMES)[number];
+
+function isThemeName(value: string | null): value is ThemeName {
+  return THEME_NAMES.some((name) => name === value);
+}
 
 interface ThemeContextValue {
   theme: ThemeName;
@@ -22,12 +35,11 @@ interface ThemeProviderProps {
   children: ReactNode;
 }
 
-export function ThemeProvider({ theme: initial = 'ice', children }: ThemeProviderProps) {
+export function ThemeProvider({ theme: initial = 'midnight-blue', children }: ThemeProviderProps) {
   const [theme, updateTheme] = useState<ThemeName>(() => {
     try {
       const saved = localStorage.getItem('niuu.theme');
-      if (saved === 'ice' || saved === 'amber' || saved === 'spring' || saved === 'xteo')
-        return saved;
+      if (isThemeName(saved)) return saved;
     } catch {
       /* Storage can be disabled; the configured theme still works. */
     }
@@ -44,6 +56,11 @@ export function ThemeProvider({ theme: initial = 'ice', children }: ThemeProvide
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    const browserColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    const surface = getComputedStyle(document.documentElement)
+      .getPropertyValue('--color-bg-primary')
+      .trim();
+    if (browserColor && surface) browserColor.content = surface;
   }, [theme]);
 
   const value = useMemo(() => ({ theme, setTheme }), [theme, setTheme]);
