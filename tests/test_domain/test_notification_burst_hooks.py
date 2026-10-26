@@ -83,3 +83,55 @@ async def test_broadcast_created_without_broadcaster_is_a_no_op():
             created_at=datetime(2026, 10, 22, tzinfo=UTC),
         )
     )
+
+
+async def test_burst_notice_live_event_carries_the_guild_instance():
+    """A burst notice is broadcast after its own commit; it still has the feed's shape,
+    including the node's Guild instance fields, like every other live notification."""
+    from niuu.domain.guild_membership import GuildInstance
+    from tests.test_domain.test_notification_service import InMemoryNotificationStore
+    from volundr.domain.notifications import NotificationSinkInfo
+    from volundr.domain.services.notifications import NotificationService
+
+    broadcaster = MockEventBroadcaster()
+    store = InMemoryNotificationStore()
+    guild = GuildInstance(id="i-thor", name="Thor", slug="thor")
+    service = NotificationService(
+        store.feed,
+        store.rule_repo,
+        store.outbox,
+        image_repository=store.images,
+        image_scheduler=store.image_scheduler,
+        broadcaster=broadcaster,
+        reply_ready_enabled=False,
+        reply_title_chars=40,
+        reply_body_chars=60,
+        sinks=[NotificationSinkInfo(name="ops", label="Ops")],
+        engine_resolver=lambda session: "claude",
+        guild_instance=guild,
+    )
+    session = _session()
+    candidate = service.burst_candidate(
+        session,
+        dedupe_key="artifact-burst:b4",
+        draft=NotificationDraft(kind="milestone", title="Deck published"),
+        metadata={"burst_id": "b4"},
+    )
+    await service.broadcast_created(
+        Notification(
+            id=candidate.id,
+            seq=9,
+            dedupe_key=candidate.dedupe_key,
+            session_id=session.id,
+            owner_id=candidate.owner_id,
+            kind=candidate.kind,
+            severity=candidate.severity,
+            source=candidate.source,
+            title=candidate.title,
+            metadata=candidate.metadata,
+            created_at=datetime(2026, 10, 22, tzinfo=UTC),
+        )
+    )
+    [event] = [e for e in broadcaster.events if e.type is EventType.SESSION_NOTIFICATION]
+    assert {key: event.data[key] for key in guild.fields()} == guild.fields()
+    assert event.data["source"] == "system"
