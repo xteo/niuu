@@ -329,6 +329,50 @@ async def test_outbox_claim_lease_fence_and_settle(pool):
     assert by_id[dead.id] == "dead" and by_id[quiet.id] == "suppressed"
 
 
+async def test_question_signals_survive_storage_and_the_outbox(pool):
+    """The ask and the runtime request live in metadata JSONB: the feed read and the
+    dispatcher's claimed notification both serve them exactly as recorded (LEX-1486)."""
+    repo = PostgresNotificationRepository(pool)
+    rules = PostgresNotificationRuleRepository(pool)
+    outbox = PostgresNotificationDeliveryRepository(pool, max_error_chars=50)
+    await rules.create(rule())
+    ask = {
+        "items": [
+            {
+                "id": "db",
+                "kind": "question",
+                "text": "Which database? 😀",
+                "options": [{"label": "Postgres", "description": "shared"}, {"label": "SQLite"}],
+                "multi_select": True,
+            },
+            {"id": "access", "kind": "action", "text": "Grant access."},
+        ]
+    }
+    asked = candidate(
+        "asked",
+        kind=NotificationKind.ATTENTION,
+        metadata={"turn_id": "asked", "question": True, "ask": ask},
+    )
+    blocked = candidate(
+        "blocked",
+        kind=NotificationKind.ATTENTION,
+        source=NotificationSource.SYSTEM,
+        metadata={"input_kind": "question", "request_id": "toolu_01"},
+    )
+    await repo.project([asked, blocked])
+
+    stored = await repo.get(asked.id)
+    assert stored.wire()["ask"] == ask and stored.wire()["question"] is True
+    runtime = (await repo.get(blocked.id)).wire()
+    assert runtime["input_request"] == {"kind": "question", "request_id": "toolu_01"}
+
+    claimed = {
+        item.notification.id: item for item in await outbox.claim_due(limit=5, lease_seconds=30)
+    }
+    assert claimed[asked.id].notification.wire()["ask"] == ask
+    assert claimed[blocked.id].notification.metadata["request_id"] == "toolu_01"
+
+
 async def test_expired_lease_is_reclaimed(pool):
     repo = PostgresNotificationRepository(pool)
     await PostgresNotificationRuleRepository(pool).create(rule())
