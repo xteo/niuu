@@ -18,6 +18,7 @@ from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
     NOTIFICATION_IMAGE_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
+    QUESTION_GUIDANCE,
 )
 from skuld.session_runtime import write_private_file
 
@@ -44,6 +45,10 @@ rules — on their phone or chat. It is how a long-running session gets the user
 ## When to notify
 
 {trigger_guidance}
+
+## Asking the user a question
+
+{question_guidance}
 
 ## How to write one
 
@@ -81,6 +86,7 @@ def forge_notify_skill_markdown(server_name: str) -> str:
         trigger_guidance=NOTIFICATION_TRIGGER_GUIDANCE,
         compact_guidance=COMPACT_NOTIFICATION_GUIDANCE,
         image_guidance=NOTIFICATION_IMAGE_GUIDANCE,
+        question_guidance=QUESTION_GUIDANCE,
     )
 
 

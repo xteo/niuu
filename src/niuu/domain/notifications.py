@@ -206,6 +206,40 @@ def notification_image_url(
     return f"{path}?{urlencode(params)}"
 
 
+#: The host-qualified question reference ``question:<host>:<notification uuid>``
+#: (control-plane identity §5b). A bare uuid is refused: a coordinator on one host
+#: relays another host's question by naming that host.
+QUESTION_REF_PATTERN = r"^question:[^:]+:[0-9a-f-]{36}$"
+
+#: The notice fields that carry question signals (F11b), stored in the notification's
+#: ``metadata`` and served on the read wire.
+QUESTION_FIELDS = ("question", "about_question")
+
+
+class QuestionAction(StrEnum):
+    """What a notice does to an earlier question (F11b, cp-api ``NotifyQuestionFields``).
+
+    Only the asking session may remind, replace, resolve or withdraw its question; any
+    session filed in the same project may relay it. The control plane enforces that and
+    records anything else as an error, never applied.
+    """
+
+    REMIND = "remind"
+    REPLACE = "replace"
+    RELAY = "relay"
+    RESOLVED = "resolved"
+    WITHDRAWN = "withdrawn"
+
+
+class AboutQuestion(BaseModel):
+    """The question a notice refers to, and what it does to it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=QUESTION_REF_PATTERN)
+    action: QuestionAction
+
+
 class NotificationDraft(BaseModel):
     """What a producer asks to publish; Forge adds identity, ownership and order."""
 
@@ -216,6 +250,23 @@ class NotificationDraft(BaseModel):
     links: list[NotificationLink] = Field(default_factory=list, max_length=MAX_LINKS)
     correlation_id: str | None = Field(default=None, max_length=MAX_CORRELATION_ID_CHARS)
     image: NotificationImageRef | None = None
+    question: bool | None = Field(
+        default=None,
+        description=(
+            "true declares a Question the user must answer; a notice that carries the "
+            "field (true or false) is never inferred to be one"
+        ),
+    )
+    about_question: AboutQuestion | None = None
+
+    def question_metadata(self) -> dict:
+        """The question signals this draft carries, for ``metadata`` (only those set)."""
+        out: dict = {}
+        if self.question is not None:
+            out["question"] = self.question
+        if self.about_question is not None:
+            out["about_question"] = self.about_question.model_dump(mode="json")
+        return out
 
     @field_validator("title")
     @classmethod
@@ -234,10 +285,11 @@ class NotificationDraft(BaseModel):
 def draft_payload(draft: NotificationDraft) -> dict[str, Any]:
     """The JSON a producer sends for a draft (a turn's notification, a submit body).
 
-    ``image`` appears only when one is attached, so drafts without an image keep the
-    exact shape older producers wrote and older Forge releases read.
+    ``image`` and the question signals appear only when set, so drafts without them
+    keep the exact shape older producers wrote and older Forge releases read.
     """
-    payload = draft.model_dump(mode="json", exclude={"image"})
+    payload = draft.model_dump(mode="json", exclude={"image", *QUESTION_FIELDS})
+    payload.update(draft.question_metadata())
     if draft.image is not None:
         payload["image"] = draft.image.wire()
     return payload

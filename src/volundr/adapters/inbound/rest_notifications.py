@@ -113,6 +113,17 @@ class NotificationResponse(BaseModel):
             "the resident's main room."
         ),
     )
+    question: bool | None = Field(
+        default=None,
+        description="true: the notice declares a Question for the user (F11b); null: unset",
+    )
+    about_question: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "{id: question:<host>:<uuid>, action: remind|replace|relay|resolved|withdrawn}: "
+            "the earlier question this notice refers to; null when none"
+        ),
+    )
     created_at: datetime
     image: NotificationImageResponse | None = Field(
         default=None,
