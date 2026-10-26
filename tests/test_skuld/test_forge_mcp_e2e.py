@@ -200,7 +200,8 @@ def _rpc(process: subprocess.Popen[bytes], request: dict[str, Any]) -> dict[str,
     return json.loads(line)
 
 
-def test_notify_round_trips_through_the_real_broker(broker, forge) -> None:
+@pytest.mark.parametrize("structured", [False, True], ids=["legacy", "structured-question"])
+def test_notify_round_trips_through_the_real_broker(broker, forge, structured) -> None:
     from skuld.forge_mcp.integration import forge_mcp_command
 
     command = [
@@ -214,6 +215,12 @@ def test_notify_round_trips_through_the_real_broker(broker, forge) -> None:
         "--max-concurrency",
         "2",
     ]
+    ask = {
+        "items": [
+            {"id": "choice", "kind": "question", "text": "Proceed?", "options": [{"label": "Yes"}]},
+            {"id": "access", "kind": "action", "text": "Grant the test account access."},
+        ]
+    }
     stdio = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -258,7 +265,11 @@ def test_notify_round_trips_through_the_real_broker(broker, forge) -> None:
                 "method": "tools/call",
                 "params": {
                     "name": "notify",
-                    "arguments": {"kind": "milestone", "title": "E2E milestone reached"},
+                    "arguments": {
+                        "kind": "attention" if structured else "milestone",
+                        "title": "E2E milestone reached",
+                        **({"question": True, "ask": ask} if structured else {}),
+                    },
                 },
             },
         )["result"]
@@ -287,6 +298,7 @@ def test_notify_round_trips_through_the_real_broker(broker, forge) -> None:
     assert entry["seq"] == receipt["session_seq"]
     turn_id, draft = draft_from_log_payload(entry["payload"])
     assert turn_id == receipt["turn_id"] and draft.title == "E2E milestone reached"
+    assert (draft.ask.wire() if draft.ask else None) == (ask if structured else None)
 
     # The loopback routes refuse callers without this start's secret.
     import urllib.error

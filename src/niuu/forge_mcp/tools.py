@@ -19,6 +19,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from niuu.domain.artifact_reports import ARTIFACT_REPORT_TYPES, ArtifactReport
 from niuu.domain.notifications import (
     AGENT_KINDS,
+    ASK_ITEM_ID_PATTERN,
+    MAX_ASK_BYTES,
+    MAX_ASK_HEADER_CHARS,
+    MAX_ASK_ITEM_ID_CHARS,
+    MAX_ASK_ITEMS,
+    MAX_ASK_OPTION_DESCRIPTION_CHARS,
+    MAX_ASK_OPTION_LABEL_CHARS,
+    MAX_ASK_OPTIONS,
+    MAX_ASK_TEXT_CHARS,
     MAX_BODY_CHARS,
     MAX_CORRELATION_ID_CHARS,
     MAX_IMAGE_ALT_CHARS,
@@ -230,6 +239,67 @@ def _object(properties: dict[str, Any], required: Iterable[str] = ()) -> dict[st
     }
 
 
+_ASK_SCHEMA = _object(
+    {
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_ASK_ITEMS,
+            "description": "Items with unique stable ids, in answer order.",
+            "items": _object(
+                {
+                    "id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_ASK_ITEM_ID_CHARS,
+                        "pattern": ASK_ITEM_ID_PATTERN,
+                    },
+                    "kind": {"type": "string", "enum": ["question", "action"]},
+                    "text": {"type": "string", "minLength": 1, "maxLength": MAX_ASK_TEXT_CHARS},
+                    "header": {"type": "string", "minLength": 1, "maxLength": MAX_ASK_HEADER_CHARS},
+                    "options": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_ASK_OPTIONS,
+                        "description": "Choices with unique, nonblank labels within this item.",
+                        "items": _object(
+                            {
+                                "label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MAX_ASK_OPTION_LABEL_CHARS,
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "maxLength": MAX_ASK_OPTION_DESCRIPTION_CHARS,
+                                },
+                            },
+                            required=("label",),
+                        ),
+                    },
+                    "multi_select": {"type": "boolean", "default": False},
+                    "allow_text": {"type": "boolean", "default": True},
+                },
+                required=("id", "kind", "text"),
+            ),
+        },
+    },
+    required=("items",),
+)
+_ASK_SCHEMA["description"] = (
+    f"Structured question/action items; requires question=true. At most {MAX_ASK_BYTES} "
+    "UTF-8 bytes as compact JSON. An action asks the user to report completion, never executes it."
+)
+_ASK_SCHEMA["properties"]["items"]["items"]["allOf"] = [
+    {
+        "if": {
+            "properties": {"kind": {"const": "question"}, "allow_text": {"const": False}},
+            "required": ["kind", "allow_text"],
+        },
+        "then": {"required": ["options"]},
+    }
+]
+
 _NOTIFY_SCHEMA = _object(
     {
         "kind": {
@@ -322,6 +392,7 @@ _NOTIFY_SCHEMA = _object(
                 "open in their Needs-you list until resolved. Omit it for announcements."
             ),
         },
+        "ask": _ASK_SCHEMA,
         "about_question": _object(
             {
                 "id": {
@@ -346,6 +417,12 @@ _NOTIFY_SCHEMA = _object(
     },
     required=("kind", "title"),
 )
+_NOTIFY_SCHEMA["allOf"] = [
+    {
+        "if": {"required": ["ask"]},
+        "then": {"required": ["question"], "properties": {"question": {"const": True}}},
+    }
+]
 
 _NOTIFY_DESCRIPTION = """\
 Notify the user about THIS session. The notification appears inline in the \
