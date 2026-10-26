@@ -316,6 +316,9 @@ export function ShellLayout() {
               <PopoverContent align="end" className="niuu-shell__theme-options">
                 {(
                   [
+                    ['midnight-blue', 'Midnight Blue'],
+                    ['deep-blue', 'Deep Blue'],
+                    ['dark-blue', 'Dark Blue'],
                     ['xteo', 'blue'],
                     ['ice', 'Native dark'],
                     ['amber', 'Amber'],
