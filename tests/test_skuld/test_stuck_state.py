@@ -33,12 +33,21 @@ def broker(tmp_path):
     return b
 
 
-def _transport(turn_active: bool) -> MagicMock:
-    transport = MagicMock()
-    transport.is_turn_active = turn_active
-    transport.session_id = None
-    transport.capabilities = MagicMock(steering_mode="native", slash_commands=False)
-    return transport
+class _TurnTrackingTransport:
+    """A transport that reports its own turn flag (like tmux, Codex, SDK)."""
+
+    def __init__(self, turn_active: bool) -> None:
+        self.turn_active = turn_active
+        self.session_id = None
+        self.capabilities = MagicMock(steering_mode="native", slash_commands=False)
+
+    @property
+    def is_turn_active(self) -> bool:
+        return self.turn_active
+
+
+def _transport(turn_active: bool) -> _TurnTrackingTransport:
+    return _TurnTrackingTransport(turn_active)
 
 
 async def _drain() -> None:
@@ -185,6 +194,24 @@ class TestF12cHeartbeatGuard:
         report.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_untracked_transport_is_never_guessed_idle(self, broker):
+        """A transport on the port's default is_turn_active (always False) is unknown."""
+        from niuu.ports.cli import CLITransport
+
+        class Untracked(CLITransport):
+            pass
+
+        Untracked.__abstractmethods__ = frozenset()
+        broker._transport = Untracked()
+        broker._last_transport_row_at = time.monotonic() - 601
+        assert broker._transport_tracks_turns() is False
+        with patch.object(broker, "_report_activity_state", new_callable=AsyncMock) as report:
+            assert await broker._heartbeat_guard("active") is False
+        report.assert_not_called()
+        broker._transport = None
+        assert broker._transport_tracks_turns() is False
+
+    @pytest.mark.asyncio
     async def test_awaiting_input_is_never_guarded(self, broker):
         broker._transport = _transport(turn_active=False)
         broker._last_transport_row_at = time.monotonic() - 10_000
@@ -236,7 +263,7 @@ class TestReplayProjectModeUx:
             await broker._handle_cli_event(frame)
             await _drain()
         # The transport ends its turn, then flushes the absorbed steer.
-        transport.is_turn_active = False
+        transport.turn_active = False
         with patch.object(broker, "_activate_user_turn", new_callable=AsyncMock):
             await broker._handle_cli_event(dict(FLUSH))
             await _drain()
@@ -288,3 +315,16 @@ class TestOpenControls:
         broker._pending_attention = {}
         assert broker._open_controls("awaiting_input") is None
         assert broker._open_controls("active") == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_names_the_gate_still_open(broker):
+    """Answering the gate the detail names re-points the detail at the remaining one."""
+    broker._activity_state = "awaiting_input"
+    broker._pending_attention = {"a": "permission", "b": "question"}
+    broker._activity_extra = {"kind": "question", "request_id": "b", "prompt": "Pick"}
+    with patch.object(broker, "_report_activity_state", new_callable=AsyncMock) as report:
+        await broker._exit_attention("b")
+    report.assert_awaited_once_with(
+        "awaiting_input", extra_metadata={"kind": "permission", "request_id": "a"}, force=True
+    )

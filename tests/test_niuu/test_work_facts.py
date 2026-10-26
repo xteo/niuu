@@ -93,7 +93,8 @@ def test_predicate_matches_reference():
 def test_hook_name_shapes():
     assert hook_name({"hook_event_name": "Stop"}) == "Stop"
     assert hook_name({"payload": {"hook_event_name": "PreToolUse"}}) == "PreToolUse"
-    assert hook_name({"payload": {"hookEventName": "PostToolUse"}}) == "PostToolUse"
+    assert hook_name({"payload": {"hookEventName": "PostToolUse"}}) == ""
+    assert hook_name({"hook": "Stop"}) == ""
     assert hook_name({"payload": "x"}) == ""
     assert hook_name(None) == ""
 

@@ -55,15 +55,19 @@ TURN_END_KIND = "result"
 
 
 def hook_name(payload: Mapping[str, Any] | None) -> str:
-    """The Claude hook event name carried by a ``claude_hook`` frame ("" if none)."""
+    """The Claude hook event name carried by a ``claude_hook`` frame ("" if none).
+
+    Reads exactly what Forge's ingest SQL reads: the frame's ``hook_event_name``, else
+    the raw hook payload's.
+    """
     if not isinstance(payload, Mapping):
         return ""
-    name = payload.get("hook_event_name") or payload.get("hook")
+    name = payload.get("hook_event_name")
     if name:
         return str(name)
     inner = payload.get("payload")
     if isinstance(inner, Mapping):
-        return str(inner.get("hook_event_name") or inner.get("hookEventName") or "")
+        return str(inner.get("hook_event_name") or "")
     return ""
 
 
