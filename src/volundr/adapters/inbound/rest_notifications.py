@@ -73,6 +73,20 @@ class NotificationImageResponse(BaseModel):
     alt: str | None = None
 
 
+class NotificationInputRequestResponse(BaseModel):
+    """The pending runtime request a system attention item stands for."""
+
+    kind: str = Field(description="question, confirmation or permission")
+    request_id: str | None = Field(
+        default=None,
+        description=(
+            "The pending request's id, as the session's question/permission card carries "
+            "it; answer it there (ask_user_answer / permission response). Null when the "
+            "runtime reported none."
+        ),
+    )
+
+
 class NotificationResponse(BaseModel):
     """Reader view: read through the host watermark or acknowledged individually."""
 
@@ -128,6 +142,13 @@ class NotificationResponse(BaseModel):
     ask: NotificationAsk | None = Field(
         default=None,
         description="Structured question/action items when question=true; null for legacy notices.",
+    )
+    input_request: NotificationInputRequestResponse | None = Field(
+        default=None,
+        description=(
+            "Set on a system attention item: the runtime request (AskUserQuestion, "
+            "confirmation, permission) the session or resident is blocked on; null otherwise."
+        ),
     )
     created_at: datetime
     image: NotificationImageResponse | None = Field(

@@ -152,6 +152,26 @@ class Notification(BaseModel):
         """The resident channel it is about; ``None`` is the main room (or no resident)."""
         return _metadata_text(self.metadata, RESIDENT_SESSION_ID_KEY)
 
+    @property
+    def input_request(self) -> dict[str, str | None] | None:
+        """The pending request a system ``attention`` item stands for, or ``None``.
+
+        ``{kind: question|confirmation|permission, request_id}``: the session (or
+        resident) is blocked on that request, and it is answered where the transcript's
+        question card answers it (``ask_user_answer`` / the permission response on the
+        session socket), never through the notification. ``request_id`` is null when
+        the runtime reported none. Agent notices carry ``question``/``ask`` instead.
+        """
+        if (
+            self.kind is not NotificationKind.ATTENTION
+            or self.source is not NotificationSource.SYSTEM
+        ):
+            return None
+        kind = _metadata_text(self.metadata, "input_kind")
+        if kind is None:
+            return None
+        return {"kind": kind, "request_id": _metadata_text(self.metadata, "request_id")}
+
     def wire(self) -> dict[str, Any]:
         """The ``NotificationResponse`` JSON without the per-reader ``read`` flag.
 
@@ -165,6 +185,7 @@ class Notification(BaseModel):
         data["question"] = self.metadata.get("question")
         data["about_question"] = self.metadata.get("about_question")
         data["ask"] = self.metadata.get("ask")
+        data["input_request"] = self.input_request
         data["image"] = self.image.wire(self.id) if self.image is not None else None
         data["image_state"] = self.image.state.value if self.image is not None else None
         data["image_error"] = self.image.error if self.image is not None else None

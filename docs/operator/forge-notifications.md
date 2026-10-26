@@ -224,6 +224,17 @@ the same route describes the Guild itself: `guild_url` is the Guild chart's `gui
 (its own public origin), and the instance is its embedded node, else its default node,
 else `null`.
 
+## Questions and runtime requests
+
+An agent asks the user something with `notify`'s `question: true`, optionally with a
+structured `ask: {items: [...]}` (questions with options, or actions the user reports as
+done), and refers to an earlier question with `about_question: {id, action}`. Forge
+stores these in the notification's metadata and serves them unchanged on the feed and
+the live event; the user's answer is an ordinary message to the session. A system
+`attention` item instead carries `input_request: {kind, request_id}`: the runtime request
+(AskUserQuestion, confirmation, permission) the session is blocked on, answered in the
+session's question card. Field rules: `docs/forge/session-notifications-contract.md` §12.
+
 ## Images
 
 An agent attaches an image with `notify`'s `image` input: `{"file_id": …}` from
