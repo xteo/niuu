@@ -548,6 +548,32 @@ class NotificationService(NotificationRecorder):
             raise RuntimeError(f"Deduplicated notification {candidate.id} is not readable")
         return existing, False
 
+    def burst_candidate(
+        self,
+        session: Session,
+        *,
+        dedupe_key: str,
+        draft: NotificationDraft,
+        metadata: dict,
+    ) -> NotificationCandidate:
+        """A ``system`` notice about ``session`` that another store commits (F1n).
+
+        The artifact hold inserts it in its own emission transaction, then hands the
+        committed row back to :meth:`broadcast_created`.
+        """
+        return self._candidate(
+            self._context(session),
+            dedupe_key=dedupe_key,
+            draft=draft,
+            source=NotificationSource.SYSTEM,
+            session_seq=None,
+            metadata=metadata,
+        )
+
+    async def broadcast_created(self, notification: Notification) -> None:
+        """Broadcast a notification committed outside :meth:`_record` (post-commit)."""
+        await self._broadcast(notification)
+
     def _context(self, session: Session) -> _SessionContext:
         coordination = session.coordination
         return _SessionContext(

@@ -2534,6 +2534,66 @@ def create_volundr_router(
             "instances": states,
         }
 
+    # -- artifact publications (F1/F1n) and host identity (F7): one node at a time --------
+
+    async def _artifact_read(request: Request, principal: Principal, path: str) -> dict[str, Any]:
+        instance = await _notification_target(request, principal)
+        payload = _remote_json(await _proxy_to(instance, request, method="GET", path=path))
+        if not isinstance(payload, dict):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unexpected Forge artifact response")
+        return {**payload, "instance_id": instance.id}
+
+    @router.get("/artifact-publications")
+    async def list_artifact_publications(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> dict[str, Any]:
+        """One node's publication feed (``after=<seq>``); ``scope=local`` pins this node."""
+        return await _artifact_read(request, principal, "/artifact-publications")
+
+    @router.get("/artifact-bursts")
+    async def list_artifact_bursts(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> dict[str, Any]:
+        """One node's bursts in change order (``after=<rev>``)."""
+        return await _artifact_read(request, principal, "/artifact-bursts")
+
+    @router.get("/artifact-bursts/{burst_id}")
+    async def get_artifact_burst(
+        request: Request, burst_id: UUID, principal: Principal = Depends(extract_principal)
+    ) -> dict[str, Any]:
+        return await _artifact_read(request, principal, f"/artifact-bursts/{burst_id}")
+
+    @router.post("/artifact-publications/backfill")
+    async def backfill_artifact_publications(
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Replay this node's durable log into publications (silent; admin only)."""
+        instance = await _local_session_instance(service, principal, request)
+        remote = await _proxy_to(
+            instance, request, method="POST", path="/artifact-publications/backfill", body=body
+        )
+        payload = _remote_json(remote)
+        return {**payload, "instance_id": instance.id} if isinstance(payload, dict) else {}
+
+    @router.get("/instance")
+    async def local_instance(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> dict[str, Any]:
+        """This node's self id and slug (F7) with the Forge's host and tailnet names."""
+        instance = await _local_session_instance(service, principal, request)
+        payload = _remote_json(await _proxy_to(instance, request, method="GET", path="/instance"))
+        identity = payload if isinstance(payload, dict) else {}
+        return {
+            "instance_id": instance.id,
+            "slug": instance.slug,
+            "name": instance.name,
+            "host": identity.get("host"),
+            "tailnet_name": identity.get("tailnet_name"),
+            "projects_instance_id": identity.get("instance_id"),
+        }
+
     @router.put("/notifications/read-state")
     async def put_notification_read_state(
         request: Request,

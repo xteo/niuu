@@ -156,6 +156,7 @@ class TestToolList:
         assert set(TOOL_NAMES) == {
             "environment",
             "notify",
+            "report_artifact",
             "describe_session",
             "list_notifications",
             "list_sessions",
@@ -520,7 +521,9 @@ class TestFeedNotify:
         assert schema["required"] == ["kind", "title", "idempotency_key"]
         assert {"session_id", "instance_id", "idempotency_key"} <= set(schema["properties"])
         assert "feed-only" in notify["description"]
-        assert [tool["name"] for tool in toolbox.list_tools()] == list(TOOL_NAMES)
+        assert [tool["name"] for tool in toolbox.list_tools()] == [
+            name for name in TOOL_NAMES if name != "report_artifact"
+        ]
 
     def test_transcript_mode_keeps_the_session_schema(self) -> None:
         toolbox, _, _ = _toolbox()
