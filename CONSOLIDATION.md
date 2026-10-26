@@ -360,7 +360,7 @@ broker, transcript or provider call on read.
 | `make test-forge-database` (scratch PG 16, 127.0.0.1) | **115 passed** (now incl. work-facts and usage real-PG tests) | 88 |
 | `helm lint charts/volundr` + `helm template` | pass; renders 000091/000092 and `session_usage.model_windows` | pass |
 | migration dry run on Thor + m6 ledger exports (B1a.3) | only 000091 + 000092 execute; second run a no-op | |
-| pre-push web-next build | run by the push hook (no `web-next` change) | |
+| web-next build | `pnpm build` pass (run explicitly: the pre-push hooks skip without a `web-next` change, and there is none) | pass |
 
 The failures are exactly B0's box-specific set, each reproduced on pure upstream `dev`
 (§6): 14 = `test_install_sh*` (10), `test_docker_container` recovery,
