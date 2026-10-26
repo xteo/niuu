@@ -230,6 +230,13 @@ class ArtifactService:
         if failures < self._max_emit_failures:
             return None
         self._emit_failures.pop(burst.burst_id, None)
+        logger.error(
+            "burst %s: settled without a notice after %d failed emissions "
+            "(artifacts.max_emit_failures); its suppress_reason is %r",
+            burst.burst_id,
+            failures,
+            EMIT_FAILED_REASON,
+        )
         await self._repository.settle(burst.burst_id, reason=EMIT_FAILED_REASON)
         return EmitResult(outcome=EmitOutcome.SETTLED)
 
