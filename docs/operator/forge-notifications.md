@@ -271,6 +271,20 @@ or tailnet hosts. Types: PNG, JPEG, GIF, WebP; at most 10 MiB and 40 megapixels.
 Pending copies left by a restart are claimed again after their lease. The worker logs
 under `volundr.domain.services.notification_images`.
 
+## Speak intent
+
+An agent may ask for a notification to be spoken aloud on the owner's phone with
+`notify`'s `speak` input: `{"text": "…", "priority": "now" | "next_window"}`. `text`
+is what is said (trimmed, 1–600 characters); `priority` defaults to `now`. Any agent
+kind may carry it, never `reply_ready`. An invalid intent is refused (MCP tool error,
+HTTP 422) and nothing is recorded.
+
+Forge only stores the intent and returns it as `speak` on every item (the feed, the
+per-session list and the live `session_notification` event; `null` when absent). It
+does not deliver or speak anything: the Lexi agent service reads the feed and decides
+whether and when the phone speaks. The web shows a "Spoken" badge on such items.
+Field rules: `docs/forge/session-notifications-contract.md` §13.
+
 ## Delivery rules and the outbox
 
 A rule selects notifications from its owner and names a sink:
@@ -601,6 +615,10 @@ state (`pending`/`ready`/`failed`, with a lease and attempt fence), and once sto
 original bytes, the thumbnail, their types and sizes. A partial index covers pending rows.
 Thor applied the same SQL as `000072_forge_notification_images` before upstream renumbered
 the notification migrations; `migrations/lineage-aliases.json` adopts that ledger row.
+
+Migration `000094_forge_notification_speak` adds `speak_text` and `speak_priority` to
+`forge_notifications` (both null, or both set with a check on length, priority and
+kind). It is additive: existing rows keep both null.
 
 The migrations live in `migrations/`; the Helm migrations configmap and the CLI bundle
 read them from there. Mini mode applies them at startup.

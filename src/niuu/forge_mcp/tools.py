@@ -35,6 +35,7 @@ from niuu.domain.notifications import (
     MAX_LINK_LABEL_CHARS,
     MAX_LINK_URL_CHARS,
     MAX_LINKS,
+    MAX_SPEAK_TEXT_CHARS,
     MAX_TITLE_CHARS,
     PRESENTED_FILE_ID_PATTERN,
     QUESTION_REF_PATTERN,
@@ -44,6 +45,7 @@ from niuu.domain.notifications import (
     NotificationSeverity,
     NotificationSource,
     QuestionAction,
+    SpeakPriority,
 )
 from niuu.domain.session_description import (
     DESCRIPTION_FIELDS,
@@ -383,6 +385,30 @@ _NOTIFY_SCHEMA = _object(
             "description": (
                 "Optional image shown with the notification: exactly one of file_id "
                 "(from present-file) or url, plus alt text. Forge keeps its own copy."
+            ),
+        },
+        "speak": {
+            **_object(
+                {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SPEAK_TEXT_CHARS,
+                        "description": "What Lexi says aloud, written to be heard.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": [priority.value for priority in SpeakPriority],
+                        "default": SpeakPriority.NOW.value,
+                        "description": "now (default) or next_window (the next good moment).",
+                    },
+                },
+                required=("text",),
+            ),
+            "description": (
+                "Optional: ask for this notification to be spoken aloud to the user on "
+                "their phone, only when it is worth interrupting them by voice. Forge only "
+                "records the intent; the user's phone decides whether and when to speak it."
             ),
         },
         "question": {
@@ -917,6 +943,7 @@ def _notification_summary(raw: dict[str, Any], *, max_body_chars: int) -> dict[s
         "links",
         "image_state",
         "image_error",
+        "speak",
         "created_at",
         "read",
     )

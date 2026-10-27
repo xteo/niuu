@@ -26,6 +26,7 @@ using the same append path as present-file.
   set, so turns without an image keep their earlier shape.
 - The question signals `question`, `about_question` and `ask` (§12) follow the same
   rule: present in `input` only when set.
+- So does the speak intent `speak` (§13).
 
 Notification id: `notification_id(turn_dedupe_key(session_id, turn.id, kind))`,
 where `session_id` is the Forge session UUID string.
@@ -117,6 +118,7 @@ The notification JSON (`NotificationResponse`):
  "image_state":"pending|ready|failed|null","image_error":"…|null",
  "question":true|false|null,"about_question":{"id":"question:<host>:<uuid>","action":"relay"}|null,
  "ask":{"items":[…]}|null,"input_request":{"kind":"question","request_id":"…|null"}|null,
+ "speak":{"text":"…","priority":"now|next_window"}|null,
  "created_at":"ISO-8601","read":false,"instance_id":"<added by the Guild facade>"}
 ```
 `image` is present only when Forge holds a stored copy (§11); `image_state` is null
@@ -397,3 +399,30 @@ carries no `question`/`ask`.
 catalog while the server stays connected. `ask` → `question: true` is enforced by
 `NotificationDraft` before anything is written.
 
+## 13. Speak intent (shared)
+
+A notification may ask to be spoken aloud to its owner (LEX-1536). Forge carries the
+intent and nothing more: it does not deliver, schedule or speak it. A reader (the
+Lexi agent service) decides whether and when the phone speaks it.
+
+**Input.** `NotificationDraft.speak` is an optional `NotificationSpeak`:
+`{"text": "…", "priority": "now" | "next_window"}`. Strict: extra keys are refused.
+
+| Field | Rule |
+|---|---|
+| `text` | trimmed, then 1–`MAX_SPEAK_TEXT_CHARS` (600) characters; no NUL |
+| `priority` | `now` (default) or `next_window` (the next good moment) |
+
+Only agent kinds (`milestone`, `decision`, `attention`, `error`, `info`) may carry
+it; a draft of kind `reply_ready` with `speak` is refused. The MCP `notify` tool
+(transcript and feed modes) and `POST /sessions/{id}/notifications` accept it; an
+invalid one is an MCP tool error or HTTP 422 and records nothing.
+
+**Storage.** Migration `000094_forge_notification_speak` adds `speak_text` and
+`speak_priority` to `forge_notifications`, set together or both null, with a check
+that repeats the rules above.
+
+**Read.** `speak` is on every `NotificationResponse` (§4): `GET /notifications`,
+`GET /sessions/{id}/notifications`, the submit response, and the
+`session_notification` live event (§5); `null` when the notification has none. The
+MCP `list_notifications` summary includes it when set.

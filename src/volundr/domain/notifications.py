@@ -35,6 +35,7 @@ from niuu.domain.notifications import (
     NotificationLink,
     NotificationSeverity,
     NotificationSource,
+    NotificationSpeak,
     notification_id,
     notification_image_url,
     notification_visible_to,
@@ -132,6 +133,7 @@ class Notification(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     image: NotificationImage | None = None
+    speak: NotificationSpeak | None = None
 
     @property
     def turn_id(self) -> str | None:
@@ -215,6 +217,7 @@ class NotificationCandidate(BaseModel):
     correlation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     image: NotificationImageRef | None = None
+    speak: NotificationSpeak | None = None
 
     @property
     def id(self) -> UUID:

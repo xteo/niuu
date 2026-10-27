@@ -284,7 +284,7 @@ async def test_durable_turn_projector_jsonb_and_read_model_keep_the_same_ask():
     [stored] = await PostgresNotificationRepository(pool).project([candidate])
     assert stored.metadata["ask"] == ASK
     args = conn.fetchrow.await_args.args
-    assert json.loads(args[-1])["ask"] == ASK
+    assert json.loads(args[18])["ask"] == ASK  # $18 is metadata
     restored = Notification.model_validate_json(stored.model_dump_json())
     assert restored.wire()["ask"] == ASK
     assert NotificationResponse.build(restored, 0).model_dump(mode="json")["ask"] == ASK

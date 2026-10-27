@@ -77,9 +77,9 @@ class TestDraftWithImage:
         draft = NotificationDraft(kind="milestone", title="Done")
         payload = draft_payload(draft)
         assert "image" not in payload
-        # Unset question signals stay absent too: the shape older producers wrote.
+        # Unset question signals and speak stay absent too: the shape older producers wrote.
         assert payload == draft.model_dump(
-            mode="json", exclude={"image", "question", "about_question", "ask"}
+            mode="json", exclude={"image", "speak", "question", "about_question", "ask"}
         )
 
     def test_payload_carries_the_image_wire_form(self) -> None:

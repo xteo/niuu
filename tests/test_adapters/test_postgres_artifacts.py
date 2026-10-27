@@ -132,6 +132,8 @@ def _notice_row(candidate: NotificationCandidate) -> dict:
         "model": None,
         "correlation_id": None,
         "metadata": "{}",
+        "speak_text": None,
+        "speak_priority": None,
         "created_at": T0,
     }
 

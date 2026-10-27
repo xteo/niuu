@@ -105,6 +105,8 @@ def _notification_row(candidate: NotificationCandidate, seq: int, *, as_text: bo
         "model": None,
         "correlation_id": None,
         "metadata": json.dumps(candidate.metadata) if as_text else None,
+        "speak_text": candidate.speak.text if candidate.speak else None,
+        "speak_priority": candidate.speak.priority.value if candidate.speak else None,
         "created_at": NOW,
     }
 
