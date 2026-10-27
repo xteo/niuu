@@ -1,6 +1,10 @@
 # Promotion runbook: consolidated Forge to Thor, then mini-m6 (LEX-1489)
 
-**Status: PREPARED, NOT APPLIED.** Prepared 2026-10-26 by the niuu-consolidation
+**Status: THOR APPLIED 2026-10-27 09:16:44Z (attempt 2); m6 PENDING its window.**
+Attempt 1 (08:46:49Z) rolled back on its own. Read §7 before the m6 window: it
+records what the Thor switch taught and changes how a cutover is launched.
+
+Prepared 2026-10-26 by the niuu-consolidation
 lane. Nothing on Thor `:8080`, Thor's web, mini-m6 or `lexiexp-*` was changed:
 live databases were only read (`pg_dump`, `SELECT`), and live files were only
 listed and read. Every proof below ran against scratch copies on 127.0.0.1, and
@@ -10,7 +14,8 @@ those copies were removed afterwards.
 then m6, in a quiet window that Damien picks. Each host's switch needs Damien's
 explicit go. Run it from a shell that does not live under the Forge API being
 restarted (an ssh login or a tmux pane outside Forge). Never run it from a Forge
-session on that host.
+session on that host. Launch the cutover script itself with
+`systemd-run --user --unit <name> --collect` so it has its own cgroup (§7.2).
 
 | | Thor (Home Forge, `:8080`) | mini-m6 (`100.92.69.62:8080`) |
 |---|---|---|
@@ -54,9 +59,9 @@ Both were clean at prep time.
 
 ### 1.2 Database backup (LEX-1498), with a proven restore
 
-LEX-1498 (a nightly `volundr-pg` dump timer) is still **Todo**. Whether or not it
-has landed, the window starts with a fresh, one-off backup, taken immediately
-before the switch:
+LEX-1498, the nightly `volundr-pg` dump timer, landed on Thor after its switch
+(§7.7). Even so, a window starts with a fresh, one-off backup, taken
+immediately before the switch:
 
 **Thor** (`volundr-pg`: Docker, PostgreSQL 16.13). The Home Forge uses the
 `volundr` database (70 GB, of which 65 GB is the TOAST of `session_event_log`),
@@ -195,7 +200,9 @@ Thor's.)
   shutdown is 15 s), then boot with migrations. In the drill the full migration
   ran in **1.8 s** on a copy of the real 70 GB data (§3.1). The
   previous cutover (10-16) was healthy 4 s after its restart. Expect under a
-  minute; `cutover.sh` rolls back on its own after 120 s.
+  minute. **Actual (2026-10-27, attempt 2): 18 s** from `restart` (09:16:44Z) to
+  a healthy new build (09:17:02Z); most of it was the old process's graceful
+  stop. Attempt 2's `cutover2.sh` fails fast instead of waiting 120 s (§7.4).
 - **m6:** pg_ctl stop + start, the migration (0.4 s in the drill) and boot: about
   a minute. The session restarts come on top.
 
@@ -657,6 +664,26 @@ curl -s http://100.92.69.62:8080/health
 ssh xteo@mini-m6 'tail -50 ~/Library/Logs/niuu-forge/forge.log | grep -E "Applied startup migration|ERROR"'
 ```
 
+**Lessons from Thor applied to m6 (§7).** m6 kills every session anyway, so
+the persistent-process versus tmux distinction does not matter there, but the
+rest does:
+
+- Run the switch from Thor, not from a session on m6, and launch it with
+  `systemd-run --user --unit lexi-b3-m6 --collect <script>` on Thor, so the
+  driver outlives whatever happens to the calling session.
+- Readiness fails fast: stop waiting as soon as `/health` names a
+  `failed_plugins` entry or `forge.log` shows `Failed to start … lifespan` /
+  `Failed to create API app`, then roll back (§5.2). The script writes a
+  one-line verdict file, as Thor's `attempt2/RESULT` did.
+- The two Thor failures should not occur on m6, but check both during the
+  window prep: m6's seeded Guild instance is `embedded://local-forge`, which the
+  transport check exempts. m6's running release (6c31bfe1) already uses the
+  file-backed Ting repo and boots through the same workflow-catalog check, and
+  m6 has its `ting/` ledger (44 rows). Rehearse the switch on a copy of m6's
+  data first, as Thor's attempt 2 was, rather than relying on this reading.
+- m6 has no health-check job: its only LaunchAgent is `world.niuu.forge.m6`
+  (checked 2026-10-27), so there is nothing to pause.
+
 After the smoke (§4.3), start the sessions that were stopped:
 
 ```bash
@@ -704,9 +731,15 @@ curl -s 127.0.0.1:8080/health      # build forge-session-metadata-20261016, revi
 # web, if swapped:
 cp -p ~/.config/niuu-forge-web/nginx.conf.bak-20261026-b3 ~/.config/niuu-forge-web/nginx.conf
 systemctl --user reload niuu-forge-web.service
-# config: optional. The old build ignores the new keys (Settings has extra="ignore"):
-cp -p ~/.config/niuu-forge-thor/config.yaml.bak-20261026-b3 ~/.config/niuu-forge-thor/config.yaml
+# config: optional. The old build ignores the new keys (Settings has extra="ignore").
+# The attempt-2 edits (§7.5) have their own backup, taken just before them:
+cp -p ~/.config/niuu-forge-thor/config.yaml.bak-20261027-b3a2 ~/.config/niuu-forge-thor/config.yaml
 ```
+
+Removing the drop-in also drops the Ting-off launcher (`start_platform_b3.py`):
+the old release comes back through the unchanged `start_platform.py` with Ting
+on. Proven on a scratch copy before the switch: the old release on the migrated
+schema with the new config reports `/health` ok, `failed_plugins: []`.
 
 ### 5.2 m6
 
@@ -819,6 +852,144 @@ Also from the summary, decided here:
   keep running sessions alive like Thor's. *Recommendation:* do it in this same
   m6 window, since the sessions are stopped anyway. It is a plist change, so
   Damien's call.
+
+---
+
+## 7. Thor switch record and lessons (2026-10-27)
+
+The full record lives in `~/.local/share/niuu/rollouts/forge-consolidated-20261026/`:
+`cutover.log` and `candidate-failure.log` (attempt 1); `attempt2/PLAN.md`,
+`cutover2.sh`, `cutover2.log`, `RESULT`, `before2.json`/`after2.json` (attempt 2).
+
+### 7.1 Timeline (UTC)
+
+| Time | Event |
+|---|---|
+| 08:33–08:46 | `pre-b3-20261027T0833Z` dump (§1.2), volundr 763 s |
+| 08:46:49 | attempt 1: `cutover.sh` restarts the API. The executing session (a persistent-process session inside the service) is killed with it |
+| 08:47:08 | candidate up; 08:47:09–11 Volundr 000062–000093 applied |
+| 08:47:09 | **ting** lifespan fails: workflow-catalog check |
+| 08:47:11 | **guild** lifespan fails: plaintext transport refused; `/api/v1/forge/*` 404, `/health` 503 `degraded` |
+| 08:49:08 | 120 s readiness wait expires; rollback; old build ready in 4 s. Forge API unusable ≈ 2 min 20 s; nothing lost, the old release runs on the new schema |
+| 08:55 | health-check timer paused by the coordinator |
+| 09:00–09:16 | diagnosis and rehearsal on a scratch restore of the 08:33 dump |
+| 09:16:40 | config edits applied (§7.5), Ting-off launcher installed |
+| 09:16:43 | attempt 2 launched as `systemd-run --user --unit lexi-b3-cutover-2 --collect …/attempt2/cutover2.sh` |
+| 09:16:44 | API restart |
+| 09:17:02 | `forge-consolidated-20261026` healthy, `failed_plugins: []` (**downtime ≈ 18 s**) |
+| 09:17:13 | autonomous smoke passed → `RESULT: CUTOVER_OK` |
+| 09:18 | health-check timer re-enabled by the coordinator |
+
+`preserve_check compare`: 724/724 sessions, 101 protected processes, conversation
+sample identical (16/16 turns). Its one reported status change (`lexi-mini`,
+stopped → running) was an explicit `POST /start` at 09:18:04, after the switch.
+
+### 7.2 Launch the cutover outside the service, and park persistent-process sessions
+
+`KillMode=process` protects tmux-hosted sessions and Skuld brokers, which
+survive the restart. It does **not** protect a persistent-process session: that
+session lives inside the API's own cgroup, so the restart kills it, and with it
+any shell it started. `setsid nohup` does not help, because the cgroup is what
+gets killed. Therefore:
+
+- Park (stop) persistent-process sessions before the window, or accept that
+  they restart.
+- Launch the cutover script with `systemd-run --user --unit <name> --collect`,
+  never as a child of a session. Make it fully autonomous: switch, readiness,
+  smoke and rollback, then a one-line verdict file (`RESULT`) and a complete
+  log. Whoever started it may not be alive to report.
+- Write the exact script and the config diff (secrets masked) into the log
+  *before* launching, so the record is complete even if the caller dies.
+
+### 7.3 The health-check timer
+
+`volundr-forge-healthcheck.timer` restarts an unhealthy unit. Keep it stopped
+from before the restart until the smoke has passed, then re-enable it. A
+cutover script must not re-arm it on its own; attempt 1's `cutover.sh` did so
+after rolling back. Attempt 2's script never touches it.
+
+### 7.4 Reading `/health`, and the fail-fast readiness rule
+
+`/health` 503 with `"status": "degraded"` does not mean "still starting". It
+means a plugin's app or lifespan failed. uvicorn still reports "Application
+startup complete", and the failed plugin's routes are missing (404) or answer
+503. The body names the plugins: read `failed_plugins`.
+
+`cutover2.sh` polls once a second and stops waiting as soon as one of these is
+true:
+
+- `/health.build` is the new release and `failed_plugins` is non-empty;
+- the unit's journal since the restart cursor contains `Failed to start … lifespan`
+  or `Failed to create API app`.
+
+It succeeds on `status: ok` with an empty `failed_plugins` and the new build.
+It also gives up after 60 s (the boot took 2–5 s in rehearsal and 4 s live).
+Then it runs the smoke list (sessions list, the ios-coordinator session
+present, a conversation read, `/status` on two sessions, the web UI, `/health`).
+On any failure it removes the drop-in, restarts the old build and waits for it
+under the same rules.
+
+### 7.5 What changed on Thor to make it boot
+
+1. **Guild `allow_plaintext: true`** on the seeded "Thor" instance
+   (`niuu.instances[0].config` in `~/.config/niuu-forge-thor/config.yaml`).
+   This release refuses `http://` for a non-loopback, non-`embedded://`
+   instance unless the instance opts in. Thor's is `http://100.66.123.128:8080`
+   on the tailnet, an already-encrypted path, which is the opt-in's stated
+   case. Without the opt-in the Guild lifespan fails, and Guild mounts
+   `/api/v1/forge` and `/api/v1/forge/sessions`: hence attempt 1's 404s.
+2. **Ting off on Home.** The new release's launcher is
+   `~/.config/niuu-forge-thor/start_platform_b3.py`. It is `start_platform.py`
+   plus `registry.apply_config({"ting": False})`, and only the new drop-in uses
+   it. Why:
+   - This release defaults Ting to the file-backed workflow repo and refuses
+     to start while PostgreSQL `workflows` holds rows without a verified
+     migration marker (`ting.main._assert_workflow_catalog_migrated`).
+   - The remedy it names, `python -m ting.migrate_workflows`, cannot run on
+     Thor. The release's Postgres reader fails on `tenant_id`, because Thor's
+     Ting tables stop around `ting/000032` (no ledger, §2.3). The tables from
+     000033–000047 (`workflow_executions`, `delivery_executions`,
+     `workflow_waits`, `workflow_versions`, `tracker_connections`) do not exist
+     at all.
+   - Ting on Home was dormant: 1 saga and 1 draft workflow (both
+     2026-05-22), 0 raids, 0 campaigns, 7 packaged system workflows. Its rows
+     stay untouched in PostgreSQL.
+3. **`workflow_repository.kwargs.catalog_path: ~/.niuu/workflows-home`**, which
+   is inert while Ting is off. `~/.niuu/workflows` is **Thor Work's live
+   catalog** (`forge-work-*`, same HOME, same default path). Home must never
+   point at it.
+
+### 7.6 Bringing Thor's Ting back (not done; needs its own rehearsal)
+
+1. Seed a `ting/` ledger that matches Thor's real Ting schema (it diverges from
+   the files at 000025, `column "depends_on" does not exist`). Then apply the
+   rest up to 000047 on a scratch restore until the stream is clean.
+2. Run the workflow migration with the **app's** database identity. Run bare,
+   the module uses Ting's defaults (`ting`/`ting`), which is the wrong catalog:
+
+   ```bash
+   env DATABASE__NAME=volundr DATABASE__USER=volundr DATABASE__PASSWORD=volundr \
+     $REL/.venv/bin/python -m ting.migrate_workflows --catalog-path ~/.niuu/workflows-home   # dry run
+   # … --apply             writes YAML + .migration-complete.yaml there; never writes PostgreSQL
+   # … --skip-if-migrated  exits 0 when the marker is current
+   ```
+
+   Rolling it back means deleting `~/.niuu/workflows-home`.
+3. Remove the `apply_config` line (or the `_b3` launcher) and restart.
+4. Every start of the *old* release re-upserts the packaged workflows, which
+   moves `max(updated_at)`. A rollback therefore stales the marker, and the new
+   release then refuses to start until `--apply` is run again.
+
+### 7.7 Standing backup (LEX-1498)
+
+Since 2026-10-27, `volundr-pg-backup.timer` (02:30 UTC daily, `Persistent=true`)
+runs `~/.local/bin/volundr-pg-backup`. It writes per-DB `pg_dump -Fc -Z zstd:3`
+dumps and globals for `volundr volundr_forge guild ting niuu_shared observatory`
+into `~/backups/volundr-pg/nightly-<stamp>/`, and verifies each dump with
+`pg_restore --list`. It keeps 14 days. Its freshness marker is
+`~/backups/volundr-pg/LATEST.json`, the last successful dump; `LAST_RUN.json`
+records the last attempt, failed or not. Restore as in §1.2. Hand-made dumps
+(`pre-b3-*`) are never rotated.
 
 ---
 
