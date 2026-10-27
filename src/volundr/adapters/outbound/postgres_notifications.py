@@ -16,7 +16,11 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from niuu.domain.notifications import NotificationImageRef, NotificationImageSourceKind
+from niuu.domain.notifications import (
+    NotificationImageRef,
+    NotificationImageSourceKind,
+    NotificationSpeak,
+)
 from volundr.adapters.outbound._jsonb import dumps_jsonb, scrub_text
 from volundr.domain.notification_ports import (
     NotificationDeliveryRepository,
@@ -66,9 +70,9 @@ FEED_ORDER_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('forge_notification
 INSERT_NOTIFICATION_SQL = """INSERT INTO forge_notifications
     (id, dedupe_key, session_id, session_seq, session_name, owner_id, tenant_id,
      project_id, kind, severity, source, title, body, links, engine, model,
-     correlation_id, metadata, created_at)
+     correlation_id, metadata, speak_text, speak_priority, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16,
-        $17, $18::jsonb, clock_timestamp())
+        $17, $18::jsonb, $19, $20, clock_timestamp())
 ON CONFLICT (dedupe_key) DO NOTHING
 RETURNING *"""
 
@@ -142,7 +146,14 @@ def row_to_notification(row: asyncpg.Record | dict) -> Notification:
         correlation_id=row["correlation_id"],
         metadata=_json(row["metadata"], {}),
         created_at=row["created_at"],
+        speak=_speak(row),
     )
+
+
+def _speak(row: asyncpg.Record | dict) -> NotificationSpeak | None:
+    if row["speak_text"] is None:
+        return None
+    return NotificationSpeak(text=row["speak_text"], priority=row["speak_priority"])
 
 
 def row_to_image(row: asyncpg.Record | dict) -> NotificationImage:
@@ -228,6 +239,8 @@ def _candidate_args(candidate: NotificationCandidate) -> tuple:
         scrub_text(candidate.model),
         scrub_text(candidate.correlation_id),
         dumps_jsonb(candidate.metadata),
+        scrub_text(candidate.speak.text) if candidate.speak is not None else None,
+        candidate.speak.priority.value if candidate.speak is not None else None,
     )
 
 

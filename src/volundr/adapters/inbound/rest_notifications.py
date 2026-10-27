@@ -31,6 +31,7 @@ from niuu.domain.notifications import (
     NotificationLink,
     NotificationSeverity,
     NotificationSource,
+    NotificationSpeak,
 )
 from niuu.domain.services.token_scope import (
     FORGE_NOTIFY_SCOPE,
@@ -178,6 +179,13 @@ class NotificationResponse(BaseModel):
     )
     image_error: str | None = Field(
         default=None, description="Why the attached image could not be stored."
+    )
+    speak: NotificationSpeak | None = Field(
+        default=None,
+        description=(
+            "{text, priority: now|next_window}: what a voice client may say aloud for "
+            "this notification and how soon; null when none. Forge never speaks it."
+        ),
     )
     read: bool
     instance_id: str | None = Field(

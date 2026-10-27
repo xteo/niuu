@@ -615,6 +615,7 @@ class NotificationService(NotificationRecorder):
             correlation_id=draft.correlation_id,
             metadata={**metadata, **context.anchor, **draft.question_metadata()},
             image=draft.image,
+            speak=draft.speak,
         )
 
     async def _record(self, candidates: list[NotificationCandidate]) -> list[Notification]:

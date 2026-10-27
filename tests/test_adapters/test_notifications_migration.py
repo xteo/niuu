@@ -96,7 +96,7 @@ def test_images_migration_is_additive_idempotent_and_goes_with_its_notification(
     assert down.strip() == "DROP TABLE IF EXISTS forge_notification_images;"
 
 
-def test_images_migration_is_the_newest_notification_migration():
+def test_images_migration_is_followed_only_by_the_speak_migration():
     names = sorted(path.name for path in (ROOT / "migrations").glob("*.up.sql"))
     notifications = [name for name in names if "_forge_notification" in name]
-    assert notifications[-1] == f"{IMAGES}.up.sql"
+    assert notifications[-2:] == [f"{IMAGES}.up.sql", "000094_forge_notification_speak.up.sql"]

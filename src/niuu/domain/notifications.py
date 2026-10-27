@@ -10,6 +10,10 @@ limits and the deterministic ids cannot drift between producer and projector.
 A draft may carry one image reference (:class:`NotificationImageRef`). Forge copies
 the referenced bytes once when it records the notification and serves its own
 durable copy at :data:`NOTIFICATION_IMAGE_PATH`.
+
+A draft may also carry a speak intent (:class:`NotificationSpeak`): the words a
+voice client may say aloud for it and how soon. Forge only stores and serves the
+intent; whether and when anything is spoken is the reader's decision.
 """
 
 from __future__ import annotations
@@ -20,13 +24,14 @@ import uuid
 from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode, urlsplit
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StringConstraints,
     field_validator,
     model_serializer,
     model_validator,
@@ -76,6 +81,10 @@ NOTIFICATION_IMAGE_MIME_TYPES: frozenset[str] = frozenset(
 #: Where Forge serves a notification's stored image; ``?variant=thumb`` is the thumbnail.
 NOTIFICATION_IMAGE_PATH = "/api/v1/forge/notifications/{notification_id}/image"
 NOTIFICATION_IMAGE_THUMB_VARIANT = "thumb"
+
+#: The longest speak text, counted after trimming: what a voice client says aloud for
+#: one notification. Wire contract like the limits above, not a tunable.
+MAX_SPEAK_TEXT_CHARS = 600
 
 NOTIFICATION_TOOL_NAME = "forge_notification"
 NOTIFICATION_TURN_KIND = "notification"
@@ -417,6 +426,39 @@ class NotificationImageRef(BaseModel):
         return self.model_dump(mode="json", exclude_none=True)
 
 
+class SpeakPriority(StrEnum):
+    """How soon a speak intent should be said: right away, or at the next good moment."""
+
+    NOW = "now"
+    NEXT_WINDOW = "next_window"
+
+
+class NotificationSpeak(BaseModel):
+    """What a voice client may say aloud for a notification, and how soon.
+
+    Forge stores and serves it unchanged; it never speaks or delivers it. Only agent
+    kinds may carry one (never ``reply_ready``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_SPEAK_TEXT_CHARS),
+    ]
+    priority: SpeakPriority = SpeakPriority.NOW
+
+    @field_validator("text")
+    @classmethod
+    def _no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("speak text must not contain NUL")
+        return value
+
+    def wire(self) -> dict[str, str]:
+        return self.model_dump(mode="json")
+
+
 def notification_image_url(
     notification_id: uuid.UUID | str,
     *,
@@ -481,6 +523,13 @@ class NotificationDraft(BaseModel):
         return out
 
     image: NotificationImageRef | None = None
+    speak: NotificationSpeak | None = None
+
+    @model_validator(mode="after")
+    def _speak_only_on_agent_kinds(self) -> NotificationDraft:
+        if self.speak is not None and self.kind not in AGENT_KINDS:
+            raise ValueError(f"speak is not allowed on {self.kind.value} notifications")
+        return self
 
     @field_validator("title")
     @classmethod
@@ -499,13 +548,15 @@ class NotificationDraft(BaseModel):
 def draft_payload(draft: NotificationDraft) -> dict[str, Any]:
     """The JSON a producer sends for a draft (a turn's notification, a submit body).
 
-    ``image`` and the question signals appear only when set, so drafts without them
-    keep the exact shape older producers wrote and older Forge releases read.
+    ``image``, ``speak`` and the question signals appear only when set, so drafts
+    without them keep the exact shape older producers wrote and older Forge releases read.
     """
-    payload = draft.model_dump(mode="json", exclude={"image", *QUESTION_FIELDS})
+    payload = draft.model_dump(mode="json", exclude={"image", "speak", *QUESTION_FIELDS})
     payload.update(draft.question_metadata())
     if draft.image is not None:
         payload["image"] = draft.image.wire()
+    if draft.speak is not None:
+        payload["speak"] = draft.speak.wire()
     return payload
 
 
