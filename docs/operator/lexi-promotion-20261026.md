@@ -681,6 +681,10 @@ rest does:
   file-backed Ting repo and boots through the same workflow-catalog check, and
   m6 has its `ting/` ledger (44 rows). Rehearse the switch on a copy of m6's
   data first, as Thor's attempt 2 was, rather than relying on this reading.
+- After m6 switches, list its registry (`GET http://100.92.69.62:8080/api/v1/niuu/instances`).
+  Give every `http://` row `allow_plaintext: true`, plus `health_path: /health`
+  for any host that has not upgraded yet (§7.5 item 3). Then add both checks,
+  every instance `ok` and the federated session count, to the smoke.
 - m6 has no health-check job: its only LaunchAgent is `world.niuu.forge.m6`
   (checked 2026-10-27), so there is nothing to pause.
 
@@ -954,7 +958,33 @@ under the same rules.
    - Ting on Home was dormant: 1 saga and 1 draft workflow (both
      2026-05-22), 0 raids, 0 campaigns, 7 packaged system workflows. Its rows
      stay untouched in PostgreSQL.
-3. **`workflow_repository.kwargs.catalog_path: ~/.niuu/workflows-home`**, which
+3. **Every remote instance needs the same opt-in, and the old releases need a
+   health path.** After the switch, `GET /api/v1/niuu/instances` showed mini-m6
+   and Spark `unreachable`, and the federated session list fell from 76 to
+   Thor's 61. There were two causes:
+   - their registry rows (`http://100.92.69.62:8080`, `http://100.127.141.74:8080`)
+     hit the same plaintext refusal;
+   - once that was fixed, the new probe path for `volundr` instances,
+     `/api/v1/forge/health`, does not exist on their older releases (404).
+
+   Both rows live in the Guild registry, not the config seed, so they were fixed
+   live, with no restart, at about 09:30. `PATCH` replaces `config` whole, so
+   resend the existing keys:
+
+   ```bash
+   B=127.0.0.1:8080/api/v1/niuu/instances
+   curl -s -X PATCH $B/<id> -H 'content-type: application/json' \
+     -d '{"config":{"defaultFolder":"<existing>","allow_plaintext":true,"health_path":"/health"}}'
+   curl -s -X POST $B/<id>/test        # {"ok":true,...}; health flips on the next 30 s sweep
+   ```
+
+   Result: all three `ok`; the federated list is 76 again (Thor 61, mini-m6 14,
+   Spark 1). `health_path: /health` stays valid after those hosts upgrade.
+   **Rule:** every `http://` tailnet instance, seeded or registered, on every
+   host running this release, needs `allow_plaintext: true`. Check
+   `GET …/instances` right after any switch: `health` must be `ok` for every
+   reachable host. This includes m6's own records once m6 runs this release.
+4. **`workflow_repository.kwargs.catalog_path: ~/.niuu/workflows-home`**, which
    is inert while Ting is off. `~/.niuu/workflows` is **Thor Work's live
    catalog** (`forge-work-*`, same HOME, same default path). Home must never
    point at it.
