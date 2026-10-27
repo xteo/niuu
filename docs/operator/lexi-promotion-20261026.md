@@ -681,7 +681,8 @@ rest does:
   file-backed Ting repo and boots through the same workflow-catalog check, and
   m6 has its `ting/` ledger (44 rows). Rehearse the switch on a copy of m6's
   data first, as Thor's attempt 2 was, rather than relying on this reading.
-- After m6 switches, list its registry (`GET http://100.92.69.62:8080/api/v1/niuu/instances`).
+- After m6 switches, list its registry (`GET http://100.92.69.62:8080/api/v1/niuu/instances`),
+  including its records of Thor and Spark.
   Give every `http://` row `allow_plaintext: true`, plus `health_path: /health`
   for any host that has not upgraded yet (§7.5 item 3). Then add both checks,
   every instance `ok` and the federated session count, to the smoke.
@@ -979,7 +980,13 @@ under the same rules.
    ```
 
    Result: all three `ok`; the federated list is 76 again (Thor 61, mini-m6 14,
-   Spark 1). `health_path: /health` stays valid after those hosts upgrade.
+   Spark 1). The two fixes are independent:
+   - `allow_plaintext` alone restores federation, because the session proxy
+     dials `base_url`.
+   - The `health` label stays `unreachable` until `health_path` is set too,
+     because the probe keeps getting a 404. That is not reconcile lag.
+   - "Federation works but the host shows unreachable" therefore means the
+     probe path, not the network. `health_path: /health` stays valid after those hosts upgrade.
    **Rule:** every `http://` tailnet instance, seeded or registered, on every
    host running this release, needs `allow_plaintext: true`. Check
    `GET …/instances` right after any switch: `health` must be `ok` for every
