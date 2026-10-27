@@ -1,8 +1,8 @@
 # Promotion runbook: consolidated Forge to Thor, then mini-m6 (LEX-1489)
 
-**Status: THOR APPLIED 2026-10-27 09:16:44Z (attempt 2); m6 PENDING its window.**
-Attempt 1 (08:46:49Z) rolled back on its own. Read §7 before the m6 window: it
-records what the Thor switch taught and changes how a cutover is launched.
+**Status: APPLIED. Thor 2026-10-27 09:16:44Z (attempt 2), mini-m6 09:46:28Z.**
+Thor's attempt 1 (08:46:49Z) rolled back on its own. §7 records what the Thor
+switch taught and how a cutover is now launched; §8 is the m6 record.
 
 Prepared 2026-10-26 by the niuu-consolidation
 lane. Nothing on Thor `:8080`, Thor's web, mini-m6 or `lexiexp-*` was changed:
@@ -715,7 +715,7 @@ for m6), and `F=$A/api/v1/forge`.
 | 7 | scratch session | create one Claude session in a scratch folder (UI, or `create_session` through the Forge MCP; see `docs/forge/openclaw-session-orchestrator-guide.md`) | starts on the new broker code |
 | 8 | `describe_session` | in it: `forge-describe --short "B3 smoke"` | the session row shows it; one `session_updated` |
 | 9 | `notify` | in it: the Forge MCP `notify` (kind `info`, title "B3 smoke") | listed by `curl -s "$F/notifications?limit=5"`. It **reaches Damien's phone** under his rules, so say so beforehand |
-| 10 | presented file | in it: `present-file /tmp/b3-smoke.png` | the notice URL is `http://<host>.tail737f2a.ts.net:8080/api/v1/forge/sessions/<id>/files/presented/pf_…`; `curl -sI` → 200, `cache-control: private, max-age=86400, immutable`, `content-security-policy: sandbox`; `~/.niuu/presented-files/<id>/` exists; **stop** the session and fetch it again → still 200 (durable) |
+| 10 | presented file | in it: `present-file ./b3-smoke.png`. The path must be under the session's workspace or home: the broker refuses anything else, `/tmp` included (`path is outside the session roots`; on macOS `/tmp` is `/private/tmp`). That rule predates B3 | the notice URL is `http://<host>.tail737f2a.ts.net:8080/api/v1/forge/sessions/<id>/files/presented/pf_…`; `curl -s -D - -o /dev/null <url>` → 200 (use GET: the route answers HEAD with 405), `cache-control: private, max-age=86400, immutable`, `content-security-policy: sandbox`; `~/.niuu/presented-files/<id>/` exists; **stop** the session and fetch it again → still 200 (durable) |
 | 11 | `/model` choices | while it runs, idle: `curl -s $A/s/<id>/api/runtime-options` | `source: "catalog"`, `claude-*` models, `current.model` = launch model; then `curl -s -X POST $A/s/<id>/api/runtime-options -H 'content-type: application/json' -d '{"options":{"model":"<another id>"}}'` → 200, and `GET $F/sessions/<id>` shows that `model`. It also writes the CLI's saved default (§6.5): set it back afterwards |
 | 12 | web | Thor: `https://thor.tail737f2a.ts.net:3001` (m6: its `:8080`) | header `X-Niuu-Web-Revision: consolidated-59c974c8` (Thor); the UI in midnight blue; Settings offers midnight/deep/dark blue and light; m6 sessions show under mini-m6 through the Guild |
 | 13 | cleanup | delete the scratch session | 204; `~/.niuu/presented-files/<id>/` is gone |
@@ -1027,6 +1027,101 @@ into `~/backups/volundr-pg/nightly-<stamp>/`, and verifies each dump with
 `~/backups/volundr-pg/LATEST.json`, the last successful dump; `LAST_RUN.json`
 records the last attempt, failed or not. Restore as in §1.2. Hand-made dumps
 (`pre-b3-*`) are never rotated.
+
+Off-box: `volundr-pg-offbox.timer` (Sunday 04:30 UTC) runs
+`~/.local/bin/volundr-pg-offbox`. It copies the dump named by `LATEST.json`, and
+refuses if that dump is not `ok` or is more than 36 h old. The copy goes to
+`spark:/shared/backups/thor-volundr-pg/<stamp>/`, and the job keeps the 2 newest
+copies there. Each copy is checked file by file with sha256 and carries its own
+`SHA256SUMS`. Markers: `OFFBOX.json` and `OFFBOX_LAST_RUN.json`. To restore
+after losing Thor, `rsync` the directory back, run `sha256sum -c SHA256SUMS`,
+then restore as in §1.2. The first copy (6.38 GB) took 32 s.
+
+## 8. mini-m6 switch record (2026-10-27)
+
+Record: `~/.local/share/niuu/rollouts/forge-consolidated-20261026/m6/` on Thor
+(`cutover-m6.sh`, `cutover-m6.log`, `RESULT`, `ROWS_DONE`, `second_run.py`).
+Damien's go: "Mini go, don't think anything running. Take the recommendations."
+
+### 8.1 Timeline (UTC)
+
+| Time | Event |
+|---|---|
+| 09:35–09:39 | backup `~/backups/mini-m6/pre-b3-20261027T0935Z` on Thor: 1.35 GB in 247 s; all 5 dumps pass `pg_restore --list` |
+| 09:40–09:43 | release `forge-m6-consolidated-20261026` built on m6 (486 MB; `59c974c8a`, `dirty: false`, same `source_sha256` as Thor); config extended (backup `config.yaml.bak-20261027-b3`); plist and launcher staged in `~/.local/share/niuu-forge/b3-staged/` |
+| 09:46:20 | the coordinator stops m6's six running sessions |
+| 09:46:26 | `systemd-run --user --unit lexi-b3-m6 --collect …/m6/cutover-m6.sh` **on Thor**; preflight: 0 running, 14 sessions, ledger `129\|43` |
+| 09:46:28 | `bootout` of the 6c31bfe1 job; launcher and plist (`AbandonProcessGroup`) installed; `bootstrap` |
+| 09:46:34 | new build healthy, `failed_plugins: []`: **downtime ≈ 6 s** |
+| 09:46:35 | ledger `137\|44` (Volundr 000087–000093 + `ting/000047`); a second runner pass added 0 |
+| 09:46:36 | automatic smoke passed → `RESULT: CUTOVER_OK` |
+| 09:47:27 | the coordinator restarts the six sessions |
+| 09:49–09:51 | interactive rows on a scratch session (after a slot was freed, §8.3); scratch session and folder deleted |
+
+### 8.2 How it differed from the plan
+
+- **Driver on Thor.** `cutover-m6.sh` runs under `systemd-run` on Thor and acts
+  on m6 over ssh, so nothing on m6 can kill it. The rules are the same as
+  Thor's (§7.4): fail fast on `failed_plugins` or a lifespan error in
+  `forge.log`, a verdict file, and automatic rollback (old launcher and old
+  plist, `bootstrap`, wait for 6c31bfe1).
+- **The switch is `bootout` + `bootstrap`, not `kickstart -k`,** because the
+  plist changed in the same step (§6, `AbandonProcessGroup`).
+- **Ting is not loaded on m6.** None of its route domains are in `forge-run.sh`'s
+  `--mounts`, so its catalog check cannot trip (m6's `workflows` table is
+  empty anyway). The `ting/` migration stream still runs at boot.
+- **Guild:** m6's registry has only its own `embedded://local-forge` record,
+  which the plaintext rule exempts. It holds no records of Thor or Spark, so
+  there was nothing to patch.
+- **No health-check job on m6**, so nothing to pause.
+
+### 8.3 Smoke
+
+Automatic, in the driver: sessions list 14/14, a conversation read and
+`/status` on `919384a8`, web `/` 200, `/instance` (host `mini-m6`, tailnet
+`mini-m6.tail737f2a.ts.net`), `/health` ok, and Thor's Guild facade showing all
+14 m6 sessions.
+
+By hand:
+- `/status` and the `/model` choices on a running session (read only:
+  `source: catalog`, six Claude models).
+- A scratch session: `describe_session`, one `notify`, and a presented-file
+  round trip, all green. m6 has no delivery rules or sinks, so the `notify`
+  went to the feed only (`deliveries: []`). The file was still 200 after
+  the session stopped, and its directory went with the session's delete.
+
+**`max_concurrent` caps smoke.** m6 runs `pod_manager.max_concurrent: 6`. Once
+its six sessions were restarted, the scratch session was refused (`No session
+slot is free`), and one idle session had to be stopped for it. Run the
+interactive rows *before* restarting the sessions, or keep a slot free.
+
+### 8.4 Does an m6 restart still kill sessions?
+
+- **Before 2026-10-27:** yes. Without `AbandonProcessGroup`, launchd killed the
+  whole job process group, brokers included.
+- **Now (`AbandonProcessGroup: true`):** launchd no longer kills the group when
+  the API exits.
+  - A plain `launchctl kickstart -k gui/$(id -u)/world.niuu.forge.m6` (for
+    example, to raise `max_concurrent`) is *expected* to behave like Thor's
+    `KillMode=process`: the API restarts, and brokers keep running and
+    reconnect. The API code that leaves brokers alive on shutdown is the same
+    code that does so on Thor.
+  - **This is not yet observed on m6.** Prove it at the next restart with one
+    idle scratch session first.
+  - Until then, treat an m6 restart as session-killing, as before.
+- A plist change still needs `bootout` + `bootstrap`. Treat that as
+  session-killing too.
+
+So "persistent-process sessions die with the service" (§7.2) holds on both hosts.
+"m6 kills every session on restart" becomes Thor-like once the `kickstart -k`
+proof above passes.
+
+### 8.5 Follow-ups
+
+- Presented files: `presented_files` is on, with no total quota (the release has
+  only the per-file `max_bytes`). Watch `du -sh ~/.niuu/presented-files` on m6
+  (8 KB after the smoke). Follow-up ticket: a total-size quota that refuses new
+  copies loudly.
 
 ---
 
