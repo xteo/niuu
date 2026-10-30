@@ -64,7 +64,7 @@ in `description`.
 
 ## Storage
 
-Migration `000089_session_descriptions` adds four nullable columns to `sessions`
+Migration `000090_session_descriptions` adds four nullable columns to `sessions`
 (Thor applied the same SQL as `000087_session_descriptions` before upstream took
 that number; `migrations/lineage-aliases.json` adopts it).
 Only `SessionRepository.update_description` writes them, in one statement that

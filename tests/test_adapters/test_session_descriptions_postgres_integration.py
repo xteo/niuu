@@ -107,8 +107,8 @@ async def test_generic_update_keeps_and_returns_the_stored_description(pool) -> 
 
 
 async def test_down_migration_drops_the_columns(pool) -> None:
-    down = (MIGRATIONS / "000089_session_descriptions.down.sql").read_text()
-    up = (MIGRATIONS / "000089_session_descriptions.up.sql").read_text()
+    down = (MIGRATIONS / "000090_session_descriptions.down.sql").read_text()
+    up = (MIGRATIONS / "000090_session_descriptions.up.sql").read_text()
     async with pool.acquire() as conn:
         await conn.execute(down)
         columns = {

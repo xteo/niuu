@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-NAME = "000089_session_descriptions"
+NAME = "000090_session_descriptions"
 # Thor production applied this SQL as 000087 before upstream took that number.
 APPLIED_AS = "000087_session_descriptions.up.sql"
 APPLIED_SHA256 = "3d47e0afee0c560b32bc66ae6d9857cd277806564ae748d55917d77b5ba99b88"
@@ -20,7 +20,11 @@ COLUMNS = (
 def test_lineage_alias_adopts_the_applied_filename():
     aliases = json.loads((ROOT / "migrations" / "lineage-aliases.json").read_text())
     up = (ROOT / "migrations" / f"{NAME}.up.sql").read_bytes()
-    assert aliases[f"{NAME}.up.sql"] == [{"filename": APPLIED_AS, "sha256": APPLIED_SHA256}]
+    # Thor applied it as 000087; the fork that carried it numbered it 000089.
+    assert aliases[f"{NAME}.up.sql"] == [
+        {"filename": APPLIED_AS, "sha256": APPLIED_SHA256},
+        {"filename": "000089_session_descriptions.up.sql", "sha256": APPLIED_SHA256},
+    ]
     assert hashlib.sha256(up).hexdigest() == APPLIED_SHA256
 
 
