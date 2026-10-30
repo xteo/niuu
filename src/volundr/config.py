@@ -1148,6 +1148,7 @@ class PresentedFilesConfig(BaseModel):
           enabled: true
           public_base_url: "http://thor.tail737f2a.ts.net:8380"
           max_bytes: 52428800
+          max_total_bytes: 5368709120   # required when enabled (LEX-1514)
           store:
             adapter: "volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore"
             root: "~/.niuu/presented-files"
@@ -1174,6 +1175,16 @@ class PresentedFilesConfig(BaseModel):
         gt=0,
         description="Largest durable copy accepted (matches Skuld's max_presented_file_bytes).",
     )
+    max_total_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Total bytes of durable copies this host keeps (LEX-1514). Required when "
+            "enabled: it is bounded by the host's free disk, which only the operator "
+            "knows. A copy that would pass it is refused (HTTP 507, present-file fails "
+            "with the remedy) and counted; nothing is evicted."
+        ),
+    )
     store: dict[str, Any] = Field(
         default_factory=lambda: {
             "adapter": "volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore",
@@ -1186,6 +1197,15 @@ class PresentedFilesConfig(BaseModel):
     @classmethod
     def _tailnet_url(cls, value: str) -> str:
         return validate_public_base_url(value)
+
+    @model_validator(mode="after")
+    def _quota_when_enabled(self) -> "PresentedFilesConfig":
+        if self.enabled and self.max_total_bytes is None:
+            raise ValueError(
+                "presented_files.enabled needs presented_files.max_total_bytes: the total "
+                "bytes of copies this host may keep (for example 5368709120 for 5 GiB)"
+            )
+        return self
 
 
 class NotificationsConfig(BaseModel):

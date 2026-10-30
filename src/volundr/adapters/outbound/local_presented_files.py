@@ -51,6 +51,23 @@ class LocalPresentedFileStore(PresentedFileStore):
     async def delete_session(self, session_id: UUID) -> int:
         return await asyncio.to_thread(self._delete_session, session_id)
 
+    async def total_bytes(self) -> int:
+        return await asyncio.to_thread(self._total_bytes)
+
+    def _total_bytes(self) -> int:
+        """Sum of stored content files (``{root}/{session}/{file}/content``)."""
+        if not self._root.is_dir():
+            return 0
+        total = 0
+        for content in self._root.glob(f"*/*/{_CONTENT}"):
+            if content.is_symlink() or not is_presented_file_id(content.parent.name):
+                continue
+            try:
+                total += content.stat().st_size
+            except OSError:
+                continue  # removed by a concurrent session delete
+        return total
+
     def _delete_session(self, session_id: UUID) -> int:
         target = self._root / str(UUID(str(session_id)))
         if target.is_symlink():

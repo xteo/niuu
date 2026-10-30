@@ -601,6 +601,7 @@ artifacts: {}
 #     enabled: true
 #     public_base_url: http://forge.tailnet-name.ts.net:8080
 #     max_bytes: 52428800
+#     max_total_bytes: 5368709120   # required when enabled: what the volume may hold
 #     store:
 #       adapter: volundr.adapters.outbound.local_presented_files.LocalPresentedFileStore
 #       root: /data/presented-files

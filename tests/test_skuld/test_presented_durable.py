@@ -362,3 +362,66 @@ def test_registry_rebuild_never_serves_a_partial_copy(tmp_path, monkeypatch):
     monkeypatch.setattr(api_mod, "_presented_staging_dir", lambda: root)
     api_mod._rebuild_presented_registry()
     assert entry.name not in api_mod._presented_registry
+
+
+# --- LEX-1514: the host's presented-file quota ---------------------------------
+
+
+def _quota_refusal():
+    response = MagicMock(status_code=507)
+    response.json.return_value = {
+        "detail": {
+            "code": "presented_files_quota",
+            "message": "Forge refused to keep this file: ... (presented_files.max_total_bytes)",
+        }
+    }
+    return response
+
+
+async def test_a_quota_refusal_raises_and_is_final(staged):
+    from skuld.presented_durable import PresentedFileQuotaRefusedError
+
+    broker = _broker(_quota_refusal())
+    with pytest.raises(PresentedFileQuotaRefusedError, match="max_total_bytes"):
+        await upload_presented_file(broker, "pf_x", staged, name="n", mime="m")
+    assert (staged.parent / REFUSED_MARKER).exists()
+
+
+async def test_the_retry_loop_stops_on_a_quota_refusal(staged):
+    broker = _broker(_quota_refusal(), retry_attempts=4)
+    write_pending_record(staged, name="n", mime="m")
+    assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
+    assert broker.client.put.await_count == 1
+    assert pending_uploads(staged.parent.parent) == []
+
+
+async def test_a_plain_507_is_still_retried(staged):
+    broker = _broker(_status(507), retry_attempts=3)
+    assert await retry_presented_upload(broker, "pf_x", staged, name="n", mime="m") is None
+    assert broker.client.put.await_count == 3
+
+
+def test_present_file_fails_loudly_when_the_quota_is_full(client, tmp_path, monkeypatch):
+    from skuld import broker as bmod
+    from skuld import broker_api as api_mod
+    from skuld.presented_durable import PresentedFileQuotaRefusedError
+
+    async def refused(*args, **kwargs):
+        raise PresentedFileQuotaRefusedError(
+            "Forge refused to keep this file (presented_files.max_total_bytes). Raise "
+            "presented_files.max_total_bytes, or delete sessions with presented files."
+        )
+
+    monkeypatch.setattr(api_mod, "upload_presented_file", refused)
+    monkeypatch.setattr(bmod.broker, "volundr_api_url", "http://forge")
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 10)
+    turns_before = len(bmod.broker._conversation_turns)
+
+    resp = client.post("/api/present-file", json={"path": str(src)})
+
+    assert resp.status_code == 507
+    assert "presented_files.max_total_bytes" in resp.text
+    assert len(bmod.broker._conversation_turns) == turns_before  # nothing presented
+    assert api_mod._presented_registry == {}
+    assert not any((tmp_path / "staging").glob("pf_*"))

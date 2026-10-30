@@ -28,7 +28,11 @@ from niuu.build_identity import build_identity
 from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
-from niuu.domain.presented_files import PRESENTED_FILE_LIVE_CACHE, presented_file_safety_headers
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_LIVE_CACHE,
+    PRESENTED_FILES_QUOTA_STATUS,
+    presented_file_safety_headers,
+)
 from niuu.domain.text_projection import projection_revision
 from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for_route
 from skuld.conversation_models import ConversationTurn
@@ -45,6 +49,7 @@ from skuld.path_security import (
 )
 from skuld.presented_durable import (
     SIDECARS,
+    PresentedFileQuotaRefusedError,
     pending_record,
     pending_uploads,
     retry_presented_upload,
@@ -1149,14 +1154,22 @@ async def present_file(body: dict) -> dict:
 
     # F2: hand Forge a durable copy so the file outlives this broker; its URL goes in
     # the turn. A failure never fails present-file: it is retried in the background.
-    receipt = await upload_presented_file(
-        broker,
-        file_id,
-        dest,
-        name=name,
-        mime=mime,
-        timeout=broker._settings.presented_durable.inline_upload_timeout_seconds,
-    )
+    try:
+        receipt = await upload_presented_file(
+            broker,
+            file_id,
+            dest,
+            name=name,
+            mime=mime,
+            timeout=broker._settings.presented_durable.inline_upload_timeout_seconds,
+        )
+    except PresentedFileQuotaRefusedError as exc:
+        # LEX-1514: the host has no room for another durable copy. Fail present-file
+        # loudly (the shim exits non-zero with this text) instead of presenting a file
+        # that disappears when the session stops.
+        _presented_registry.pop(file_id, None)
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise HTTPException(PRESENTED_FILES_QUOTA_STATUS, str(exc)) from None
     if receipt is None and broker.volundr_api_url:
         _schedule_presented_retry(file_id, dest, name=name, mime=mime)
     url = (receipt or {}).get("url") or None
