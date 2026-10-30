@@ -338,6 +338,7 @@ class TestLiveActivityContentState:
                 state,
                 timestamp=CREATED_UNIX,
                 stale_date=CREATED_UNIX + 28800,
+                relevance_score=10,
                 alert_title="é" * 90,
                 alert_body="ü" * 40,
             ),
@@ -354,6 +355,7 @@ class TestLiveActivityPayload:
             self.STATE,
             timestamp=CREATED_UNIX,
             stale_date=CREATED_UNIX + 28800,
+            relevance_score=10,
         )
         assert payload == {
             "aps": {
@@ -361,6 +363,7 @@ class TestLiveActivityPayload:
                 "event": "update",
                 "content-state": self.STATE,
                 "stale-date": 1_790_952_014,
+                "relevance-score": 10,
             }
         }
 
@@ -370,6 +373,7 @@ class TestLiveActivityPayload:
             self.STATE,
             timestamp=CREATED_UNIX,
             stale_date=CREATED_UNIX + 28800,
+            relevance_score=10,
             alert_title="Final round green",
             alert_body="horde-coordinator",
         )
@@ -379,11 +383,35 @@ class TestLiveActivityPayload:
                 "event": "start",
                 "content-state": self.STATE,
                 "stale-date": 1_790_952_014,
+                "relevance-score": 10,
                 "attributes-type": "ForgeNotificationsActivityAttributes",
                 "attributes": {},
                 "alert": {"title": "Final round green", "body": "horde-coordinator"},
             }
         }
+
+
+class TestLiveActivityRelevance:
+    """LEX-1353: Forge's notifications activity ranks below a live call (scored 100 by
+    the app), on push-to-start and on every update, so the call owns the Dynamic Island."""
+
+    def test_config_default_is_the_notifications_level(self):
+        from volundr.config import PushLiveActivityConfig
+
+        assert PushLiveActivityConfig().relevance_score == 10
+        assert PushLiveActivityConfig(relevance_score=0).relevance_score == 0
+
+    def test_configured_score_reaches_every_push(self):
+        state = {"items": [], "unreadCount": 0, "updatedAt": CREATED_SWIFT}
+        for event in (LiveActivityEvent.START, LiveActivityEvent.UPDATE):
+            payload = live_activity_payload(
+                event,
+                state,
+                timestamp=CREATED_UNIX,
+                stale_date=CREATED_UNIX + 1,
+                relevance_score=25,
+            )
+            assert payload["aps"]["relevance-score"] == 25, event
 
 
 class TestWidgetAndTopics:

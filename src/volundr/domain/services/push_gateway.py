@@ -145,6 +145,7 @@ class LiveActivitySettings:
     stale_seconds: int
     start_enabled: bool
     start_min_interval_seconds: float
+    relevance_score: float
 
 
 @dataclass(frozen=True)
@@ -843,6 +844,7 @@ class PushGateway:
                 state,
                 timestamp=timestamp,
                 stale_date=timestamp + settings.stale_seconds,
+                relevance_score=settings.relevance_score,
                 alert_title=alert_title,
                 alert_body=alert_body,
             ),

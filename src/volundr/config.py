@@ -998,6 +998,15 @@ class PushLiveActivityConfig(BaseModel):
     stale_seconds: int = Field(
         default=28800, ge=1, description="How long after a push iOS shows the content as current."
     )
+    relevance_score: float = Field(
+        default=10,
+        ge=0,
+        description=(
+            "aps.relevance-score on every Live Activity push (start and update): which of "
+            "the app's own activities iOS shows in the Dynamic Island. The app's scale "
+            "(LEX-1324/LEX-1353): a live call 100, notifications 10, so a call always wins."
+        ),
+    )
     start: PushLiveActivityStartConfig = Field(default_factory=PushLiveActivityStartConfig)
 
 
