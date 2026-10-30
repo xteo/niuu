@@ -1123,7 +1123,14 @@ async def present_file(body: dict) -> dict:
     elif candidate_source.startswith(home_prefix):
         safe_source = Path(candidate_source)
     else:
-        raise HTTPException(400, "path is outside the session roots")
+        # LEX-1515: say which roots are allowed and how to get a scratch file in.
+        raise HTTPException(
+            400,
+            "path is outside the session roots: present-file accepts files under the "
+            f"session workspace ({workspace_root}) or home ({home_root}). Copy scratch "
+            "files there first, e.g. mkdir -p ~/tmp && cp /tmp/report.pdf ~/tmp/ "
+            "(/tmp is outside both, on macOS and Linux).",
+        )
     if not safe_source.exists():
         raise HTTPException(404, "no such file")
     if not safe_source.is_file():

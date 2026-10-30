@@ -34,9 +34,10 @@ CLAUDE_MCP_CONFIG_FILE = "claude-mcp.json"
 PRESENT_FILE_INSTRUCTION = """\
 FILE DELIVERY: when you produce a file the user should SEE or open (a report, image, PDF, diagram, \
 screenshot, chart, or build artifact), run `present-file <path> [--caption "…"] [--title "…"]`. It \
-surfaces the file in the user's app as a tappable card that opens in the file preview, and accepts \
-ANY path, including scratch files outside the workspace (e.g. /tmp). Use it for finished \
-deliverables the user would want to open — not for routine tool output or intermediate files."""
+surfaces the file in the user's app as a tappable card that opens in the file preview. The path \
+must be under the session workspace or your home directory: write scratch files to ~/tmp/, not \
+/tmp, which is refused. Use it for finished deliverables the user would want to open — not for \
+routine tool output or intermediate files."""
 
 FORGE_NOTIFY_INSTRUCTION = """\
 NOTIFICATIONS: the `{server}` MCP server's `notify` tool sends the user a notification about this \

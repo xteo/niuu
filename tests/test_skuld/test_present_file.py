@@ -200,7 +200,13 @@ def test_local_mode_accepts_files_from_the_real_home(tmp_path, monkeypatch, modu
     assert client.get(f"/api/files/presented/{fid}").content == b"# from home"
     outside = tmp_path / "elsewhere.txt"
     outside.write_text("x")
-    assert client.post("/api/present-file", json={"path": str(outside)}).status_code == 400
+    refused = client.post("/api/present-file", json={"path": str(outside)})
+    assert refused.status_code == 400
+    # LEX-1515: the refusal names both roots and how to get a scratch file in.
+    detail = refused.json()["detail"]
+    assert "outside the session roots" in detail
+    assert bmod.broker._settings.home_path in detail or "home (" in detail
+    assert "~/tmp" in detail
 
 
 def test_broker_serves_presented_files_inline_and_sandboxed(client, tmp_path):
@@ -221,3 +227,13 @@ def test_broker_serves_presented_files_inline_and_sandboxed(client, tmp_path):
     r = client.get(f"/api/files/presented/{fid}")
     assert "content-security-policy" not in r.headers
     assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_the_session_prompt_states_where_present_file_reads_from():
+    """LEX-1515: the prompt every session gets must not promise /tmp."""
+    from skuld.transports.session_tools import capability_instructions
+
+    text = capability_instructions(forge_mcp_server=None)
+    assert "workspace or your home directory" in text
+    assert "~/tmp/" in text
+    assert "ANY path" not in text
