@@ -474,6 +474,8 @@ class TmuxInteractiveTransport(CLITransport):
         # Assistant texts already emitted via MessageDisplay this turn (re-display dedup +
         # the Stop-hook final-message twin guard) + per-message flush accumulators.
         self._turn_displayed_texts: list[str] = []
+        #: The pane Claude itself runs in (``main.0``); its death ends the session.
+        self._primary_pane_id: str | None = None
         self._display_msg_buffers: dict[str, str] = {}
         self._text_hook_lock = asyncio.Lock()
         self._displayed_message_ids: set[str] = set()
@@ -822,14 +824,21 @@ class TmuxInteractiveTransport(CLITransport):
         result = await self._run_tmux(
             "show-options", "-v", "-t", self._session_name, HOOK_BINDING_OPTION, check=False
         )
-        return result.returncode == 0 and result.stdout.strip() == self._hook_binding()
+        if result.returncode != 0 or result.stdout.strip() != self._hook_binding():
+            return False
+        # A session whose Claude has exited is a corpse (remain-on-exit), never adoptable.
+        panes = await self._run_tmux(
+            "list-panes", "-t", f"{self._session_name}:main.0", "-F", "#{pane_dead}", check=False
+        )
+        return panes.returncode == 0 and panes.stdout.strip() == "0"
 
     async def _replace_stale_session(self) -> None:
         logger.warning(
-            "tmux session %s was started for another broker (hook binding differs); "
+            "tmux session %s was started for another broker, or its Claude has exited; "
             "ending it and starting a fresh Claude that resumes the conversation",
             self._session_name,
         )
+        self._primary_pane_id = None
         await self._graceful_terminate_pane()
         await self._run_tmux("kill-session", "-t", self._session_name, check=False)
         await self._emit(
@@ -3717,7 +3726,7 @@ class TmuxInteractiveTransport(CLITransport):
             (
                 "#{pane_id}\t#{pane_index}\t#{window_name}\t#{pane_active}\t"
                 "#{pane_current_command}\t#{pane_width}\t#{pane_height}\t"
-                "#{cursor_x}\t#{cursor_y}\t#{pane_dead}\t#{pane_title}"
+                "#{cursor_x}\t#{cursor_y}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_title}"
             ),
             check=False,
         )
@@ -3745,8 +3754,34 @@ class TmuxInteractiveTransport(CLITransport):
             cursor_x = self._coerce_int(parts[7] if len(parts) > 7 else None, 0)
             cursor_y = self._coerce_int(parts[8] if len(parts) > 8 else None, 0)
             pane_dead = (parts[9].strip() if len(parts) > 9 else "") == "1"
+            dead_status = parts[10].strip() if len(parts) > 10 else ""
             # pane_title is last so an (unlikely) embedded tab is recovered intact.
-            pane_title = "\t".join(parts[10:]).strip() if len(parts) > 10 else ""
+            pane_title = "\t".join(parts[11:]).strip() if len(parts) > 11 else ""
+            if self._primary_pane_id is None and window_name == "main" and pane_index == "0":
+                self._primary_pane_id = pane_id
+
+            # The PRIMARY pane is Claude itself: dead means the session is dead, whatever
+            # its teammates do. Report it once so the broker can stop instead of serving a
+            # corpse as "running" (LEX-1699: ios-speaker-bargein, 8 h on 2026-10-30).
+            if pane_dead and pane_id == self._primary_pane_id:
+                was_alive = self._alive
+                self._alive = False
+                if was_alive and emit_events:
+                    logger.error(
+                        "tmux session %s: Claude's pane exited (status %s); stopping",
+                        self._session_name,
+                        dead_status or "unknown",
+                    )
+                    with suppress(Exception):
+                        await self._emit(
+                            {
+                                "type": "transport_stopped",
+                                "reason": "claude_exited",
+                                "exit_status": dead_status or None,
+                            }
+                        )
+                await self._evict_pane(pane_id, window_name=window_name, emit_events=emit_events)
+                continue
 
             # DEAD pane: a corpse left listed by `remain-on-exit on` (kept for the primary REPL's
             # crash forensics). It never vanishes from `list-panes`, so the disappearance sweep

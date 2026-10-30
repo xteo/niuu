@@ -1174,6 +1174,16 @@ class SkuldSettings(BaseSettings):
     # Default ``False`` (internal tool_use/tool_result HIDDEN), matching ReplayConfig.
     default_show_internal: bool = Field(default=False)
     max_upload_size_bytes: int = Field(default=104_857_600)  # 100 MB
+    exit_when_transport_stops: bool = Field(
+        default=True,
+        description=(
+            "When the agent's transport dies (Claude's pane exited, its tmux session is "
+            "gone), report activity 'stopped' and exit, so the pod manager reconciles the "
+            "session as stopped: Forge then refuses messages instead of queueing them for "
+            "a corpse, and start launches a fresh agent (LEX-1699). false keeps the broker "
+            "up, serving history only."
+        ),
+    )
     max_presented_file_bytes: int = Field(
         default=52_428_800,
         gt=0,
