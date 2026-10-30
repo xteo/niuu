@@ -173,6 +173,13 @@ def _strip_instance_hints(payload: Any) -> Any:
     return sanitized
 
 
+FORGE_READ_MS_HEADER = "X-Forge-Read-Ms"
+
+
+def _read_ms(started: float) -> str:
+    return f"{(time.perf_counter() - started) * 1000.0:.1f}"
+
+
 def _with_instance(
     payload: Any,
     instance: RegisteredInstance,
@@ -1753,8 +1760,12 @@ def create_volundr_router(
         scope: Literal["guild", "local"] = Query(
             default="guild", description="Guild aggregation, or only this server's embedded runtime"
         ),
+        limit: int | None = Query(
+            default=None, ge=1, description="Only the N sessions with the newest activity."
+        ),
         principal: Principal = Depends(extract_principal),
     ) -> list[dict[str, Any]]:
+        started = time.perf_counter()
         if scope == "local":
             instance = await _local_session_instance(service, principal, request)
             result = await _request_remote(
@@ -1775,6 +1786,7 @@ def create_volundr_router(
             if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
                 raise HTTPException(502, "Unexpected local Forge sessions response")
             response.headers["X-Forge-Session-Scope"] = "local"
+            response.headers[FORGE_READ_MS_HEADER] = _read_ms(started)
             return [_with_instance(item, instance) for item in payload]
         selected = request.query_params.get("instance_id")
         instances = (
@@ -1835,12 +1847,16 @@ def create_volundr_router(
         sessions = [item for item in merged.values() if item.get("id")]
         sessions.sort(
             key=lambda item: _normalize_timestamp(
-                item.get("last_active") or item.get("lastActive")
+                item.get("last_active") or item.get("lastActive") or item.get("last_activity_at")
             ),
             reverse=True,
         )
+        if limit is not None:
+            # Each node already returned at most `limit`; keep the newest across nodes.
+            sessions = sessions[:limit]
         if not selected:
             set_source_health_header(response, instance_source_failures(instances, results))
+        response.headers[FORGE_READ_MS_HEADER] = _read_ms(started)
         return sessions
 
     @router.get("/sessions/stream")
@@ -2321,6 +2337,8 @@ def create_volundr_router(
         # Advertise this facade's public surface, not routes that exist only on
         # its embedded service. Clients can avoid expected 404s and keep the
         # existing Bifrost model fallback.
+        node_capabilities = flags.get("capabilities")
+        node_capabilities = node_capabilities if isinstance(node_capabilities, dict) else {}
         flags["capabilities"] = {
             "models": False,
             "chronicles": False,
@@ -2330,6 +2348,9 @@ def create_volundr_router(
             "native_history_import": True,
             "local_session_scope": True,
             "notifications": True,
+            # Forwarded reads: true only when the node behind this facade serves them.
+            "voice_conversation": node_capabilities.get("voice_conversation") is True,
+            "summary_sessions": node_capabilities.get("summary_sessions") is True,
         }
         return flags
 
@@ -3638,6 +3659,7 @@ def create_volundr_router(
     @router.get("/sessions/{session_id}/conversation")
     async def get_conversation(
         request: Request,
+        response_out: Response,
         session_id: str = Path(description="Volundr session identifier"),
         principal: Principal = Depends(extract_principal),
     ) -> dict[str, Any]:
@@ -3664,6 +3686,10 @@ def create_volundr_router(
         t_remote = time.perf_counter()
         _ensure_history_success(response)
         payload = response.json()
+        response_out.headers[FORGE_READ_MS_HEADER] = _read_ms(t0)
+        if isinstance(payload, dict) and payload.get("detail") == "voice":
+            # A voice page stays text-only: no aggregate timings in the body.
+            return payload
         if isinstance(payload, dict) and payload.get("history_protocol") == 2:
             # The owner fitted the WHOLE page envelope to the requested byte
             # limit. Adding aggregate timings afterwards can exceed that limit.
