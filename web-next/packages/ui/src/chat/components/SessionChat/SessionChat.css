@@ -430,6 +430,31 @@
   margin-top: var(--space-1);
 }
 
+/* LEX-1502: choices with descriptions, multi-select state and the refusal message. */
+.niuu-chat-request-choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: var(--space-1);
+}
+
+.niuu-chat-request-choice[aria-pressed='true'] {
+  border-color: var(--color-brand);
+  background: var(--color-bg-tertiary);
+}
+
+.niuu-chat-request-choice small,
+.niuu-chat-request-hint {
+  color: var(--color-text-secondary);
+  font-weight: normal;
+}
+
+.niuu-chat-request-error {
+  color: var(--color-critical);
+  font-size: var(--text-sm);
+}
+
 .niuu-chat-request-response {
   margin-top: var(--space-1);
 }
