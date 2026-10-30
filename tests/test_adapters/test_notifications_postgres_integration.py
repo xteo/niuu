@@ -134,8 +134,8 @@ async def test_migration_is_idempotent_and_reversible(pool):
     await pool.execute(up)  # re-applying is a no-op
     item_up = (MIGRATIONS / "000086_forge_notification_reads.up.sql").read_text()
     item_down = (MIGRATIONS / "000086_forge_notification_reads.down.sql").read_text()
-    image_up = (MIGRATIONS / "000090_forge_notification_images.up.sql").read_text()
-    image_down = (MIGRATIONS / "000090_forge_notification_images.down.sql").read_text()
+    image_up = (MIGRATIONS / "000091_forge_notification_images.up.sql").read_text()
+    image_down = (MIGRATIONS / "000091_forge_notification_images.down.sql").read_text()
     await pool.execute(item_up)  # every migration is idempotent
     await pool.execute(image_up)
     await pool.execute(image_down)  # children before the parent migration

@@ -661,7 +661,7 @@ Migration `000089_odin_review_relay` creates `odin_review_relay_owners` (one bac
 watermark and digest flag per owner) and `odin_review_relay_items` (the review items an
 owner has a notification for, and when it was retired).
 
-Migration `000090_forge_notification_images` adds `forge_notification_images`: one row
+Migration `000091_forge_notification_images` adds `forge_notification_images`: one row
 per notification with an image (cascading from it), holding the reference, the copy
 state (`pending`/`ready`/`failed`, with a lease and attempt fence), and once stored the
 original bytes, the thumbnail, their types and sizes. A partial index covers pending rows.

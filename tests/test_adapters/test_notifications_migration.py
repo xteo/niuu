@@ -62,7 +62,7 @@ def test_odin_review_relay_migration_is_idempotent_and_reversible():
     assert "DROP TABLE" in down and "CREATE" not in down
 
 
-IMAGES = "000090_forge_notification_images"
+IMAGES = "000091_forge_notification_images"
 # Thor production applied this SQL as 000072 before upstream renumbered the notification
 # migrations; migrations/lineage-aliases.json adopts that ledger row.
 IMAGES_APPLIED_AS = "000072_forge_notification_images.up.sql"
@@ -72,8 +72,10 @@ IMAGES_APPLIED_SHA256 = "cd39abfca6355c64df73f10a1b5ae9c0933cc8cfebf43a6962993a2
 def test_images_migration_adopts_the_applied_filename():
     aliases = json.loads((ROOT / "migrations" / "lineage-aliases.json").read_text())
     up = (ROOT / "migrations" / f"{IMAGES}.up.sql").read_bytes()
+    # Thor applied it as 000072; the fork that carried it numbered it 000090.
     assert aliases[f"{IMAGES}.up.sql"] == [
-        {"filename": IMAGES_APPLIED_AS, "sha256": IMAGES_APPLIED_SHA256}
+        {"filename": IMAGES_APPLIED_AS, "sha256": IMAGES_APPLIED_SHA256},
+        {"filename": "000090_forge_notification_images.up.sql", "sha256": IMAGES_APPLIED_SHA256},
     ]
     assert hashlib.sha256(up).hexdigest() == IMAGES_APPLIED_SHA256
 

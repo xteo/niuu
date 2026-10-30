@@ -123,6 +123,8 @@ def _notifications() -> tuple[NotificationService, InMemoryNotificationStore]:
         reply_title_chars=40,
         reply_body_chars=60,
         sinks=[NotificationSinkInfo(name="push", label="Push")],
+        image_repository=store.images,
+        image_scheduler=store.image_scheduler,
     )
     return service, store
 
