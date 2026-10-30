@@ -212,6 +212,7 @@ def _session_summary(item: Any, node: str | None) -> dict[str, Any]:
             else None
         ),
         "last_activity_at": getattr(item, "last_active", None),
+        "worked_seconds_24h": getattr(item, "worked_seconds_24h", None),
         "unread": read_state.is_unread if read_state is not None else None,
         "node": node,
     }
@@ -1073,6 +1074,14 @@ class SessionResponse(BaseModel):
     created_at: str = Field(description="ISO 8601 creation timestamp")
     updated_at: str = Field(description="ISO 8601 last update timestamp")
     last_active: str = Field(description="ISO 8601 last activity timestamp")
+    worked_seconds_24h: int | None = Field(
+        default=None,
+        description=(
+            "Seconds Forge worked on this session in the last 24 hours: the union of its "
+            "assistant turns in that window (LEX-1465). Set on GET /sessions; null when "
+            "this Forge records no turn spans."
+        ),
+    )
     message_count: int = Field(description="Total chat messages exchanged")
     tokens_used: int = Field(description="Total tokens consumed")
     context: SessionContext = Field(default_factory=SessionContext)
@@ -2279,6 +2288,16 @@ def create_router(
             result.sort(key=_session_activity_key, reverse=True)
         if limit is not None:
             result = result[:limit]
+        worked = await forge.worked_seconds_24h(
+            [item.id for item in result if isinstance(item, SessionResponse)]
+        )
+        if worked is not None:
+            result = [
+                item.model_copy(update={"worked_seconds_24h": worked.get(item.id, 0)})
+                if isinstance(item, SessionResponse)
+                else item
+                for item in result
+            ]
         response.headers[FORGE_READ_MS_HEADER] = _read_ms(started)
         if fields == "summary":
             node = project_service.instance_id if project_service is not None else None

@@ -87,6 +87,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The window ``worked_seconds_24h`` covers; its length is the field's definition.
+WORKED_WINDOW = timedelta(hours=24)
+
 
 def _sanitize_log(value: object) -> str:
     """Sanitize a value for safe log output (prevent log injection)."""
@@ -1642,6 +1645,20 @@ class SessionService:
             grants=stored | requested | from_spec,
             launch_id=new_launch_id(),
         )
+
+    async def worked_seconds_24h(self, session_ids: list[UUID]) -> dict[UUID, int] | None:
+        """Seconds Forge worked on each session in the last 24 hours (LEX-1465).
+
+        ``None`` when this Forge records no turn spans (no span repository), so the
+        figure is unknown rather than zero. Sessions without work in the window get 0.
+        """
+        if self._span_repository is None:
+            return None
+        until = datetime.now(UTC)
+        worked = await self._span_repository.worked_seconds(
+            session_ids, since=until - WORKED_WINDOW, until=until
+        )
+        return {session_id: worked.get(session_id, 0) for session_id in session_ids}
 
     def _role_grants(self, role: str | None) -> frozenset[ForgeMcpGrant]:
         if role is None:

@@ -262,6 +262,7 @@ async def test_summary_fields() -> None:
         "short_description",
         "project",
         "last_activity_at",
+        "worked_seconds_24h",
         "unread",
         "node",
     }

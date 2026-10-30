@@ -1403,6 +1403,19 @@ class SessionSpanRepository(ABC):
     async def delete_by_session(self, session_id: UUID) -> int:
         """Delete all spans for a session. Returns count deleted."""
 
+    @abstractmethod
+    async def worked_seconds(
+        self, session_ids: list[UUID], *, since: datetime, until: datetime
+    ) -> dict[UUID, int]:
+        """Seconds each session spent in assistant turns between ``since`` and ``until``.
+
+        The union of its ``turn.assistant`` spans, clipped to the window, so concurrent
+        turns (teammates) count once. A span still open counts up to ``until`` only while
+        its session is running and not idle; otherwise up to the session's last activity,
+        so a span that was never closed cannot count forever. Sessions with no work in
+        the window are absent.
+        """
+
 
 class AdminSettingsRepository(ABC):
     """Persists the admin settings edited on the Settings page, one row per section.

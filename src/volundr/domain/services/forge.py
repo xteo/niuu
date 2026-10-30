@@ -278,6 +278,9 @@ class ForgeService:
     ) -> Session:
         return await self._session_service.update_description(session_id, patch, principal)
 
+    async def worked_seconds_24h(self, session_ids: list[UUID]) -> dict[UUID, int] | None:
+        return await self._session_service.worked_seconds_24h(session_ids)
+
     async def get_forge_mcp_grants(self, session_id: UUID, *, principal: Principal | None = None):
         return await self._session_service.get_forge_mcp_grants(session_id, principal)
 
