@@ -75,6 +75,7 @@ from volundr.adapters.inbound.rest_openshell_credentials import (
 )
 from volundr.adapters.inbound.rest_presented_files import create_presented_files_router
 from volundr.adapters.inbound.rest_prompts import create_prompts_router
+from volundr.adapters.inbound.rest_push import create_push_router
 from volundr.adapters.inbound.rest_resident_a2a import create_resident_a2a_router
 from volundr.adapters.inbound.rest_resident_runtimes import create_resident_runtimes_router
 from volundr.adapters.inbound.rest_resources import create_resources_router
@@ -95,8 +96,8 @@ from volundr.adapters.outbound.config_resident_profiles import (
 from volundr.adapters.outbound.git_registry import create_git_registry
 from volundr.adapters.outbound.linear import LinearAdapter
 from volundr.adapters.outbound.memory_secrets import InMemorySecretManager
-from volundr.adapters.outbound.odin_review_notification_relay import OdinReviewNotificationRelay
 from volundr.adapters.outbound.notification_image_fetcher import SessionLookup
+from volundr.adapters.outbound.odin_review_notification_relay import OdinReviewNotificationRelay
 from volundr.adapters.outbound.pg_event_sink import PostgresEventSink
 from volundr.adapters.outbound.pg_message_delivery import PostgresMessageDelivery
 from volundr.adapters.outbound.pg_session_event_log import PostgresSessionEventLog
@@ -220,6 +221,7 @@ from volundr.notification_composition import (
     create_notification_image_worker,
     create_push_channel,
 )
+from volundr.push_composition import create_push_gateway
 
 # Interval for periodic stats and heartbeat broadcasts (seconds)
 BROADCAST_INTERVAL = 30
@@ -1226,10 +1228,19 @@ def create_app(
                 credential_store=credential_store,
                 device_repository=device_repository,
             )
-            # push.enabled: an owner registering a device gets the "Needs-input
-            # pushes" rule, so the outbox pushes each session that needs them.
+            # The Guild push gateway (push.gateway.enabled): this node pushes for
+            # every Guild node's notifications. Configured-but-impossible (an
+            # unreadable APNs key, no HTTP/2, a registry without token kinds) raises
+            # here and stops the start.
+            push_gateway = create_push_gateway(
+                settings.push, pool, device_repository, local_events=broadcaster
+            )
+            app.state.push_gateway = push_gateway
+            # push.enabled without the gateway: an owner registering a device gets the
+            # "Needs-input pushes" rule, so the outbox pushes each session that needs
+            # them. The gateway alerts for that moment from its `attention` notification.
             on_device_registered = None
-            if settings.push.enabled:
+            if settings.push.enabled and push_gateway is None:
                 on_device_registered = partial(
                     notification_service.ensure_attention_push_rule,
                     sink=settings.push.attention_sink,
@@ -2009,6 +2020,8 @@ def create_app(
             app.include_router(
                 create_message_delivery_router(PostgresMessageDelivery(pool), session_service)
             )
+            if push_gateway is not None:
+                app.include_router(create_push_router(push_gateway, prefix="/api/v1/forge"))
             if settings.forge_mcp.http.enabled:
                 app.include_router(create_forge_mcp_router(settings.forge_mcp.http))
             app.state.forge_mcp_http = settings.forge_mcp.http.enabled
@@ -2130,6 +2143,8 @@ def create_app(
                     before_first_tick=lambda: startup_backfill(artifact_service, settings),
                 )
                 artifact_hold.start()
+            if push_gateway is not None:
+                await push_gateway.start()
             if settings.telegram_ingress.enabled:
                 await telegram_ingress.start()
             else:
@@ -2173,6 +2188,8 @@ def create_app(
                     await notification_image_worker.stop()
                 if artifact_hold is not None:
                     await artifact_hold.stop()
+                if push_gateway is not None:
+                    await push_gateway.stop()
                 background_task.cancel()
                 try:
                     await background_task

@@ -646,6 +646,19 @@ push:
     label: Forge app push
     # -- Longest push body (APNs caps the whole payload at 4 KB)
     maxBodyChars: 280
+  # -- APNs key for the push gateway, rendered verbatim as `push.apns` (snake_case keys;
+  # see ApnsConfig). The .p8 key is a file: mount it from a Secret and name its path.
+  # e.g. {team_id: ABCDE12345, key_id: KEY1234567, bundle_id: com.example.app,
+  #       private_key_path: /etc/volundr/apns/AuthKey_KEY1234567.p8}
+  apns: {}
+  # -- The Guild push gateway, rendered verbatim as `push.gateway` (snake_case keys; see
+  # PushGatewayConfig). One node of a Guild runs it: it holds the APNs key and the
+  # registered devices and pushes for every node (alerts, Live Activity, widgets,
+  # background). It replaces the per-node adapter and the needs-input rule, and needs
+  # deviceRegistry: postgres. See docs/operator/forge-notifications.md ("Apple push").
+  # e.g. {enabled: true, guild_url: "http://niuu-guild:8080",
+  #       public_api_url: "https://forge.example.com", origin_label: Forge}
+  gateway: {}
 
 # Forge MCP session credentials and the Forge-hosted MCP endpoint. Rendered verbatim
 # as config.yaml's `forge_mcp:` section (snake_case keys; see ForgeMcpConfig). Empty

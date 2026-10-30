@@ -78,6 +78,8 @@ from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
 from niuu.forge_mcp.credentials import token_scopes
 
 UNAVAILABLE_INSTANCES_HEADER = "X-Forge-Unavailable-Instances"
+#: The push-token kind every node pushes to; other kinds serve only the push gateway.
+ALERT_TOKEN_KIND = "alert"
 #: The Forge-hosted MCP endpoint, under the Forge API prefix on every node.
 MCP_PATH = "/mcp"
 NOTIFICATION_EVENT = "session_notification"
@@ -2826,6 +2828,28 @@ def create_volundr_router(
             request, principal, method="GET", path="/notifications/sinks"
         )
 
+    # -- Push gateway -----------------------------------------------------------
+    # The push gateway runs on one node (the default node unless ``instance_id``
+    # selects another); its status and test pushes go to that node.
+
+    @router.get("/push/status")
+    async def push_status(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> Response:
+        """The push gateway's counters, from the node that runs it."""
+        return await _proxy_rule_request(request, principal, method="GET", path="/push/status")
+
+    @router.post("/push/test")
+    async def send_test_push(
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Push once to the caller's own registered tokens (the gateway node sends it)."""
+        return await _proxy_rule_request(
+            request, principal, method="POST", path="/push/test", body=body
+        )
+
     @router.get("/notifications/{notification_id}/image")
     async def get_notification_image(
         request: Request,
@@ -2922,6 +2946,7 @@ def create_volundr_router(
         method: str,
         path: str,
         body: Any = None,
+        params: list[tuple[str, str]] | None = None,
     ) -> tuple[list[RegisteredInstance], dict[str, httpx.Response], set[str]]:
         instances = await _visible_instances(service, principal)
         if not instances:
@@ -2933,7 +2958,7 @@ def create_volundr_router(
             request,
             method=method,
             path=path,
-            params_for=lambda _instance: [],
+            params_for=lambda _instance: list(params or []),
             json_for=(lambda _instance: body) if body is not None else None,
         )
         return instances, responses, unavailable
@@ -2949,8 +2974,15 @@ def create_volundr_router(
         Idempotent on (owner, token) per node, so a failed registration is simply
         retried. 201 with one node's device record when every node accepted; a node's
         4xx refusal propagates, anything else (unreachable, 5xx) is 502, and the
-        detail names each instance that did not accept.
+        detail names each instance that did not accept. A token of another ``kind``
+        than ``alert`` serves only the push gateway and registers on its node alone.
         """
+        if body.get("kind", ALERT_TOKEN_KIND) != ALERT_TOKEN_KIND:
+            # Live Activity, push-to-start and widget tokens serve only the push
+            # gateway, which runs on one node: they register there alone.
+            return await _proxy_rule_request(
+                request, principal, method="POST", path="/devices", body=body
+            )
         instances, responses, unavailable = await _device_fan_out(
             request, principal, method="POST", path="/devices", body=body
         )
@@ -2969,7 +3001,7 @@ def create_volundr_router(
     async def list_devices(
         request: Request, principal: Principal = Depends(extract_principal)
     ) -> list[dict[str, Any]]:
-        """The caller's push devices across every visible node, one row per token.
+        """The caller's push devices across every visible node, one row per token and kind.
 
         Nodes may share a device store, so a token can come back from several;
         the first node's row wins. An unreachable or refusing node fails the call
@@ -2999,25 +3031,33 @@ def create_volundr_router(
                         status.HTTP_502_BAD_GATEWAY,
                         f"Unexpected device row from Forge instance {instance.id}",
                     )
-                devices.setdefault(device["token"], device)
+                devices.setdefault(
+                    f"{device['token']}\0{device.get('kind', ALERT_TOKEN_KIND)}", device
+                )
         return list(devices.values())
 
     @router.delete("/devices/{token}", status_code=status.HTTP_204_NO_CONTENT)
     async def unregister_device(
         request: Request,
         token: str = Path(description="The push token to unregister"),
+        kind: str | None = Query(default=None, description="Remove only this token kind"),
         principal: Principal = Depends(extract_principal),
     ) -> Response:
         """Unregister a push device on every visible Forge node.
 
         A node that no longer knows the token (404) counts as done. Any other
-        failure is reported with the instances that did not remove it.
+        failure is reported with the instances that did not remove it. ``kind``
+        removes one kind only; a gateway-only kind is removed on the gateway node.
         """
+        path = f"/devices/{quote(token, safe='')}"
+        if kind is not None and kind != ALERT_TOKEN_KIND:
+            return await _proxy_rule_request(request, principal, method="DELETE", path=path)
         instances, responses, unavailable = await _device_fan_out(
             request,
             principal,
             method="DELETE",
-            path=f"/devices/{quote(token, safe='')}",
+            path=path,
+            params=[("kind", kind)] if kind is not None else [],
         )
         _raise_device_failures(
             "unregistration",
