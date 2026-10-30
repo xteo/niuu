@@ -395,7 +395,7 @@ There are three ways to resolve one:
 - marking an old unresolved alarm as stale when there is no correlation id (item 4
   of the ticket).
 
-Storage: migration `000095_forge_notification_resolved`. It adds three nullable
+Storage: migration `000096_forge_notification_resolved`. It adds three nullable
 columns, which rewrites nothing, and a partial index on `(owner_id, correlation_id)`
 for unresolved rows.
 
