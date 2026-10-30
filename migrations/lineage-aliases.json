@@ -116,5 +116,17 @@
       "filename": "000090_forge_notification_images.up.sql",
       "sha256": "cd39abfca6355c64df73f10a1b5ae9c0933cc8cfebf43a6962993a2b2e5565e4"
     }
+  ],
+  "000093_session_usage_status.up.sql": [
+    {
+      "filename": "000092_session_usage_status.up.sql",
+      "sha256": "e3d31ef385d5d81a08e5f17bfad78e249cc1f3ee0a7181e17dcef1831abc80d7"
+    }
+  ],
+  "000092_session_work_facts.up.sql": [
+    {
+      "filename": "000091_session_work_facts.up.sql",
+      "sha256": "d501f084ba0022d1224396527d451c66c7cffbbb33257a03ef1101db14d2980e"
+    }
   ]
 }

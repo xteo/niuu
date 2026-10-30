@@ -313,7 +313,7 @@ def test_usage_migration_is_single_source_and_follows_work_facts():
     numbers = sorted(p.name[:6] for p in (root / "migrations").glob("*.up.sql"))
     assert numbers.count("000092") == 1
     assert numbers[numbers.index("000092") - 1] == "000091"
-    up = (root / "migrations" / "000092_session_usage_status.up.sql").read_text()
-    down = (root / "migrations" / "000092_session_usage_status.down.sql").read_text()
+    up = (root / "migrations" / "000093_session_usage_status.up.sql").read_text()
+    down = (root / "migrations" / "000093_session_usage_status.down.sql").read_text()
     assert "ADD COLUMN IF NOT EXISTS session_usage JSONB;" in up
     assert "DROP COLUMN IF EXISTS session_usage;" in down

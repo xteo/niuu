@@ -3,7 +3,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-NAME = "000091_session_work_facts"
+NAME = "000092_session_work_facts"
 
 
 def test_up_is_idempotent_and_down_reverses_it():
@@ -18,4 +18,4 @@ def test_up_is_idempotent_and_down_reverses_it():
 def test_number_is_unique_and_follows_its_predecessor():
     numbers = sorted(p.name[:6] for p in (ROOT / "migrations").glob("*.up.sql"))
     assert numbers.count(NAME[:6]) == 1
-    assert numbers[numbers.index(NAME[:6]) - 1] == "000090"
+    assert numbers[numbers.index(NAME[:6]) - 1] == "000091"

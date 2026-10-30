@@ -200,7 +200,7 @@ async def test_migration_up_down_up_retains_raw_log(isolated_pool):
     await log.append([entry(session, 1)])
     for direction in ("down", "up", "up"):
         await isolated_pool.execute(
-            (MIGRATIONS / f"000092_session_usage_status.{direction}.sql").read_text()
+            (MIGRATIONS / f"000093_session_usage_status.{direction}.sql").read_text()
         )
     assert (await log.read_after(session.id))[0].payload == claude()
     assert (await repo.get(session.id)).session_usage is None
