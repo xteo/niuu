@@ -1416,6 +1416,8 @@ class ForgeMcpConfig(BaseModel):
 
         forge_mcp:
           default_grants: []          # message, lifecycle: added to every session
+          role_grants:                # by project role (coordination.role)
+            coordinator: [lifecycle, message]
           session_tokens:
             enabled: true
             ttl_seconds: 2592000
@@ -1429,6 +1431,14 @@ class ForgeMcpConfig(BaseModel):
         default_factory=list,
         description="Grants every session's credential carries (on top of the launch "
         "spec's and the session-create request's).",
+    )
+    role_grants: dict[str, list[ForgeMcpGrant]] = Field(
+        default_factory=lambda: {
+            "coordinator": [ForgeMcpGrant.LIFECYCLE, ForgeMcpGrant.MESSAGE],
+        },
+        description="Grants a session's credential carries by its project role "
+        "(coordination.role), applied at every mint. A role not listed gets none; "
+        "set {} to grant nothing by role.",
     )
     session_tokens: ForgeMcpSessionTokenConfig = Field(default_factory=ForgeMcpSessionTokenConfig)
     http: ForgeMcpHttpConfig = Field(default_factory=ForgeMcpHttpConfig)

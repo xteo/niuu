@@ -3541,6 +3541,47 @@ def create_volundr_router(
         payload = response.json()
         return _with_instance(payload, instance) if isinstance(payload, dict) else {}
 
+    async def _forward_forge_mcp(
+        request: Request, principal: Principal, session_id: str, method: str, body=None
+    ) -> dict[str, Any]:
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method=method,
+            path=f"/sessions/{session_id}/forge-mcp",
+            json_body=body,
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, "Update this session's Forge host to manage Forge MCP grants")
+        _ensure_remote_success(response)
+        return _with_instance(response.json(), instance)
+
+    @router.get("/sessions/{session_id}/forge-mcp")
+    async def get_session_forge_mcp(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """A session's Forge MCP grants by source, from its owning host."""
+        return await _forward_forge_mcp(request, principal, session_id, "GET")
+
+    @router.put("/sessions/{session_id}/forge-mcp")
+    async def set_session_forge_mcp(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Replace a session's Forge MCP grants on its owning host.
+
+        Operators only: the owning Forge refuses scoped credentials and audits changes.
+        """
+        return await _forward_forge_mcp(request, principal, session_id, "PUT", body)
+
     @router.put("/sessions/{session_id}")
     async def update_session(
         request: Request,

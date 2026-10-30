@@ -711,3 +711,26 @@ async def test_create_persists_seeded_descriptions(repository, mock_pool, sample
 def test_rows_before_the_migration_read_as_unset(repository, sample_row):
     session = repository._row_to_session(sample_row)
     assert session.short_description is None and session.description_updated_at is None
+
+
+class TestPostgresSessionRepositoryForgeMcpGrants:
+    """update_forge_mcp_grants replaces only the grants key (LEX-1506)."""
+
+    async def test_sets_only_the_grants_key(
+        self, repository: PostgresSessionRepository, mock_pool, sample_session, sample_row
+    ):
+        sample_row["workload_config"] = '{"forge_mcp": {"grants": ["message"], "launch_id": "abc"}}'
+        mock_pool.fetchrow.return_value = sample_row
+        now = datetime.now(UTC)
+
+        result = await repository.update_forge_mcp_grants(sample_session.id, ["message"], now)
+
+        sql, session_id, grants, stamp = mock_pool.fetchrow.call_args[0]
+        assert "jsonb_set(" in sql and "'{forge_mcp}'" in sql
+        assert "jsonb_build_object('grants', $2::jsonb)" in sql
+        assert (session_id, grants, stamp) == (sample_session.id, '["message"]', now)
+        assert result.workload_config["forge_mcp"] == {"grants": ["message"], "launch_id": "abc"}
+
+    async def test_missing_session_is_none(self, repository: PostgresSessionRepository, mock_pool):
+        mock_pool.fetchrow.return_value = None
+        assert await repository.update_forge_mcp_grants(uuid4(), [], datetime.now(UTC)) is None

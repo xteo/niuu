@@ -174,6 +174,16 @@ class SessionRepository(ABC):
         """
 
     @abstractmethod
+    async def update_forge_mcp_grants(
+        self, session_id: UUID, grants: list[str], now: datetime
+    ) -> Session | None:
+        """Replace only ``workload_config.forge_mcp.grants``; keep the launch id.
+
+        Returns the stored session, or ``None`` when it no longer exists. The
+        running launch's credential is unchanged; the next start mints from these.
+        """
+
+    @abstractmethod
     async def get_read_states(
         self,
         session_ids: list[UUID],
