@@ -1223,6 +1223,16 @@ class NotificationsConfig(BaseModel):
     odin_review_relay: OdinReviewRelayConfig = Field(default_factory=OdinReviewRelayConfig)
     default_page_size: int = Field(default=50, ge=1, description="Feed page size default.")
     max_page_size: int = Field(default=200, ge=1, description="Largest feed page allowed.")
+    stale_after_seconds: int = Field(
+        default=4 * 3600,
+        gt=0,
+        description=(
+            "An unresolved attention, error or critical notification older than this whose "
+            "session has posted a newer milestone is served as stale: the session moved "
+            "on, so the alarm is probably over even though nothing resolved it (LEX-1442). "
+            "It is display only: nothing is resolved or hidden."
+        ),
+    )
     dispatcher: NotificationDispatcherConfig = Field(default_factory=NotificationDispatcherConfig)
     images: NotificationImagesConfig = Field(default_factory=NotificationImagesConfig)
     sinks: list[dict[str, Any]] = Field(

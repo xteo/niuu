@@ -1104,6 +1104,7 @@ def _notification_summary(raw: dict[str, Any], *, max_body_chars: int) -> dict[s
         "correlation_id",
         "resolved_at",
         "resolved_by_notification_id",
+        "stale",
     )
     summary = {key: raw.get(key) for key in keys if raw.get(key) is not None}
     body = str(raw.get("body") or "")

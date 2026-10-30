@@ -267,6 +267,13 @@ class InMemoryNotificationRepository(NotificationRepository):
             rows, resolved_at=resolved_at, resolved_by=resolved_by, resolution=resolution
         )
 
+    async def latest_milestone_seqs(self, session_ids) -> dict:
+        latest: dict = {}
+        for n in self.store.notifications.values():
+            if n.kind.value == "milestone" and n.session_id in session_ids:
+                latest[n.session_id] = max(latest.get(n.session_id, 0), n.seq)
+        return latest
+
     async def resolve_correlated(
         self, owner_id, correlation_id, *, before_seq, problems_only, resolved_at, resolved_by
     ) -> list[Notification]:

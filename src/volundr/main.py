@@ -387,6 +387,7 @@ def _create_notification_service(
         reply_ready_enabled=config.reply_ready.enabled,
         reply_title_chars=config.reply_ready.title_chars,
         reply_body_chars=config.reply_ready.body_chars,
+        stale_after_seconds=config.stale_after_seconds,
         sinks=[
             NotificationSinkInfo(
                 name=sink["name"],

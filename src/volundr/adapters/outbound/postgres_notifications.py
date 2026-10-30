@@ -542,6 +542,16 @@ class PostgresNotificationRepository(NotificationRepository):
         )
         return await self._reread([row["id"] for row in rows])
 
+    async def latest_milestone_seqs(self, session_ids: list[UUID]) -> dict[UUID, int]:
+        if not session_ids:
+            return {}
+        rows = await self._pool.fetch(
+            "SELECT session_id, max(seq) AS seq FROM forge_notifications "
+            "WHERE kind = 'milestone' AND session_id = ANY($1::uuid[]) GROUP BY session_id",
+            session_ids,
+        )
+        return {row["session_id"]: row["seq"] for row in rows}
+
     async def _reread(self, notification_ids: list[UUID]) -> list[Notification]:
         """The rows again with their image state, in feed order."""
         found = [await self.get(notification_id) for notification_id in notification_ids]

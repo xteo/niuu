@@ -117,6 +117,10 @@ class NotificationRepository(ABC):
         """
 
     @abstractmethod
+    async def latest_milestone_seqs(self, session_ids: list[UUID]) -> dict[UUID, int]:
+        """The seq of each session's newest milestone (sessions without one are absent)."""
+
+    @abstractmethod
     async def resolve_correlated(
         self,
         owner_id: str,
