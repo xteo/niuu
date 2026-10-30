@@ -2272,6 +2272,26 @@ def create_volundr_router(
         """The endpoint is stateless and offers no server stream (MCP JSON mode)."""
         return Response(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, headers={"Allow": "POST"})
 
+    @router.get("/health")
+    async def get_forge_health(
+        request: Request,
+        instance_id: str | None = Query(default=None),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """The node's Forge health, including presented-file usage against its quota
+        (LEX-1514), from the local node or the one named by ``instance_id``."""
+        instance = (
+            await _local_session_instance(service, principal, request)
+            if _local_session_scope(request)
+            else await _resolve_target_instance(service, principal, instance_id)
+        )
+        response = await _request_remote(
+            instance, request, method="GET", path="/health", embedded_app=embedded_forge_app
+        )
+        _ensure_remote_success(response)
+        payload = response.json()
+        return _with_instance(payload, instance) if isinstance(payload, dict) else {}
+
     @router.get("/feature-flags")
     async def get_feature_flags(
         request: Request,

@@ -2401,3 +2401,19 @@ def test_resolve_notification_is_forwarded_and_tagged() -> None:
     import json as _json
 
     assert _json.loads(route.calls.last.request.content) == {"resolution": "fixed"}
+
+
+@respx.mock
+def test_forge_health_is_forwarded_with_presented_file_usage() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha", is_default=True)])
+    health = {
+        "status": "healthy",
+        "presented_files": {"used_bytes": 10, "max_total_bytes": 100, "quota_refusals": 1},
+    }
+    respx.get("http://alpha/api/v1/forge/health").mock(return_value=Response(200, json=health))
+
+    response = client.get("/api/v1/forge/health", headers=_headers())
+
+    assert response.status_code == 200
+    assert response.json()["presented_files"] == health["presented_files"]
+    assert response.json()["instance_id"] == "alpha"
