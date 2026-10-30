@@ -1585,6 +1585,9 @@ def create_app(
                 session_status_host=configured_host(settings),
                 openshell_internal_gateway_url=settings.openshell_internal_gateway_url,
                 preview_cache_dir=preview_cache_root,
+                preview_default_edge=settings.tool_result_preview.default_edge,
+                preview_min_edge=settings.tool_result_preview.min_edge,
+                preview_edge_limit=settings.tool_result_preview.max_edge,
                 project_service=project_service,
                 runtime_build=build_identity()
                 if pod_manager.runtime_backend == "process"

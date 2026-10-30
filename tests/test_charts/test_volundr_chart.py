@@ -1410,6 +1410,18 @@ class TestPreviewCacheStorage:
 
         assert config["preview_cache_dir"] == "/custom/preview"
 
+    def test_configmap_leaves_preview_edges_to_defaults(self):
+        configmap, _ = self._render()
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert "tool_result_preview" not in config
+
+    def test_configmap_renders_preview_edges(self):
+        configmap, _ = self._render("--set", "previewCache.edges.max_edge=2048")
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+
+        assert config["tool_result_preview"] == {"max_edge": 2048}
+
     def test_deployment_mounts_preview_cache_emptydir_at_configured_path(self):
         _, deployment = self._render()
         containers = deployment["spec"]["template"]["spec"]["containers"]

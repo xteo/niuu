@@ -48,6 +48,9 @@ data:
     conversation_tail_growth: {{ .Values.config.conversationTailGrowth | default 2 }}
     runtime_health_timeout_seconds: {{ .Values.config.runtimeHealthTimeoutSeconds | default 3.0 }}
     preview_cache_dir: {{ .Values.previewCache.mountPath | default "/volundr/preview-cache" | quote }}
+    {{- with .Values.previewCache.edges }}
+    tool_result_preview: {{ toJson . }}
+    {{- end }}
     openshell_internal_gateway_url: {{ .Values.config.openshellInternalGatewayUrl | default "http://openshell.openshell.svc.cluster.local:8080" | quote }}
 
     cors:

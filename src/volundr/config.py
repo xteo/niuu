@@ -51,6 +51,7 @@ from niuu.domain.observability import ObservabilityConfig
 from niuu.domain.presented_files import PRESENTED_FILE_DEFAULT_MAX_BYTES
 from niuu.forge_mcp.models import ForgeMcpGrant
 from ravn.config import LLMConfig, PersonaSourceConfig
+from skuld.tool_result_preview import PREVIEW_EDGE_LIMIT, PREVIEW_MAX_EDGE, PREVIEW_MIN_EDGE
 from volundr.compute.config import ComputeConfig
 from volundr.domain.mcp_hosts import normalize_internal_host_pattern
 from volundr.domain.model_gateway import MODEL_GATEWAY_TOKEN_ENV
@@ -1315,6 +1316,44 @@ class ForgeMcpHttpConfig(BaseModel):
         if self.transcript_default_turns > self.transcript_max_turns:
             raise ValueError(
                 "forge_mcp.http.transcript_default_turns must not exceed transcript_max_turns"
+            )
+        return self
+
+
+class ToolResultPreviewConfig(BaseModel):
+    """Sizes of tool-result image previews (``GET …/tool-result/{id}/preview``).
+
+    Example YAML::
+
+        tool_result_preview:
+          default_edge: 400   # served when the client sends no ?max_edge=
+          min_edge: 320
+          max_edge: 1600
+    """
+
+    default_edge: int = Field(
+        default=PREVIEW_MAX_EDGE,
+        gt=0,
+        description="Longest edge (px) served without ?max_edge=; existing clients get this.",
+    )
+    min_edge: int = Field(
+        default=PREVIEW_MIN_EDGE,
+        gt=0,
+        description="Smallest ?max_edge= accepted; smaller requests get 422.",
+    )
+    max_edge: int = Field(
+        default=PREVIEW_EDGE_LIMIT,
+        gt=0,
+        description="Largest ?max_edge= accepted (bounds Pillow work and cache bytes per "
+        "preview); larger requests get 422 and should fetch the full image instead.",
+    )
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "ToolResultPreviewConfig":
+        if not self.min_edge <= self.default_edge <= self.max_edge:
+            raise ValueError(
+                "tool_result_preview needs min_edge <= default_edge <= max_edge "
+                f"(got {self.min_edge}, {self.default_edge}, {self.max_edge})"
             )
         return self
 
@@ -2918,6 +2957,10 @@ class Settings(BaseSettings):
         le=65535,
         validation_alias=AliasChoices("server_port", "NIUU_SERVER_PORT"),
         description="Port of the shared Niuu host used by local session brokers.",
+    )
+    tool_result_preview: ToolResultPreviewConfig = Field(
+        default_factory=ToolResultPreviewConfig,
+        description="Tool-result image preview sizes (?max_edge= bounds and default).",
     )
     preview_cache_dir: str = Field(
         default="~/.niuu/preview-cache",

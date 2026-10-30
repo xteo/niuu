@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
@@ -51,6 +52,9 @@ from skuld.conversation_snapshot import (
     prepare_recent_snapshot,
 )
 from skuld.tool_result_preview import (
+    PREVIEW_EDGE_LIMIT,
+    PREVIEW_MAX_EDGE,
+    PREVIEW_MIN_EDGE,
     PreviewCache,
     PreviewUnavailableError,
     extract_image_bytes,
@@ -179,6 +183,18 @@ DEFAULT_PREVIEW_CACHE_DIR = FilePath("~/.niuu/preview-cache").expanduser()
 # A tool_use_id's result is immutable — a regenerated preview is byte-equivalent —
 # so previews are safely long-lived cacheable at every layer (incl. URLSession).
 _PREVIEW_RESPONSE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+PREVIEW_MAX_EDGE_HEADER = "X-Preview-Max-Edge"
+"""The longest-edge bound the preview was generated for (the request's ``max_edge``)."""
+PREVIEW_EDGE_HEADER = "X-Preview-Edge"
+"""The served JPEG's actual longest edge; smaller than the bound for a small source."""
+
+
+def _jpeg_longest_edge(data: bytes) -> int:
+    """Longest edge of a cached/generated preview (Pillow reads only the header)."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as img:
+        return max(img.size)
 
 
 def _execution_catalog_http_error(
@@ -1861,6 +1877,9 @@ def create_router(
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     preview_cache: PreviewCache | None = None,
     preview_cache_dir: FilePath | str = DEFAULT_PREVIEW_CACHE_DIR,
+    preview_default_edge: int = PREVIEW_MAX_EDGE,
+    preview_min_edge: int = PREVIEW_MIN_EDGE,
+    preview_edge_limit: int = PREVIEW_EDGE_LIMIT,
     durable_transcripts: DurableTranscripts | None = None,
     project_service=None,
     runtime_build: dict | None = None,
@@ -1874,7 +1893,12 @@ def create_router(
     """Create FastAPI router with session, stats, token, repo, and SSE endpoints."""
     router = APIRouter(prefix=prefix)
     if preview_cache is None:
-        preview_cache = PreviewCache(preview_cache_dir)
+        preview_cache = PreviewCache(preview_cache_dir, max_edge=preview_default_edge)
+    if not preview_min_edge <= preview_cache.max_edge <= preview_edge_limit:
+        raise ValueError(
+            f"tool_result_preview.default_edge {preview_cache.max_edge} must lie within "
+            f"min_edge {preview_min_edge} and max_edge {preview_edge_limit}"
+        )
     if durable_transcripts is None:
         durable_transcripts = DurableTranscripts()
     event_stream = None
@@ -4708,8 +4732,20 @@ def create_router(
         session_id: UUID = Path(description="Unique session identifier"),
         tool_use_id: str = Path(description="tool_use_id of the image result"),
         image_index: int = Query(default=0, ge=0, description="Image within a multi-image result"),
+        max_edge: int | None = Query(
+            default=None,
+            description=(
+                "Longest edge in pixels, within the host's tool_result_preview "
+                "min_edge..max_edge (320-1600 by default). Omitted: default_edge (400)."
+            ),
+        ),
     ) -> Response:
         """Return a scaled-down JPEG preview of an image tool_result.
+
+        ``?max_edge=`` asks for a larger or smaller preview; out of bounds is 422.
+        ``X-Preview-Max-Edge`` names the bound served and ``X-Preview-Edge`` the
+        JPEG's actual longest edge (smaller when the source image is). Each edge is
+        cached separately, with the same immutable caching and access as before.
 
         Generated on FIRST request (full envelope resolved via the same
         live-pod → durable-fallback chain as ``get_tool_result``, then
@@ -4720,6 +4756,16 @@ def create_router(
         absent or not an image (the client falls back to the full fetch);
         501 when Pillow is unavailable.
         """
+        edge = preview_cache.max_edge if max_edge is None else max_edge
+        if not preview_min_edge <= edge <= preview_edge_limit:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"max_edge must be between {preview_min_edge} and "
+                    f"{preview_edge_limit} pixels (got {edge}); omit it for "
+                    f"{preview_cache.max_edge}"
+                ),
+            )
         sid = str(session_id)
         # Keep existing first-image cache keys compatible with native clients.
         cache_key = tool_use_id if image_index == 0 else f"{tool_use_id}:image:{image_index}"
@@ -4728,10 +4774,14 @@ def create_router(
             return Response(
                 content=data,
                 media_type="image/jpeg",
-                headers=dict(_PREVIEW_RESPONSE_HEADERS),
+                headers={
+                    **_PREVIEW_RESPONSE_HEADERS,
+                    PREVIEW_MAX_EDGE_HEADER: str(edge),
+                    PREVIEW_EDGE_HEADER: str(_jpeg_longest_edge(data)),
+                },
             )
 
-        cached = preview_cache.get(sid, cache_key)
+        cached = preview_cache.get(sid, cache_key, edge)
         if cached is not None:
             return _jpeg_response(cached)
         if preview_cache.is_non_image(sid, cache_key):
@@ -4752,7 +4802,7 @@ def create_router(
         # rebuild — the first holder pays it once (and warms the whole session);
         # the waiters wake into cache hits.
         async with preview_cache.session_lock(sid):
-            cached = preview_cache.get(sid, cache_key)
+            cached = preview_cache.get(sid, cache_key, edge)
             if cached is not None:
                 return _jpeg_response(cached)
 
@@ -4772,7 +4822,9 @@ def create_router(
                             warmed,
                             _sanitize_log(session_id),
                         )
-                    cached = preview_cache.get(sid, cache_key)
+                    # The warm pass fills the default edge; another edge is
+                    # generated below from the same rebuilt result.
+                    cached = preview_cache.get(sid, cache_key, edge)
                     if cached is not None:
                         return _jpeg_response(cached)
 
@@ -4801,7 +4853,7 @@ def create_router(
                     jpeg = await asyncio.to_thread(
                         generate_preview_jpeg,
                         extracted[0],
-                        max_edge=preview_cache.max_edge,
+                        max_edge=edge,
                     )
                 except ValueError:
                     logger.warning(
@@ -4819,7 +4871,7 @@ def create_router(
                     status_code=status.HTTP_501_NOT_IMPLEMENTED,
                     detail="Preview generation unavailable: Pillow is not installed",
                 ) from None
-            preview_cache.put(sid, cache_key, jpeg)
+            preview_cache.put(sid, cache_key, jpeg, edge)
             return _jpeg_response(jpeg)
 
     @router.get(

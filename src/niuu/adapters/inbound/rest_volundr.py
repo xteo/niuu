@@ -3625,7 +3625,7 @@ def create_volundr_router(
         _ensure_remote_success(response)
         headers = {
             name: value
-            for name in ("cache-control", "etag")
+            for name in ("cache-control", "etag", "x-preview-max-edge", "x-preview-edge")
             if (value := response.headers.get(name))
         }
         return Response(
