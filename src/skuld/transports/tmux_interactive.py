@@ -114,6 +114,12 @@ _KEY_ALIASES = {
 # PermissionRequest hook still fires, but only the question menu is on screen.
 _NO_GATE_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
 
+#: The env knob (and constructor kwarg ``turn_max_seconds``) bounding how long a turn
+#: may run without a completion signal before Forge stops waiting for it.
+TURN_MAX_SECONDS_ENV = "SKULD__TMUX_TURN_MAX_SECONDS"
+#: ``system`` frame subtype recording that a turn reached that bound.
+TURN_CAP_SUBTYPE = "turn_cap_reached"
+
 _CLAUDE_HOOK_EVENTS = [
     "SessionStart",
     "UserPromptSubmit",
@@ -342,9 +348,7 @@ class TmuxInteractiveTransport(CLITransport):
         self._turn_no_output_timeout_s = self._float_env(
             "SKULD__TMUX_TURN_NO_OUTPUT_TIMEOUT_SECONDS", turn_no_output_timeout_s, 30.0
         )
-        self._turn_max_seconds = self._float_env(
-            "SKULD__TMUX_TURN_MAX_SECONDS", turn_max_seconds, 3600.0
-        )
+        self._turn_max_seconds = self._float_env(TURN_MAX_SECONDS_ENV, turn_max_seconds, 3600.0)
         self._pane_poll_interval_s = self._float_env(
             "SKULD__TMUX_PANE_POLL_INTERVAL_SECONDS", pane_poll_interval_s, 1.0
         )
@@ -1497,6 +1501,15 @@ class TmuxInteractiveTransport(CLITransport):
 
         if event_name == "Stop":
             if self._is_child_hook(payload):
+                return True
+            last = self._last_result or {}
+            if (
+                not self._turn_active
+                and last.get("stop_reason") == "timeout"
+                and self._normalize_prompt(self._coerce_str(payload.get("last_assistant_message")))
+                == self._normalize_prompt(str(last.get("result") or ""))
+            ):
+                # The capped turn already carried this exact text.
                 return True
             if (
                 not self._turn_active
@@ -3989,11 +4002,7 @@ class TmuxInteractiveTransport(CLITransport):
                     waiting_since = None
                 if self._hook_events_enabled:
                     if now - self._turn_started_at - waited >= self._turn_max_seconds:
-                        await self._finish_hook_turn(
-                            content="",
-                            reason="timeout",
-                            is_error=True,
-                        )
+                        await self._finish_capped_hook_turn()
                         return
                     await asyncio.sleep(0.2)
                     continue
@@ -4005,7 +4014,8 @@ class TmuxInteractiveTransport(CLITransport):
                     await self._finish_synthetic_turn(reason="no_terminal_output")
                     return
                 if now - self._turn_started_at - waited >= self._turn_max_seconds:
-                    await self._finish_synthetic_turn(reason="timeout", is_error=True)
+                    await self._report_turn_cap(had_text=None)
+                    await self._finish_synthetic_turn(reason="timeout")
                     return
                 await asyncio.sleep(0.2)
         except asyncio.CancelledError:
@@ -4026,6 +4036,55 @@ class TmuxInteractiveTransport(CLITransport):
                 "cacheCreationInputTokens": 0,
             }
         }
+
+    async def _report_turn_cap(self, *, had_text: bool | None) -> None:
+        """Make a turn_max_seconds hit loud: an error log and a durable system frame.
+
+        The cap only stops Forge waiting for a turn whose end it never saw; it does not
+        mean the agent failed, so the turn itself is not marked as an error.
+        """
+        logger.error(
+            "tmux turn reached turn_max_seconds (%.0f s) without a completion signal; "
+            "ending it as a timeout. Raise SKULD__TMUX_TURN_MAX_SECONDS if turns run "
+            "longer, and check the terminal: the agent may still be working.",
+            self._turn_max_seconds,
+        )
+        event: dict[str, Any] = {
+            "type": "system",
+            "subtype": TURN_CAP_SUBTYPE,
+            "knob": TURN_MAX_SECONDS_ENV,
+            "turn_max_seconds": self._turn_max_seconds,
+            "metadata": {"source": "tmux_interactive"},
+        }
+        if had_text is not None:
+            event["had_text"] = had_text
+        await self._emit(event)
+
+    def _displayed_turn_text(self) -> str:
+        """The last message this turn displayed (or is still flushing), if any."""
+        pending = [text.strip() for text in self._display_msg_buffers.values() if text.strip()]
+        if pending:
+            return pending[-1]
+        displayed = [text.strip() for text in self._turn_displayed_texts if text.strip()]
+        return displayed[-1] if displayed else ""
+
+    async def _finish_capped_hook_turn(self) -> None:
+        """End a hook-mode turn that saw no Stop within turn_max_seconds, keeping its text.
+
+        A Stop can be missing for long, healthy turns: the main agent waiting on
+        background agents, or a Stop the transport could not attribute. The turn ends
+        with the last message it displayed, or else what the terminal shows, never with
+        an empty error that replaces the agent's reply.
+        """
+        if not self._turn_active:
+            return
+        content = (
+            self._displayed_turn_text()
+            or await self._capture_turn_text()
+            or self._turn_last_clean_text
+        )
+        await self._report_turn_cap(had_text=bool(content))
+        await self._finish_hook_turn(content=content, reason="timeout")
 
     async def _finish_synthetic_turn(self, *, reason: str, is_error: bool = False) -> None:
         if not self._turn_active:
