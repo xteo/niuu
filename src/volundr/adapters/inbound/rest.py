@@ -62,6 +62,7 @@ from skuld.tool_result_preview import (
     warm_previews_from_turns,
 )
 from volundr.adapters.inbound.auth import extract_principal, require_role
+from volundr.adapters.inbound.conversation_voice import VOICE_DETAIL, voice_page
 from volundr.adapters.inbound.durable_transcripts import DurableTranscripts
 from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.adapters.inbound.rest_projects import (
@@ -182,6 +183,40 @@ DEFAULT_PREVIEW_CACHE_DIR = FilePath("~/.niuu/preview-cache").expanduser()
 
 # A tool_use_id's result is immutable — a regenerated preview is byte-equivalent —
 # so previews are safely long-lived cacheable at every layer (incl. URLSession).
+FORGE_READ_MS_HEADER = "X-Forge-Read-Ms"
+"""Server time (ms) spent on a read, so a caller can tell Forge time from its own."""
+
+
+def _read_ms(started: float) -> str:
+    return f"{(time.perf_counter() - started) * 1000.0:.1f}"
+
+
+def _session_activity_key(item: Any) -> str:
+    """Sort key for newest activity first; a room-only row has no activity time."""
+    return getattr(item, "last_active", None) or ""
+
+
+def _session_summary(item: Any, node: str | None) -> dict[str, Any]:
+    """The compact row of ``GET /sessions?fields=summary`` (LEX-1677)."""
+    coordination = getattr(item, "coordination", None)
+    read_state = getattr(item, "read_state", None)
+    return {
+        "id": str(item.id),
+        "name": item.name,
+        "status": item.status.value if hasattr(item.status, "value") else item.status,
+        "activity_state": getattr(item, "activity_state", None),
+        "short_description": getattr(item, "short_description", None),
+        "project": (
+            {"id": str(coordination.project_id), "role": coordination.role}
+            if coordination is not None
+            else None
+        ),
+        "last_activity_at": getattr(item, "last_active", None),
+        "unread": read_state.is_unread if read_state is not None else None,
+        "node": node,
+    }
+
+
 _PREVIEW_RESPONSE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 PREVIEW_MAX_EDGE_HEADER = "X-Preview-Max-Edge"
 """The longest-edge bound the preview was generated for (the request's ``max_edge``)."""
@@ -2057,6 +2092,10 @@ def create_router(
                 "forge_session_tokens": session_tokens is not None,
                 "forge_session_token_key": session_tokens.key_source if session_tokens else None,
                 "forge_mcp_http": getattr(request.app.state, "forge_mcp_http", False),
+                # LEX-1677: GET /sessions/{id}/conversation?detail=voice&limit=N
+                "voice_conversation": True,
+                # LEX-1677: GET /sessions?fields=summary (and limit)
+                "summary_sessions": True,
             },
             "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
@@ -2176,7 +2215,19 @@ def create_router(
         role: str | None = Query(default=None),
         parent_session_id: UUID | None = Query(default=None),
         parent_instance_id: str | None = Query(default=None),
-    ) -> list[SessionResponse | SessionRoomSummary]:
+        limit: int | None = Query(
+            default=None,
+            ge=1,
+            description="Only the N sessions with the newest activity (LEX-1677). "
+            "Omitted: every session, in the existing order.",
+        ),
+        fields: Literal["full", "summary"] = Query(
+            default="full",
+            description="'summary' returns {id, name, status, activity_state, "
+            "short_description, project, last_activity_at, unread, node} per session, "
+            "newest activity first.",
+        ),
+    ) -> list[SessionResponse | SessionRoomSummary] | list[dict]:
         """List all sessions. Archived sessions are excluded by default.
 
         A session the caller owns (or is tenant-admin/viewer for) renders as
@@ -2188,6 +2239,7 @@ def create_router(
         pod_name, error, activity_metadata, external ids).
         """
         response.headers["X-Forge-Session-Scope"] = "local"
+        started = time.perf_counter()
         principal = await _optional_principal(request)
         if principal is None and _strict_identity_enabled(request):
             return []
@@ -2223,6 +2275,14 @@ def create_router(
         )
         room_session_ids = {s.id for s in room_sessions}
         result.extend(_room_summary(s, g) for s, g in room_pairs if s.id in room_session_ids)
+        if limit is not None or fields == "summary":
+            result.sort(key=_session_activity_key, reverse=True)
+        if limit is not None:
+            result = result[:limit]
+        response.headers[FORGE_READ_MS_HEADER] = _read_ms(started)
+        if fields == "summary":
+            node = project_service.instance_id if project_service is not None else None
+            return [_session_summary(item, node) for item in result]
         return result
 
     @router.get(
@@ -3955,13 +4015,16 @@ def create_router(
     )
     async def get_conversation(
         request: Request,
+        response: Response,
         session_id: UUID = Path(description="Unique session identifier"),
         detail: str = Query(
             "full",
             description=(
                 "'shallow' elides heavy tool_result content to lazy-load "
                 "placeholders; fetch a full result via "
-                "/sessions/{id}/tool-result/{tool_use_id}."
+                "/sessions/{id}/tool-result/{tool_use_id}. 'voice' (LEX-1677) returns "
+                "only the newest `limit` turns' user/agent text as messages "
+                "{role, text, created_at, turn_id}, read from the end of the source."
             ),
         ),
         limit: int = Query(
@@ -4020,6 +4083,14 @@ def create_router(
                 "combined with `cursor`, `before`, `after`, `after_id` or `turn_id`."
             ),
         ),
+        since_turn: str | None = Query(
+            None,
+            description=(
+                "detail=voice only: return only messages after this turn id. "
+                "`since_turn_found: false` means the turn is older than the page read, "
+                "so messages between it and the page may be missing."
+            ),
+        ),
     ) -> dict:
         """Return conversation history from a live session or stopped-session workspace.
 
@@ -4028,6 +4099,39 @@ def create_router(
         and the durable-log rebuild fallback (elided here), so the shape is
         identical regardless of which path served the transcript.
         """
+        if detail == VOICE_DETAIL:
+            if tail or cursor or before or after >= 0 or after_id or turn_id:
+                raise HTTPException(400, "detail=voice cannot be combined with paging parameters")
+            if history_protocol or max_bytes:
+                raise HTTPException(400, "detail=voice takes only limit and since_turn")
+            if not 1 <= limit <= history_max_turns:
+                raise HTTPException(
+                    422,
+                    f"detail=voice needs limit between 1 and {history_max_turns} "
+                    "(conversation_recent_max_turns)",
+                )
+            started = time.perf_counter()
+            page = await get_conversation(
+                request,
+                response,
+                session_id,
+                detail=SHALLOW_DETAIL,
+                limit=0,
+                before=0,
+                after=-1,
+                max_bytes=0,
+                after_id=None,
+                history_protocol=0,
+                cursor=None,
+                turn_id=None,
+                tail=limit,
+                since_turn=None,
+            )
+            out = voice_page(page, session_id=str(session_id), limit=limit, since_turn=since_turn)
+            response.headers[FORGE_READ_MS_HEADER] = _read_ms(started)
+            return out
+        if since_turn is not None:
+            raise HTTPException(400, "since_turn requires detail=voice")
         if tail and (cursor or before or after >= 0 or after_id or turn_id):
             raise HTTPException(400, "tail cannot be combined with paging parameters")
         if tail:
@@ -4503,7 +4607,9 @@ def create_router(
         tags=["Sessions"],
         dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
     )
-    async def get_conversation_item(request: Request, session_id: UUID, turn_id: str) -> dict:
+    async def get_conversation_item(
+        request: Request, response: Response, session_id: UUID, turn_id: str
+    ) -> dict:
         """Explicit full-item expansion, never used for automatic history recovery.
 
         Also reports where the turn sits (``index`` of ``total_turns``) in the complete
@@ -4514,6 +4620,7 @@ def create_router(
         """
         item = await get_conversation(
             request=request,
+            response=response,
             session_id=session_id,
             detail="full",
             limit=0,
@@ -4525,9 +4632,11 @@ def create_router(
             cursor=None,
             turn_id=turn_id,
             tail=0,
+            since_turn=None,
         )
         listing = await get_conversation(
             request=request,
+            response=response,
             session_id=session_id,
             detail="shallow",
             limit=0,
@@ -4539,6 +4648,7 @@ def create_router(
             cursor=None,
             turn_id=None,
             tail=0,
+            since_turn=None,
         )
         turns = listing.get("turns") if isinstance(listing, dict) else None
         turns = turns if isinstance(turns, list) else []

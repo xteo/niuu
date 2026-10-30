@@ -2287,3 +2287,95 @@ def test_session_forge_mcp_refusal_from_the_owner_is_returned() -> None:
     )
 
     assert response.status_code == 403
+
+
+@respx.mock
+def test_list_sessions_limit_keeps_the_newest_across_nodes_and_forwards_fields() -> None:
+    client = _client(
+        [_instance("alpha", base_url="http://alpha"), _instance("beta", base_url="http://beta")]
+    )
+    alpha = respx.get("http://alpha/api/v1/forge/sessions").mock(
+        return_value=Response(
+            200,
+            json=[
+                {
+                    "id": "a1",
+                    "name": "A1",
+                    "status": "running",
+                    "last_activity_at": "2026-10-30T08:00:00Z",
+                },
+                {
+                    "id": "a2",
+                    "name": "A2",
+                    "status": "stopped",
+                    "last_activity_at": "2026-10-30T06:00:00Z",
+                },
+            ],
+        )
+    )
+    respx.get("http://beta/api/v1/forge/sessions").mock(
+        return_value=Response(
+            200,
+            json=[
+                {
+                    "id": "b1",
+                    "name": "B1",
+                    "status": "running",
+                    "last_activity_at": "2026-10-30T07:00:00Z",
+                }
+            ],
+        )
+    )
+
+    response = client.get(
+        "/api/v1/forge/sessions", headers=_headers(), params={"limit": 2, "fields": "summary"}
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == ["a1", "b1"]
+    assert alpha.calls.last.request.url.params["limit"] == "2"
+    assert alpha.calls.last.request.url.params["fields"] == "summary"
+    assert float(response.headers["X-Forge-Read-Ms"]) >= 0
+
+
+@respx.mock
+def test_feature_flags_mirror_the_nodes_voice_reads() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha", is_default=True)])
+    respx.get("http://alpha/api/v1/forge/feature-flags").mock(
+        return_value=Response(
+            200, json={"capabilities": {"voice_conversation": True, "summary_sessions": True}}
+        )
+    )
+    old = _client([_instance("beta", base_url="http://beta", is_default=True)])
+    respx.get("http://beta/api/v1/forge/feature-flags").mock(
+        return_value=Response(200, json={"capabilities": {"notifications": True}})
+    )
+
+    new_caps = client.get("/api/v1/forge/feature-flags", headers=_headers()).json()["capabilities"]
+    old_caps = old.get("/api/v1/forge/feature-flags", headers=_headers()).json()["capabilities"]
+
+    assert new_caps["voice_conversation"] is True and new_caps["summary_sessions"] is True
+    assert old_caps["voice_conversation"] is False and old_caps["summary_sessions"] is False
+
+
+@respx.mock
+def test_voice_conversation_passes_through_without_aggregate_timings() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2", "name": "Session 2"})
+    )
+    voice = {"session_id": "s2", "detail": "voice", "limit": 2, "messages": []}
+    route = respx.get("http://beta/api/v1/forge/sessions/s2/conversation").mock(
+        return_value=Response(200, json=voice)
+    )
+
+    response = client.get(
+        "/api/v1/forge/sessions/s2/conversation",
+        headers=_headers(),
+        params={"detail": "voice", "limit": 2, "since_turn": "t1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == voice
+    assert route.calls.last.request.url.params["since_turn"] == "t1"
+    assert float(response.headers["X-Forge-Read-Ms"]) >= 0
