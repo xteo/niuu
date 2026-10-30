@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import respx
 from fastapi import FastAPI, Request
 from httpx import Response
 
+from identity.adapters.identity import AllowAllIdentityAdapter
 from niuu.adapters.inbound.rest_instances import create_instances_router
 from niuu.adapters.inbound.rest_volundr import create_volundr_router
 from tests.support.push_fakes import (
@@ -27,6 +29,7 @@ from tests.support.push_fakes import (
     device,
     gateway_settings,
 )
+from tests.test_niuu.test_rest_instances import StubHealthChecker
 from tests.test_niuu.test_rest_volundr import StubInstanceService, _instance
 from tests.test_niuu.test_rest_volundr_notifications import T0, _item, _page
 from volundr.adapters.outbound.http_guild_feed import HttpGuildFeed
@@ -64,7 +67,11 @@ class Guild:
 
         registry = StubInstanceService([LOCAL, REMOTE, DISABLED])
         app = FastAPI()
-        app.include_router(create_instances_router(registry))  # type: ignore[arg-type]
+        # The gateway sends no credential without reader_token_path: an AllowAll Guild.
+        app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
+        app.include_router(
+            create_instances_router(registry, health_checker=StubHealthChecker())  # type: ignore[arg-type]
+        )
         app.include_router(  # type: ignore[arg-type]
             create_volundr_router(registry, embedded_forge_app=node)
         )
