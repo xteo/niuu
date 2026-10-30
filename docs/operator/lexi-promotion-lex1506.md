@@ -1,8 +1,9 @@
 # Promotion note: Forge MCP grants and preview size (LEX-1506, LEX-1655)
 
-**Status: PREPARED, not applied.** The release trees are built on both hosts.
-Nothing live has changed: the databases were only read and the configurations
-were validated from scratch copies.
+**Status: APPLIED 2026-10-30.** Thor switched at 08:53:45 UTC and mini-m6 at
+08:57:00 UTC. Both passed their smoke, and nothing was rolled back. The record is
+in §Switch record below and in `~/.local/share/niuu/rollouts/forge-grants-ef6dead3/`
+on Thor.
 
 This release replaces the prepared LEX-1536 release
 (`docs/operator/lexi-promotion-lex1536.md`). It contains that release, so the
@@ -53,3 +54,39 @@ Run these against the scratch session. Set `F=$A/api/v1/forge` and `S=<scratch i
 If G2's audit read answers 404 on the Guild host, read the audit events on the
 embedded Volundr instead. The row is written either way, and the G2 `PUT` itself
 proves the write succeeded.
+
+## Switch record (2026-10-30)
+
+The coordinator relaxed the quiet rule. A host could restart when:
+
+- no voice call was live on the agent service (`/api/voice/calls`; a call that
+  ended more than 2 minutes ago counts as none);
+- ios-coordinator's last turn had ended more than 2 minutes ago;
+- on m6, in addition, ios-release was idle and no `qa.sh` process was running.
+
+Sessions marked active were interrupted. The check is `gate.py`.
+
+| | Thor | mini-m6 |
+|---|---|---|
+| Backup | `~/backups/volundr-pg/nightly-20261030T0556Z` (6.6 GB) | (the B3 off-box copy; m6 data unchanged except one migration) |
+| Restart | 08:53:45, ready after 7 s, `CUTOVER_OK` 08:54:01 | stopped its 6 running sessions from 08:56:09; `kickstart -k` 08:57:00, ready after 6 s, `CUTOVER_OK` 08:57:09; the 6 sessions restarted at once, all running and idle |
+| Preservation | `PRESERVED` (113 processes, 729 sessions); sample conversation 16/16 turns the same | sessions 15/15; the Thor Guild sees all 15 |
+| Ledger | 115 → **116**, `000094` sha `f29350b3…4482c` | 137\|44 → **138\|44**, the same sha; a second migration run added 0 |
+| Web | swapped to `forge-grants-ef6dead3` (`X-Niuu-Web-Revision: grants-ef6dead3`; `nginx.conf.bak-20261030-grants`) | served from the release |
+
+**Smoke on Thor** (scratch session `a13c92f6`, deleted afterwards):
+
+- **G1:** `GET` returned 200.
+- **G2:** `PUT ["message"]` returned 200, and its audit row is readable through the
+  Guild host.
+- **G3:** the session's own token got 403 on both `PUT` and `GET`.
+- **G4:** after a restart, the new launch's grants are `[message]`.
+- **P1:** the preview without `max_edge` was 400. With `max_edge=1200` it was 827,
+  the source's own size. 2000 and 319 got 422.
+- **S4:** both bad `speak` requests got 422, and nothing was recorded.
+
+S1, S2 and S6 were skipped: each would create a real notification, and the lane's
+contract forbids Forge notifications from it.
+
+**Smoke on m6:** the driver's automatic checks, plus the `forge-mcp` route (200) and
+a preview with `max_edge` out of bounds (422).
