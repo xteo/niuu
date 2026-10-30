@@ -346,6 +346,9 @@ class CodexWebSocketTransport(CLITransport):
         3. JSON-RPC ``initialize`` handshake, then ``thread/start``
         4. User messages are sent via ``turn/start``
         5. Streaming events arrive as JSON-RPC notifications
+        6. If the app-server exits while serving (not through ``stop()``), the
+           transport emits ``transport_stopped`` (``reason: codex_exited``), so the
+           broker reports the session stopped instead of idle with no agent
 
     Authentication is selected by the configured ``CodexAuthProviderPort``.
     Local sessions retain Codex's host login; Kubernetes sessions use externally
@@ -447,6 +450,8 @@ class CodexWebSocketTransport(CLITransport):
         self._process: asyncio.subprocess.Process | None = None
         self._ws: ClientConnection | None = None
         self._receive_task: asyncio.Task | None = None
+        self._process_watch: asyncio.Task | None = None
+        self._stopping = False
         self._compaction_task: asyncio.Task | None = None
         self._codex_socket_dir: str | None = None
         self._codex_socket_path: str | None = None
@@ -585,13 +590,44 @@ class CodexWebSocketTransport(CLITransport):
                 "Codex app-server startup failed; fix the configured runtime before retrying"
             ) from exc
 
+        self._process_watch = asyncio.create_task(self._watch_app_server(self._process))
+
         # On resume the prior thread's history is reloaded, so don't replay
         # the initial prompt (it was already part of that conversation).
         if self._initial_prompt and not self._resume_session_id:
             await self.send_message(self._initial_prompt)
 
+    async def _watch_app_server(self, process: asyncio.subprocess.Process | None) -> None:
+        """Report an app-server that exits while serving (LEX-1699 for Codex).
+
+        Its exit closes the WebSocket, and nothing else would tell the broker: the
+        session would read idle with no agent until the next message. Exits caused
+        by ``stop()`` or by a later restart's process are not reported.
+        """
+        if process is None:
+            return
+        status = await process.wait()
+        if self._stopping or process is not self._process:
+            return
+        logger.error("Codex app-server exited while serving (status %s)", status)
+        await self._emit(
+            {"type": "transport_stopped", "reason": "codex_exited", "exit_status": str(status)}
+        )
+
     async def stop(self) -> None:
+        self._stopping = True
+        try:
+            await self._stop()
+        finally:
+            self._stopping = False
+
+    async def _stop(self) -> None:
         self._alive = False
+
+        if self._process_watch and not self._process_watch.done():
+            self._process_watch.cancel()
+            await asyncio.gather(self._process_watch, return_exceptions=True)
+        self._process_watch = None
 
         await self._finalize_stranded_turn("cancelled", "Codex transport stopped")
 
