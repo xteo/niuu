@@ -201,6 +201,10 @@ previewCache:
   mountPath: /volundr/preview-cache
   # -- Size limit for the preview cache emptyDir volume (leave empty/"" for no limit)
   sizeLimit: 1Gi
+  # -- Preview sizes, rendered as config.yaml's tool_result_preview (snake_case keys).
+  # Empty keeps the defaults: default_edge 400 (no ?max_edge=), min_edge 320,
+  # max_edge 1600. Example: {default_edge: 400, min_edge: 320, max_edge: 2048}
+  edges: {}
 
 scratch:
   # -- Size limit for the /tmp emptyDir (the root filesystem is read-only). It holds

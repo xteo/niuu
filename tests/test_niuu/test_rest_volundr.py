@@ -2026,6 +2026,8 @@ def test_tool_result_preview_byte_proxies_jpeg_from_owner() -> None:
             headers={
                 "content-type": "image/jpeg",
                 "cache-control": "public, max-age=31536000, immutable",
+                "x-preview-max-edge": "1200",
+                "x-preview-edge": "1200",
             },
         )
     )
@@ -2033,7 +2035,7 @@ def test_tool_result_preview_byte_proxies_jpeg_from_owner() -> None:
     response = client.get(
         "/api/v1/forge/sessions/s2/tool-result/tu-img/preview",
         headers=_headers(),
-        params={"image_index": 1},
+        params={"image_index": 1, "max_edge": 1200},
     )
 
     assert response.status_code == 200
@@ -2042,6 +2044,9 @@ def test_tool_result_preview_byte_proxies_jpeg_from_owner() -> None:
     assert "immutable" in response.headers["cache-control"]
     assert route.called
     assert route.calls[0].request.url.params["image_index"] == "1"
+    assert route.calls[0].request.url.params["max_edge"] == "1200"
+    assert response.headers["x-preview-max-edge"] == "1200"
+    assert response.headers["x-preview-edge"] == "1200"
 
 
 @respx.mock

@@ -1015,6 +1015,28 @@ it and answers with its protocol-2 recent page, which is also the newest turns.
 Without `tail`, the response is unchanged. Check for `tail` (or
 `history_protocol: 2`) in the response before trusting it as a tail.
 
+### Image tool-result previews
+
+```http
+GET /api/v1/forge/sessions/{session_id}/tool-result/{tool_use_id}/preview
+GET /api/v1/forge/sessions/{session_id}/tool-result/{tool_use_id}/preview?max_edge=1200&image_index=1
+```
+
+The preview is a JPEG of an image tool result, scaled down to a longest edge of
+`max_edge` pixels and never scaled up.
+
+- `max_edge` is optional. Without it you get 400 px, as older clients always have.
+- It must lie within the host's `tool_result_preview.min_edge` and `max_edge`
+  (320–1600 by default). Anything outside those bounds is answered with **422**,
+  never clamped.
+- The response names the size it served:
+  - `X-Preview-Max-Edge` is the bound used for the preview.
+  - `X-Preview-Edge` is the JPEG's real longest edge, which is smaller when the
+    source image is smaller.
+- Each edge is cached separately, with `Cache-Control: immutable`.
+- A 404 means the result is absent or not an image, so fall back to the full
+  tool-result fetch. A 501 means the host has no Pillow.
+
 ### Read persisted transcript directly
 
 ```http
