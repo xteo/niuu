@@ -194,6 +194,44 @@ restart them after the switch. Claude resumes its conversation on restart.
 (§6 proposes `AbandonProcessGroup` so that later m6 promotions behave like
 Thor's.)
 
+### 1.3a Busy lanes: never restart a lane mid-work (LEX-1706)
+
+On 2026-10-30 at 20:36 the mini switch stopped every lane while ios-release was running a
+release train (build 2442, after its release commit had landed): no result, no tag. Forge
+reported the lane `idle`, because Claude ran the train from background shells. Forge's
+activity state alone is therefore not enough.
+
+A lane may be restarted (or stopped by a host switch) only when **all** of these hold:
+
+1. Forge reports it `idle` (a question or menu on screen counts as busy);
+2. its tmux pane runs no tool command: no shell the agent spawned (`sh|bash|zsh -c …`,
+   Claude's Bash tool and background tasks, a Codex exec). MCP servers and other
+   long-lived helpers are direct executables and do not count;
+3. for a host switch, no train process runs anywhere on the host, even detached:
+   `release.py`, `qa.sh`, `xcodebuild`, a journey runner, `archive`, `fastlane`,
+   `altool`, `notarytool`.
+
+`scripts/forge_lane_busy.py FORGE_BASE TMUX_BIN [SESSION_ID …]` checks this on the host
+it runs on, prints JSON (`busy` lanes with their reasons, `host_trains`) and exits 1 when
+anything is busy. Copy it to the host. It runs with the system `python3` (3.9 or later).
+
+```bash
+python3 scripts/forge_lane_busy.py http://127.0.0.1:8080 "$(which tmux)"           # Thor
+ssh -n xteo@mini-m6 'python3 ~/.local/share/niuu-forge/lane_busy.py \
+  http://100.92.69.62:8080 $HOME/.local/share/niuu-forge/tools/bin/tmux'           # m6
+```
+
+How the drivers use it:
+
+- A **host switch that stops lanes** (m6) waits until the check passes twice, 20 s
+  apart, and checks again just before the stop. It has a bounded deadline (4 h); past
+  it, the host is not switched, and the busy lanes are reported. The release lane is
+  never stopped while a train runs.
+- A **host switch that leaves lanes running** (Thor's API restart) logs the busy lanes
+  when it switches.
+- A **session restart** waits, per lane, for the check on that lane, with a bounded
+  deadline, and reports the lanes it skipped.
+
 ### 1.4 Expected downtime
 
 - **Thor:** the stop takes ≤ 20 s (`TimeoutStopSec=20`, uvicorn's graceful
