@@ -326,8 +326,17 @@ There are three ways to resolve one:
 
 - collapsing resolved items under their milestone in the apps;
 - the control plane's Needs-you counts and the voice summaries;
-- marking an old unresolved alarm as stale when there is no correlation id (item 4
-  of the ticket).
+
+**Stale.** An unresolved attention, error or critical notification is served with
+`stale: true` when both of these hold:
+
+- it is older than `notifications.stale_after_seconds` (4 hours by default);
+- its session has posted a newer milestone.
+
+The session moved on, so the alarm is probably over even though nothing resolved it.
+The flag is computed when the feed is read, with one grouped query per page, and never
+stored. It resolves and hides nothing: clients grey the item out, and voice summaries
+say "stale, from 05:12".
 
 Storage: migration `000095_forge_notification_resolved`. It adds three nullable
 columns, which rewrites nothing, and a partial index on `(owner_id, correlation_id)`

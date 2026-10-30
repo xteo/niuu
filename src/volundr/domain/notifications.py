@@ -137,6 +137,8 @@ class Notification(BaseModel):
     resolved_at: datetime | None = None
     resolved_by_notification_id: UUID | None = None
     resolution: str | None = None
+    #: Computed at read time, never stored: see ``notifications.stale_after_seconds``.
+    stale: bool = False
 
     @property
     def resolved(self) -> bool:

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from niuu.domain.guild_membership import GuildInstance
@@ -190,6 +190,7 @@ class NotificationService(NotificationRecorder):
         reply_title_chars: int,
         reply_body_chars: int,
         sinks: list[NotificationSinkInfo],
+        stale_after_seconds: float | None = None,
         engine_resolver: EngineResolver | None = None,
         integration_repository: IntegrationRepository | None = None,
         attention_retire_page_size: int = 200,
@@ -197,6 +198,11 @@ class NotificationService(NotificationRecorder):
     ) -> None:
         if attention_retire_page_size < 1:
             raise ValueError("attention_retire_page_size must be positive")
+        if stale_after_seconds is not None and stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        self._stale_after = (
+            timedelta(seconds=stale_after_seconds) if stale_after_seconds is not None else None
+        )
         self._attention_retire_page_size = attention_retire_page_size
         self._repository = repository
         self._rules = rule_repository
@@ -688,6 +694,7 @@ class NotificationService(NotificationRecorder):
         page = await self._repository.list_feed(
             scope, query, read_through_seq=watermark.read_through_seq
         )
+        page = replace(page, items=await self._mark_stale(page.items))
         head, unread = await self._repository.feed_counts(
             scope, read_through_seq=watermark.read_through_seq
         )
@@ -710,7 +717,31 @@ class NotificationService(NotificationRecorder):
         """
         watermark = await self._repository.get_watermark(principal.user_id)
         items = await self._repository.list_for_session(session_id, after=after, limit=limit)
-        return items, watermark.read_through_seq
+        return await self._mark_stale(items), watermark.read_through_seq
+
+    async def _mark_stale(self, items: list[Notification]) -> list[Notification]:
+        """Flag alarms whose session has moved on (LEX-1442 item 4); display only."""
+        if self._stale_after is None:
+            return items
+        cutoff = datetime.now(UTC) - self._stale_after
+        candidates = [
+            n
+            for n in items
+            if n.resolved_at is None
+            and n.session_id is not None
+            and n.created_at <= cutoff
+            and (
+                n.kind in (NotificationKind.ATTENTION, NotificationKind.ERROR)
+                or n.severity is NotificationSeverity.CRITICAL
+            )
+        ]
+        if not candidates:
+            return items
+        latest = await self._repository.latest_milestone_seqs(
+            sorted({n.session_id for n in candidates}, key=str)
+        )
+        stale = {n.id for n in candidates if latest.get(n.session_id, 0) > n.seq}
+        return [n.model_copy(update={"stale": True}) if n.id in stale else n for n in items]
 
     async def read_through_seq(self, principal: Principal) -> int:
         watermark = await self._repository.get_watermark(principal.user_id)

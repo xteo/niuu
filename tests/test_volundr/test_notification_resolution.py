@@ -160,3 +160,33 @@ def test_the_draft_carries_resolves_on_the_wire_only_when_set() -> None:
 
     assert "resolves" not in plain
     assert closing["resolves"] == ["LEX-1", "x"]  # trimmed and de-duplicated
+
+
+async def test_an_old_alarm_whose_session_moved_on_is_stale() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    forge = build_forge_app()
+    forge.notifications._stale_after = timedelta(hours=4)
+    session = await forge.session(owner=DEV)
+    other = await forge.session("other", owner=DEV)
+    now = datetime.now(UTC)
+    forge.store.clock = lambda: now - timedelta(hours=5)
+    alarm = _submit(forge, session.id, "c1", kind="attention", severity="critical")
+    quiet = _submit(forge, other.id, "c2", kind="attention")
+    note = _submit(forge, session.id, "i1")
+    forge.store.clock = lambda: now - timedelta(hours=1)
+    young = _submit(forge, session.id, "c3", kind="error")
+    _submit(forge, session.id, "m1", kind="milestone", title="moved on")
+
+    items = forge.client.get(f"{PREFIX}/notifications").json()["items"]
+    stale = {item["id"]: item["stale"] for item in items}
+    per_session = forge.client.get(f"{PREFIX}/sessions/{session.id}/notifications").json()
+    rows = per_session.get("items", per_session) if isinstance(per_session, dict) else per_session
+
+    assert stale[alarm["id"]] is True  # old, unresolved, its session has a newer milestone
+    assert stale[young["id"]] is False  # not old enough yet
+    assert stale[quiet["id"]] is False  # its session posted no milestone
+    assert stale[note["id"]] is False  # info is not an alarm
+    assert next(r for r in rows if r["id"] == alarm["id"])["stale"] is True
+    # Display only: nothing was resolved.
+    assert _row(forge, alarm["id"]).resolved_at is None

@@ -195,6 +195,13 @@ class NotificationResponse(BaseModel):
     resolution: str | None = Field(
         default=None, description="Free text given when an operator resolved it by hand."
     )
+    stale: bool = Field(
+        default=False,
+        description=(
+            "An unresolved alarm older than notifications.stale_after_seconds whose session "
+            "has posted a newer milestone: probably over. Display only."
+        ),
+    )
     resolves: list[str] | None = Field(
         default=None,
         description="Notification or correlation ids this notification resolved, as sent.",
