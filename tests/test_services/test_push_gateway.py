@@ -87,6 +87,7 @@ def live_activity(**overrides) -> LiveActivitySettings:
         "stale_seconds": 28800,
         "start_enabled": False,
         "start_min_interval_seconds": 3600.0,
+        "relevance_score": 10,
     }
     values.update(overrides)
     return LiveActivitySettings(**values)

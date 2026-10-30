@@ -112,6 +112,7 @@ def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
             stale_seconds=live.stale_seconds,
             start_enabled=live.start.enabled,
             start_min_interval_seconds=live.start.min_interval_seconds,
+            relevance_score=live.relevance_score,
         ),
         widgets=WidgetSettings(
             enabled=widgets.enabled,

@@ -468,6 +468,7 @@ def gateway_settings(
             stale_seconds=28800,
             start_enabled=False,
             start_min_interval_seconds=3600.0,
+            relevance_score=10,
         ),
         "widgets": widgets or WidgetSettings(enabled=True, priority=5, min_interval_seconds=300.0),
         # Off unless a test turns it on: most tests count the pushes of one type.

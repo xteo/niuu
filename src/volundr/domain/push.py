@@ -456,15 +456,21 @@ def live_activity_payload(
     *,
     timestamp: int,
     stale_date: int,
+    relevance_score: float,
     alert_title: str = "",
     alert_body: str = "",
 ) -> dict[str, Any]:
-    """A Live Activity push. ``start`` also names the attributes and carries an alert."""
+    """A Live Activity push. ``start`` also names the attributes and carries an alert.
+
+    ``relevance-score`` ranks this activity against the app's others for the Dynamic
+    Island (LEX-1353): notifications sit below a live call, which the app scores higher.
+    """
     aps: dict[str, Any] = {
         "timestamp": timestamp,
         "event": event.value,
         "content-state": dict(content_state),
         "stale-date": stale_date,
+        "relevance-score": relevance_score,
     }
     if event is LiveActivityEvent.START:
         aps["attributes-type"] = LIVE_ACTIVITY_ATTRIBUTES_TYPE
