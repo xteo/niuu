@@ -140,6 +140,21 @@ history only. The test harness uses that because it hosts the broker in-process.
 Seen live on 2026-10-30: ios-speaker-bargein's pane was dead for 8 hours while Forge
 reported it running and queued its messages.
 
+### The stale-socket sweep spares new sockets
+
+Every broker sweeps the shared tmux socket directory and unlinks sockets whose
+server no longer answers. A sibling's server that is still starting fails that
+probe for a moment. On 2026-10-30, six lanes started together on the mini and
+ios-fixes lost its live socket that way: its broker could no longer reach its pane
+and stayed in `provisioning`.
+
+The sweep now spares two kinds of socket:
+
+- one younger than `SKULD__TMUX_SOCKET_SWEEP_MIN_AGE_SECONDS` (600 s by default);
+- the broker's own socket.
+
+A server still unreachable after that age is dead, and the next sweep removes it.
+
 General terminal choices without structured Claude hooks are deferred; see the
 [future terminal-question requirement](../forge/claude-terminal-questions-future.md).
 
