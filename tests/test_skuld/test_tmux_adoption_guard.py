@@ -31,6 +31,7 @@ class StampingTmux(FakeTmuxInteractiveTransport):
     def __init__(self, workspace_dir: str, **kwargs: Any) -> None:
         super().__init__(workspace_dir, **kwargs)
         self.options: dict[str, str] = {}
+        self.primary_dead = False
 
     async def _run_tmux(self, *args: str, check: bool = True, env=None) -> _TmuxResult:
         if args[:1] == ("kill-session",):
@@ -42,6 +43,9 @@ class StampingTmux(FakeTmuxInteractiveTransport):
             self.commands.append((args, env))
             self.options[HOOK_BINDING_OPTION] = args[-1]
             return _TmuxResult(0)
+        if args[:1] == ("list-panes",) and args[-1] == "#{pane_dead}":
+            self.commands.append((args, env))
+            return _TmuxResult(0, "1\n" if self.primary_dead else "0\n")
         if args[:1] == ("show-options",) and args[-1] == HOOK_BINDING_OPTION:
             self.commands.append((args, env))
             if HOOK_BINDING_OPTION not in self.options:
@@ -107,3 +111,19 @@ def test_the_binding_changes_with_the_port_and_the_secret(tmp_path: Path) -> Non
     one = StampingTmux(str(tmp_path), sdk_port=8081)
     other_port = StampingTmux(str(tmp_path), sdk_port=8082)
     assert one._hook_binding() != other_port._hook_binding()
+
+
+@pytest.mark.asyncio
+async def test_our_session_with_a_dead_claude_is_replaced(tmp_path: Path) -> None:
+    """LEX-1699: a corpse kept by remain-on-exit is never adopted, even with our stamp."""
+    transport = StampingTmux(str(tmp_path), sdk_port=8081)
+    events = await _collect_events(transport)
+    transport.session_exists = True
+    transport.options[HOOK_BINDING_OPTION] = transport._hook_binding()
+    transport.primary_dead = True
+    try:
+        await transport._ensure_started()
+        assert _new_sessions(transport) == 1
+        assert len(_replaced(events)) == 1
+    finally:
+        await transport.stop()

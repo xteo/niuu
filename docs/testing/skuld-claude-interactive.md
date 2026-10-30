@@ -115,6 +115,31 @@ and recorded as a `system` frame with `subtype: stale_tmux_session_replaced`.
 Sessions created before this release carry no stamp, so they are replaced the first
 time a new broker starts for them.
 
+### When Claude's pane dies (LEX-1699)
+
+The tmux session keeps a dead pane (`remain-on-exit`). A teammate's dead pane is just
+closed. When Claude's own pane (`main.0`) dies:
+
+1. The transport reports `transport_stopped` once, with `reason: claude_exited` and the
+   pane's exit status, and logs at error level.
+2. The broker reports activity `stopped` with the same reason and status, then exits
+   gracefully, which flushes its event log.
+3. The pod manager sees the exit and Forge reconciles the session as stopped, within
+   one pane poll plus the reconcile.
+
+From then on:
+
+- a message to the session is refused (no live pod: 409), instead of being accepted
+  as `pending` for a broker with no agent;
+- `start` launches a new broker. That broker never adopts the old tmux session: a
+  dead primary pane, or a stamp from another broker, makes it end the session and
+  start a fresh Claude, which resumes the conversation.
+
+`exit_when_transport_stops: false` (Skuld setting) keeps the broker up, serving
+history only. The test harness uses that because it hosts the broker in-process.
+Seen live on 2026-10-30: ios-speaker-bargein's pane was dead for 8 hours while Forge
+reported it running and queued its messages.
+
 General terminal choices without structured Claude hooks are deferred; see the
 [future terminal-question requirement](../forge/claude-terminal-questions-future.md).
 

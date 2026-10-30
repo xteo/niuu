@@ -217,6 +217,9 @@ class BrokerHarness:
         no_output_timeout_s: float = 3.0,
         pane_poll_interval_s: float = 0.2,
         ask_user_question_enabled: bool = False,
+        # The broker runs in-process: a real self-exit (LEX-1699) would end the test run.
+        # Tests of that exit turn this on and patch skuld.broker._exit_own_process.
+        exit_when_transport_stops: bool = False,
         start_transport: bool = False,
         bin_dir: Path | None = None,
         workspace_dir: Path | None = None,
@@ -228,6 +231,7 @@ class BrokerHarness:
         self._no_output_timeout_s = no_output_timeout_s
         self._pane_poll_interval_s = pane_poll_interval_s
         self._ask_user_question_enabled = ask_user_question_enabled
+        self._exit_when_transport_stops = exit_when_transport_stops
         # When False, the transport is NOT started in __aenter__ — the broker
         # lazy-starts it on the first connect(), so a connected client observes
         # the one-shot system/init + terminal_pane_opened start frames. Tests
@@ -304,6 +308,7 @@ class BrokerHarness:
             event_log_enabled=True,
             skip_permissions=self._skip_permissions,
             ask_user_question_enabled=self._ask_user_question_enabled,
+            exit_when_transport_stops=self._exit_when_transport_stops,
         )
         settings.session.id = self._token
         settings.session.workspace_dir = str(workspace_dir)

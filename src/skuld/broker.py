@@ -11,6 +11,8 @@ import asyncio
 import collections
 import json
 import logging
+import os
+import signal
 import socket
 import time
 import uuid
@@ -538,6 +540,11 @@ def _sanitize_directed_metadata(
     if metadata is None or role == "owner":
         return metadata
     return {k: v for k, v in metadata.items() if k not in _SUB_OWNER_STRIPPED_METADATA_KEYS}
+
+
+def _exit_own_process() -> None:
+    """Graceful SIGTERM to this broker: uvicorn shuts down and flushes the event log."""
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 class Broker(
@@ -3557,9 +3564,21 @@ class Broker(
             # terminal ``stopped`` activity_state with a final report so clients
             # stop showing the last live state frozen forever. Synthetic event —
             # nothing downstream consumes it, so return after reporting.
-            await self._report_activity_state(
-                "stopped", extra_metadata={"reason": data.get("reason", "transport_died")}
-            )
+            reason = data.get("reason", "transport_died")
+            extra: dict[str, Any] = {"reason": reason}
+            if data.get("exit_status"):
+                extra["exit_status"] = data["exit_status"]
+            await self._report_activity_state("stopped", extra_metadata=extra)
+            if self._settings.exit_when_transport_stops:
+                # A broker without its agent serves nothing but accepts messages that
+                # would pend forever. Exit (graceful SIGTERM: event logs flush) so the pod
+                # manager marks the session stopped and a start launches a fresh agent.
+                logger.error(
+                    "Agent transport stopped (%s); exiting so the session is reconciled as "
+                    "stopped (set exit_when_transport_stops=false to keep serving history)",
+                    reason,
+                )
+                asyncio.get_running_loop().call_soon(_exit_own_process)
             return
 
         if event_type == "control_request":
