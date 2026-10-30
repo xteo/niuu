@@ -613,7 +613,12 @@ class NotificationService(NotificationRecorder):
             engine=context.engine,
             model=context.model,
             correlation_id=draft.correlation_id,
-            metadata={**metadata, **context.anchor, **draft.question_metadata()},
+            metadata={
+                **metadata,
+                **context.anchor,
+                **draft.question_metadata(),
+                **draft.resolution_metadata(),
+            },
             image=draft.image,
             speak=draft.speak,
         )
@@ -635,7 +640,77 @@ class NotificationService(NotificationRecorder):
             await self._broadcast(notification)
         if images_pending:
             self._image_scheduler.wake()
+        for notification in created:
+            await self._apply_resolutions(notification)
         return created
+
+    async def _apply_resolutions(self, notification: Notification) -> None:
+        """Resolve what a new notification closes (LEX-1442).
+
+        * Its ``resolves`` refs: notification ids, or correlation ids standing for
+          every earlier notification of that incident (any kind).
+        * A milestone with a ``correlation_id`` closes that incident's earlier
+          problems: attention and error notifications and anything critical.
+
+        Only the same owner's notifications are touched. Every row resolved is sent
+        again on the live stream, so clients replace it in place.
+        """
+        refs = notification.metadata.get("resolves") or []
+        ids: list[UUID] = []
+        resolved: list[Notification] = []
+        now = datetime.now(UTC)
+        for ref in refs:
+            try:
+                ids.append(UUID(ref))
+            except ValueError:
+                resolved += await self._repository.resolve_correlated(
+                    notification.owner_id,
+                    ref,
+                    before_seq=notification.seq,
+                    problems_only=False,
+                    resolved_at=now,
+                    resolved_by=notification.id,
+                )
+        if ids:
+            resolved += await self._repository.resolve(
+                notification.owner_id,
+                [i for i in ids if i != notification.id],
+                resolved_at=now,
+                resolved_by=notification.id,
+                resolution=None,
+            )
+        if notification.kind is NotificationKind.MILESTONE and notification.correlation_id:
+            resolved += await self._repository.resolve_correlated(
+                notification.owner_id,
+                notification.correlation_id,
+                before_seq=notification.seq,
+                problems_only=True,
+                resolved_at=now,
+                resolved_by=notification.id,
+            )
+        for row in resolved:
+            await self._broadcast(row)
+
+    async def resolve(
+        self, principal: Principal, notification_id: UUID, *, resolution: str | None
+    ) -> Notification:
+        """An operator resolves one notification by hand (idempotent)."""
+        notification = await self._repository.get(notification_id)
+        scope = NotificationScope.for_principal(principal)
+        if notification is None or not scope.allows(notification.owner_id, notification.tenant_id):
+            raise NotificationNotFoundError(f"Notification not found: {notification_id}")
+        if notification.resolved:
+            return notification
+        changed = await self._repository.resolve(
+            notification.owner_id,
+            [notification_id],
+            resolved_at=datetime.now(UTC),
+            resolved_by=None,
+            resolution=resolution,
+        )
+        for row in changed:
+            await self._broadcast(row)
+        return changed[0] if changed else await self._repository.get(notification_id)
 
     @property
     def instance_fields(self) -> dict[str, str]:

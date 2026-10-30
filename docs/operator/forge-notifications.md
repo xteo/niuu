@@ -351,6 +351,54 @@ does not deliver or speak anything: the Lexi agent service reads the feed and de
 whether and when the phone speaks. The web shows a "Spoken" badge on such items.
 Field rules: `docs/forge/session-notifications-contract.md` §13.
 
+## Resolving notifications (LEX-1442)
+
+An alarm should stop alarming once its incident is over. A notification carries
+`resolved` (bool), `resolved_at`, `resolved_by_notification_id` (the notification that
+closed it; null when it was resolved by hand) and `resolution` (the operator's text).
+A notification is resolved at most once: the first resolution is kept.
+
+There are three ways to resolve one:
+
+- **By incident.** Give every notification about one incident the same `correlation_id`
+  (a ticket or PR number: one incident = one id). A later `milestone` with that id
+  resolves the owner's earlier **attention** and **error** notifications, and anything
+  **critical**, for that id. Earlier info, decision and milestone items stay as they
+  are.
+- **Explicitly.** `notify` (and `POST /sessions/{id}/notifications`) accept
+  `resolves: [...]`, up to 20 refs:
+  - a notification id resolves that notification;
+  - any other string is a correlation id, and resolves every earlier notification of
+    that incident, of any kind.
+
+  Only the same owner's notifications are touched. The refs are served back as
+  `resolves`.
+- **By hand.** `PUT /api/v1/forge/notifications/{id}/resolve` with an optional
+  `{"resolution": "…"}`. It is idempotent, and on a Guild host it is forwarded to the
+  node that holds the notification. Session credentials are refused (403); a session
+  resolves through `resolves` instead.
+
+**Reading:**
+
+- `GET /notifications?unresolved=true` returns only open notifications, and
+  `unresolved=false` only resolved ones. Without the parameter the feed is unchanged.
+- The Forge MCP `list_notifications` defaults to `unresolved=true`: an agent checking
+  what is still open does not see finished incidents. Pass `unresolved=false` or `null`
+  to see them.
+- When a notification is resolved, Forge sends it again as `session_notification`
+  with the resolved fields, so clients replace it in place.
+
+**Not done in Forge (other lanes):**
+
+- collapsing resolved items under their milestone in the apps;
+- the control plane's Needs-you counts and the voice summaries;
+- marking an old unresolved alarm as stale when there is no correlation id (item 4
+  of the ticket).
+
+Storage: migration `000095_forge_notification_resolved`. It adds three nullable
+columns, which rewrites nothing, and a partial index on `(owner_id, correlation_id)`
+for unresolved rows.
+
 ## Delivery rules and the outbox
 
 A rule selects notifications from its owner and names a sink:

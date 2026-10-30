@@ -36,6 +36,7 @@ from niuu.domain.notifications import (
     MAX_LINK_LABEL_CHARS,
     MAX_LINK_URL_CHARS,
     MAX_LINKS,
+    MAX_RESOLVES,
     MAX_SPEAK_TEXT_CHARS,
     MAX_TITLE_CHARS,
     PRESENTED_FILE_ID_PATTERN,
@@ -147,6 +148,9 @@ class _ListNotificationsArgs(_Args):
     session_id: str | None = None
     project_id: str | None = None
     unread: bool | None = None
+    # LEX-1442: an agent checking "what is still open" should not see incidents that
+    # are over. Ask for unresolved=false (or null) to see resolved ones too.
+    unresolved: bool | None = True
 
     @field_validator("session_id")
     @classmethod
@@ -415,7 +419,11 @@ _NOTIFY_SCHEMA = _object(
         "correlation_id": {
             "type": "string",
             "maxLength": MAX_CORRELATION_ID_CHARS,
-            "description": "Optional id tying related notifications together (e.g. a PR number).",
+            "description": (
+                "One incident = one id (a ticket or PR number) on every notification about "
+                "it. A later milestone with the same id resolves the incident's attention, "
+                "error and critical notifications."
+            ),
         },
         "image": {
             **_object(
@@ -475,6 +483,17 @@ _NOTIFY_SCHEMA = _object(
             ),
         },
         "ask": _ASK_SCHEMA,
+        "resolves": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_RESOLVES,
+            "items": {"type": "string", "minLength": 1, "maxLength": MAX_CORRELATION_ID_CHARS},
+            "description": (
+                "What this notification closes: notification ids, or correlation ids (every "
+                "earlier notification of that incident). A milestone with a correlation_id "
+                "already closes that incident's attention, error and critical items."
+            ),
+        },
         "about_question": _object(
             {
                 "id": {
@@ -718,7 +737,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "List Forge notifications you can see, newest first (bounded). Use it to check "
             "what was already reported before notifying again, or what other sessions "
             "raised. Page older items with `before` (the previous next_before) or catch up "
-            "with `after` (a seq)."
+            "with `after` (a seq). Resolved notifications (an incident that is over) are "
+            "left out unless you pass unresolved=false (only resolved) or null (all)."
         ),
         input_schema=_object(
             {
@@ -740,6 +760,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "session_id": _SESSION_ID_SCHEMA,
                 "project_id": {"type": "string"},
                 "unread": {"type": "boolean"},
+                "unresolved": {"type": ["boolean", "null"], "default": True},
             }
         ),
         args_model=_ListNotificationsArgs,
@@ -1080,6 +1101,9 @@ def _notification_summary(raw: dict[str, Any], *, max_body_chars: int) -> dict[s
         "speak",
         "created_at",
         "read",
+        "correlation_id",
+        "resolved_at",
+        "resolved_by_notification_id",
     )
     summary = {key: raw.get(key) for key in keys if raw.get(key) is not None}
     body = str(raw.get("body") or "")
@@ -1286,6 +1310,8 @@ class ForgeMcpToolbox:
             params["project_id"] = args.project_id
         if args.unread is not None:
             params["unread"] = "true" if args.unread else "false"
+        if args.unresolved is not None:
+            params["unresolved"] = "true" if args.unresolved else "false"
         page = await self._client.list_notifications(params)
         items = page.get("items") if isinstance(page.get("items"), list) else []
         body_chars = self._limits.transcript_turn_max_chars

@@ -150,6 +150,13 @@ class Notification(BaseModel):
     created_at: datetime
     image: NotificationImage | None = None
     speak: NotificationSpeak | None = None
+    resolved_at: datetime | None = None
+    resolved_by_notification_id: UUID | None = None
+    resolution: str | None = None
+
+    @property
+    def resolved(self) -> bool:
+        return self.resolved_at is not None
 
     @property
     def turn_id(self) -> str | None:
@@ -215,6 +222,8 @@ class Notification(BaseModel):
         data["question"] = self.metadata.get("question")
         data["about_question"] = self.metadata.get("about_question")
         data["ask"] = self.metadata.get("ask")
+        data["resolves"] = self.metadata.get("resolves")
+        data["resolved"] = self.resolved
         data["input_request"] = self.input_request
         data["image"] = self.image.wire(self.id) if self.image is not None else None
         data["image_state"] = self.image.state.value if self.image is not None else None
@@ -296,6 +305,7 @@ class NotificationQuery:
     session_id: UUID | None = None
     project_id: str | None = None
     unread: bool | None = None
+    unresolved: bool | None = None
 
     def __post_init__(self) -> None:
         if self.limit < 1:
