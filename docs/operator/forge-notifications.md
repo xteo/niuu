@@ -693,7 +693,7 @@ original bytes, the thumbnail, their types and sizes. A partial index covers pen
 Thor applied the same SQL as `000072_forge_notification_images` before upstream renumbered
 the notification migrations; `migrations/lineage-aliases.json` adopts that ledger row.
 
-Migration `000094_forge_notification_speak` adds `speak_text` and `speak_priority` to
+Migration `000095_forge_notification_speak` adds `speak_text` and `speak_priority` to
 `forge_notifications` (both null, or both set with a check on length, priority and
 kind). It is additive: existing rows keep both null.
 

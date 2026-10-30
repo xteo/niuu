@@ -450,7 +450,7 @@ it; a draft of kind `reply_ready` with `speak` is refused. The MCP `notify` tool
 (transcript and feed modes) and `POST /sessions/{id}/notifications` accept it; an
 invalid one is an MCP tool error or HTTP 422 and records nothing.
 
-**Storage.** Migration `000094_forge_notification_speak` adds `speak_text` and
+**Storage.** Migration `000095_forge_notification_speak` adds `speak_text` and
 `speak_priority` to `forge_notifications`, set together or both null, with a check
 that repeats the rules above.
 

@@ -42,7 +42,7 @@ from volundr.domain.services.session import SessionService
 
 PREFIX = "/api/v1/forge"
 ROOT = Path(__file__).resolve().parents[2]
-MIGRATION = "000094_forge_notification_speak"
+MIGRATION = "000095_forge_notification_speak"
 # The SQL promoted to Thor and mini-m6; pinned so it cannot change after it is applied.
 MIGRATION_SHA256 = "f29350b3570c90d4d55455951a563f998943ab86b1c7f2ed870dee6c3be4482c"
 
