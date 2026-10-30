@@ -32,8 +32,8 @@ from volundr.domain.services.push_gateway import BackgroundSettings, PushGateway
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
 
 MIGRATIONS = Path(__file__).resolve().parents[3] / "migrations"
-UP = (MIGRATIONS / "000096_push_gateway.up.sql").read_text()
-DOWN = (MIGRATIONS / "000096_push_gateway.down.sql").read_text()
+UP = (MIGRATIONS / "000097_push_gateway.up.sql").read_text()
+DOWN = (MIGRATIONS / "000097_push_gateway.down.sql").read_text()
 
 
 @pytest.fixture

@@ -147,9 +147,13 @@
       "sha256": "4e3a2003250d016bdc6b9a8cfb1ae6c07a176f0b1f145eae3944b25d8912dd0a"
     }
   ],
-  "000096_push_gateway.up.sql": [
+  "000097_push_gateway.up.sql": [
     {
       "filename": "000073_push_gateway.up.sql",
+      "sha256": "2de323206ec4e0f0e17c8c46805a74563cb44897d5342355264c0bae3ab6b6bb"
+    },
+    {
+      "filename": "000096_push_gateway.up.sql",
       "sha256": "2de323206ec4e0f0e17c8c46805a74563cb44897d5342355264c0bae3ab6b6bb"
     }
   ]

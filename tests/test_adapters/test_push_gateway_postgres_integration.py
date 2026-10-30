@@ -37,7 +37,7 @@ from volundr.domain.services.push_gateway import PushGateway
 pytestmark = pytest.mark.integration
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION = "000096_push_gateway.up.sql"
+MIGRATION = "000097_push_gateway.up.sql"
 
 
 @pytest_asyncio.fixture

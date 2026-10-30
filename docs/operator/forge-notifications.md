@@ -751,8 +751,13 @@ the gateway node directly, with the caller's normal credentials:
   (`push.enabled` is off), so a client can tell the token is not in use there.
 
 `GET /api/v1/forge/devices` lists the caller's registrations and
-`DELETE /api/v1/forge/devices/{token}` removes them (`?kind=` removes one kind). The Guild
-facade forwards all three to its default node, or to the node `instance_id` selects.
+`DELETE /api/v1/forge/devices/{token}` removes them (`?kind=` removes one kind). On the
+Guild facade an `alert` token fans out to every visible node (each node pushes alerts to
+the devices registered with it), and the list is the union, one row per token and kind.
+Live Activity, push-to-start and widget tokens serve only the gateway, so they register
+and unregister on its node alone: the default node, or the node `instance_id` selects.
+In a Guild with a gateway, leave `push.enabled` off on the other nodes so an alert is
+not sent twice.
 Session credentials (an agent's own token) cannot use these routes.
 
 A token APNs reports as dead is deleted: HTTP `410`, or the reasons `BadDeviceToken`,
@@ -870,7 +875,7 @@ notification of the gateway's own node would then alert twice.
 1. In the Apple Developer portal, create an APNs auth key (`.p8`). Note its key id and
    the team id. Put the file on the gateway node, readable only by the Forge user.
 2. Add the `push:` section (see [Configuration](#configuration)) with `push.enabled`,
-   `push.apns` and `push.gateway`, and restart Forge. Migration `000096_push_gateway`
+   `push.apns` and `push.gateway`, and restart Forge. Migration `000097_push_gateway`
    is applied at start.
 3. Start is refused, with the setting to fix, when the key file is missing, unreadable
    or not an EC P-256 key, when the HTTP/2 library (`h2`) is missing, or when
@@ -1119,15 +1124,15 @@ Migration `000095_forge_notification_speak` adds `speak_text` and `speak_priorit
 `forge_notifications` (both null, or both set with a check on length, priority and
 kind). It is additive: existing rows keep both null.
 
-Migration `000096_push_gateway` serves the push gateway. It extends `device_tokens` with
+Migration `000097_push_gateway` serves the push gateway. It extends `device_tokens` with
 `kind`, `environment`, `activity_id`, `last_push_at` and `push_due`, and makes a token
 unique per `(token, kind)` instead of per owner (existing rows become production alert
 tokens; of a token two owners had registered, the newest row is kept). It adds
 `forge_push_gateway_state` (the gateway's position per node) and `forge_push_deliveries`
 (its alert outbox, one row per `(instance_id, notification_id)`, with partial indexes for
-due, sent and settled rows). The same SQL was written as `000073_push_gateway` on the
-unmerged `forge/apns-push` branch; `migrations/lineage-aliases.json` adopts a ledger row of
-that name.
+due, sent and settled rows). The same SQL was applied as `000073_push_gateway` and
+`000096_push_gateway` on the xteo fork; `migrations/lineage-aliases.json` adopts a ledger row
+of either name.
 
 The migrations live in `migrations/`; the Helm migrations configmap and the CLI bundle
 read them from there. Mini mode applies them at startup.

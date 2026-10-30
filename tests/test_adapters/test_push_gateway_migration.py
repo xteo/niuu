@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-NAME = "000096_push_gateway"
+NAME = "000097_push_gateway"
 
 
 def test_it_is_the_newest_volundr_migration():
@@ -17,11 +17,13 @@ def test_it_is_the_newest_volundr_migration():
 
 
 def test_the_branch_name_of_the_same_sql_is_adopted():
-    """forge/apns-push wrote this SQL as 000073; a ledger row of that name is adopted."""
+    """The fork wrote this SQL as 000073, then 000096; a ledger row of either name is adopted."""
     sql = (ROOT / "migrations" / f"{NAME}.up.sql").read_bytes()
     aliases = json.loads((ROOT / "migrations" / "lineage-aliases.json").read_text())
+    sha = hashlib.sha256(sql).hexdigest()
     assert aliases[f"{NAME}.up.sql"] == [
-        {"filename": "000073_push_gateway.up.sql", "sha256": hashlib.sha256(sql).hexdigest()}
+        {"filename": "000073_push_gateway.up.sql", "sha256": sha},
+        {"filename": "000096_push_gateway.up.sql", "sha256": sha},
     ]
 
 
