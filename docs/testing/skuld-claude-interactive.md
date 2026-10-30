@@ -67,6 +67,36 @@ Existing running gateways keep their loaded transport code. Deploying the change
 affects gateways started from the updated source; adopting it in a running session
 requires that session's normal controlled restart.
 
+## A turn with no completion signal (LEX-1670)
+
+A tmux turn normally ends with Claude's `Stop` hook, or with the idle-prompt
+recovery when a `Stop` is missing. `SKULD__TMUX_TURN_MAX_SECONDS` (3600 by default)
+bounds how long the transport waits for either. Time spent waiting on a question or
+permission menu does not count toward it.
+
+A turn can pass that bound and still be healthy. Two cases have been seen:
+
+- The main agent replies and then waits on background agents. Claude sends no `Stop`
+  while it waits.
+- A `Stop` is not attributed to the main pane. Brokers built before #1072 failed to
+  correlate long pasted prompts. After `/clear` changed Claude's session id, such a
+  broker treated every main-pane hook as a sub-agent's.
+
+When the bound is reached, the turn ends with `stop_reason: timeout` and
+`is_error: false`. It carries the last message it displayed (MessageDisplay), or
+else the reply the terminal shows. It is never an empty error result: that used to
+replace the reply in the Forge conversation with "The agent stopped with an error."
+
+The hit is loud in two ways:
+
+- an error-level log line naming the knob;
+- a durable `system` frame with `subtype: turn_cap_reached`, plus `knob`,
+  `turn_max_seconds` and `had_text`, which you can count in the session log.
+
+If a `Stop` arrives later with the same text, it is dropped as an echo. If it
+carries new text, that text is recorded as well. Only a `StopFailure` (an API error)
+or the process exiting still ends a turn as an error.
+
 General terminal choices without structured Claude hooks are deferred; see the
 [future terminal-question requirement](../forge/claude-terminal-questions-future.md).
 
