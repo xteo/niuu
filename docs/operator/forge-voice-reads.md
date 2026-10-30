@@ -81,12 +81,30 @@ GET /api/v1/forge/sessions?fields=summary&limit=10
   session is returned in the existing order and shape.
 - **`fields=summary`:** returns, newest activity first:
   `{id, name, status, activity_state, short_description, project: {id, role} | null,
-  last_activity_at, unread, node}`.
+  last_activity_at, worked_seconds_24h, unread, node}`.
   - `node` is the Forge host key (`thor`, `mini-m6`).
   - The Guild facade also adds `instance_id`, `instance_name` and `instance_slug`.
   - `unread` is null for a session you only participate in.
 - **Through the Guild:** each node returns at most `limit` rows, and the facade
   keeps the newest `limit` across nodes.
+
+## Worked time (LEX-1465)
+
+Every row of `GET /sessions`, full or summary, carries `worked_seconds_24h`: the seconds
+Forge spent on that session in the last 24 hours. That supports a line like "Today · 6
+sessions · 2 h 14 m": count the rows with a value above 0, and sum the values.
+
+It is the union of the session's assistant turns (`turn.assistant` spans), clipped to
+the window, so concurrent turns, such as teammates', count once. A turn whose end was
+never recorded is bounded by evidence:
+
+- the latest one counts until now while its session is running and not idle, and
+  otherwise until the session's `last_active`;
+- an older one counts until the last tool call recorded inside it, never past the next
+  turn's start, and counts nothing when there is no such call.
+
+It is computed in one query per list, about 90 ms for 65 sessions on Thor. It is null
+only on a Forge that records no turn spans.
 
 ## Timing
 
