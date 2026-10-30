@@ -99,7 +99,7 @@ cannot be created there); set `forgeMcp.session_tokens.enabled` to override.
 | `message` | `forge:session:message` | `send_message`, `message_status` |
 | `lifecycle` | `forge:session:lifecycle` | `create_session`, `start_session`, `stop_session` (never delete or archive) |
 
-A session's grants are the union of three sources:
+A session's grants are the union of four sources:
 
 1. **The session-create request.** For example
    `POST /api/v1/forge/sessions {"name": "…", "forge_mcp": {"grants": ["message"]}}`.
@@ -109,20 +109,73 @@ A session's grants are the union of three sources:
    start instead of silently granting less.
 3. **The node default**, `forge_mcp.default_grants` (empty by default). It is applied
    at every mint.
+4. **The project role.** A session filed in a project carries the grants of its role
+   (`coordination.role`) from `forge_mcp.role_grants`, applied at every mint. By
+   default a `coordinator` gets `lifecycle` and `message`, so it can create, start,
+   stop and steer its workers. Workers, any role not listed and sessions in no project
+   get none. Set `role_grants: {}` to grant nothing by role.
 
-Grants from the first two sources are stored on the session row
-(`workload_config.forge_mcp.grants`), so they survive restarts and are re-minted on
-every start. A caller holding a session credential cannot give a session a grant it
-does not hold itself. That covers creating a session with more grants, and starting
-a peer with a launch spec that adds some. Either is refused with 403 before anything
-changes.
+Grants from the first two sources, and those an operator sets (below), are stored on
+the session row (`workload_config.forge_mcp.grants`), so they survive restarts and are
+re-minted on every start. The node default and role grants are not copied onto the
+row: changing the configuration or the session's role changes the next mint.
+
+A caller holding a session credential cannot give a session a grant it does not hold
+itself. That covers creating a session with more grants, starting a peer with a launch
+spec that adds some, and creating a session filed under a role whose `role_grants` it
+does not hold (a coordinator without `message` cannot create another coordinator).
+Each is refused with 403 before anything changes, including the project dispatch claim.
+
+### Changing an existing session's grants (operators)
+
+```bash
+# Read the grants by source and what the next start's credential carries
+curl -s http://127.0.0.1:8080/api/v1/forge/sessions/<id>/forge-mcp
+
+# Replace the session's stored grants; [] removes them
+curl -s -X PUT http://127.0.0.1:8080/api/v1/forge/sessions/<id>/forge-mcp \
+  -H 'Content-Type: application/json' -d '{"grants": ["message", "lifecycle"]}'
+```
+
+Both answer:
+
+```json
+{
+  "session_id": "…",
+  "grants": ["lifecycle", "message"],
+  "default_grants": [],
+  "role": "worker",
+  "role_grants": [],
+  "effective_grants": ["lifecycle", "message"],
+  "applies_at": "next_start"
+}
+```
+
+- `PUT` replaces `workload_config.forge_mcp.grants` and nothing else. The running
+  launch keeps the credential it has. **Restart the session to apply**: the next
+  start mints a credential with `effective_grants`, and the previous one is revoked.
+- Only an operator may call either route: a person, a PAT, or the anonymous local user
+  in allow-all mini mode. **Any scoped credential gets 403**, a session's own
+  (`forge_session`, whatever grants it holds) or a build token (`valkyrie_build`), so
+  a session can never widen its own grants or a peer's. The routes are not on the
+  session-credential allow-list either.
+- Every change is audited as a `volundr.session.forge_mcp_grants_changed` event in the
+  audit log (`GET /api/v1/audit/events?event_type=volundr.session.forge_mcp_grants_changed`),
+  with the session, owner, acting user, previous grants and new grants. If the audit
+  write fails, the request fails (500); the row may already be changed, so read it back
+  with `GET` and repeat the `PUT`.
+- A launch spec's grants are added back at its next start, and the node default and
+  role grants always apply. Removing a grant here does not remove those.
+- On a Guild host the routes forward to the session's owning Forge.
 
 Skuld reads the grants from the token's `scopes` claim. It decodes the claim without
 verifying it, only to decide which tools to offer, because Forge enforces. An explicit
 `SKULD__FORGE_MCP__GRANTS` / `forge_mcp.grants` can only narrow those grants, never
 widen them. Without a token, no grant is offered. The `environment` tool reports the
 effective `grants`, the offered `tools` and the credential in use
-(`forge_credential.kind`: `forge_session` or `broker`), never the token itself.
+(`forge_credential.kind`: `forge_session` or `broker`), never the token itself. Those
+are the grants actually minted into this launch's token, from all four sources. After
+an operator change they move only once the session restarts.
 
 ## What a session credential may call
 
@@ -153,7 +206,8 @@ session of the same owner.
 | `PUT /sessions/{id}/description` (never `PUT /sessions/{id}`) | `forge:notify` | own |
 | `POST /mcp` | none. Every tool call re-enters this table. | none |
 
-Everything else is denied to session credentials. That includes notification rules,
+Everything else is denied to session credentials. That includes the Forge MCP grants
+routes (`GET`/`PUT /sessions/{id}/forge-mcp`), notification rules,
 sinks and delivery rows, delete, archive and restore, session updates, files, logs,
 the session stream, admin settings, credentials, PATs, integrations and the session
 proxy.
@@ -270,6 +324,8 @@ host the endpoint also works without a token, as the local dev user.
 ```yaml
 forge_mcp:
   default_grants: []                 # message, lifecycle: added to every session
+  role_grants:                       # by project role (coordination.role), at every mint
+    coordinator: [lifecycle, message]   # the default; {} grants nothing by role
   session_tokens:
     enabled: true                    # false: no session credentials, no grants
     ttl_seconds: 2592000             # backstop; revocation is tied to the launch
@@ -317,4 +373,8 @@ credential is then the only authority a session's MCP holds.
 - **`403 Forge session tokens may not call …`.** The route is not on the allow-list.
   This is by design.
 - **`403 Token is missing the required scope: forge:session:message`.** Grant `message`
-  on the session (create request or launch spec) and restart it.
+  on the session (`PUT /sessions/{id}/forge-mcp`, the create request or a launch spec),
+  or file it as a project coordinator, and restart it. `environment` shows the grants
+  the running launch holds.
+- **`403 A forge_session credential cannot change Forge MCP grants`.** By design: ask
+  an operator to set them.

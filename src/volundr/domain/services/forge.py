@@ -135,7 +135,16 @@ class ForgeService:
         *,
         principal: Principal | None = None,
     ) -> Session:
-        if getattr(data, "coordination", None) is not None:
+        # Refuse an escalating create before a dispatch claim or session row exists.
+        coordination = getattr(data, "coordination", None)
+        forge_mcp = getattr(data, "forge_mcp", None)
+        self._session_service.check_forge_mcp_grants(
+            principal,
+            tuple(forge_mcp.grants) if forge_mcp is not None else (),
+            launch_spec=data.launch_spec,
+            role=coordination.role if coordination is not None else None,
+        )
+        if coordination is not None:
             if self._project_service is None:
                 raise ValueError("Projects are not enabled on this Forge host")
             async with self._project_service.dispatch(data, principal) as (existing, options):
@@ -150,10 +159,6 @@ class ForgeService:
         resolved_definition = self._resolve_session_definition(data.model, data.definition)
         forge_mcp = getattr(data, "forge_mcp", None)
         requested_grants = tuple(forge_mcp.grants) if forge_mcp is not None else ()
-        # Refuse an escalating create before a session row exists.
-        self._session_service.check_forge_mcp_grants(
-            principal, requested_grants, launch_spec=data.launch_spec
-        )
         # No slot, no record: a session created only to fail would sit in the
         # list as an error the person did not ask for.
         await self._session_service.ensure_capacity()
@@ -272,6 +277,14 @@ class ForgeService:
         principal: Principal | None = None,
     ) -> Session:
         return await self._session_service.update_description(session_id, patch, principal)
+
+    async def get_forge_mcp_grants(self, session_id: UUID, *, principal: Principal | None = None):
+        return await self._session_service.get_forge_mcp_grants(session_id, principal)
+
+    async def set_forge_mcp_grants(
+        self, session_id: UUID, grants, *, principal: Principal | None = None
+    ):
+        return await self._session_service.set_forge_mcp_grants(session_id, grants, principal)
 
     async def delete_session(
         self,

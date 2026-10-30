@@ -285,6 +285,29 @@ class PostgresSessionRepository(SessionRepository):
         )
         return self._row_to_session(row) if row is not None else None
 
+    async def update_forge_mcp_grants(
+        self, session_id: UUID, grants: list[str], now: datetime
+    ) -> Session | None:
+        # One statement, so a concurrent start's launch_id write is never lost:
+        # only the grants key of the forge_mcp block is replaced.
+        row = await self._pool.fetchrow(
+            """UPDATE sessions SET
+                   workload_config = jsonb_set(
+                       COALESCE(workload_config, '{}'::jsonb),
+                       '{forge_mcp}',
+                       CASE WHEN jsonb_typeof(workload_config->'forge_mcp') = 'object'
+                            THEN workload_config->'forge_mcp' ELSE '{}'::jsonb END
+                       || jsonb_build_object('grants', $2::jsonb)
+                   ),
+                   updated_at = $3
+               WHERE id = $1
+               RETURNING *""",
+            session_id,
+            json.dumps(grants),
+            now,
+        )
+        return self._row_to_session(row) if row is not None else None
+
     async def list_stale_running(self, older_than: datetime) -> list[Session]:
         """Return RUNNING sessions whose last_active is at/before older_than."""
         rows = await self._pool.fetch(

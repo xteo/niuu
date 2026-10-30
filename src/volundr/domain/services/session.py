@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -26,6 +26,7 @@ from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
 from niuu.domain.session_description import SessionDescriptionPatch
 from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
 from niuu.forge_mcp.models import ForgeMcpGrant
+from sleipnir.domain.catalog import volundr_session_forge_mcp_grants_changed
 from volundr.domain.execution_catalog import ExecutionCatalogError, ExecutionSelectionError
 from volundr.domain.models import (
     CleanupTarget,
@@ -66,10 +67,13 @@ from volundr.domain.ports import (
 from volundr.domain.presented_files import PresentedFileStore
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.services.forge_session_launch import (
+    ForgeMcpGrantChangeRefusedError,
     ForgeMcpGrantEscalationError,
+    ForgeMcpGrants,
     grants_in,
     launch_id_of,
     launch_spec_grants,
+    stored_grant_values,
     with_forge_mcp,
     without_forge_mcp,
 )
@@ -77,6 +81,7 @@ from volundr.domain.session_read_state import SessionReadState, SessionReadState
 
 if TYPE_CHECKING:
     from niuu.ports.user_integration import UserIntegrationPort
+    from sleipnir.ports.audit import AuditRepository
     from volundr.adapters.outbound.git_registry import GitProviderRegistry
     from volundr.domain.notification_ports import NotificationRecorder
 
@@ -178,6 +183,8 @@ class SessionService:
         notification_recorder: NotificationRecorder | None = None,
         forge_session_tokens: ForgeSessionTokenService | None = None,
         forge_mcp_default_grants: Iterable[ForgeMcpGrant | str] = (),
+        forge_mcp_role_grants: Mapping[str, Iterable[ForgeMcpGrant | str]] | None = None,
+        audit_repository: AuditRepository | None = None,
         user_integration: UserIntegrationPort | None = None,
         presented_file_store: PresentedFileStore | None = None,
     ):
@@ -205,6 +212,11 @@ class SessionService:
         self._notification_recorder = notification_recorder
         self._forge_session_tokens = forge_session_tokens
         self._forge_mcp_default_grants = frozenset(normalize_grants(forge_mcp_default_grants))
+        self._forge_mcp_role_grants = {
+            role: frozenset(normalize_grants(grants))
+            for role, grants in (forge_mcp_role_grants or {}).items()
+        }
+        self._audit_repository = audit_repository
         self._runtime_backend = runtime_backend
         self._execution_resolver = execution_resolver
         normalized_public_origin = public_origin.rstrip("/")
@@ -1584,16 +1596,21 @@ class SessionService:
         requested: Iterable[ForgeMcpGrant | str],
         *,
         launch_spec: str | None,
+        role: str | None = None,
     ) -> None:
         """Refuse a new session whose grants exceed a session-credential caller's own.
 
+        The new session's project ``role`` counts: a session credential cannot file
+        a peer under a role whose ``forge_mcp.role_grants`` it does not hold itself.
         Raises :class:`ForgeMcpGrantEscalationError`. Callers that are not session
         credentials (humans, PATs) may grant anything.
         """
         if principal is None or principal.token_use != FORGE_SESSION_TOKEN_USE:
             return
-        wanted = frozenset(normalize_grants(requested)) | launch_spec_grants(
-            self._launch_spec_for(launch_spec)
+        wanted = (
+            frozenset(normalize_grants(requested))
+            | launch_spec_grants(self._launch_spec_for(launch_spec))
+            | self._role_grants(role)
         )
         beyond = wanted - grants_from_scopes(principal.scopes)
         if beyond:
@@ -1626,6 +1643,91 @@ class SessionService:
             launch_id=new_launch_id(),
         )
 
+    def _role_grants(self, role: str | None) -> frozenset[ForgeMcpGrant]:
+        if role is None:
+            return frozenset()
+        return self._forge_mcp_role_grants.get(role, frozenset())
+
+    def forge_mcp_grants(self, session: Session) -> ForgeMcpGrants:
+        """The grants this session's next credential carries, by source."""
+        role = session.coordination.role if session.coordination is not None else None
+        return ForgeMcpGrants(
+            stored=grants_in(session.workload_config, source=f"session {session.id}"),
+            default=self._forge_mcp_default_grants,
+            role=role,
+            by_role=self._role_grants(role),
+        )
+
+    async def get_forge_mcp_grants(
+        self, session_id: UUID, principal: Principal | None
+    ) -> tuple[Session, ForgeMcpGrants]:
+        """An operator's view of a session's grants (refused to scoped credentials)."""
+        session = await self._operator_forge_mcp_session(session_id, principal, "read")
+        return session, self.forge_mcp_grants(session)
+
+    async def set_forge_mcp_grants(
+        self,
+        session_id: UUID,
+        grants: Iterable[ForgeMcpGrant | str],
+        principal: Principal | None,
+    ) -> tuple[Session, ForgeMcpGrants]:
+        """Replace the session's stored grants; they take effect at its next start.
+
+        Operator only: any scoped credential (a session's own, a build token) is
+        refused, so a session can never widen its own grants or a peer's. Every
+        change is appended to the audit log, and a failed audit write raises.
+        Grants a launch spec carries are added back at the next start, and the
+        node default and role grants apply regardless; this sets only the row's.
+        """
+        if self._audit_repository is None:
+            raise RuntimeError(
+                "Changing Forge MCP grants needs the audit log; this SessionService "
+                "was built without an audit repository"
+            )
+        session = await self._operator_forge_mcp_session(session_id, principal, "update")
+        previous = stored_grant_values(
+            grants_in(session.workload_config, source=f"session {session.id}")
+        )
+        values = stored_grant_values(grants)
+        updated = await self._repository.update_forge_mcp_grants(
+            session_id, values, datetime.now(UTC)
+        )
+        if updated is None:
+            raise SessionNotFoundError(session_id)
+        await self._audit_repository.append(
+            volundr_session_forge_mcp_grants_changed(
+                session_id=str(session_id),
+                owner_id=session.owner_id or "",
+                actor_user_id=principal.user_id if principal is not None else "",
+                actor_token_use=principal.token_use if principal is not None else "",
+                previous_grants=previous,
+                grants=values,
+                source="volundr",
+                tenant_id=session.tenant_id,
+            )
+        )
+        logger.info(
+            "Forge MCP grants for session %s set to %s (were %s) by %s; next start applies",
+            session_id,
+            values,
+            previous,
+            _sanitize_log(principal.user_id if principal is not None else "anonymous"),
+        )
+        if self._broadcaster is not None:
+            await self._broadcaster.publish_session_updated(updated)
+        return updated, self.forge_mcp_grants(updated)
+
+    async def _operator_forge_mcp_session(
+        self, session_id: UUID, principal: Principal | None, action: str
+    ) -> Session:
+        if principal is not None and principal.token_use:
+            raise ForgeMcpGrantChangeRefusedError(session_id, principal.token_use)
+        session = await self._repository.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+        await self._check_access(session, principal, action)
+        return session
+
     def _launch_spec_for(self, name: str | None):
         """The launch spec a start applies (as the launch-spec contributor resolves it)."""
         if self._launch_spec_provider is None:
@@ -1651,10 +1753,7 @@ class SessionService:
                 session.id,
             )
             return None
-        grants = (
-            grants_in(session.workload_config, source=f"session {session.id}")
-            | self._forge_mcp_default_grants
-        )
+        grants = self.forge_mcp_grants(session).effective
         return self._forge_session_tokens.mint(
             session_id=session.id,
             session_name=session.name,

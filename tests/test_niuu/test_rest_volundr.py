@@ -2236,3 +2236,49 @@ def test_create_pr_preserves_the_owning_instances_refusal() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Session has no repository configured"
+
+
+@respx.mock
+def test_session_forge_mcp_grants_are_forwarded_to_the_owner() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2", "name": "Session 2"})
+    )
+    view = {"session_id": "s2", "grants": ["message"], "effective_grants": ["message"]}
+    put = respx.put("http://beta/api/v1/forge/sessions/s2/forge-mcp").mock(
+        return_value=Response(200, json=view)
+    )
+    get = respx.get("http://beta/api/v1/forge/sessions/s2/forge-mcp").mock(
+        return_value=Response(200, json=view)
+    )
+
+    changed = client.put(
+        "/api/v1/forge/sessions/s2/forge-mcp", headers=_headers(), json={"grants": ["message"]}
+    )
+    read = client.get("/api/v1/forge/sessions/s2/forge-mcp", headers=_headers())
+
+    assert changed.status_code == 200 and read.status_code == 200
+    assert {key: changed.json()[key] for key in view} == view
+    assert changed.json()["instance_id"] == "beta"
+    assert read.json()["instance_id"] == "beta"
+    import json as _json
+
+    assert _json.loads(put.calls.last.request.content) == {"grants": ["message"]}
+    assert get.called
+
+
+@respx.mock
+def test_session_forge_mcp_refusal_from_the_owner_is_returned() -> None:
+    client = _client([_instance("beta", base_url="http://beta")])
+    respx.get("http://beta/api/v1/forge/sessions/s2").mock(
+        return_value=Response(200, json={"id": "s2", "name": "Session 2"})
+    )
+    respx.put("http://beta/api/v1/forge/sessions/s2/forge-mcp").mock(
+        return_value=Response(403, json={"detail": "cannot change Forge MCP grants"})
+    )
+
+    response = client.put(
+        "/api/v1/forge/sessions/s2/forge-mcp", headers=_headers(), json={"grants": ["message"]}
+    )
+
+    assert response.status_code == 403

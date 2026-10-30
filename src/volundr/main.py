@@ -1270,6 +1270,8 @@ def create_app(
                 notification_recorder=notification_service,
                 forge_session_tokens=forge_session_tokens,
                 forge_mcp_default_grants=settings.forge_mcp.default_grants,
+                forge_mcp_role_grants=settings.forge_mcp.role_grants,
+                audit_repository=PostgresAuditRepository(pool),
                 presented_file_store=presented_file_store,
             )
             # Local-process brokers notify the session service when they exit so

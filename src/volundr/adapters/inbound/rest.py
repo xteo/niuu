@@ -139,6 +139,7 @@ from volundr.domain.services.attachments_index import KINDS as ATTACHMENT_KINDS
 from volundr.domain.services.attachments_index import filter_attachments
 from volundr.domain.services.forge_session_launch import (
     FORGE_MCP_KEY,
+    ForgeMcpGrantChangeRefusedError,
     ForgeMcpGrantEscalationError,
 )
 from volundr.domain.services.permission_auto_approval import (
@@ -495,6 +496,38 @@ class ForgeMcpSessionOptions(BaseModel):
             "sessions) and 'lifecycle' (create/start/stop sessions). Reading sessions "
             "and notifying need no grant. They persist across restarts."
         ),
+    )
+
+
+class ForgeMcpGrantsUpdate(BaseModel):
+    """Request body for ``PUT /sessions/{id}/forge-mcp``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    grants: list[ForgeMcpGrant] = Field(
+        description=(
+            "The session's own Forge MCP grants, replacing the stored ones: 'message' "
+            "and/or 'lifecycle'. [] removes them. They apply at the next start."
+        ),
+    )
+
+
+class ForgeMcpGrantsResponse(BaseModel):
+    """A session's Forge MCP grants by source, and what its next credential carries."""
+
+    session_id: UUID
+    grants: list[ForgeMcpGrant] = Field(
+        description="Stored on the session (create request, launch specs, operator)."
+    )
+    default_grants: list[ForgeMcpGrant] = Field(description="The node's forge_mcp.default_grants.")
+    role: str | None = Field(description="The session's project role, if it is filed.")
+    role_grants: list[ForgeMcpGrant] = Field(description="forge_mcp.role_grants for that role.")
+    effective_grants: list[ForgeMcpGrant] = Field(
+        description="The union: what the next start's credential carries."
+    )
+    applies_at: str = Field(
+        default="next_start",
+        description="Grants change only when a start mints a new session credential.",
     )
 
 
@@ -2760,6 +2793,77 @@ def create_router(
                 detail=f"Session not found: {session_id}",
             )
         return _session_response(session)
+
+    def _forge_mcp_grants_response(session_id: UUID, view) -> ForgeMcpGrantsResponse:
+        return ForgeMcpGrantsResponse(
+            session_id=session_id,
+            grants=sorted(view.stored),
+            default_grants=sorted(view.default),
+            role=view.role,
+            role_grants=sorted(view.by_role),
+            effective_grants=sorted(view.effective),
+        )
+
+    async def _forge_mcp_grants_call(request: Request, session_id: UUID, call):
+        principal = await _optional_principal(request)
+        try:
+            _, view = await call(principal)
+        except ForgeMcpGrantChangeRefusedError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+        except SessionNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        return _forge_mcp_grants_response(session_id, view)
+
+    @router.get(
+        "/sessions/{session_id}/forge-mcp",
+        response_model=ForgeMcpGrantsResponse,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def get_session_forge_mcp(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> ForgeMcpGrantsResponse:
+        """A session's Forge MCP grants by source. Operators only."""
+        return await _forge_mcp_grants_call(
+            request,
+            session_id,
+            lambda principal: forge.get_forge_mcp_grants(session_id, principal=principal),
+        )
+
+    @router.put(
+        "/sessions/{session_id}/forge-mcp",
+        response_model=ForgeMcpGrantsResponse,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def set_session_forge_mcp(
+        request: Request,
+        data: ForgeMcpGrantsUpdate,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> ForgeMcpGrantsResponse:
+        """Replace a session's stored Forge MCP grants; the next start applies them.
+
+        Operators only: any session or other scoped credential gets 403, so a session
+        can never widen its own grants or a peer's. Each change is audited
+        (``volundr.session.forge_mcp_grants_changed``). The running launch keeps its
+        credential; restart the session to apply.
+        """
+        return await _forge_mcp_grants_call(
+            request,
+            session_id,
+            lambda principal: forge.set_forge_mcp_grants(
+                session_id, data.grants, principal=principal
+            ),
+        )
 
     @router.delete(
         "/sessions/{session_id}",
