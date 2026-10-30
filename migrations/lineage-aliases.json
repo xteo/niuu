@@ -128,5 +128,11 @@
       "filename": "000091_session_work_facts.up.sql",
       "sha256": "d501f084ba0022d1224396527d451c66c7cffbbb33257a03ef1101db14d2980e"
     }
+  ],
+  "000094_forge_artifact_publications.up.sql": [
+    {
+      "filename": "000093_forge_artifact_publications.up.sql",
+      "sha256": "651dde42b471daa8a90ec2cbffc1812f37e6f3cf49d2917989f1ea8f270fcd34"
+    }
   ]
 }
