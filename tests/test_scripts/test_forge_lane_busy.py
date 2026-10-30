@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,3 +56,32 @@ def test_a_detached_train_is_a_host_train():
     _, lane_pids = lane_busy.lane_reasons("idle", "300", procs)
     trains = lane_busy.host_trains(procs, lane_pids)
     assert [t.split()[0] for t in trains] == ["500"]
+
+
+def test_a_launchd_job_does_not_make_the_host_busy(monkeypatch, capsys):
+    rows = [{"id": "s1", "name": "ios-release", "status": "running", "activity_state": "idle"}]
+    monkeypatch.setattr(lane_busy.urllib.request, "urlopen", lambda *a, **k: _Json(rows))
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "ps":
+            return _Done(PS)
+        return _Done("200\n")  # the lane's pane: only its MCP servers
+
+    monkeypatch.setattr(lane_busy.subprocess, "run", run)
+    monkeypatch.setattr(lane_busy.os, "getuid", lambda: 501)
+
+    assert lane_busy.main(["http://forge", "tmux"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["busy"] == []
+    # pane 300 is not this lane's, so its train is not in the judged pane tree either
+    assert [t.split()[0] for t in report["host_trains"]] == ["301", "302", "303", "500"]
+
+
+class _Json(io.BytesIO):
+    def __init__(self, data):
+        super().__init__(json.dumps(data).encode())
+
+
+class _Done:
+    def __init__(self, stdout):
+        self.stdout = stdout

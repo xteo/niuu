@@ -3,9 +3,11 @@
 usage: forge_lane_busy.py FORGE_BASE TMUX_BIN [SESSION_ID ...]
 A running lane is busy when (1) Forge does not report it idle at the prompt, or (2) its tmux
 pane runs a tool command (a shell the agent spawned, e.g. a background release train in a
-lane Forge reports idle) or a train process, or (3) for a host switch, any train process
-runs anywhere on the host, even detached. With SESSION_IDs only those lanes are judged;
-host trains are still reported. Prints JSON; exit 1 when busy.
+lane Forge reports idle) or a train process. A lane restart or a host switch ends the lane's
+tmux server and with it everything in the pane's process tree; launchd and cron jobs (a
+nightly qa.sh) and other detached processes are not in it and survive, so they are reported
+as ``host_trains`` but do not make the host busy. With SESSION_IDs only those lanes are
+judged. Prints JSON; exit 1 when a lane is busy.
 """
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ def lane_reasons(
 
 
 def host_trains(procs: dict[str, tuple[str, str, str]], lane_pids: set[str]) -> list[str]:
-    """Train processes outside every lane's pane (detached ones included)."""
+    """Train processes outside every lane's pane (launchd or cron jobs, detached runs)."""
     return [
         f"{pid} {etime} {cmd[:100]}"
         for pid, (_, etime, cmd) in procs.items()
@@ -93,7 +95,7 @@ def main(argv: list[str]) -> int:
             busy.append({"id": sid, "name": lane.get("name"), "reasons": reasons})
     host = host_trains(procs, lane_pids)
     print(json.dumps({"lanes": len(lanes), "busy": busy, "host_trains": host}))
-    return 1 if busy or (host and not only) else 0
+    return 1 if busy else 0
 
 
 if __name__ == "__main__":

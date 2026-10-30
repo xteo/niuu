@@ -207,13 +207,17 @@ A lane may be restarted (or stopped by a host switch) only when **all** of these
 2. its tmux pane runs no tool command: no shell the agent spawned (`sh|bash|zsh -c …`,
    Claude's Bash tool and background tasks, a Codex exec). MCP servers and other
    long-lived helpers are direct executables and do not count;
-3. for a host switch, no train process runs anywhere on the host, even detached:
-   `release.py`, `qa.sh`, `xcodebuild`, a journey runner, `archive`, `fastlane`,
-   `altool`, `notarytool`.
+3. no train process runs in its pane's process tree: `release.py`, `qa.sh`, `xcodebuild`,
+   a journey runner, `archive`, `fastlane`, `altool`, `notarytool`.
+
+Only the pane's process tree counts. A restart or a host switch ends the lane's tmux
+server, and with it everything in that tree. launchd or cron jobs (the mini's nightly
+`qa.sh`) and other detached processes are not in it and keep running, so they do not
+hold a switch. The check lists them as `host_trains`, for the record.
 
 `scripts/forge_lane_busy.py FORGE_BASE TMUX_BIN [SESSION_ID …]` checks this on the host
-it runs on, prints JSON (`busy` lanes with their reasons, `host_trains`) and exits 1 when
-anything is busy. Copy it to the host. It runs with the system `python3` (3.9 or later).
+it runs on, prints JSON (`busy` lanes with their reasons, and `host_trains` for information) and
+exits 1 when a lane is busy. Copy it to the host. It runs with the system `python3` (3.9 or later).
 
 ```bash
 python3 scripts/forge_lane_busy.py http://127.0.0.1:8080 "$(which tmux)"           # Thor
