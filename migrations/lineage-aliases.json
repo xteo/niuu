@@ -108,5 +108,11 @@
       "filename": "000072_forge_notification_images.up.sql",
       "sha256": "cd39abfca6355c64df73f10a1b5ae9c0933cc8cfebf43a6962993a2b2e5565e4"
     }
+  ],
+  "000096_push_gateway.up.sql": [
+    {
+      "filename": "000073_push_gateway.up.sql",
+      "sha256": "2de323206ec4e0f0e17c8c46805a74563cb44897d5342355264c0bae3ab6b6bb"
+    }
   ]
 }

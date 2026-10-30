@@ -46,7 +46,13 @@ from niuu.config_models import (
     default_session_definitions,
 )
 from niuu.domain.delivery import AcceptancePolicy
-from niuu.domain.notifications import MAX_BODY_CHARS, MAX_TITLE_CHARS
+from niuu.domain.notifications import (
+    MAX_BODY_CHARS,
+    MAX_TITLE_CHARS,
+    NotificationKind,
+    NotificationSeverity,
+    NotificationSource,
+)
 from niuu.domain.observability import ObservabilityConfig
 from niuu.domain.presented_files import PRESENTED_FILE_DEFAULT_MAX_BYTES
 from niuu.forge_mcp.models import ForgeMcpGrant
@@ -66,6 +72,7 @@ from volundr.domain.notifications import (
     INTEGRATION_SINK,
     MAX_SINK_NAME_CHARS,
     SINK_NAME_PATTERN,
+    NotificationQuietHours,
     NotificationRateLimit,
 )
 from volundr.domain.presented_files import validate_public_base_url
@@ -834,18 +841,333 @@ class SleipnirConfig(BaseModel):
     secret_kwargs_env: dict[str, str] = Field(default_factory=dict)
 
 
+DEFAULT_PUSH_ADAPTER = "volundr.adapters.outbound.push_channels.LoggingNotificationChannel"
+
+
+class ApnsConfig(BaseModel):
+    """Apple Push Notification service credentials (token-based auth).
+
+    ``private_key_path`` is the ``AuthKey_<KEYID>.p8`` file from the Apple Developer
+    portal. It is read once at startup; a missing or wrong key stops the start.
+    One key serves the sandbox and the production host.
+    """
+
+    team_id: str = Field(default="", description="Apple Developer team id (the JWT issuer).")
+    key_id: str = Field(default="", description="Id of the APNs auth key (the JWT kid).")
+    bundle_id: str = Field(
+        default="",
+        description="The app's bundle id: the APNs topic for a token registered without one.",
+    )
+    private_key_path: str = Field(
+        default="", description="Path of the .p8 signing key file (never its contents)."
+    )
+    token_ttl_seconds: int = Field(
+        default=3000,
+        ge=1200,
+        le=3540,
+        description=(
+            "How long one provider JWT is reused. APNs refuses a JWT older than an "
+            "hour and throttles a provider that signs more often than every 20 minutes."
+        ),
+    )
+    request_timeout_seconds: float = Field(
+        default=10.0, gt=0, description="Timeout for one request to APNs."
+    )
+    production_url: str = Field(
+        default="https://api.push.apple.com",
+        description="APNs host for tokens of TestFlight and App Store installs.",
+    )
+    sandbox_url: str = Field(
+        default="https://api.sandbox.push.apple.com",
+        description="APNs host for tokens of development installs.",
+    )
+
+
+class PushAlertsConfig(BaseModel):
+    """Which Guild notifications alert the owner's devices, and how.
+
+    This is the gateway's one alert rule, applied per owner. Its rate limit and
+    quiet hours mean what they mean on a delivery rule (``notifications`` rules).
+    """
+
+    enabled: bool = Field(default=True, description="Send alert pushes.")
+    kinds: list[NotificationKind] = Field(
+        default_factory=lambda: [
+            NotificationKind.MILESTONE,
+            NotificationKind.DECISION,
+            NotificationKind.ATTENTION,
+            NotificationKind.ERROR,
+        ],
+        description="Notification kinds that alert. Others still reach the Live Activity.",
+    )
+    min_severity: NotificationSeverity = Field(
+        default=NotificationSeverity.INFO, description="Lowest severity that alerts."
+    )
+    sources: list[NotificationSource] = Field(
+        default_factory=list, description="Sources that alert; empty means any."
+    )
+    time_sensitive_kinds: list[NotificationKind] = Field(
+        default_factory=lambda: [
+            NotificationKind.ATTENTION,
+            NotificationKind.DECISION,
+            NotificationKind.ERROR,
+        ],
+        description="Kinds sent with the time-sensitive interruption level; others are active.",
+    )
+    low_priority_kinds: list[NotificationKind] = Field(
+        default_factory=list,
+        description="Kinds APNs may deliver when power allows (apns-priority 5).",
+    )
+    body_chars: int = Field(default=280, ge=1, description="Longest alert body.")
+    expiration_seconds: int = Field(
+        default=3600, ge=0, description="How long APNs keeps trying a device that is offline."
+    )
+    max_age_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "A notification older than this when the gateway reads it is not alerted "
+            "(after the gateway or a node was unreachable)."
+        ),
+    )
+    rate_limit: NotificationRateLimit | None = Field(
+        default_factory=lambda: NotificationRateLimit(max_count=30, window_seconds=3600),
+        description="At most max_count alerts per owner in any window_seconds; null disables.",
+    )
+    quiet_hours: NotificationQuietHours | None = Field(
+        default=None,
+        description=(
+            "A daily window (start, end, timezone) in which only notifications at or "
+            "above allow_min_severity alert."
+        ),
+    )
+    category: str = Field(
+        default="FORGE_ACTIVITY", description="The alert's category (aps.category)."
+    )
+    sound: str = Field(default="default", description="The alert's sound; empty is silent.")
+    deep_link_base: str = Field(
+        default="lexichat://activity",
+        min_length=1,
+        description="The app link a tap opens; the notification id and its session are appended.",
+    )
+    session_subtitle: bool = Field(
+        default=True,
+        description="Show the session name as the alert's subtitle when the title lacks it.",
+    )
+    batch_size: int = Field(default=20, ge=1, description="Alerts claimed per round.")
+    lease_seconds: float = Field(
+        default=60.0, gt=0, description="How long a claimed alert is leased to one worker."
+    )
+    max_attempts: int = Field(
+        default=5, ge=1, description="Attempts before an alert APNs cannot take is given up."
+    )
+    backoff_base_seconds: float = Field(
+        default=15.0, gt=0, description="First retry delay; doubles per attempt."
+    )
+    backoff_max_seconds: float = Field(default=600.0, gt=0, description="Longest retry delay.")
+
+    @model_validator(mode="after")
+    def _ordered_backoff(self) -> "PushAlertsConfig":
+        if self.backoff_base_seconds > self.backoff_max_seconds:
+            raise ValueError("alerts.backoff_base_seconds must not exceed backoff_max_seconds")
+        return self
+
+
+class PushLiveActivityStartConfig(BaseModel):
+    """Starting the Notifications Live Activity by push when none is running."""
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Start the Live Activity on a new notification when the owner has a "
+            "push-to-start token and no running activity."
+        ),
+    )
+    min_interval_seconds: float = Field(
+        default=3600.0, gt=0, description="At most one start per token in this interval."
+    )
+
+
+class PushLiveActivityConfig(BaseModel):
+    """Live Activity pushes: the newest Guild notifications on the Lock Screen."""
+
+    enabled: bool = Field(default=True, description="Send Live Activity pushes.")
+    priority: int = Field(
+        default=10, ge=1, le=10, description="apns-priority of a Live Activity push (5 or 10)."
+    )
+    stale_seconds: int = Field(
+        default=28800, ge=1, description="How long after a push iOS shows the content as current."
+    )
+    start: PushLiveActivityStartConfig = Field(default_factory=PushLiveActivityStartConfig)
+
+
+class PushWidgetsConfig(BaseModel):
+    """WidgetKit reload pushes. iOS budgets them, so they are spaced per token."""
+
+    enabled: bool = Field(default=True, description="Send widget reload pushes.")
+    min_interval_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            "At most one reload per widget token in this interval; a reload held "
+            "back is sent when the interval ends, so the last change is never dropped."
+        ),
+    )
+    priority: int = Field(
+        default=10, ge=1, le=10, description="apns-priority of a widget reload (5 or 10)."
+    )
+
+
+class PushBackgroundConfig(BaseModel):
+    """Silent background pushes to the app's alert token.
+
+    They let iOS wake the app, which then reads every server it knows (a server
+    only knows its own Guild). iOS delivers only a few per hour, so they are spaced
+    per token.
+    """
+
+    enabled: bool = Field(default=True, description="Send background pushes.")
+    min_interval_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "At most one background push per alert token in this interval; one held "
+            "back is sent when the interval ends."
+        ),
+    )
+    priority: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="apns-priority of a background push. APNs refuses 10 for this type.",
+    )
+
+
+class PushGatewayConfig(BaseModel):
+    """The push gateway: Apple pushes for every notification of this server's Guild.
+
+    Any Forge server turns it on with configuration. A phone that uses several
+    servers registers with each; each pushes for its own Guild.
+
+    One node holds the APNs key (``push.apns``) and the registered devices. It
+    reads every node's notification feed through the Guild API at ``guild_url`` and
+    sends the alert, Live Activity and widget pushes for all of them, so no other
+    node needs a key.
+    """
+
+    enabled: bool = Field(default=False, description="Run the push gateway on this node.")
+    guild_url: str = Field(
+        default="",
+        description=(
+            "Origin of the Guild API (its registry and its notification feed), "
+            "e.g. http://127.0.0.1:8080."
+        ),
+    )
+    reader_token_path: str = Field(
+        default="",
+        description=(
+            "File holding the bearer token the gateway reads the Guild with. Empty "
+            "sends no credential (a Guild with the AllowAll identity)."
+        ),
+    )
+    request_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Timeout for one read of one Guild node. A node that does not answer in "
+            "time fails only its own read."
+        ),
+    )
+    node_retry_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        description="How long a node that did not answer is left alone before the next try.",
+    )
+    poll_interval_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "How often the gateway reads the Guild feed. This node's own notifications "
+            "wake it at once; another node's are pushed within this interval."
+        ),
+    )
+    stream_enabled: bool = Field(
+        default=False,
+        description=(
+            "Also listen to the Guild's live event stream, so another node's notification "
+            "is pushed at once. It holds one streaming connection to guild_url: leave it "
+            "off when the Guild runs in this same process, where an open stream delays a "
+            "graceful shutdown."
+        ),
+    )
+    stream_retry_seconds: float = Field(
+        default=5.0, gt=0, description="Wait before reconnecting a lost event stream."
+    )
+    page_size: int = Field(default=50, ge=1, description="Notifications read per node per request.")
+    feed_page_size: int = Field(
+        default=20,
+        ge=3,
+        description="Newest notifications read per node to build the Live Activity content.",
+    )
+    catch_up_items: int = Field(
+        default=10,
+        ge=0,
+        description="How many of a newly found node's latest notifications are read back.",
+    )
+    discovery_interval_seconds: float = Field(
+        default=300.0, gt=0, description="How often the gateway looks for new Guild nodes."
+    )
+    retention_seconds: float = Field(
+        default=604800.0, gt=0, description="How long settled alert rows are kept."
+    )
+    max_detail_chars: int = Field(
+        default=500, ge=1, description="Longest delivery detail kept on an alert row."
+    )
+    public_api_url: str = Field(
+        default="",
+        description=(
+            "Origin a phone reaches this Guild at, for image URLs in alerts. Empty "
+            "leaves the image out of the alert."
+        ),
+    )
+    origin_label: str = Field(
+        default="",
+        description="This server's display name, shown on a Live Activity it pushed.",
+    )
+    alerts: PushAlertsConfig = Field(default_factory=PushAlertsConfig)
+    live_activity: PushLiveActivityConfig = Field(default_factory=PushLiveActivityConfig)
+    widgets: PushWidgetsConfig = Field(default_factory=PushWidgetsConfig)
+    background: PushBackgroundConfig = Field(default_factory=PushBackgroundConfig)
+
+    @model_validator(mode="after")
+    def _needs_guild(self) -> "PushGatewayConfig":
+        if self.enabled and not self.guild_url.strip():
+            raise ValueError(
+                "push.gateway.enabled needs push.gateway.guild_url (the Guild API origin)"
+            )
+        return self
+
+
 class PushNotificationConfig(BaseModel):
-    """The push channel, and the needs-input push (optional).
+    """Apple push: the Guild push gateway, or the per-node push channel (optional).
 
-    ``adapter`` + ``kwargs`` build the NotificationChannel that push sinks deliver
-    through (the default adapter only logs). With ``enabled``, every owner who
-    registers a device gets a "Needs-input pushes" delivery rule targeting
-    ``attention_sink``, so each session entering ``awaiting_input`` is pushed
-    through the notification outbox (retried, recorded, quiet hours honoured).
-    That needs ``notifications.enabled`` and a ``notifications.sinks`` entry
-    named ``attention_sink``.
+    Two modes, both behind ``enabled``:
 
-    Example YAML::
+    * **Gateway** (``gateway.enabled``): this node pushes for every Guild node's
+      notifications through APNs (``apns``): alerts, Live Activity, widgets and
+      background pushes. The needs-input moment is alerted from its ``attention``
+      notification, so no "Needs-input pushes" rule is given and the per-node
+      channel below must be left at its default. It needs the ``device_tokens``
+      table (``device_registry`` postgres, or auto in mini mode).
+    * **Per-node channel** (``adapter`` + ``kwargs``): the NotificationChannel
+      that push sinks deliver through (the default adapter only logs). Every owner
+      who registers a device gets a "Needs-input pushes" delivery rule targeting
+      ``attention_sink``, so each session entering ``awaiting_input`` is pushed
+      through the notification outbox (retried, recorded, quiet hours honoured).
+      That needs ``notifications.enabled`` and a ``notifications.sinks`` entry
+      named ``attention_sink``.
+
+    Per-node channel YAML::
 
         push:
           enabled: true
@@ -862,22 +1184,40 @@ class PushNotificationConfig(BaseModel):
     Secret, e.g. from an ExternalSecret), not a credential-store record. Registered
     devices are per user: outside mini mode they are the owners' push-device
     integrations (``device_registry``), their tokens in the credential store.
+
+    Gateway YAML::
+
+        push:
+          enabled: true
+          device_registry: postgres
+          apns:
+            team_id: "ABCDE12345"
+            key_id: "KEY1234567"
+            bundle_id: "com.example.app"
+            private_key_path: "/etc/volundr/secrets/AuthKey_KEY1234567.p8"
+          gateway:
+            enabled: true
+            guild_url: "http://127.0.0.1:8080"
     """
 
     enabled: bool = Field(
         default=False,
         description=(
-            "Push every session that needs its owner: give each owner who registers a "
-            "device a delivery rule for it (needs notifications.enabled)."
+            "Enable push: the gateway when gateway.enabled; else every owner who registers "
+            "a device gets a delivery rule for sessions that need them (needs "
+            "notifications.enabled)."
         ),
     )
     attention_sink: str = Field(
         default="push",
-        description="The notifications.sinks entry the needs-input push rule delivers through.",
+        description=(
+            "The notifications.sinks entry the needs-input push rule delivers through "
+            "(per-node mode; the gateway gives no such rule)."
+        ),
     )
     adapter: str = Field(
-        default="volundr.adapters.outbound.push_channels.LoggingNotificationChannel",
-        description="Fully-qualified NotificationChannel class path.",
+        default=DEFAULT_PUSH_ADAPTER,
+        description="Fully-qualified NotificationChannel class path (per-node mode).",
     )
     kwargs: dict[str, Any] = Field(default_factory=dict)
     secret_kwargs_env: dict[str, str] = Field(
@@ -892,6 +1232,35 @@ class PushNotificationConfig(BaseModel):
             "'postgres': the device_tokens table. 'auto': postgres in mini mode, else integrations."
         ),
     )
+    apns: ApnsConfig = Field(default_factory=ApnsConfig)
+    gateway: PushGatewayConfig = Field(default_factory=PushGatewayConfig)
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> "PushNotificationConfig":
+        if not self.gateway.enabled:
+            return self
+        if not self.enabled:
+            raise ValueError(
+                "push.gateway.enabled needs push.enabled: true (or disable the gateway)"
+            )
+        missing = [
+            name
+            for name in ("team_id", "key_id", "bundle_id", "private_key_path")
+            if not getattr(self.apns, name).strip()
+        ]
+        if missing:
+            raise ValueError("push.gateway.enabled needs push.apns." + ", push.apns.".join(missing))
+        if self.adapter != DEFAULT_PUSH_ADAPTER or self.kwargs or self.secret_kwargs_env:
+            raise ValueError(
+                "push.adapter / push.kwargs configure the per-node needs-input push, which "
+                "the gateway replaces: remove them, or disable push.gateway"
+            )
+        if self.device_registry == "integrations":
+            raise ValueError(
+                "push.gateway.enabled needs the device_tokens table (token kinds and push "
+                "throttles); set push.device_registry to postgres, or disable push.gateway"
+            )
+        return self
 
     def uses_integration_devices(self, *, mini_mode: bool) -> bool:
         """Whether push devices are stored as integrations (see ``device_registry``)."""
@@ -3185,8 +3554,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _needs_input_push_has_its_sink(self) -> "Settings":
-        """``push.enabled`` delivers through the outbox; refuse it without one."""
-        if not self.push.enabled:
+        """``push.enabled`` delivers through the outbox; refuse it without one.
+
+        The push gateway alerts for the needs-input moment itself, so it needs no sink.
+        """
+        if not self.push.enabled or self.push.gateway.enabled:
             return self
         if not self.notifications.enabled:
             raise ValueError(

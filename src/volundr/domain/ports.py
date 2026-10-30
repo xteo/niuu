@@ -7,7 +7,7 @@ Adapters implement these interfaces.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -97,6 +97,7 @@ from volundr.domain.models import (  # noqa: F401
     WorkspaceStatus,
 )
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.push import PushTokenKind
 from volundr.domain.session_participants import ParticipantRole, SessionParticipant
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
@@ -734,19 +735,60 @@ class EventBroadcaster(ABC):
 
 
 class DeviceTokenRepository(ABC):
-    """Persistence port for per-user push device registrations."""
+    """Persistence port for per-user push device registrations.
+
+    A registration is one ``(token, kind)``. A registry that keeps only alert
+    tokens (the owners' push-device integrations) refuses any other kind.
+    """
 
     @abstractmethod
     async def upsert(self, device: DeviceToken) -> DeviceToken:
-        """Register a device, or refresh it if the (owner, token) already exists."""
+        """Register a token, or refresh it if the (token, kind) already exists.
+
+        The row moves to ``device.owner_id``: a token belongs to whoever is signed
+        in on that install now. A Live Activity token replaces the owner's earlier
+        token for the same ``activity_id``."""
 
     @abstractmethod
-    async def list_for_owner(self, owner_id: str) -> list[DeviceToken]:
-        """Return every device registered by an owner."""
+    async def list_for_owner(
+        self, owner_id: str, *, kinds: Sequence[PushTokenKind] | None = None
+    ) -> list[DeviceToken]:
+        """Return an owner's registrations, optionally only those of ``kinds``."""
 
     @abstractmethod
-    async def delete(self, owner_id: str, token: str) -> bool:
-        """Remove a device registration. Returns True if one was deleted."""
+    async def delete(self, owner_id: str, token: str, *, kind: PushTokenKind | None = None) -> bool:
+        """Remove an owner's registration(s) of a token. True if any was deleted."""
+
+
+class PushTokenRegistry(DeviceTokenRepository):
+    """A device registry the push gateway can drive: every token kind, plus throttles.
+
+    The throttle methods serve pushes iOS budgets (widget reloads, Live Activity
+    push-to-start): a push is *claimed* before it is sent, so two workers never
+    send the same one twice.
+    """
+
+    @abstractmethod
+    async def delete_registration(self, device_id: UUID) -> bool:
+        """Remove one registration by id (a token APNs reported as dead)."""
+
+    @abstractmethod
+    async def claim_push(self, device_id: UUID, *, min_interval_seconds: float) -> bool:
+        """Claim a throttled push for a token.
+
+        True when at least ``min_interval_seconds`` passed since its last claim; the
+        claim is recorded. False otherwise, and the token is marked as owing a push
+        (see :meth:`claim_owed_pushes`)."""
+
+    @abstractmethod
+    async def release_push(self, device_id: UUID) -> None:
+        """Undo a claim whose push was not delivered, so the next attempt may send."""
+
+    @abstractmethod
+    async def claim_owed_pushes(
+        self, kind: PushTokenKind, *, min_interval_seconds: float
+    ) -> list[DeviceToken]:
+        """Claim every token of ``kind`` that owes a push and whose interval elapsed."""
 
 
 class NotificationChannel(ABC):

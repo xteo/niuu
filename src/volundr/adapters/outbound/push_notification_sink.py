@@ -23,6 +23,7 @@ from niuu.ports.notifications import (
 )
 from volundr.domain.models import PushMessage
 from volundr.domain.ports import DeviceTokenRepository, NotificationChannel
+from volundr.domain.push import PushTokenKind
 
 PUSH_NOTIFICATION_EVENT = "session.notification"
 
@@ -80,7 +81,8 @@ class PushNotificationSink(NotificationSink):
             raise NotificationDeliveryError(
                 "Push needs an owner to find devices for", retryable=False
             )
-        devices = await self._devices.list_for_owner(message.owner_id)
+        # Alert tokens only: Live Activity and widget tokens take other push types.
+        devices = await self._devices.list_for_owner(message.owner_id, kinds=(PushTokenKind.ALERT,))
         push = PushMessage(
             owner_id=message.owner_id,
             title=message.title,

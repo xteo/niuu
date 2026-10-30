@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid5
 
@@ -36,6 +37,7 @@ from niuu.ports.credentials import CredentialStorePort
 from niuu.ports.integrations import IntegrationRepository
 from volundr.domain.models import DevicePlatform, DeviceToken
 from volundr.domain.ports import DeviceTokenRepository
+from volundr.domain.push import PushTokenKind, UnsupportedTokenKindError
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,14 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
 
         The credential is written first: a connection never points at a missing secret.
         Re-registering keeps the connection's ``enabled`` choice and creation time.
+        Only alert tokens are kept: Live Activity, push-to-start and widget tokens
+        need the push gateway's ``device_tokens`` table.
         """
+        if device.kind is not PushTokenKind.ALERT:
+            raise UnsupportedTokenKindError(
+                f"This Forge keeps alert tokens only (push-device integrations); a "
+                f"{device.kind.value} token needs push.device_registry: postgres"
+            )
         name = self.credential_name(device.owner_id, device.token)
         connection_id = self.connection_id(device.owner_id, device.token)
         await self._credentials.store(
@@ -94,7 +103,7 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
         if device.app_bundle_id:
             config["app_bundle_id"] = device.app_bundle_id
         if device.environment:
-            config["environment"] = device.environment
+            config["environment"] = device.environment.value
         connection = IntegrationConnection(
             id=connection_id,
             owner_id=device.owner_id,
@@ -110,8 +119,15 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
         await self._integrations.save_connection(connection)
         return self._device(connection, device.token)
 
-    async def list_for_owner(self, owner_id: str) -> list[DeviceToken]:
-        """The owner's enabled push devices whose token is in the credential store."""
+    async def list_for_owner(
+        self, owner_id: str, *, kinds: Sequence[PushTokenKind] | None = None
+    ) -> list[DeviceToken]:
+        """The owner's enabled push devices whose token is in the credential store.
+
+        They are all alert tokens, so asking for other kinds only returns nothing.
+        """
+        if kinds is not None and PushTokenKind.ALERT not in kinds:
+            return []
         connections = await self._integrations.list_connections(
             owner_id, integration_type=IntegrationType.MESSAGING
         )
@@ -133,8 +149,10 @@ class IntegrationDeviceTokenRepository(DeviceTokenRepository):
             devices.append(self._device(connection, token))
         return sorted(devices, key=lambda device: device.updated_at, reverse=True)
 
-    async def delete(self, owner_id: str, token: str) -> bool:
-        """Remove the device's connection, then its credential."""
+    async def delete(self, owner_id: str, token: str, *, kind: PushTokenKind | None = None) -> bool:
+        """Remove the device's connection, then its credential (alert tokens only)."""
+        if kind is not None and kind is not PushTokenKind.ALERT:
+            return False
         connection_id = self.connection_id(owner_id, token)
         connection = await self._integrations.get_connection(connection_id)
         if connection is None or connection.owner_id != owner_id or not is_push_device(connection):

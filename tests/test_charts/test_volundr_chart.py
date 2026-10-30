@@ -772,6 +772,53 @@ class TestConfigMapTemplate:
         ]
         assert Settings(push=own["push"], notifications=own["notifications"])
 
+    def test_push_gateway_renders_without_the_needs_input_sink(self, tmp_path):
+        from tests.helpers.apns_keys import write_p8
+        from volundr.config import Settings
+
+        key = write_p8(tmp_path)
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                str(CHART_DIR),
+                "--set",
+                "push.enabled=true",
+                "--set",
+                "push.deviceRegistry=postgres",
+                "--set-json",
+                'push.apns={"team_id":"ABCDE12345","key_id":"KEY1234567",'
+                f'"bundle_id":"com.example.app","private_key_path":"{key}"}}',
+                "--set-json",
+                'push.gateway={"enabled":true,"guild_url":"http://niuu-guild:8080",'
+                '"origin_label":"Forge","alerts":{"rate_limit":null},'
+                '"live_activity":{"start":{"enabled":true},"relevance_score":10}}',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+        configmap = next(
+            doc
+            for doc in documents
+            if doc.get("kind") == "ConfigMap"
+            and doc.get("metadata", {}).get("name") == "test-volundr"
+        )
+        config = yaml.safe_load(configmap["data"]["config.yaml"])
+        # The gateway alerts for the needs-input moment itself: no push sink is added.
+        assert "notifications" not in config
+        push = Settings(push=config["push"]).push
+        assert push.enabled and push.gateway.enabled
+        assert push.device_registry == "postgres"
+        assert push.apns.key_id == "KEY1234567"
+        assert push.apns.private_key_path == str(key)
+        assert push.gateway.guild_url == "http://niuu-guild:8080"
+        assert push.gateway.alerts.rate_limit is None
+        assert push.gateway.live_activity.start.enabled is True
+        assert push.gateway.live_activity.relevance_score == 10
+
     def test_forge_mcp_section_renders_into_config(self):
         from volundr.config import ForgeMcpConfig
 

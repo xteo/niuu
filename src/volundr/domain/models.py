@@ -28,6 +28,7 @@ from niuu.domain import models as shared_models
 from niuu.domain.services.forge_session_token import IssuedForgeSessionToken
 from tracker.models import ProjectMapping, TrackerConnectionStatus, TrackerIssue  # noqa: F401
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.push import PushEnvironment, PushTokenKind
 from volundr.domain.session_read_state import SessionReadState
 
 CIStatus = shared_models.CIStatus
@@ -239,7 +240,9 @@ class DeviceToken(BaseModel):
     """A user's registered device for push notifications.
 
     Stored per-owner so a session that needs attention can fan a push out to
-    every device the owner has registered (the iOS app/widget, etc.).
+    every device the owner has registered (the iOS app/widget, etc.). One row per
+    ``(token, kind)``: an app install registers its alert token, the token of each
+    running Live Activity, its push-to-start token and its widget token.
     """
 
     id: UUID = Field(default_factory=uuid4)
@@ -254,9 +257,25 @@ class DeviceToken(BaseModel):
         default=None,
         description="APNs topic (bundle id) to target; falls back to the channel default",
     )
-    environment: str | None = Field(
+    kind: PushTokenKind = Field(
+        default=PushTokenKind.ALERT,
+        description="What the token receives: alerts, Live Activity pushes or widget reloads",
+    )
+    environment: PushEnvironment | None = Field(
         default=None,
-        description="APNs environment of the token: 'sandbox' (development builds) or 'production'",
+        description=(
+            "The APNs host that issued the token (development installs: sandbox); "
+            "omitted uses the registry's default (device_tokens: production)"
+        ),
+    )
+    activity_id: str | None = Field(
+        default=None,
+        max_length=200,
+        description="The Live Activity a live_activity token updates",
+    )
+    last_push_at: datetime | None = Field(
+        default=None,
+        description="When a throttled push (widget reload, push-to-start) was last sent",
     )
     created_at: datetime = Field(default_factory=_utc_now)
     updated_at: datetime = Field(default_factory=_utc_now)

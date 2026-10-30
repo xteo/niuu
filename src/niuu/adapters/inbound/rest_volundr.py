@@ -2785,6 +2785,55 @@ def create_volundr_router(
             request, principal, method="GET", path="/notifications/sinks"
         )
 
+    # -- Push devices -----------------------------------------------------------
+    # A device registers once, on the node that sends pushes for the Guild (the
+    # default node unless ``instance_id`` selects another). Requests carry the
+    # caller's identity like the feed does; a node without push answers 503.
+
+    @router.post("/devices", status_code=status.HTTP_201_CREATED)
+    async def register_device(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        return await _proxy_rule_request(
+            request, principal, method="POST", path="/devices", body=body
+        )
+
+    @router.get("/devices")
+    async def list_devices(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> Response:
+        return await _proxy_rule_request(request, principal, method="GET", path="/devices")
+
+    @router.delete("/devices/{token}", status_code=status.HTTP_204_NO_CONTENT)
+    async def unregister_device(
+        request: Request,
+        token: str = Path(description="The push token to unregister"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        return await _proxy_rule_request(
+            request, principal, method="DELETE", path=f"/devices/{quote(token, safe='')}"
+        )
+
+    @router.get("/push/status")
+    async def push_status(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> Response:
+        """The push gateway's counters, from the node that runs it."""
+        return await _proxy_rule_request(request, principal, method="GET", path="/push/status")
+
+    @router.post("/push/test")
+    async def send_test_push(
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Push once to the caller's own registered tokens (the gateway node sends it)."""
+        return await _proxy_rule_request(
+            request, principal, method="POST", path="/push/test", body=body
+        )
+
     @router.get("/notifications/{notification_id}/image")
     async def get_notification_image(
         request: Request,

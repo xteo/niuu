@@ -115,6 +115,7 @@ from volundr.domain.ports import (
 )
 from volundr.domain.presented_files import PresentedFileStore, is_presented_file_id
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.push import PushEnvironment, PushTokenKind, UnsupportedTokenKindError
 from volundr.domain.services import (
     ChronicleAccessDeniedError,
     ChronicleNotFoundError,
@@ -999,14 +1000,32 @@ class ActivityReport(BaseModel):
 
 
 class DeviceRegistration(BaseModel):
-    """Request model for registering a push device."""
+    """Request model for registering a push token.
+
+    One registration per ``(token, kind)``: an app install registers its alert
+    token, the update token of each running Live Activity (with ``activity_id``),
+    its push-to-start token and its widget token.
+    """
 
     platform: str = Field(description="Device platform (ios/android/web)")
     token: str = Field(min_length=1, max_length=512, description="Push token / endpoint")
     app_bundle_id: str | None = Field(default=None, description="APNs topic (bundle id) to target")
-    environment: Literal["sandbox", "production"] | None = Field(
+    kind: PushTokenKind = Field(
+        default=PushTokenKind.ALERT,
+        description="alert, live_activity, live_activity_start or widget",
+    )
+    environment: PushEnvironment | None = Field(
         default=None,
-        description="APNs environment of the token; omitted uses the push channel's default",
+        description=(
+            "sandbox for a development install, production otherwise; omitted uses the "
+            "registry's default (the push channel's for integrations, production for "
+            "the device_tokens table)"
+        ),
+    )
+    activity_id: str | None = Field(
+        default=None,
+        max_length=200,
+        description="The Live Activity a live_activity token updates",
     )
 
 
@@ -1017,6 +1036,9 @@ class DeviceResponse(BaseModel):
     platform: str
     token: str
     app_bundle_id: str | None = None
+    kind: str
+    environment: str | None = None
+    activity_id: str | None = None
     created_at: str
     updated_at: str
 
@@ -1027,6 +1049,9 @@ class DeviceResponse(BaseModel):
             platform=device.platform.value,
             token=device.token,
             app_bundle_id=device.app_bundle_id,
+            kind=device.kind.value,
+            environment=device.environment.value if device.environment else None,
+            activity_id=device.activity_id,
             created_at=device.created_at.isoformat(),
             updated_at=device.updated_at.isoformat(),
         )
@@ -3188,12 +3213,15 @@ def create_router(
         tags=["Devices"],
     )
     async def register_device(request: Request, data: DeviceRegistration) -> DeviceResponse:
-        """Register a push device for the authenticated user.
+        """Register a push token for the authenticated user.
 
-        The iOS app/widget calls this so a session that needs attention can fan
-        a push out to it. Idempotent on (owner, token). With ``push.enabled`` it
-        also gives the owner the "Needs-input pushes" rule; when that fails the
-        registration answers 500 so the app registers again.
+        The iOS app and its widget extension call this so Forge can push to them.
+        Idempotent on (token, kind): a token registered again is refreshed, and it
+        moves to the caller when another user registered it before. With
+        ``push.enabled`` (without the gateway) it also gives the owner the
+        "Needs-input pushes" rule; when that fails the registration answers 500 so
+        the app registers again. A registry that keeps alert tokens only answers 422
+        for any other kind.
         """
         if device_repository is None:
             raise HTTPException(
@@ -3218,9 +3246,17 @@ def create_router(
             platform=platform,
             token=data.token,
             app_bundle_id=data.app_bundle_id,
+            kind=data.kind,
             environment=data.environment,
+            # Only a Live Activity update token belongs to one activity.
+            activity_id=data.activity_id if data.kind is PushTokenKind.LIVE_ACTIVITY else None,
         )
-        stored = await device_repository.upsert(device)
+        try:
+            stored = await device_repository.upsert(device)
+        except UnsupportedTokenKindError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
         if on_device_registered is not None:
             await on_device_registered(principal.user_id)
         return DeviceResponse.from_device(stored)
@@ -3256,8 +3292,11 @@ def create_router(
     async def unregister_device(
         request: Request,
         token: str = Path(description="The push token to unregister"),
+        kind: PushTokenKind | None = Query(
+            default=None, description="Only this kind's registration; omitted removes every kind"
+        ),
     ) -> None:
-        """Unregister a push device for the authenticated user."""
+        """Unregister a push token for the authenticated user."""
         if device_repository is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3269,7 +3308,7 @@ def create_router(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required",
             )
-        await device_repository.delete(principal.user_id, token)
+        await device_repository.delete(principal.user_id, token, kind=kind)
 
     @router.patch(
         "/sessions/{session_id}/archive",
