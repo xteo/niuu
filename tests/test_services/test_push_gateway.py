@@ -782,6 +782,7 @@ class TestLiveActivity:
                 "timestamp": START_UNIX,
                 "event": "update",
                 "stale-date": START_UNIX + 28800,
+                "relevance-score": 10,
                 "content-state": {
                     "items": [
                         {

@@ -175,7 +175,9 @@ def test_instance_id_selects_another_node_and_is_not_forwarded():
     assert calls == []
     request = route.calls.last.request
     assert request.url.query == b""
-    assert request.headers["x-auth-user-id"] == "user-a"
+    # A remote node re-verifies the caller's bearer; x-auth-* headers never cross.
+    assert request.headers["authorization"] == "Bearer test-token"
+    assert "x-auth-user-id" not in request.headers
 
 
 def test_a_node_without_push_answers_503_through_the_facade():
