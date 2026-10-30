@@ -175,6 +175,7 @@ from volundr.config import Settings
 from volundr.domain.models import SessionStatus
 from volundr.domain.notifications import NotificationSinkInfo
 from volundr.domain.ports import OpenShellCredentialGrantPort
+from volundr.domain.presented_files import PresentedFileQuota
 from volundr.domain.services import (
     ChronicleService,
     ExternalSessionService,
@@ -1246,6 +1247,9 @@ def create_app(
                 store_cls = import_class(store_config.pop("adapter"))
                 presented_file_store = store_cls(**store_config)
                 app.state.presented_file_store = presented_file_store
+                app.state.presented_file_quota = PresentedFileQuota(
+                    settings.presented_files.max_total_bytes
+                )
 
             session_service = SessionService(
                 repository,
@@ -1620,6 +1624,7 @@ def create_app(
                         session_service,
                         public_base_url=settings.presented_files.public_base_url,
                         max_bytes=settings.presented_files.max_bytes,
+                        quota=app.state.presented_file_quota,
                         prefix="/api/v1/forge",
                     )
                 )
@@ -2155,8 +2160,13 @@ def create_app(
 
     @app.get("/health", tags=["Health"])
     @app.get("/api/v1/forge/health", include_in_schema=False)
-    async def health_check() -> dict[str, str]:
-        """Health check endpoint."""
-        return {"status": "healthy"}
+    async def health_check() -> dict[str, Any]:
+        """Health check endpoint, with presented-file usage when the store is on."""
+        health: dict[str, Any] = {"status": "healthy"}
+        quota = getattr(app.state, "presented_file_quota", None)
+        store = getattr(app.state, "presented_file_store", None)
+        if quota is not None and store is not None:
+            health["presented_files"] = await quota.usage(store)
+        return health
 
     return app

@@ -29,6 +29,7 @@ from volundr.config import LocalMountsConfig, PresentedFilesConfig
 from volundr.domain.models import GitSource, Session, SessionStatus
 from volundr.domain.presented_files import (
     PresentedFileConflictError,
+    PresentedFileQuota,
     durable_file_url,
     presented_file_path,
     validate_public_base_url,
@@ -145,7 +146,7 @@ async def test_store_ignores_corrupt_metadata(tmp_path):
 # ------------------------------------------------------------------ upload route
 
 
-def _upload_client(tmp_path, *, session=object(), max_bytes=1024):
+def _upload_client(tmp_path, *, session=object(), max_bytes=1024, max_total_bytes=1 << 30):
     from identity.adapters.identity import AllowAllIdentityAdapter
 
     store = LocalPresentedFileStore(root=str(tmp_path))
@@ -154,7 +155,13 @@ def _upload_client(tmp_path, *, session=object(), max_bytes=1024):
     app = FastAPI()
     app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
     app.include_router(
-        create_presented_files_router(store, service, public_base_url=BASE, max_bytes=max_bytes)
+        create_presented_files_router(
+            store,
+            service,
+            public_base_url=BASE,
+            max_bytes=max_bytes,
+            quota=PresentedFileQuota(max_total_bytes),
+        )
     )
     return TestClient(app), store, service
 

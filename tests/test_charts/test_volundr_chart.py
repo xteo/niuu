@@ -645,6 +645,7 @@ class TestConfigMapTemplate:
             'artifacts={"hold_seconds":60,"backfill_on_start":true}',
             "--set-json",
             'presentedFiles={"enabled":true,"public_base_url":"http://forge.t.ts.net:8080",'
+            '"max_total_bytes":5368709120,'
             '"store":{"adapter":"volundr.adapters.outbound.local_presented_files.'
             'LocalPresentedFileStore","root":"/data/presented-files"}}',
             "--set-json",

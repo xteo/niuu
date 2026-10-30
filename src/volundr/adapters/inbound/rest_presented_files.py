@@ -16,12 +16,18 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from pydantic import BaseModel
 
-from niuu.domain.presented_files import PRESENTED_FILE_NAME_HEADER
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_NAME_HEADER,
+    PRESENTED_FILES_QUOTA_CODE,
+    PRESENTED_FILES_QUOTA_STATUS,
+)
 from niuu.domain.services.token_scope import FORGE_NOTIFY_SCOPE, require_scope
 from volundr.adapters.inbound.forge_session_auth import require_bound_session
 from volundr.domain.presented_files import (
     PRESENTED_FILE_ID_PATTERN,
     PresentedFileConflictError,
+    PresentedFileQuota,
+    PresentedFileQuotaError,
     PresentedFileStore,
     durable_file_url,
     presented_file_path,
@@ -51,6 +57,7 @@ def create_presented_files_router(
     *,
     public_base_url: str = "",
     max_bytes: int,
+    quota: PresentedFileQuota,
     prefix: str = "/api/v1/forge",
 ) -> APIRouter:
     router = APIRouter(prefix=prefix)
@@ -95,7 +102,24 @@ def create_presented_files_router(
         mime = (request.headers.get("content-type") or "").split(";")[0].strip()
         mime = mime or "application/octet-stream"
         try:
-            record = await store.put(session_id, file_id, name=name, mime=mime, data=data)
+            async with quota.lock:
+                await quota.admit(store, session_id, file_id, len(data))
+                record = await store.put(session_id, file_id, name=name, mime=mime, data=data)
+        except PresentedFileQuotaError as exc:
+            logger.error(
+                "presented file refused by quota: session=%s file=%s size=%d used=%d "
+                "limit=%d refusals=%d",
+                session_id,
+                file_id,
+                exc.size,
+                exc.used,
+                exc.limit,
+                quota.refusals,
+            )
+            raise HTTPException(
+                PRESENTED_FILES_QUOTA_STATUS,
+                {"code": PRESENTED_FILES_QUOTA_CODE, "message": str(exc)},
+            ) from None
         except PresentedFileConflictError:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "a different file is stored under this id"

@@ -153,6 +153,7 @@ def build_forge_app(
     tokens: ForgeSessionTokenService | None = None,
     mcp_config: ForgeMcpHttpConfig | None = None,
     presented_file_store: Any = None,
+    presented_file_quota: Any = None,
     **service_kwargs: Any,
 ):
     """The Forge app slice. ``tokens=None`` builds one; pass ``False`` for none."""
@@ -196,6 +197,7 @@ def build_forge_app(
     )
     if presented_file_store is not None:
         from volundr.adapters.inbound.rest_presented_files import create_presented_files_router
+        from volundr.domain.presented_files import PresentedFileQuota
 
         app.include_router(
             create_presented_files_router(
@@ -203,6 +205,7 @@ def build_forge_app(
                 session_service,
                 public_base_url="http://thor.tail737f2a.ts.net:8380",
                 max_bytes=1 << 20,
+                quota=presented_file_quota or PresentedFileQuota(1 << 40),
                 prefix=PREFIX,
             )
         )

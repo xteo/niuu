@@ -6,6 +6,12 @@ PRESENTED_FILE_ID_PATTERN = r"^pf_[0-9a-f]{32}$"
 #: Forge's default cap on one durable presented file (``presented_files.max_bytes``).
 PRESENTED_FILE_DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 
+#: Forge's answer when a durable copy would exceed the host's total quota (LEX-1514):
+#: HTTP 507 with ``detail.code`` set to this. The broker fails ``present-file`` with
+#: ``detail.message``; the refusal is final, never retried.
+PRESENTED_FILES_QUOTA_STATUS = 507
+PRESENTED_FILES_QUOTA_CODE = "presented_files_quota"
+
 #: The header carrying a presented file's display name on the durable upload (URL-quoted).
 PRESENTED_FILE_NAME_HEADER = "x-presented-file-name"
 

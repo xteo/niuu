@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from niuu.domain.presented_files import PRESENTED_FILE_NAME_HEADER
+from niuu.domain.presented_files import (
+    PRESENTED_FILE_NAME_HEADER,
+    PRESENTED_FILES_QUOTA_CODE,
+    PRESENTED_FILES_QUOTA_STATUS,
+)
 from skuld.event_log import FORGE_SESSIONS_PATH
 
 logger = logging.getLogger("skuld.broker")
@@ -32,6 +36,27 @@ SIDECARS = frozenset({DURABLE_MARKER, PENDING_MARKER, REFUSED_MARKER})
 # 4xx answers that a later attempt can succeed past; every other 4xx is final.
 _RETRYABLE_CLIENT_ERRORS = frozenset({408, 425, 429})
 NAME_HEADER = PRESENTED_FILE_NAME_HEADER
+
+
+class PresentedFileQuotaRefusedError(Exception):
+    """Forge refused the durable copy: the host's presented-file quota is full (LEX-1514).
+
+    Final, never retried: ``present-file`` fails with Forge's message, which names
+    ``presented_files.max_total_bytes`` and the remedy.
+    """
+
+
+def _quota_refusal(response: Any) -> str | None:
+    """Forge's quota message when ``response`` is a quota refusal, else ``None``."""
+    if response.status_code != PRESENTED_FILES_QUOTA_STATUS:
+        return None
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(detail, dict) and detail.get("code") == PRESENTED_FILES_QUOTA_CODE:
+        return str(detail.get("message") or "presented-file quota exceeded")
+    return None
 
 
 def durable_record(staged: Path) -> dict[str, Any] | None:
@@ -130,6 +155,10 @@ async def upload_presented_file(
     except Exception as exc:  # network, auth refresh or file errors: retry later
         logger.warning("present-file: durable upload of %s failed: %s", file_id, repr(exc))
         return None
+    if (quota := _quota_refusal(response)) is not None:
+        logger.error("present-file: %s refused by Forge's quota: %s", file_id, quota)
+        _mark_refused(staged, response.status_code)
+        raise PresentedFileQuotaRefusedError(quota)
     if response.status_code >= 300:
         logger.warning(
             "present-file: Forge refused durable copy of %s (HTTP %d)",
@@ -173,7 +202,10 @@ async def retry_presented_upload(
         if attempt or not immediate:
             await asyncio.sleep(delay)
             delay = min(delay * 2, settings.retry_backoff_max_seconds)
-        receipt = await upload_presented_file(broker, file_id, staged, name=name, mime=mime)
+        try:
+            receipt = await upload_presented_file(broker, file_id, staged, name=name, mime=mime)
+        except PresentedFileQuotaRefusedError:
+            return None  # final and already logged at error; the marker stops resumes
         if receipt is not None:
             return receipt
         if is_refused(staged):
