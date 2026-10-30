@@ -19,8 +19,10 @@ intent; whether and when anything is spoken is the reader's decision.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode, urlsplit
@@ -54,6 +56,12 @@ MAX_ASK_OPTIONS = 8
 MAX_ASK_OPTION_LABEL_CHARS = 120
 MAX_ASK_OPTION_DESCRIPTION_CHARS = 500
 MAX_ASK_BYTES = 32 * 1024
+#: What happens to an unanswered item when no option applies (``default.option``).
+ASK_DEFAULT_NONE = "none"
+#: The label suffix older producers used to mark a recommendation; still honoured.
+RECOMMENDED_LABEL_SUFFIX = "(recommended)"
+#: An ISO-8601 duration (``PT4H``, ``P1D``, ``P1DT12H``, ``PT30M``) for ``default.after``.
+ISO_DURATION_PATTERN = re.compile(r"^P(?!$)(\d+W)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+(\.\d+)?S)?)?$")
 
 # Image protocol limits: what a producer may attach and what Forge will copy. Like
 # the text limits above they are wire contract, not tunables.
@@ -193,6 +201,23 @@ class AskOption(BaseModel):
 
     label: str = Field(min_length=1, max_length=MAX_ASK_OPTION_LABEL_CHARS)
     description: str | None = Field(default=None, max_length=MAX_ASK_OPTION_DESCRIPTION_CHARS)
+    recommended: bool | None = Field(
+        default=None, description="The asking agent recommends this option (at most one per item)."
+    )
+
+    @property
+    def is_recommended(self) -> bool:
+        """``recommended: true``, or the older ``… (Recommended)`` label suffix."""
+        return self.recommended is True or (
+            self.label.strip().lower().endswith(RECOMMENDED_LABEL_SUFFIX)
+        )
+
+    @field_validator("recommended", mode="before")
+    @classmethod
+    def _recommended_not_null(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("omit recommended instead of setting null")
+        return value
 
     @field_validator("description", mode="before")
     @classmethod
@@ -209,6 +234,41 @@ class AskOption(BaseModel):
         return value
 
 
+def _aware_timestamp(value: str, field: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp with a timezone") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must be an ISO-8601 timestamp with a timezone")
+    return value
+
+
+class AskDefault(BaseModel):
+    """What happens if the user does not answer an item, and when."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    option: str = Field(
+        min_length=1,
+        max_length=MAX_ASK_OPTION_LABEL_CHARS,
+        description=f"The option label taken if unanswered, or {ASK_DEFAULT_NONE!r}.",
+    )
+    after: str = Field(
+        min_length=1,
+        max_length=64,
+        description="When: an ISO-8601 timestamp with timezone, or an ISO-8601 duration "
+        "from the notification (PT4H, P1D).",
+    )
+
+    @field_validator("after")
+    @classmethod
+    def _timestamp_or_duration(cls, value: str) -> str:
+        if ISO_DURATION_PATTERN.match(value):
+            return value
+        return _aware_timestamp(value, "default.after")
+
+
 class AskItem(BaseModel):
     """An answerable question or an action the user reports completing; never executable."""
 
@@ -221,8 +281,25 @@ class AskItem(BaseModel):
     options: list[AskOption] | None = Field(default=None, min_length=1, max_length=MAX_ASK_OPTIONS)
     multi_select: bool | None = None
     allow_text: bool | None = None
+    default: AskDefault | None = None
+    deadline: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Optional ISO-8601 timestamp (with timezone) the answer is needed by.",
+    )
 
-    @field_validator("header", "options", "multi_select", "allow_text", mode="before")
+    @field_validator("deadline")
+    @classmethod
+    def _deadline_timestamp(cls, value: str | None) -> str | None:
+        return None if value is None else _aware_timestamp(value, "deadline")
+
+    @property
+    def recommended_option(self) -> AskOption | None:
+        return next((option for option in self.options or [] if option.is_recommended), None)
+
+    @field_validator(
+        "header", "options", "multi_select", "allow_text", "default", "deadline", mode="before"
+    )
     @classmethod
     def _supplied_fields_are_not_null(cls, value: Any) -> Any:
         if value is None:
@@ -245,6 +322,16 @@ class AskItem(BaseModel):
             raise ValueError("option labels must be unique within each item")
         if self.kind == "question" and self.allow_text is False and not self.options:
             raise ValueError("question items must allow text or provide options")
+        if sum(option.is_recommended for option in self.options or []) > 1:
+            raise ValueError("at most one option per item may be recommended")
+        if (
+            self.default is not None
+            and self.default.option != ASK_DEFAULT_NONE
+            and self.default.option not in labels
+        ):
+            raise ValueError(
+                f"default.option must be one of this item's option labels or {ASK_DEFAULT_NONE!r}"
+            )
         return self
 
 

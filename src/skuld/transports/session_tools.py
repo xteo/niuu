@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from niuu.question_standard import QUESTION_STANDARD
 from skuld.session_runtime import write_private_file
 from skuld.transports.mcp_config import build_claude_mcp_payload
 
@@ -42,11 +43,14 @@ NOTIFICATIONS: the `{server}` MCP server's `notify` tool sends the user a notifi
 session (inline in the chat, in the Forge Activities feed and, through their rules, on their \
 phone). Notify only when the user would want to be interrupted: when the task they asked for is \
 done (kind=milestone, title = the outcome; Forge sends nothing when a turn ends, so this is their \
-"done" signal), when you need them (kind=attention to unblock or approve, kind=decision to choose, \
-with your recommendation), and when a failure stops the work (kind=error). Never notify for turn \
+"done" signal), when you need them (kind=decision to choose, kind=attention to act or unblock: \
+both are questions, sent with question=true and an ask, see below), and when a failure stops the \
+work (kind=error). Never notify for turn \
 ends, chat replies, plans or progress; if in doubt, don't. Title: the outcome or the ask in one \
 plain line; body: at most one short sentence of new context. Link artifacts (PRs, presented \
-files). The same server's `environment` tool describes where this session runs."""
+files). The same server's `environment` tool describes where this session runs.
+
+QUESTIONS: """ + QUESTION_STANDARD.replace("{", "{{").replace("}", "}}")
 
 
 SESSION_DESCRIPTION_INSTRUCTION = """\

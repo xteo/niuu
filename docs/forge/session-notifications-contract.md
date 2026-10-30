@@ -372,9 +372,11 @@ Later notices refer to it with `about_question: {id, action}`, `action` one of
 | `kind` | `question` or `action` (an action asks the user to report done/not done; it never executes anything) |
 | `text` | 1–2000 chars, nonblank |
 | `header` | optional, 1–80 chars |
-| `options` | optional, 1–8 `{label, description?}`; labels 1–120 chars, unique per item; descriptions ≤ 500 |
+| `options` | optional, 1–8 `{label, description?, recommended?}`; labels 1–120 chars, unique per item; descriptions ≤ 500; `recommended: true` on at most one option per item (a label ending in `(Recommended)` counts as one, so older producers keep working) |
 | `multi_select` | optional boolean; omitted means false |
 | `allow_text` | optional boolean; omitted means true; a question with `false` must offer options |
+| `default` | optional `{option, after}`: what happens if the user does not answer. `option` is one of the item's option labels or `none`; `after` is an ISO-8601 timestamp with a timezone, or an ISO-8601 duration counted from the notification (`PT4H`, `P1D`). Forge records it and acts on nothing; the asking session carries it out (LEX-1671) |
+| `deadline` | optional ISO-8601 timestamp with a timezone: when the answer is needed |
 
 At most 8 items and 32768 UTF-8 bytes of compact ask JSON; optional fields are omitted,
 never null; NUL is refused. The fields live in the notification's `metadata` and are
@@ -384,6 +386,23 @@ message to the asking session: `POST /sessions/{id}/messages` with a stable
 delivered, 202 pending, the same id with different content 409 (`request_id_conflict`;
 409 also when the pod is unreachable). Delivery is not resolution: the asking session confirms it later with
 `about_question` (`resolved`).
+
+**The question standard (LEX-1597, LEX-1671).** An agent's `decision` (the user must
+choose) or `attention` (the user must act or unblock) is a question: `question: true`,
+an `ask` with 2–4 options, one `recommended`, and a `default`. The text is
+`niuu.question_standard.QUESTION_STANDARD`; the `notify` tool, the Forge MCP server
+instructions and the session prompt all carry it. The `notify` tool lints before it
+records:
+
+- a `decision`/`attention` with no `ask`, no `?` in its title and no options listed in
+  its body (two or more lines starting `-`, `*`, `•`, `1.`, `a)`…) is recorded as
+  `info`. The tool result adds `kind: "info"`, `requested_kind` and a `warnings` entry
+  quoting the standard;
+- one with an `ask` whose choice has no recommended option, or whose items have no
+  `default`, is recorded as sent, with a `warnings` entry.
+
+Direct REST submits (`POST /sessions/{id}/notifications`) are not linted; they validate
+the fields above.
 
 **Runtime requests (Forge's system `attention` item).** When a session (or resident)
 blocks on AskUserQuestion, a confirmation or a permission, Forge records an

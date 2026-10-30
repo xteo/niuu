@@ -1,6 +1,15 @@
 """Shared authoring guidance for session and feed notification tools and skills."""
 
 from niuu.domain.notifications import MAX_IMAGE_BYTES, NOTIFICATION_IMAGE_MIME_TYPES
+from niuu.question_standard import QUESTION_STANDARD
+
+__all__ = [
+    "COMPACT_NOTIFICATION_GUIDANCE",
+    "NOTIFICATION_IMAGE_GUIDANCE",
+    "NOTIFICATION_TRIGGER_GUIDANCE",
+    "QUESTION_GUIDANCE",
+    "QUESTION_STANDARD",
+]
 
 _BYTES_PER_MB = 1024 * 1024
 _IMAGE_TYPE_NAMES = ", ".join(
@@ -15,9 +24,10 @@ Notify only when the user would want to be interrupted, because they may not be 
 watching this conversation. Send one when:
 - the task the user asked for is done: kind=milestone, severity=success, title = the \
 outcome. Forge sends nothing when a turn ends, so this is the user's "done" signal;
-- you need the user to act: kind=attention when you are blocked or need approval; \
-when they must answer or choose, also set question=true (give the options and your \
-recommendation). kind=decision is a significant choice you made, for their information;
+- you need the user: kind=decision when they must choose, kind=attention when they \
+must act or unblock (approve, grant access). Both are questions: set question=true and \
+send an ask with 2-4 options, one recommended, and a default (see the question standard). \
+A choice you already made is not a decision: report it as info;
 - something failed that stops the work or needs them: kind=error;
 - an important result they would act on before the whole task ends, such as a PR \
 ready for review or a deployment finished: kind=milestone.
@@ -57,9 +67,13 @@ question; from any other session these are rejected and never applied;
 - any session filed in the same project, on any host, may relay it (action=relay), \
 for example a coordinator passing on a worker's question; relay links, it never copies.
 Always name the host: a bare uuid is refused.
-For one or several concrete questions/actions, also send ask={items:[...]}. Each item \
-has a stable id, kind=question|action and text; optional header and options=[{label, \
-description?}] make choices clear. Use unique item ids and option labels. Omitted \
+Send the question as ask={items:[...]}. Each item has a stable id, kind=question|action \
+and text; header and options=[{label, description?, recommended?}] make the choice clear. \
+Mark exactly one option recommended=true (the older "<label> (Recommended)" suffix still \
+counts). default={option, after} says what happens if the user does not answer: option is \
+an option label or "none", after an ISO-8601 timestamp with timezone or a duration from \
+now (PT4H, P1D). deadline (ISO-8601 timestamp) is optional. Use unique item ids and \
+option labels. Omitted \
 multi_select means false; omitted allow_text means true. A question with allow_text=false \
 must offer options. Include at most 8 items and \
 8 options per item, with at most 32768 UTF-8 bytes of compact ask JSON. Keep these \
@@ -67,10 +81,10 @@ items concise instead of hiding a questionnaire in the body. An action asks the 
 to report done/not done; it never authorizes the app to execute anything. Legacy \
 question=true without ask still works as one free-text question. Sending an answer \
 does not mean the work is resolved: the asking session confirms resolution later.
-Example: question=true, ask={"items":[\
-{"id":"database","kind":"question","text":"Which database?",\
-"options":[{"label":"Postgres"},{"label":"SQLite"}]},\
-{"id":"access","kind":"action","text":"Grant the test account access."}]}"""
+Example: kind=decision, title "Postgres or SQLite for the cache?", question=true, \
+ask={"items":[{"id":"database","kind":"question","text":"Which database for the cache?",\
+"options":[{"label":"Postgres","description":"Already deployed","recommended":true},\
+{"label":"SQLite"}],"default":{"option":"Postgres","after":"PT4H"}}]}"""
 
 
 NOTIFICATION_IMAGE_GUIDANCE = f"""\

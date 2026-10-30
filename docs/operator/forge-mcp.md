@@ -177,6 +177,53 @@ effective `grants`, the offered `tools` and the credential in use
 are the grants actually minted into this launch's token, from all four sources. After
 an operator change they move only once the session restarts.
 
+## Questions from agents
+
+An agent's question reaches the user as a notification they can answer in one tap. The
+`notify` tool, the Forge MCP server instructions (stdio and HTTP), the session prompt and
+the `forge-notify` skill all state the same standard (`niuu.question_standard`):
+
+> A question to the user is a closed question they can answer in one word or one tap: it
+> names the choice, gives at most two sentences of context, lists 2–4 options with the
+> recommendation marked, and says what happens if they do not answer (the default and
+> when it applies). Send it as `kind=decision` (they must choose) or `kind=attention`
+> (they must act or unblock) with `question=true` and an `ask`: options with one
+> `recommended=true`, and a `default {option, after}`. Progress, findings and "here is
+> where I am" are not questions: send them as milestone or info. Never two questions in
+> one notification.
+
+```json
+{"kind": "decision", "title": "Postgres or SQLite for the cache?", "question": true,
+ "ask": {"items": [{"id": "database", "kind": "question",
+   "text": "Which database for the cache?",
+   "options": [{"label": "Postgres", "description": "Already deployed", "recommended": true},
+               {"label": "SQLite"}],
+   "default": {"option": "Postgres", "after": "PT4H"}}]}}
+```
+
+- `options[].recommended`: at most one per item. A label ending in `(Recommended)`
+  still counts, for older agents.
+- `default`: `option` is an option label or `none`. `after` is an ISO-8601 timestamp
+  with a timezone, or a duration from the notification (`PT4H`, `P1D`). Forge only
+  records it: the asking session carries out its own default.
+- `deadline`: optional ISO-8601 timestamp.
+
+Every field is served as sent on `GET /notifications`, the per-session list and the
+`session_notification` event. The field rules are in
+`docs/forge/session-notifications-contract.md` §12.
+
+**Lint.** `notify` checks a `decision` or `attention` before recording it:
+
+| The notification | Recorded as | Tool result |
+|---|---|---|
+| has an `ask` with one recommended option and a `default` per item | sent | as usual |
+| has an `ask`, but a choice has no recommended option or an item has no `default` | sent | `warnings` with the standard |
+| has no `ask`, but its title asks (`?`) or its body lists two or more options | sent | as usual (a free-text question) |
+| has no `ask`, no question in the title and no options in the body | **`info`** | `kind: "info"`, `requested_kind`, and `warnings` quoting the standard |
+
+The downgrade is also logged at warning level by the MCP server. Direct REST submits
+are not linted.
+
 ## What a session credential may call
 
 Forge verifies a `forge_session` bearer in every identity mode, allow-all/mini mode

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from niuu.domain.artifact_reports import ARTIFACT_REPORT_TYPES, ArtifactReport
 from niuu.domain.notifications import (
     AGENT_KINDS,
+    ASK_DEFAULT_NONE,
     ASK_ITEM_ID_PATTERN,
     MAX_ASK_BYTES,
     MAX_ASK_HEADER_CHARS,
@@ -57,6 +58,7 @@ from niuu.forge_mcp.guidance import (
     NOTIFICATION_IMAGE_GUIDANCE,
     NOTIFICATION_TRIGGER_GUIDANCE,
     QUESTION_GUIDANCE,
+    QUESTION_STANDARD,
 )
 from niuu.forge_mcp.models import (
     ForgeApiError,
@@ -66,6 +68,7 @@ from niuu.forge_mcp.models import (
     ToolResult,
 )
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
+from niuu.forge_mcp.question_lint import LintedNotification, lint_question
 
 # Wire-format patterns Forge itself enforces (request ids) or that keep ids from
 # being spliced into a REST path; they are protocol shape, not tunables.
@@ -275,12 +278,44 @@ _ASK_SCHEMA = _object(
                                     "type": "string",
                                     "maxLength": MAX_ASK_OPTION_DESCRIPTION_CHARS,
                                 },
+                                "recommended": {
+                                    "type": "boolean",
+                                    "description": "Your recommendation; mark exactly one.",
+                                },
                             },
                             required=("label",),
                         ),
                     },
                     "multi_select": {"type": "boolean", "default": False},
                     "allow_text": {"type": "boolean", "default": True},
+                    "default": {
+                        **_object(
+                            {
+                                "option": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MAX_ASK_OPTION_LABEL_CHARS,
+                                    "description": f"An option label, or {ASK_DEFAULT_NONE!r}.",
+                                },
+                                "after": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 64,
+                                    "description": (
+                                        "ISO-8601 timestamp with timezone, or a duration "
+                                        "from now (PT4H, P1D)."
+                                    ),
+                                },
+                            },
+                            required=("option", "after"),
+                        ),
+                        "description": "What happens if the user does not answer, and when.",
+                    },
+                    "deadline": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Optional ISO-8601 timestamp the answer is needed by.",
+                    },
                 },
                 required=("id", "kind", "text"),
             ),
@@ -308,10 +343,12 @@ _NOTIFY_SCHEMA = _object(
             "type": "string",
             "enum": sorted(kind.value for kind in AGENT_KINDS),
             "description": (
-                "milestone = meaningful work finished; decision = a significant choice you "
-                "made (FYI, not a request); attention = an alert: blocked or need the user; "
-                "error = a failure the user must know about; info = a brief FYI. When the "
-                "user must answer, also set question=true."
+                "milestone = meaningful work finished; decision = the user must choose; "
+                "attention = the user must act or unblock; error = a failure the user must "
+                "know about; info = a brief FYI (including a choice you already made). "
+                "decision and attention require question=true and an ask with 2-4 options, "
+                "one recommended, and a default; without an ask, a question in the title or "
+                "options in the body, they are recorded as info."
             ),
         },
         "severity": {
@@ -463,6 +500,8 @@ and will reach Forge automatically when Forge is reachable — do not resend it.
 _NOTIFY_DESCRIPTION += (
     "\n\n"
     + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\nThe question standard: "
+    + QUESTION_STANDARD
     + "\n\n"
     + QUESTION_GUIDANCE
     + "\n\n"
@@ -470,6 +509,17 @@ _NOTIFY_DESCRIPTION += (
     + "\n\n"
     + NOTIFICATION_IMAGE_GUIDANCE
 )
+
+
+def _with_lint(result: dict[str, Any], linted: LintedNotification) -> dict[str, Any]:
+    """The notify result plus the question-standard verdict, when there is one."""
+    if not linted.warnings:
+        return result
+    out = {**result, "warnings": list(linted.warnings)}
+    if linted.downgraded_from is not None:
+        out["kind"] = linted.draft.kind.value
+        out["requested_kind"] = linted.downgraded_from.value
+    return out
 
 
 _FEED_NOTIFY_SCHEMA = {
@@ -510,6 +560,8 @@ already recorded. Returns {notification_id, seq, session_id, state}."""
 _FEED_NOTIFY_DESCRIPTION += (
     "\n\n"
     + NOTIFICATION_TRIGGER_GUIDANCE
+    + "\n\nThe question standard: "
+    + QUESTION_STANDARD
     + "\n\n"
     + QUESTION_GUIDANCE
     + "\n\n"
@@ -1055,8 +1107,8 @@ class ForgeMcpToolbox:
         return self._ok(environment)
 
     async def _notify(self, args: _NotifyArgs) -> ToolResult:
-        draft = NotificationDraft.model_validate(args.model_dump())
-        return self._ok(await self._host.notify(draft))
+        linted = lint_question(NotificationDraft.model_validate(args.model_dump()))
+        return self._ok(_with_lint(await self._host.notify(linted.draft), linted))
 
     async def _feed_notify(self, args: _FeedNotifyArgs) -> ToolResult:
         session_id = args.session_id or self._host.session_id
@@ -1065,23 +1117,28 @@ class ForgeMcpToolbox:
                 "notify needs session_id: name the session the notification is about "
                 "(its id from list_sessions)."
             )
-        draft = NotificationDraft.model_validate(
-            args.model_dump(exclude={"idempotency_key", "session_id", "instance_id"})
+        linted = lint_question(
+            NotificationDraft.model_validate(
+                args.model_dump(exclude={"idempotency_key", "session_id", "instance_id"})
+            )
         )
         recorded = await self._client.submit_notification(
             session_id,
-            draft,
+            linted.draft,
             idempotency_key=args.idempotency_key,
             instance_id=args.instance_id,
         )
         return self._ok(
-            {
-                "notification_id": recorded.get("id"),
-                "seq": recorded.get("seq"),
-                "session_id": recorded.get("session_id"),
-                "source": recorded.get("source"),
-                "state": "committed",
-            }
+            _with_lint(
+                {
+                    "notification_id": recorded.get("id"),
+                    "seq": recorded.get("seq"),
+                    "session_id": recorded.get("session_id"),
+                    "source": recorded.get("source"),
+                    "state": "committed",
+                },
+                linted,
+            )
         )
 
     async def _report_artifact(self, args: _ReportArtifactArgs) -> ToolResult:
