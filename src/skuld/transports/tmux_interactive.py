@@ -11,6 +11,7 @@ Skuld clients.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -119,6 +120,10 @@ _NO_GATE_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
 TURN_MAX_SECONDS_ENV = "SKULD__TMUX_TURN_MAX_SECONDS"
 #: ``system`` frame subtype recording that a turn reached that bound.
 TURN_CAP_SUBTYPE = "turn_cap_reached"
+#: tmux session option recording which broker binding (hook URL + secret) its Claude uses.
+HOOK_BINDING_OPTION = "@skuld_hook_binding"
+#: ``system`` frame subtype recording that a stale tmux session was replaced at start.
+STALE_SESSION_REPLACED_SUBTYPE = "stale_tmux_session_replaced"
 
 _CLAUDE_HOOK_EVENTS = [
     "SessionStart",
@@ -775,6 +780,8 @@ class TmuxInteractiveTransport(CLITransport):
             self._pane_log_dir.mkdir(parents=True, exist_ok=True)
             self._socket_path.parent.mkdir(parents=True, exist_ok=True)
 
+            if await self._has_session() and not await self._adoptable_session():
+                await self._replace_stale_session()
             if not await self._has_session():
                 await self._create_session()
                 self._startup_ready = False
@@ -793,6 +800,46 @@ class TmuxInteractiveTransport(CLITransport):
                     name=f"tmux-socket-sweep-{self._session_name}",
                 )
             await self._emit_system_init()
+
+    def _hook_binding(self) -> str:
+        """Fingerprint of how this broker's Claude reaches it (hook URL + secret)."""
+        hook = ""
+        if self._hook_events_enabled and self._sdk_port:
+            authorization = (
+                self._session_tools.loopback_authorization if self._session_tools else ""
+            )
+            hook = f"http://127.0.0.1:{self._sdk_port}/api/claude/hooks\n{authorization}"
+        return hashlib.sha256(hook.encode("utf-8")).hexdigest()[:32]
+
+    async def _adoptable_session(self) -> bool:
+        """An existing tmux session may be adopted only if its Claude reports to us.
+
+        Claude reads its hook URL and secret once, at launch. A session left by an earlier
+        broker (a stop that did not finish, a broker restart) keeps posting to that broker's
+        port with its secret: every hook is refused or lost, a Stop never ends the turn and
+        the reply never reaches Forge (LEX-1670, ios-fixes 401 on 2026-10-30).
+        """
+        result = await self._run_tmux(
+            "show-options", "-v", "-t", self._session_name, HOOK_BINDING_OPTION, check=False
+        )
+        return result.returncode == 0 and result.stdout.strip() == self._hook_binding()
+
+    async def _replace_stale_session(self) -> None:
+        logger.warning(
+            "tmux session %s was started for another broker (hook binding differs); "
+            "ending it and starting a fresh Claude that resumes the conversation",
+            self._session_name,
+        )
+        await self._graceful_terminate_pane()
+        await self._run_tmux("kill-session", "-t", self._session_name, check=False)
+        await self._emit(
+            {
+                "type": "system",
+                "subtype": STALE_SESSION_REPLACED_SUBTYPE,
+                "session_name": self._session_name,
+                "metadata": {"source": "tmux_interactive"},
+            }
+        )
 
     async def stop(self) -> None:
         async with self._lifecycle_lock:
@@ -3469,6 +3516,10 @@ class TmuxInteractiveTransport(CLITransport):
             "--",
             *command,
             env=env,
+        )
+        # Record which broker this Claude reports to; a later broker adopts it only on match.
+        await self._run_tmux(
+            "set-option", "-t", self._session_name, HOOK_BINDING_OPTION, self._hook_binding()
         )
 
     async def _apply_tmux_options(self) -> None:
