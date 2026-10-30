@@ -2358,6 +2358,7 @@ async def test_sweep_removes_only_dead_server_sockets(tmp_path: Path, monkeypatc
         return socket_path.name == "skuld-live.sock"
 
     monkeypatch.setattr(TmuxInteractiveTransport, "_socket_server_is_live", _fake_liveness)
+    transport._socket_sweep_min_age_s = 0  # these files are brand new
 
     removed = await transport.sweep_stale_sockets(socket_dir)
 
@@ -2386,11 +2387,46 @@ async def test_sweep_removes_orphaned_runtime_dirs_without_live_socket(
         return socket_path.name == "skuld-live.sock"
 
     monkeypatch.setattr(TmuxInteractiveTransport, "_socket_server_is_live", _fake_liveness)
+    transport._socket_sweep_min_age_s = 0  # these files are brand new
 
     await transport.sweep_stale_sockets(socket_dir, runtime_root=runtime_root)
 
     assert live_dir.exists(), "a dir with a live socket must survive"
     assert not orphan_dir.exists(), "a dir with no live socket must be removed"
+
+
+@pytest.mark.asyncio
+async def test_sweep_spares_a_starting_server_and_our_own_socket(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """LEX-1699: a sibling's tmux server that is still starting fails has-session for a
+    moment; its new socket must not be unlinked (ios-fixes lost its socket that way)."""
+    import os
+    import time as _time
+
+    transport = FakeTmuxInteractiveTransport(str(tmp_path))
+    socket_dir = tmp_path / "sockets"
+    socket_dir.mkdir()
+    starting = socket_dir / "skuld-starting.sock"
+    old_dead = socket_dir / "skuld-old.sock"
+    starting.write_text("", encoding="utf-8")
+    old_dead.write_text("", encoding="utf-8")
+    hour_ago = _time.time() - 3600
+    os.utime(old_dead, (hour_ago, hour_ago))
+    transport._socket_path = socket_dir / "skuld-mine.sock"
+    transport._socket_path.write_text("", encoding="utf-8")
+    os.utime(transport._socket_path, (hour_ago, hour_ago))
+
+    async def _nothing_answers(self, socket_path: Path) -> bool:
+        return False
+
+    monkeypatch.setattr(TmuxInteractiveTransport, "_socket_server_is_live", _nothing_answers)
+
+    removed = await transport.sweep_stale_sockets(socket_dir)
+
+    assert starting.exists(), "a socket younger than the minimum age must survive"
+    assert transport._socket_path.exists(), "a broker never sweeps its own socket"
+    assert removed == [old_dead]
 
 
 def _async_return(value: Any):

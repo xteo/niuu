@@ -423,6 +423,14 @@ class TmuxInteractiveTransport(CLITransport):
         self._socket_sweep_interval_s = self._float_env(
             "SKULD__TMUX_SOCKET_SWEEP_INTERVAL_SECONDS", None, 3600.0
         )
+        # A socket younger than this is never swept: a sibling broker's tmux server that is
+        # still starting fails has-session for a moment, and every broker sweeps the shared
+        # directory. On 2026-10-30 six lanes started together on the mini and one of them
+        # lost its live socket that way (LEX-1699). A server still unreachable after this
+        # long is dead, and the next sweep removes it.
+        self._socket_sweep_min_age_s = self._float_env(
+            "SKULD__TMUX_SOCKET_SWEEP_MIN_AGE_SECONDS", None, 600.0
+        )
         self._socket_dir = base_socket_dir
         self._runtime_root = Path(self.workspace_dir) / ".skuld" / "tmux-interactive"
         self._sweep_task: asyncio.Task[None] | None = None
@@ -1011,13 +1019,22 @@ class TmuxInteractiveTransport(CLITransport):
         if not socket_dir.is_dir():
             return removed
         live_stems: set[str] = set()
+        now = time.time()
         for sock in sorted(socket_dir.glob("*.sock")):
-            if await self._socket_server_is_live(sock):
+            if sock == self._socket_path:
+                live_stems.add(sock.stem)  # our own server: never ours to sweep
+                continue
+            try:
+                age = now - sock.stat().st_mtime
+            except OSError:
+                continue  # already gone
+            if age < self._socket_sweep_min_age_s or await self._socket_server_is_live(sock):
                 live_stems.add(sock.stem)
                 continue
             with suppress(OSError):
                 sock.unlink(missing_ok=True)
                 removed.append(sock)
+                logger.info("Swept stale tmux socket %s (age %.0f s, no server)", sock, age)
         if runtime_root is None or not Path(runtime_root).is_dir():
             return removed
         for session_dir in sorted(Path(runtime_root).iterdir()):
