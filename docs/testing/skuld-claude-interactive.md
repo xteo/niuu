@@ -97,6 +97,24 @@ If a `Stop` arrives later with the same text, it is dropped as an echo. If it
 carries new text, that text is recorded as well. Only a `StopFailure` (an API error)
 or the process exiting still ends a turn as an error.
 
+### Stale tmux sessions are never adopted
+
+Claude reads its hook URL and secret once, when it launches, and the secret is new
+for every broker start. A tmux session left by an earlier broker, for example a stop
+that did not finish or a broker restarted after a Forge switch, keeps posting hooks to
+that broker. Its hooks are refused (ios-fixes got HTTP 401 on 2026-10-30), a `Stop`
+never ends the turn, and the reply never reaches Forge.
+
+Each session the transport creates is stamped with the tmux option
+`@skuld_hook_binding`, a fingerprint of its hook URL and secret. At start, a broker
+adopts an existing session only if that session carries its own stamp. Otherwise it
+ends the session (gracefully first, when remote control is on) and starts a fresh
+Claude, which resumes the conversation. The replacement is logged at warning level
+and recorded as a `system` frame with `subtype: stale_tmux_session_replaced`.
+
+Sessions created before this release carry no stamp, so they are replaced the first
+time a new broker starts for them.
+
 General terminal choices without structured Claude hooks are deferred; see the
 [future terminal-question requirement](../forge/claude-terminal-questions-future.md).
 
