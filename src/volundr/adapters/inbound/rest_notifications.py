@@ -88,6 +88,16 @@ class NotificationInputRequestResponse(BaseModel):
     )
 
 
+class NotificationResolveRequest(BaseModel):
+    """Body of ``PUT /notifications/{id}/resolve``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: str | None = Field(
+        default=None, max_length=500, description="Why it is resolved, in a few words."
+    )
+
+
 class NotificationResponse(BaseModel):
     """Reader view: read through the host watermark or acknowledged individually."""
 
@@ -172,6 +182,22 @@ class NotificationResponse(BaseModel):
             "{text, priority: now|next_window}: what a voice client may say aloud for "
             "this notification and how soon; null when none. Forge never speaks it."
         ),
+    )
+    resolved: bool = Field(
+        default=False,
+        description="The incident is over (LEX-1442): an alarm no surface should keep raising.",
+    )
+    resolved_at: datetime | None = None
+    resolved_by_notification_id: UUID | None = Field(
+        default=None,
+        description="The notification that resolved this one; null when resolved by hand.",
+    )
+    resolution: str | None = Field(
+        default=None, description="Free text given when an operator resolved it by hand."
+    )
+    resolves: list[str] | None = Field(
+        default=None,
+        description="Notification or correlation ids this notification resolved, as sent.",
     )
     read: bool
     instance_id: str | None = Field(
@@ -345,6 +371,10 @@ def create_notifications_router(
         session_id: UUID | None = Query(default=None),
         project_id: str | None = Query(default=None, min_length=1),
         unread: bool | None = Query(default=None),
+        unresolved: bool | None = Query(
+            default=None,
+            description="true: only notifications not resolved yet; false: only resolved.",
+        ),
         principal: Principal = Depends(extract_principal),
     ) -> NotificationFeedResponse:
         """The caller's notification feed with its read watermark and unread count."""
@@ -362,6 +392,7 @@ def create_notifications_router(
             session_id=session_id,
             project_id=project_id,
             unread=unread,
+            unresolved=unresolved,
         )
         feed = await notification_service.list_feed(principal, query)
         return NotificationFeedResponse(
@@ -408,6 +439,34 @@ def create_notifications_router(
         except NotificationValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
         return NotificationReadStateResponse.build(state)
+
+    @router.put(
+        "/notifications/{notification_id}/resolve",
+        response_model=NotificationResponse,
+        responses={404: {"description": "Not found"}},
+    )
+    async def resolve_notification(
+        notification_id: UUID,
+        body: NotificationResolveRequest | None = None,
+        principal: Principal = Depends(extract_principal),
+    ) -> NotificationResponse:
+        """Mark a notification resolved by hand: its incident is over (LEX-1442).
+
+        Idempotent; the first resolution is kept. Not open to session credentials (they
+        resolve through ``notify`` ``resolves``). The resolved row is sent again on the
+        live stream so clients replace it.
+        """
+        try:
+            notification = await notification_service.resolve(
+                principal, notification_id, resolution=body.resolution if body else None
+            )
+        except NotificationNotFoundError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        state = await notification_service.get_read_state(principal)
+        read_ids = await notification_service.read_ids(principal, [notification])
+        return NotificationResponse.build(
+            notification, state.read_through_seq, read_ids, instance_fields
+        )
 
     @router.put(
         "/notifications/{notification_id}/read",

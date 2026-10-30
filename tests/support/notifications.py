@@ -190,6 +190,7 @@ class InMemoryNotificationRepository(NotificationRepository):
                 or (n.seq > read_through_seq and (scope.user_id, n.id) not in self.store.reads)
                 == query.unread
             )
+            and (query.unresolved is None or (n.resolved_at is None) == query.unresolved)
             and (query.before is None or n.seq < query.before)
             and (query.after is None or n.seq > query.after)
         ]
@@ -237,6 +238,54 @@ class InMemoryNotificationRepository(NotificationRepository):
 
     async def read_ids(self, user_id: str, notification_ids: list[UUID]) -> set[UUID]:
         return {key for key in notification_ids if (user_id, key) in self.store.reads}
+
+    def _resolve_rows(
+        self, rows: list[Notification], *, resolved_at, resolved_by, resolution
+    ) -> list[Notification]:
+        resolved = []
+        for row in rows:
+            updated = row.model_copy(
+                update={
+                    "resolved_at": resolved_at,
+                    "resolved_by_notification_id": resolved_by,
+                    "resolution": resolution,
+                }
+            )
+            self.store.notifications[row.dedupe_key] = updated
+            resolved.append(self.store.with_image(updated))
+        return sorted(resolved, key=lambda n: n.seq)
+
+    async def resolve(
+        self, owner_id, notification_ids, *, resolved_at, resolved_by, resolution
+    ) -> list[Notification]:
+        rows = [
+            n
+            for n in self.store.notifications.values()
+            if n.owner_id == owner_id and n.id in notification_ids and n.resolved_at is None
+        ]
+        return self._resolve_rows(
+            rows, resolved_at=resolved_at, resolved_by=resolved_by, resolution=resolution
+        )
+
+    async def resolve_correlated(
+        self, owner_id, correlation_id, *, before_seq, problems_only, resolved_at, resolved_by
+    ) -> list[Notification]:
+        rows = [
+            n
+            for n in self.store.notifications.values()
+            if n.owner_id == owner_id
+            and n.correlation_id == correlation_id
+            and n.seq < before_seq
+            and n.resolved_at is None
+            and (
+                not problems_only
+                or n.kind.value in ("attention", "error")
+                or n.severity.value == "critical"
+            )
+        ]
+        return self._resolve_rows(
+            rows, resolved_at=resolved_at, resolved_by=resolved_by, resolution=None
+        )
 
     async def mark_read(self, user_id: str, notification_id: UUID) -> None:
         if (user_id, notification_id) in self.store.reads:

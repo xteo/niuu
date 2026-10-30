@@ -100,6 +100,39 @@ class NotificationRepository(ABC):
     async def mark_read(self, user_id: str, notification_id: UUID) -> None:
         """Idempotently acknowledge only this item; increment the reader revision atomically."""
 
+    @abstractmethod
+    async def resolve(
+        self,
+        owner_id: str,
+        notification_ids: list[UUID],
+        *,
+        resolved_at: datetime,
+        resolved_by: UUID | None,
+        resolution: str | None,
+    ) -> list[Notification]:
+        """Resolve these of ``owner_id``'s notifications that are not resolved yet.
+
+        Returns only the rows this call resolved; one already resolved keeps its
+        first resolution. Rows of other owners are never touched.
+        """
+
+    @abstractmethod
+    async def resolve_correlated(
+        self,
+        owner_id: str,
+        correlation_id: str,
+        *,
+        before_seq: int,
+        problems_only: bool,
+        resolved_at: datetime,
+        resolved_by: UUID | None,
+    ) -> list[Notification]:
+        """Resolve ``owner_id``'s unresolved notifications of this incident before a seq.
+
+        ``problems_only`` limits it to what keeps alarming: ``attention`` and ``error``
+        kinds and any ``critical`` severity. Returns only the rows this call resolved.
+        """
+
 
 class NotificationRuleRepository(ABC):
     """Owner-scoped delivery rules."""

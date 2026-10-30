@@ -45,6 +45,8 @@ MAX_LINKS = 10
 MAX_LINK_LABEL_CHARS = 200
 MAX_LINK_URL_CHARS = 2048
 MAX_CORRELATION_ID_CHARS = 200
+#: The most notifications/incidents one notice may resolve (wire contract, LEX-1442).
+MAX_RESOLVES = 20
 
 # Structured-question protocol limits (LEX-1412), shared by producers and readers.
 MAX_ASK_ITEMS = 8
@@ -499,6 +501,25 @@ class NotificationDraft(BaseModel):
     )
     about_question: AboutQuestion | None = None
     ask: NotificationAsk | None = None
+    resolves: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_RESOLVES,
+        description=(
+            "What this notice resolves (LEX-1442): notification ids, or correlation ids "
+            "standing for every earlier notification of that incident. Same owner only."
+        ),
+    )
+
+    @field_validator("resolves")
+    @classmethod
+    def _resolves_refs(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        refs = [" ".join(ref.split()) for ref in value]
+        if any(not ref or len(ref) > MAX_CORRELATION_ID_CHARS for ref in refs):
+            raise ValueError(f"resolves items must be 1-{MAX_CORRELATION_ID_CHARS} character ids")
+        return list(dict.fromkeys(refs))
 
     @model_validator(mode="before")
     @classmethod
@@ -510,6 +531,10 @@ class NotificationDraft(BaseModel):
         ):
             raise ValueError("ask requires question=true")
         return value
+
+    def resolution_metadata(self) -> dict:
+        """The resolution refs this draft carries, for ``metadata`` (only when set)."""
+        return {"resolves": list(self.resolves)} if self.resolves else {}
 
     def question_metadata(self) -> dict:
         """The question signals this draft carries, for ``metadata`` (only those set)."""
@@ -551,8 +576,11 @@ def draft_payload(draft: NotificationDraft) -> dict[str, Any]:
     ``image``, ``speak`` and the question signals appear only when set, so drafts
     without them keep the exact shape older producers wrote and older Forge releases read.
     """
-    payload = draft.model_dump(mode="json", exclude={"image", "speak", *QUESTION_FIELDS})
+    payload = draft.model_dump(
+        mode="json", exclude={"image", "speak", "resolves", *QUESTION_FIELDS}
+    )
     payload.update(draft.question_metadata())
+    payload.update(draft.resolution_metadata())
     if draft.image is not None:
         payload["image"] = draft.image.wire()
     if draft.speak is not None:

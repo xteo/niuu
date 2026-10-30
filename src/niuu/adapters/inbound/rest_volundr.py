@@ -2689,6 +2689,28 @@ def create_volundr_router(
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid activity read response")
         return {**payload, "instance_id": instance.id}
 
+    @router.put("/notifications/{notification_id}/resolve")
+    async def resolve_notification(
+        request: Request,
+        notification_id: UUID,
+        body: dict[str, Any] | None = Body(default=None),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """Resolve one notification on the node that holds it (LEX-1442)."""
+        instance = await _notification_target(request, principal)
+        remote = await _proxy_to(
+            instance,
+            request,
+            method="PUT",
+            path=f"/notifications/{notification_id}/resolve",
+            body=body,
+        )
+        _ensure_remote_success(remote)
+        payload = _remote_json(remote)
+        if not isinstance(payload, dict):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid notification response")
+        return _tag_notification(payload, instance)
+
     @router.get("/notifications/rules")
     async def list_notification_rules(
         request: Request, principal: Principal = Depends(extract_principal)

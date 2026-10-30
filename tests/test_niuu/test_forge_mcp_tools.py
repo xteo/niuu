@@ -295,6 +295,7 @@ class TestReads:
             "session_id": PEER,
             "project_id": "p",
             "unread": "true",
+            "unresolved": "true",
         }
         items = result.structured["items"]
         assert len(items) == 3

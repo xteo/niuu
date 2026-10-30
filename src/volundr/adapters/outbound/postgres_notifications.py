@@ -147,6 +147,10 @@ def row_to_notification(row: asyncpg.Record | dict) -> Notification:
         metadata=_json(row["metadata"], {}),
         created_at=row["created_at"],
         speak=_speak(row),
+        # .get: rows from the migrated table always carry these (000095).
+        resolved_at=row.get("resolved_at"),
+        resolved_by_notification_id=row.get("resolved_by_notification_id"),
+        resolution=row.get("resolution"),
     )
 
 
@@ -288,6 +292,8 @@ def feed_sql(
             conditions.append(f"(seq > {through} AND NOT {acknowledged})")
         else:
             conditions.append(f"(seq <= {through} OR {acknowledged})")
+    if query.unresolved is not None:
+        conditions.append("resolved_at IS NULL" if query.unresolved else "resolved_at IS NOT NULL")
     if query.before is not None:
         conditions.append(f"seq < {bind(query.before)}")
     if query.after is not None:
@@ -483,6 +489,63 @@ class PostgresNotificationRepository(NotificationRepository):
             notification_ids,
         )
         return {row["notification_id"] for row in rows}
+
+    async def resolve(
+        self,
+        owner_id: str,
+        notification_ids: list[UUID],
+        *,
+        resolved_at: datetime,
+        resolved_by: UUID | None,
+        resolution: str | None,
+    ) -> list[Notification]:
+        if not notification_ids:
+            return []
+        rows = await self._pool.fetch(
+            "UPDATE forge_notifications SET resolved_at = $3, "
+            "resolved_by_notification_id = $4, resolution = $5 "
+            "WHERE owner_id = $1 AND id = ANY($2::uuid[]) AND resolved_at IS NULL "
+            "RETURNING id",
+            owner_id,
+            notification_ids,
+            resolved_at,
+            resolved_by,
+            scrub_text(resolution) if resolution is not None else None,
+        )
+        return await self._reread([row["id"] for row in rows])
+
+    async def resolve_correlated(
+        self,
+        owner_id: str,
+        correlation_id: str,
+        *,
+        before_seq: int,
+        problems_only: bool,
+        resolved_at: datetime,
+        resolved_by: UUID | None,
+    ) -> list[Notification]:
+        problems = (
+            " AND (kind IN ('attention', 'error') OR severity = 'critical')"
+            if problems_only
+            else ""
+        )
+        rows = await self._pool.fetch(
+            "UPDATE forge_notifications SET resolved_at = $4, "
+            "resolved_by_notification_id = $5 "
+            "WHERE owner_id = $1 AND correlation_id = $2 AND seq < $3 "
+            "AND resolved_at IS NULL" + problems + " RETURNING id",
+            owner_id,
+            correlation_id,
+            before_seq,
+            resolved_at,
+            resolved_by,
+        )
+        return await self._reread([row["id"] for row in rows])
+
+    async def _reread(self, notification_ids: list[UUID]) -> list[Notification]:
+        """The rows again with their image state, in feed order."""
+        found = [await self.get(notification_id) for notification_id in notification_ids]
+        return sorted((n for n in found if n is not None), key=lambda n: n.seq)
 
     async def mark_read(self, user_id: str, notification_id: UUID) -> None:
         async with self._pool.acquire() as conn:

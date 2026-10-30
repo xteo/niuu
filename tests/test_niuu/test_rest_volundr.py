@@ -2379,3 +2379,25 @@ def test_voice_conversation_passes_through_without_aggregate_timings() -> None:
     assert response.json() == voice
     assert route.calls.last.request.url.params["since_turn"] == "t1"
     assert float(response.headers["X-Forge-Read-Ms"]) >= 0
+
+
+@respx.mock
+def test_resolve_notification_is_forwarded_and_tagged() -> None:
+    client = _client([_instance("alpha", base_url="http://alpha", is_default=True)])
+    nid = "11111111-1111-1111-1111-111111111111"
+    route = respx.put(f"http://alpha/api/v1/forge/notifications/{nid}/resolve").mock(
+        return_value=Response(200, json={"id": "n1", "resolved": True, "resolution": "fixed"})
+    )
+
+    response = client.put(
+        f"/api/v1/forge/notifications/{nid}/resolve",
+        headers=_headers(),
+        json={"resolution": "fixed"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["resolved"] is True
+    assert response.json()["instance_id"] == "alpha"
+    import json as _json
+
+    assert _json.loads(route.calls.last.request.content) == {"resolution": "fixed"}
