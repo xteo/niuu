@@ -2551,9 +2551,7 @@ def create_volundr_router(
 
         # A node without the feed (an older Forge, Spark) is remembered and not asked again
         # until feedless_recheck_seconds pass; it has no notifications (LEX-1738).
-        now = time.monotonic()
-        feedless = {i.id for i in instances if feedless_until.get(i.id, 0.0) > now}
-        asked = [i for i in instances if i.id not in feedless]
+        asked, feedless, now = _split_feedless("/notifications", instances)
         responses, unavailable = await _fan_out(
             asked, request, method="GET", path="/notifications", params_for=params_for
         )
@@ -2566,7 +2564,7 @@ def create_volundr_router(
                 _ensure_remote_success(result)
             if _route_is_missing(result):
                 feedless.add(instance.id)
-                _remember_feedless(instance.id, now)
+                _remember_feedless("/notifications", instance.id, now)
                 continue
             page = _instance_page(result, instance) if result.status_code < 400 else None
             if page is None:
@@ -2574,12 +2572,7 @@ def create_volundr_router(
                 continue
             pages[instance.id] = page
         if instances and not pages and not unavailable and feedless:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "No notifications feed on Forge instance(s) "
-                f"{', '.join(sorted(feedless))} (an older Forge without the feed)",
-                headers={FEEDLESS_INSTANCES_HEADER: ",".join(sorted(feedless))},
-            )
+            raise _no_feed_anywhere(feedless)
         if instances and not pages:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, "No Forge instance answered the notification feed"
@@ -2620,11 +2613,10 @@ def create_volundr_router(
             return {**payload, "instance_id": instance.id} if isinstance(payload, dict) else {}
         instances = await _visible_instances(service, principal)
         base = _forward_params(request, drop=_FLEET_SELECTORS)
-        # A node without the feed has no read state either; same memory as the feed.
-        now = time.monotonic()
-        feedless = {i.id for i in instances if feedless_until.get(i.id, 0.0) > now}
+        # A node without the feed has no read state either (an older Forge, Spark).
+        asked, feedless, now = _split_feedless("/notifications/read-state", instances)
         responses, unavailable = await _fan_out(
-            [i for i in instances if i.id not in feedless],
+            asked,
             request,
             method="GET",
             path="/notifications/read-state",
@@ -2632,8 +2624,10 @@ def create_volundr_router(
         )
         states: dict[str, Any] = {}
         for instance_id, result in responses.items():
+            if _is_client_error(result):
+                _ensure_remote_success(result)
             if _route_is_missing(result):
-                _remember_feedless(instance_id, now)
+                _remember_feedless("/notifications/read-state", instance_id, now)
                 feedless.add(instance_id)
                 continue
             payload = _remote_json(result) if result.status_code < 400 else None
@@ -2641,6 +2635,8 @@ def create_volundr_router(
                 unavailable.add(instance_id)
                 continue
             states[instance_id] = payload
+        if instances and not states and not unavailable and feedless:
+            raise _no_feed_anywhere(feedless)
         if instances and not states:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "No Forge instance answered")
         _set_unavailable(response, unavailable)
@@ -3916,17 +3912,36 @@ def create_volundr_router(
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
 
-    #: Nodes known to lack the notifications feed: instance id -> monotonic recheck time.
-    feedless_until: dict[str, float] = {}
+    #: Nodes known to lack a notification route: (route, instance id) -> monotonic recheck
+    #: time. Per route, so one route missing never hides another the node does serve.
+    feedless_until: dict[tuple[str, str], float] = {}
 
-    def _remember_feedless(instance_id: str, now: float) -> None:
+    def _split_feedless(
+        path: str, instances: list[RegisteredInstance]
+    ) -> tuple[list[RegisteredInstance], set[str], float]:
+        """The nodes to ask for ``path``, those remembered without it, and now."""
+        now = time.monotonic()
+        known = {i.id for i in instances if feedless_until.get((path, i.id), 0.0) > now}
+        return [i for i in instances if i.id not in known], known, now
+
+    def _remember_feedless(path: str, instance_id: str, now: float) -> None:
         if feedless_recheck_seconds is None:
             return
-        feedless_until[instance_id] = now + feedless_recheck_seconds
+        feedless_until[(path, instance_id)] = now + feedless_recheck_seconds
         logger.info(
-            "Forge instance %s has no notifications feed; asked again in %ss",
+            "Forge instance %s has no %s route; asked again in %ss",
             instance_id,
+            path,
             feedless_recheck_seconds,
+        )
+
+    def _no_feed_anywhere(feedless: set[str]) -> HTTPException:
+        """Every node asked lacks the route: not an outage, so say so (404)."""
+        return HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "No notifications feed on Forge instance(s) "
+            f"{', '.join(sorted(feedless))} (an older Forge without the feed)",
+            headers={FEEDLESS_INSTANCES_HEADER: ",".join(sorted(feedless))},
         )
 
     async def _guild_owner_of(session_id: str) -> str | None:

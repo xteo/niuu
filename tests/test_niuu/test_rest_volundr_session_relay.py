@@ -386,7 +386,7 @@ class TestMemberToHub:
         assert "another node" not in response.json()["detail"]
 
     @respx.mock
-    async def test_read_state_shares_the_feedless_memory(self):
+    async def test_read_state_remembers_a_missing_route_on_its_own(self):
         client, _, _ = await _guild(feedless_recheck_seconds=3600.0)
         read_state = respx.get(f"{REMOTE}/api/v1/forge/notifications/read-state").mock(
             return_value=Response(404, json={"detail": "Not Found"})
@@ -407,4 +407,20 @@ class TestMemberToHub:
         client.get("/api/v1/forge/notifications", params=fleet, headers=user)
 
         assert read_state.call_count == 1
-        assert not feed.called
+        # One missing route never hides another: the feed is asked on its own.
+        assert feed.call_count == 1
+
+    @respx.mock
+    async def test_a_bad_read_state_request_is_the_nodes_answer(self):
+        client, _, _ = await _guild()
+        respx.get(f"{REMOTE}/api/v1/forge/notifications/read-state").mock(
+            return_value=Response(422, json={"detail": "bad filter"})
+        )
+
+        response = client.get(
+            "/api/v1/forge/notifications/read-state",
+            params={"all_instances": "true"},
+            headers={"x-auth-user-id": OWNER, "x-auth-tenant": TENANT},
+        )
+
+        assert response.status_code == 422

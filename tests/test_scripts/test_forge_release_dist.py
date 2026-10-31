@@ -42,6 +42,7 @@ def releases(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q")
+    commit(repo, ".gitignore", "dist/\n")  # as in the real repo: a build is never tracked
     first = commit(repo, "web-next/app.ts", "one")
     commit(repo, "src/api.py", "api change")
 
@@ -85,12 +86,34 @@ def test_a_changed_web_app_must_be_built(releases):
         release_dist.place(new, previous)
 
 
-def test_a_built_dist_is_kept(releases):
+def test_a_dist_just_built_is_kept(releases):
     _, first, release = releases
     previous, new = release("nine", first), release("ten")
     build(new)
 
-    assert release_dist.place(new, previous) == "ten: built dist kept"
+    assert release_dist.place(new, previous, built=True) == "ten: built dist kept"
+
+
+def test_a_stale_dist_is_not_trusted_without_built(releases):
+    repo, first, release = releases
+    commit(repo, "web-next/app.ts", "two")
+    previous, new = release("nine", first), release("ten")
+    build(previous)
+    build(new)  # e.g. inherited by copying a release dir
+
+    with pytest.raises(release_dist.DistError, match="web-next changed since nine"):
+        release_dist.place(new, previous)
+
+
+@pytest.mark.parametrize("dirty", ["nine", "ten"])
+def test_uncommitted_web_changes_are_refused(releases, dirty):
+    _, first, release = releases
+    trees = {"nine": release("nine", first), "ten": release("ten")}
+    build(trees["nine"])
+    (trees[dirty] / "web-next" / "app.ts").write_text("edited in place")
+
+    with pytest.raises(release_dist.DistError, match="uncommitted web-next"):
+        release_dist.place(trees["ten"], trees["nine"])
 
 
 @pytest.mark.parametrize("state", ["missing", "no index", "empty assets"])

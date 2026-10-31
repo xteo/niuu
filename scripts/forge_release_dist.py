@@ -6,10 +6,12 @@ Promotion ten (2026-10-31) was staged with that folder empty, because web-next h
 not changed and the build was skipped; its cutover served ``/`` as 404 and rolled
 back. So:
 
-``place RELEASE --previous PREVIOUS``
-    Leaves a built dist alone. Otherwise, when web-next is unchanged between the
-    two releases' revisions, copies the previous release's dist. When it changed,
-    fails: build it (``pnpm build`` in web-next).
+``place RELEASE --previous PREVIOUS [--built]``
+    With ``--built`` (you ran ``pnpm build`` in this release's web-next), checks the
+    dist and keeps it. Otherwise, when web-next is unchanged between the two
+    releases' revisions, replaces whatever dist is there with the previous release's.
+    When it changed, fails: build it. Either release having uncommitted web-next
+    changes fails too: its dist would match neither commit.
 ``check RELEASE``
     Fails unless the dist has ``index.html`` and a non-empty ``assets`` folder. Run
     it at the end of staging and again in the pre-GO preflight.
@@ -58,6 +60,17 @@ def _revision(release: Path) -> str:
     ).stdout.strip()
 
 
+def _require_clean_web(release: Path) -> None:
+    status = subprocess.run(
+        ["git", "-C", str(release), "status", "--porcelain", "--", "web-next"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise DistError(f"{release.name} has uncommitted web-next changes; commit or drop them")
+
+
 def web_changed(release: Path, previous: Path) -> bool:
     """Whether web-next differs between the two releases' commits."""
     diff = subprocess.run(
@@ -80,9 +93,12 @@ def web_changed(release: Path, previous: Path) -> bool:
     return diff.returncode == 1
 
 
-def place(release: Path, previous: Path) -> str:
-    if problem(release) is None:
+def place(release: Path, previous: Path, *, built: bool = False) -> str:
+    _require_clean_web(release)
+    if built:
+        check(release)
         return f"{release.name}: built dist kept"
+    _require_clean_web(previous)
     if web_changed(release, previous):
         raise DistError(
             f"web-next changed since {previous.name}: build it in {release / 'web-next'} "
@@ -103,12 +119,15 @@ def main(argv: list[str] | None = None) -> int:
     placing = sub.add_parser("place", help="give the release a dist")
     placing.add_argument("release", type=Path)
     placing.add_argument("--previous", type=Path, required=True)
+    placing.add_argument(
+        "--built", action="store_true", help="this release's web-next was just built"
+    )
     checking = sub.add_parser("check", help="fail unless the release has a dist")
     checking.add_argument("release", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.mode == "place":
-            print(place(args.release, args.previous))
+            print(place(args.release, args.previous, built=args.built))
         else:
             check(args.release)
             print(f"{args.release.name}: web app present")
