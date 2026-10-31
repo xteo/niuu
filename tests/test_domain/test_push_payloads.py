@@ -517,6 +517,7 @@ class TestAttentionPayload:
                 "instance_id": "inst-1",
                 "session_id": overrides.pop("session_id", "sess-1"),
                 "session_name": overrides.pop("session_name", "ios-fixes"),
+                "engine": overrides.pop("engine", "Claude"),
                 "owner_id": "u",
             }
         )
@@ -538,13 +539,16 @@ class TestAttentionPayload:
         assert payload["agent_id"] == "sess-1"
         assert payload["agent_name"] == "ios-fixes"
         assert payload["conversation_id"] == "inst-1:sess-1"
+        assert payload["engine"] == "claude"
 
     def test_an_attention_push_without_a_session_names_no_agent(self):
-        payload = self._payload(attention=True, session_id=None, session_name=None)
+        payload = self._payload(attention=True, session_id=None, session_name=None, engine=None)
         assert payload["attention"] is True
-        assert not {"agent_id", "agent_name", "conversation_id"} & set(payload)
+        assert not {"agent_id", "agent_name", "conversation_id", "engine"} & set(payload)
 
     def test_other_pushes_are_unchanged(self):
         payload = self._payload()
         assert "mutable-content" not in payload["aps"]
-        assert not {"attention", "agent_id", "agent_name", "conversation_id"} & set(payload)
+        assert not {"attention", "agent_id", "agent_name", "conversation_id", "engine"} & set(
+            payload
+        )

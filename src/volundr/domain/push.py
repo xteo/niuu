@@ -238,6 +238,8 @@ class GuildNotification:
     body: str = ""
     session_id: str | None = None
     session_name: str | None = None
+    #: The session's engine family (``claude``, ``codex``, …), as the feed reports it.
+    engine: str | None = None
     turn_id: str | None = None
     created_at: datetime | None = None
     read: bool = False
@@ -284,6 +286,7 @@ class GuildNotification:
             body=str(item.get("body") or ""),
             session_id=_optional_text(item.get("session_id")),
             session_name=_optional_text(item.get("session_name")),
+            engine=_optional_text(item.get("engine")),
             turn_id=_optional_text(item.get("turn_id")),
             created_at=_parse_time(item.get("created_at")),
             read=item.get("read") is True,
@@ -305,6 +308,7 @@ class GuildNotification:
             "body": self.body,
             "session_id": self.session_id,
             "session_name": self.session_name,
+            "engine": self.engine,
             "turn_id": self.turn_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "read": self.read,
@@ -388,7 +392,8 @@ def alert_payload(
     An ``attention`` push (a kind that needs the user) also lets the app's notification
     service extension run (``mutable-content``) and carries what it needs to show the
     agent as the sender (LEX-1186): the ``attention`` marker, ``agent_id`` (the session),
-    ``agent_name`` and ``conversation_id`` (``<instance_id>:<session_id>``).
+    ``agent_name``, ``conversation_id`` (``<instance_id>:<session_id>``) and ``engine``
+    (the engine family, lowercase, for the avatar).
     """
     alert: dict[str, Any] = {"title": title, "body": body}
     if subtitle:
@@ -418,6 +423,8 @@ def alert_payload(
             payload["conversation_id"] = f"{notification.instance_id}:{notification.session_id}"
         if notification.session_name:
             payload["agent_name"] = notification.session_name
+        if notification.engine:
+            payload["engine"] = notification.engine.lower()
     if image_url:
         # Lets a notification service extension attach the image before display.
         aps["mutable-content"] = 1

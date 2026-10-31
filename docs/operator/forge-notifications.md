@@ -726,7 +726,9 @@ push also lets the app's notification service extension show the agent as the se
 - `aps.mutable-content: 1` and `attention: true`;
 - `agent_id`, the session id;
 - `agent_name`, the session name;
-- `conversation_id`, `<instance_id>:<session_id>`.
+- `conversation_id`, `<instance_id>:<session_id>`;
+- `engine`, the session's engine family in lowercase (`claude`, `codex`, …), when the
+  feed reports one; the app picks the avatar from it.
 
 The agent keys are absent when the notification has no session; other kinds carry none
 of these keys. `thread-id` and `session_id` are absent for a notification without a
