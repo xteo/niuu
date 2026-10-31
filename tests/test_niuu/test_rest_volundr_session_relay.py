@@ -157,3 +157,35 @@ class TestRelayToAnotherNode:
         )
 
         assert response.status_code == 403
+
+
+class TestMalformedInstanceId:
+    """A malformed instance_id is the caller's mistake: 400 with the reason, not a 500."""
+
+    async def test_a_malformed_instance_id_answers_400(self):
+        from niuu.ports.instances import InvalidInstanceIdError
+
+        class Registry(StubInstanceService):
+            async def get_visible(self, principal, instance_id):
+                raise InvalidInstanceIdError(f"Invalid instance id {instance_id!r}")
+
+        forge = build_forge_app()
+        local = _instance(
+            "local",
+            base_url="embedded://local-forge",
+            tenant_id=TENANT,
+            is_default=True,
+            config={"transport": "embedded"},
+        )
+        app = FastAPI()
+        app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
+        app.include_router(create_volundr_router(Registry([local]), embedded_forge_app=forge.app))
+
+        response = TestClient(app).post(
+            f"/api/v1/forge/sessions/{TARGET}/messages",
+            params={"instance_id": "c3d1d72f-mini-m6"},
+            json={"content": "hi"},
+        )
+
+        assert response.status_code == 400
+        assert "c3d1d72f-mini-m6" in response.json()["detail"]

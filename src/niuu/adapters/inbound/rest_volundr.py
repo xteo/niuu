@@ -76,6 +76,7 @@ from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
 from niuu.forge_mcp.credentials import token_scopes
+from niuu.ports.instances import InvalidInstanceIdError
 
 UNAVAILABLE_INSTANCES_HEADER = "X-Forge-Unavailable-Instances"
 #: The Forge-hosted MCP endpoint, under the Forge API prefix on every node.
@@ -920,7 +921,10 @@ async def _resolve_target_instance(
     match: str = "all",
 ) -> RegisteredInstance:
     if instance_id:
-        instance = await service.get_visible(principal, instance_id)
+        try:
+            instance = await service.get_visible(principal, instance_id)
+        except InvalidInstanceIdError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if instance is None or instance.kind != InstanceKind.VOLUNDR or not instance.enabled:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
