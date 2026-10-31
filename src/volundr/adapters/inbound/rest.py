@@ -116,7 +116,12 @@ from volundr.domain.ports import (
 )
 from volundr.domain.presented_files import PresentedFileStore, is_presented_file_id
 from volundr.domain.projects import SessionCoordination
-from volundr.domain.push import PushEnvironment, PushTokenKind, UnsupportedTokenKindError
+from volundr.domain.push import (
+    EnvironmentAssumed,
+    PushEnvironment,
+    PushTokenKind,
+    UnsupportedTokenKindError,
+)
 from volundr.domain.services import (
     ChronicleAccessDeniedError,
     ChronicleNotFoundError,
@@ -1084,7 +1089,7 @@ def _registered_environment(
     value: str | None,
     kind: PushTokenKind,
     owner_id: str,
-    on_assumed: Callable[[str], None] | None,
+    on_assumed: Callable[[EnvironmentAssumed], None] | None,
 ) -> PushEnvironment | None:
     """The APNs environment to store for a registration.
 
@@ -1094,7 +1099,7 @@ def _registered_environment(
     """
     if value is not None and value.strip().lower() in _ENVIRONMENT_ALIASES:
         return _ENVIRONMENT_ALIASES[value.strip().lower()]
-    reason = "missing" if value is None else "unknown"
+    reason: EnvironmentAssumed = "missing" if value is None else "unknown"
     logger.warning(
         "Push registration of a %s token for owner %s has %s environment (%r); stored as the "
         "registry's default (production). The app should send sandbox or production.",
@@ -2020,7 +2025,7 @@ def create_router(
     external_session_service: ExternalSessionService | None = None,
     device_repository: DeviceTokenRepository | None = None,
     on_device_registered: Callable[[str], Awaitable[object]] | None = None,
-    on_environment_assumed: Callable[[str], None] | None = None,
+    on_environment_assumed: Callable[[EnvironmentAssumed], None] | None = None,
     prefix: str = "/api/v1/forge",
     server_public_host: str = "127.0.0.1",
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,

@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlencode
 
 from niuu.domain.notifications import notification_image_url
@@ -82,6 +82,10 @@ class PushTokenKind(StrEnum):
 
 class UnsupportedTokenKindError(ValueError):
     """A device registry cannot hold this token kind (it keeps alert tokens only)."""
+
+
+#: Why a registration's environment was assumed: none was sent, or one we do not know.
+EnvironmentAssumed = Literal["missing", "unknown"]
 
 
 class PushEnvironment(StrEnum):

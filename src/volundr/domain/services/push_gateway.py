@@ -53,6 +53,7 @@ from volundr.domain.push import (
     ApnsPush,
     ApnsPushType,
     ApnsResult,
+    EnvironmentAssumed,
     GuildNotification,
     InterruptionLevel,
     LiveActivityEvent,
@@ -1071,7 +1072,7 @@ class PushGateway:
             expiration=int(now.timestamp()) + alerts.expiration_seconds,
         )
 
-    def note_environment_assumed(self, reason: str) -> None:
+    def note_environment_assumed(self, reason: EnvironmentAssumed) -> None:
         """Count a registration stored as production without a known environment."""
         if reason == "missing":
             self.stats.registrations_environment_missing += 1
