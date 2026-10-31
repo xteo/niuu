@@ -81,6 +81,7 @@ def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
         catch_up_items=gateway.catch_up_items,
         discovery_interval_seconds=gateway.discovery_interval_seconds,
         node_retry_seconds=gateway.node_retry_seconds,
+        feedless_recheck_seconds=gateway.feedless_recheck_seconds,
         retention_seconds=gateway.retention_seconds,
         public_api_url=gateway.public_api_url.strip(),
         origin_label=gateway.origin_label.strip(),

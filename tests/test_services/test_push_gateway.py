@@ -33,7 +33,7 @@ from volundr.domain.push import (
     PushTestKind,
     PushTokenKind,
 )
-from volundr.domain.push_ports import GuildFeedError, PushDeliveryStatus
+from volundr.domain.push_ports import GuildFeedError, GuildNodeHasNoFeedError, PushDeliveryStatus
 from volundr.domain.services.push_gateway import (
     ALERTS_DISABLED,
     ALREADY_READ,
@@ -253,6 +253,28 @@ class TestUnreachableNodes:
         assert harness.gateway.status()["unreachable_nodes"] == {MINI: str(self.DOWN)}
         assert harness.gateway.stats.node_failures == 1
         assert f"cannot read Guild node {MINI}" in caplog.text
+
+    async def test_a_node_without_the_feed_is_rechecked_rarely_and_quietly(self, harness, caplog):
+        caplog.set_level("INFO", logger="volundr.domain.services.push_gateway")
+        harness.devices.add(device("alert-1"))
+        harness.feed.down[MINI] = GuildNodeHasNoFeedError("Guild node's feed does not exist")
+        harness.feed.add(guild_notification("m-1", instance_id=MINI, seq=1))
+        await harness.gateway.run_once()
+        assert harness.gateway.stats.node_failures == 1
+        assert f"skips Guild node {MINI}" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        harness.feed.newest_calls.clear()
+
+        # Well past the ordinary retry time, it is still not asked.
+        harness.clock.advance(600)
+        await harness.gateway.run_once()
+        assert MINI not in {node for node, _ in harness.feed.newest_calls}
+
+        # At its recheck time it is asked again, and counted again.
+        harness.clock.advance(3000)
+        await harness.gateway.run_once()
+        assert MINI in {node for node, _ in harness.feed.newest_calls}
+        assert harness.gateway.stats.node_failures == 2
 
     async def test_it_is_left_alone_until_its_retry_time_then_caught_up(self, harness, caplog):
         caplog.set_level("INFO", logger="volundr.domain.services.push_gateway")

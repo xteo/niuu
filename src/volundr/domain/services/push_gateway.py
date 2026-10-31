@@ -74,6 +74,7 @@ from volundr.domain.push_ports import (
     GuildFeed,
     GuildFeedError,
     GuildFeedPage,
+    GuildNodeHasNoFeedError,
     PushDelivery,
     PushDeliveryRepository,
     PushDeliveryStatus,
@@ -179,6 +180,7 @@ class PushGatewaySettings:
     catch_up_items: int
     discovery_interval_seconds: float
     node_retry_seconds: float
+    feedless_recheck_seconds: float
     retention_seconds: float
     public_api_url: str
     origin_label: str
@@ -443,12 +445,21 @@ class PushGateway:
         return pages
 
     def _node_failed(self, node: str, error: GuildFeedError, now: datetime) -> None:
-        self.stats.node_failures += 1
-        self._node_retry_at[node] = now + timedelta(seconds=self._settings.node_retry_seconds)
         text = str(error)
+        feedless = isinstance(error, GuildNodeHasNoFeedError)
+        wait = (
+            self._settings.feedless_recheck_seconds
+            if feedless
+            else self._settings.node_retry_seconds
+        )
+        self._node_retry_at[node] = now + timedelta(seconds=wait)
+        self.stats.node_failures += 1
         if self._node_errors.get(node) == text:
-            return  # Logged when it started; say it once, not on every retry.
+            return  # Logged when it started; not again on every retry.
         self._node_errors[node] = text
+        if feedless:
+            logger.info("Push gateway skips Guild node %s: %s", node, text)
+            return
         logger.warning("Push gateway cannot read Guild node %s: %s", node, text)
 
     def _node_answered(self, node: str) -> None:

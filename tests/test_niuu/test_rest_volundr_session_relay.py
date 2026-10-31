@@ -18,7 +18,7 @@ from httpx import Response
 from identity.adapters.identity import AllowAllIdentityAdapter
 from niuu.adapters.inbound.rest_volundr import create_volundr_router
 from niuu.domain.guild_membership import GuildMembership
-from tests.support.forge_session import TENANT, bearer, build_forge_app
+from tests.support.forge_session import OWNER, TENANT, bearer, build_forge_app
 from tests.test_niuu.test_rest_volundr import StubInstanceService, _instance
 from volundr.domain.projects import SessionCoordination
 
@@ -29,7 +29,12 @@ TARGET = "00000000-0000-4000-8000-0000000000aa"
 DELIVERED = {"status": "delivered", "delivery": "delivered", "request_id": "r1"}
 
 
-async def _guild(*, membership: GuildMembership | None = None, with_remote: bool = True):
+async def _guild(
+    *,
+    membership: GuildMembership | None = None,
+    with_remote: bool = True,
+    feedless_recheck_seconds: float | None = None,
+):
     forge = build_forge_app()
     local = _instance(
         "local",
@@ -48,6 +53,7 @@ async def _guild(*, membership: GuildMembership | None = None, with_remote: bool
             StubInstanceService(instances),
             embedded_forge_app=forge.app,
             guild_membership=membership,
+            feedless_recheck_seconds=feedless_recheck_seconds,
         )
     )
     sender = await forge.session(
@@ -223,3 +229,128 @@ class TestMalformedInstanceId:
 
         assert response.status_code == 400
         assert "c3d1d72f-mini-m6" in response.json()["detail"]
+
+
+class TestMemberToHub:
+    """LEX-1738: a member reaches the hub's sessions; the hub answers its own first."""
+
+    @respx.mock
+    async def test_the_local_node_answers_for_its_own_session_without_asking_others(self):
+        client, sender, _ = await _guild()
+        remote = respx.get(f"{REMOTE}/api/v1/forge/sessions/{sender.id}").mock(
+            return_value=Response(404, json={"detail": "Session not found"})
+        )
+
+        user = {"x-auth-user-id": OWNER, "x-auth-tenant": TENANT}
+        response = client.get(f"/api/v1/forge/sessions/{sender.id}", headers=user)
+
+        assert response.status_code == 200
+        assert response.json()["instance_id"] == "local"
+        assert not remote.called
+
+    @respx.mock
+    async def test_naming_a_node_this_registry_lacks_relays_to_the_guild(self):
+        membership = GuildMembership(guild_url=GUILD, instance=None)
+        client, _, auth = await _guild(membership=membership, with_remote=False)
+        relayed = respx.post(f"{GUILD}/api/v1/forge/sessions/{TARGET}/messages/relayed").mock(
+            return_value=Response(200, json=DELIVERED)
+        )
+
+        response = client.post(
+            f"/api/v1/forge/sessions/{TARGET}/messages",
+            params={"instance_id": "56499f00-02b3-4d80-8137-09d6d3238056"},
+            json={"content": "hi"},
+            headers=auth,
+        )
+
+        assert response.status_code == 200 and response.json()["delivery"] == "delivered"
+        assert relayed.called
+
+    @respx.mock
+    async def test_a_members_read_of_a_hub_session_names_its_owner(self):
+        membership = GuildMembership(guild_url=GUILD, instance=None)
+        client, _, auth = await _guild(membership=membership, with_remote=False)
+        respx.get(f"{GUILD}/api/v1/forge/sessions/{TARGET}").mock(
+            return_value=Response(
+                200, json={"id": TARGET, "instance_id": "hub-1", "instance_name": "Thor"}
+            )
+        )
+
+        response = client.get(f"/api/v1/forge/sessions/{TARGET}", headers=auth)
+
+        assert response.status_code == 404
+        detail = response.json()["detail"]
+        assert "owned by Thor (hub-1)" in detail
+        assert "send_message" in detail
+
+    @respx.mock
+    async def test_a_node_without_the_feed_is_left_out_quietly(self):
+        client, _, _ = await _guild()
+        respx.get(f"{REMOTE}/api/v1/forge/notifications").mock(
+            return_value=Response(404, json={"detail": "Not Found"})
+        )
+
+        response = client.get(
+            "/api/v1/forge/notifications",
+            params={"all_instances": "true"},
+            headers={"x-auth-user-id": OWNER, "x-auth-tenant": TENANT},
+        )
+
+        assert response.status_code == 200
+        assert "remote" not in response.headers.get("X-Forge-Unavailable-Instances", "")
+
+    @respx.mock
+    async def test_a_node_without_the_feed_is_not_asked_again_until_its_recheck(self):
+        client, _, _ = await _guild(feedless_recheck_seconds=3600.0)
+        feed = respx.get(f"{REMOTE}/api/v1/forge/notifications").mock(
+            return_value=Response(404, json={"detail": "Not Found"})
+        )
+        user = {"x-auth-user-id": OWNER, "x-auth-tenant": TENANT}
+
+        for _ in range(3):
+            response = client.get(
+                "/api/v1/forge/notifications", params={"all_instances": "true"}, headers=user
+            )
+            assert response.status_code == 200
+
+        assert feed.call_count == 1
+
+    @respx.mock
+    async def test_an_unknown_node_named_through_the_guild_is_a_clean_404(self):
+        membership = GuildMembership(guild_url=GUILD, instance=None)
+        client, _, auth = await _guild(membership=membership, with_remote=False)
+        relayed = respx.post(f"{GUILD}/api/v1/forge/sessions/{TARGET}/messages/relayed").mock(
+            return_value=Response(404, json={"detail": "Forge instance nowhere not found"})
+        )
+
+        response = client.post(
+            f"/api/v1/forge/sessions/{TARGET}/messages",
+            params={"instance_id": "nowhere"},
+            json={"content": "hi"},
+            headers=auth,
+        )
+
+        assert response.status_code == 404
+        assert "nowhere" in response.json()["detail"]
+        assert relayed.calls.last.request.url.params["instance_id"] == "nowhere"
+
+    @respx.mock
+    async def test_a_members_guild_listing_includes_the_hubs_sessions(self):
+        membership = GuildMembership(guild_url=GUILD, instance=None)
+        client, sender, auth = await _guild(membership=membership, with_remote=False)
+        hub = respx.get(f"{GUILD}/api/v1/forge/sessions").mock(
+            return_value=Response(
+                200,
+                json=[
+                    {"id": TARGET, "instance_id": "hub-1", "instance_name": "Thor"},
+                    {"id": str(sender.id), "instance_id": "member-1"},
+                ],
+            )
+        )
+
+        response = client.get("/api/v1/forge/sessions", headers=auth)
+
+        assert response.status_code == 200
+        by_id = {item["id"]: item["instance_id"] for item in response.json()}
+        assert by_id == {str(sender.id): "local", TARGET: "hub-1"}
+        assert "authorization" not in hub.calls.last.request.headers

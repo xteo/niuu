@@ -8,7 +8,7 @@ import pytest
 from niuu.adapters.inbound.forge_notification_feed import decode_cursor, encode_cursor
 from volundr.adapters.outbound import http_guild_feed
 from volundr.adapters.outbound.http_guild_feed import HttpGuildFeed
-from volundr.domain.push_ports import GuildFeedError
+from volundr.domain.push_ports import GuildFeedError, GuildNodeHasNoFeedError
 
 GUILD = "http://127.0.0.1:8080"
 THOR = "56499f00-02b3-4d80-8137-09d6d3238056"
@@ -211,6 +211,12 @@ class TestNodeFailures:
         with pytest.raises(GuildFeedError) as excinfo:
             await feed_for(guild).newest(THOR, limit=1)
         assert str(excinfo.value) == f"Guild node {THOR}'s feed answered HTTP {status}"
+
+    async def test_a_node_without_the_feed_says_so(self):
+        guild = Guild(httpx.Response(404, json={"detail": "No notifications feed"}))
+        with pytest.raises(GuildNodeHasNoFeedError) as excinfo:
+            await feed_for(guild).newest(THOR, limit=1)
+        assert "an older Forge without the feed" in str(excinfo.value)
 
     async def test_not_json(self):
         guild = Guild(httpx.Response(200, content=b"<html>"))

@@ -28,6 +28,10 @@ class GuildFeedError(Exception):
     """The Guild, or one of its nodes, could not be read (unreachable, refused, malformed)."""
 
 
+class GuildNodeHasNoFeedError(GuildFeedError):
+    """A Guild node has no notifications feed (an older Forge): nothing to push, no outage."""
+
+
 @dataclass(frozen=True)
 class GuildFeedPage:
     """One page of one node's notification feed, as the Guild serves it.

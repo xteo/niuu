@@ -46,17 +46,32 @@ async def guild():
 
 class TestLocalNodeOnly:
     @respx.mock
-    async def test_fleet_listing_only_reads_the_local_node(self, guild) -> None:
+    async def test_fleet_listing_reads_other_nodes_without_the_credential(self, guild) -> None:
         client, forge, session, auth = guild
         await forge.session("theirs", owner="someone-else")
         remote = respx.get(f"{REMOTE}/api/v1/forge/sessions").mock(
-            return_value=Response(200, json=[])
+            return_value=Response(200, json=[{"id": "remote-1", "name": "on the hub"}])
         )
         response = client.get("/api/v1/forge/sessions", headers=auth)
         assert response.status_code == 200
+        assert {item["id"]: item["instance_id"] for item in response.json()} == {
+            str(session.id): "local",
+            "remote-1": "remote",
+        }
+        # The session credential is local: the other node is read without it.
+        assert "authorization" not in remote.calls.last.request.headers
+        assert "x-niuu-source-failures" not in response.headers
+
+    @respx.mock
+    async def test_a_node_that_refuses_the_listing_is_named(self, guild) -> None:
+        client, _, session, auth = guild
+        respx.get(f"{REMOTE}/api/v1/forge/sessions").mock(return_value=Response(401))
+        response = client.get("/api/v1/forge/sessions", headers=auth)
+        assert response.status_code == 200
         assert [item["id"] for item in response.json()] == [str(session.id)]
-        assert response.json()[0]["instance_id"] == "local"
-        assert remote.called is False
+        (failure,) = json.loads(response.headers["x-niuu-source-failures"])
+        assert failure["instanceId"] == "remote"
+        assert failure["error"] == "HTTP 401"
 
     @respx.mock
     async def test_naming_a_remote_node_is_refused(self, guild) -> None:

@@ -33,7 +33,12 @@ from niuu.adapters.inbound.forge_notification_feed import (
 from niuu.adapters.inbound.forge_session_stream import remote_events
 from niuu.adapters.inbound.remote_urls import build_remote_url
 from volundr.domain.push import GuildNotification
-from volundr.domain.push_ports import GuildFeed, GuildFeedError, GuildFeedPage
+from volundr.domain.push_ports import (
+    GuildFeed,
+    GuildFeedError,
+    GuildFeedPage,
+    GuildNodeHasNoFeedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +75,17 @@ class HttpGuildFeed(GuildFeed):
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
 
-    async def _get(self, url: str, params: list[tuple[str, str]], what: str) -> Any:
+    async def _get(
+        self, url: str, params: list[tuple[str, str]], what: str, *, node_feed: bool = False
+    ) -> Any:
         try:
             response = await self._client.get(url, params=params, headers=self._headers)
         except httpx.HTTPError as exc:
             raise GuildFeedError(f"{what} is unreachable: {type(exc).__name__}") from None
+        if node_feed and response.status_code == httpx.codes.NOT_FOUND:
+            raise GuildNodeHasNoFeedError(
+                f"{what} does not exist (an older Forge without the feed)"
+            )
         if response.status_code >= httpx.codes.BAD_REQUEST:
             raise GuildFeedError(f"{what} answered HTTP {response.status_code}")
         try:
@@ -101,7 +112,7 @@ class HttpGuildFeed(GuildFeed):
 
     async def _page(self, node: str, params: list[tuple[str, str]]) -> dict[str, Any]:
         payload = await self._get(
-            self._feed_url, [_ALL_INSTANCES, *params], f"Guild node {node}'s feed"
+            self._feed_url, [_ALL_INSTANCES, *params], f"Guild node {node}'s feed", node_feed=True
         )
         if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
             raise GuildFeedError(f"Guild node {node}'s feed answered with an unexpected shape")

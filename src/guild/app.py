@@ -266,6 +266,7 @@ def create_app(
                             loaded_settings.forge_stream_remote_connect_timeout_seconds
                         ),
                         forge_stream_retry_seconds=loaded_settings.forge_stream_retry_seconds,
+                        feedless_recheck_seconds=loaded_settings.guild_feedless_recheck_seconds,
                         forge_stream_keepalive_seconds=(
                             loaded_settings.forge_stream_keepalive_seconds
                         ),

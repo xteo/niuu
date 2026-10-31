@@ -460,6 +460,7 @@ def gateway_settings(
         "catch_up_items": 0,
         "discovery_interval_seconds": 300.0,
         "node_retry_seconds": 30.0,
+        "feedless_recheck_seconds": 3600.0,
         "retention_seconds": 604800.0,
         "public_api_url": "http://thor.tail737f2a.ts.net:8080",
         "origin_label": "Thor",

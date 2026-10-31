@@ -1092,6 +1092,14 @@ class PushGatewayConfig(BaseModel):
             "time fails only its own read."
         ),
     )
+    feedless_recheck_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            "How long a Guild node without a notifications feed (an older Forge answering "
+            "404) is left alone before it is asked again; it is skipped quietly meanwhile."
+        ),
+    )
     node_retry_seconds: float = Field(
         default=30.0,
         ge=0,
@@ -3276,6 +3284,14 @@ class Settings(BaseSettings):
         default=5.0,
         gt=0,
         description="Delay before retrying a disconnected host in the merged session stream.",
+    )
+    guild_feedless_recheck_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            "How long the Guild's merged notification feed leaves out a node without a feed "
+            "(an older Forge answering 404) before asking it again (LEX-1738)."
+        ),
     )
     forge_stream_keepalive_seconds: float = Field(
         default=15.0,
