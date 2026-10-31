@@ -129,6 +129,13 @@ LOCAL_NODE_ONLY_DETAIL = (
     "session's own Forge node, so this request cannot go to instance {instance_id}. "
     "Use a PAT or your own identity to act on other nodes."
 )
+RELAY_LOGIN_REQUIRED_DETAIL = (
+    "The node that owns session {session_id} requires a login, and a session credential "
+    "is valid only on its own node. Messages between sessions on different nodes of such "
+    "a Guild need a node credential, which is not configured (LEX-1710 follow-up)."
+)
+#: Seconds a relayed session message may take end to end (delivery waits for the ACK).
+RELAY_TIMEOUT_SECONDS = 60.0
 #: WebSocket close code mirroring HTTP 403, and the close-frame reason bound.
 _WS_FORBIDDEN = 4403
 _WS_REASON_CHARS = 120
@@ -507,9 +514,10 @@ async def _request_remote(
     extra_headers: dict[str, str] | None = None,
     embedded_app: ASGIApp | None = None,
     timeout: float = 30.0,
+    node_relay: bool = False,
 ) -> httpx.Response:
     embedded = _uses_embedded_transport(instance)
-    if not embedded and presented_session_claims(request) is not None:
+    if not embedded and not node_relay and presented_session_claims(request) is not None:
         # Never forward a session credential to another node: it is local, and the
         # remote node could not (and must not) honour it.
         raise HTTPException(
@@ -521,7 +529,12 @@ async def _request_remote(
     # identity, same as today. A non-embedded target is a genuinely remote
     # Guild instance and gets only the bearer token — see
     # niuu.adapters.inbound.remote_urls.forward_identity_headers.
-    headers = _forward_local_headers(request) if embedded else _forward_headers(request)
+    if node_relay:
+        # A session-to-session relay (LEX-1710) carries no caller identity: the
+        # session credential is local, and the sender travels in the body.
+        headers: dict[str, str] = {}
+    else:
+        headers = _forward_local_headers(request) if embedded else _forward_headers(request)
     if extra_headers:
         headers.update(extra_headers)
     request_kwargs: dict[str, Any] = {
@@ -3808,6 +3821,147 @@ def create_volundr_router(
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
 
+    async def _sender_attestation(request: Request, principal: Principal) -> dict[str, Any]:
+        """Who a session principal is, from its own (local) node, for a relay."""
+        local = await _local_session_instance(service, principal, request)
+        response = await _request_remote(
+            local,
+            request,
+            method="GET",
+            path=f"/sessions/{principal.bound_session_id}",
+            embedded_app=embedded_forge_app,
+        )
+        _ensure_remote_success(response)
+        sender = response.json()
+        coordination = sender.get("coordination") or {}
+        parent = coordination.get("parent") or {}
+        return {
+            "session_id": principal.bound_session_id,
+            "session_name": sender.get("name") or "",
+            "instance_name": local.name,
+            "project_id": coordination.get("project_id"),
+            "parent_session_id": parent.get("session_id"),
+        }
+
+    def _relay_answer(response: httpx.Response, session_id: str) -> JSONResponse:
+        """The owning node's answer to a relay, with the reason when it refuses."""
+        if response.status_code in {status.HTTP_401_UNAUTHORIZED}:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                RELAY_LOGIN_REQUIRED_DETAIL.format(session_id=session_id),
+            )
+        _ensure_remote_success(response)
+        payload = response.json()
+        return JSONResponse(
+            content=payload if isinstance(payload, dict) else {},
+            status_code=response.status_code,
+        )
+
+    async def _relay_session_message(
+        request: Request, principal: Principal, session_id: str, body: dict[str, Any]
+    ) -> JSONResponse:
+        """A session's message to a session on another node (LEX-1710).
+
+        This node verified the session credential; the message goes to the owning
+        node's relay route without it, with the sender attested in the body. That node
+        allows it only for the sender's parent or project. A target no node of this
+        Guild knows goes to the Guild this host belongs to (``guild.url``).
+        """
+        relay_body = {
+            "content": body.get("content", ""),
+            "sender": await _sender_attestation(request, principal),
+        }
+        if body.get("request_id"):
+            relay_body["request_id"] = body["request_id"]
+        path = f"/sessions/{session_id}/messages/relayed"
+        local = await _local_session_instance(service, principal, request)
+        # The owner's registry, not the session's local-only view: the relay carries
+        # no session credential to these nodes, only the attested sender.
+        registry = await service.list_visible(
+            principal, kind=InstanceKind.VOLUNDR, enabled_only=True
+        )
+        remotes = [
+            instance
+            for instance in registry
+            if instance.id != local.id and not _uses_embedded_transport(instance)
+        ]
+        for instance in remotes:
+            probe = await _request_remote(
+                instance,
+                request,
+                method="GET",
+                path=f"/sessions/{session_id}",
+                node_relay=True,
+                timeout=5.0,
+            )
+            if probe.status_code == status.HTTP_401_UNAUTHORIZED:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    RELAY_LOGIN_REQUIRED_DETAIL.format(session_id=session_id),
+                )
+            if probe.status_code != status.HTTP_200_OK:
+                continue
+            response = await _request_remote(
+                instance,
+                request,
+                method="POST",
+                path=path,
+                json_body=relay_body,
+                node_relay=True,
+                timeout=RELAY_TIMEOUT_SECONDS,
+            )
+            return _relay_answer(response, session_id)
+        if guild_membership is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"Session not found: {session_id} (not on this node, and this host belongs "
+                "to no Guild: set guild.url to reach sessions on other nodes)",
+            )
+        try:
+            async with httpx.AsyncClient(timeout=RELAY_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    build_remote_url(guild_membership.guild_url, "/api/v1/forge", path),
+                    json=relay_body,
+                )
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"The Guild at {guild_membership.guild_url} could not be reached: "
+                f"{type(exc).__name__}",
+            ) from exc
+        return _relay_answer(response, session_id)
+
+    @router.post("/sessions/{session_id}/messages/relayed")
+    async def relay_message(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """A relayed session message from a member node: to the node owning the session.
+
+        The owning node checks the parent / project relation and delivers (LEX-1710).
+        """
+        if _is_session_principal(principal):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "A session sends through POST /sessions/{id}/messages on its own node",
+            )
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=f"/sessions/{session_id}/messages/relayed",
+            json_body=body,
+            embedded_app=embedded_forge_app,
+            node_relay=not _uses_embedded_transport(instance),
+            timeout=RELAY_TIMEOUT_SECONDS,
+        )
+        return _relay_answer(response, session_id)
+
     @router.post("/sessions/{session_id}/messages")
     async def send_message(
         request: Request,
@@ -3815,6 +3969,24 @@ def create_volundr_router(
         body: dict[str, Any] = Body(default_factory=dict),
         principal: Principal = Depends(extract_principal),
     ) -> Response:
+        if _is_session_principal(principal) and not request.query_params.get("instance_id"):
+            local = await _local_session_instance(service, principal, request)
+            probe = await _request_remote(
+                local,
+                request,
+                method="GET",
+                path=f"/sessions/{session_id}",
+                embedded_app=embedded_forge_app,
+                timeout=5.0,
+            )
+            if probe.status_code == status.HTTP_404_NOT_FOUND:
+                return await _relay_session_message(request, principal, session_id, body)
+        elif _is_session_principal(principal):
+            selected = await _resolve_target_instance(
+                service, principal, request.query_params["instance_id"]
+            )
+            if not _uses_embedded_transport(selected):
+                return await _relay_session_message(request, principal, session_id, body)
         instance, _ = await _find_session_owner(
             service,
             principal,

@@ -282,6 +282,46 @@ A session credential is local to the node that minted it. The Guild facade there
 To supervise sessions across nodes, use a PAT or your own identity against the Guild,
 or connect to that node's own endpoint.
 
+### Messages to the parent or project on another node (LEX-1710)
+
+One exception, for `send_message` only: a session with the `message` grant can message
+**its parent session and the sessions of its own project** on another node of its Guild.
+Nothing wider crosses nodes.
+
+1. The session sends `POST /sessions/{id}/messages` to its own node, as usual. That
+   node has verified the credential. When the target is not local, it relays the
+   message **without the credential** to
+   `POST /api/v1/forge/sessions/{id}/messages/relayed` on the owning node. The body
+   carries the sender, as the home node attests it: session id and name, node name,
+   project, parent.
+   - The owning node is found among this host's registry, else through the Guild
+     this host belongs to (`guild.url`).
+   - A host with neither answers 404 and says to set `guild.url`.
+2. The owning node checks the relation against its own copy of the target session:
+   the target is the sender's `coordination.parent`, or it is in the sender's
+   `coordination.project_id`.
+   - Otherwise it refuses with 403 and the reason.
+   - If the relation holds, it delivers through the normal route, with the same
+     delivered / pending / failed answer. The message is prefixed with
+     `[Message from session <name> (<id>) on <node>, relayed through the Guild]`.
+3. A session credential cannot call the relay route itself (403); it is not on the
+   session allow-list.
+
+The relay carries no credential, so it works only where the owning node accepts an
+unauthenticated caller: mini-mode hosts (`AllowAll` identity) on a tailnet. On a node
+that requires a login, the relay is refused with 403: "… requires a login … need a node
+credential, which is not configured". A node credential for relays is the planned
+follow-up (signed node requests, as `niuu join` uses for heartbeats; it needs a decision
+recorded in `.claude/rules/architecture.md`).
+
+**Setup on a host that is not the Guild** (e.g. mini-m6 in Thor's Guild): set
+```yaml
+guild:
+  url: http://thor.tail737f2a.ts.net:8080   # the Guild's facade
+```
+Leave `guild.instance_*` empty unless this host's notifications should carry the Guild's
+instance ids. The Guild itself needs nothing: its registry already lists every node.
+
 Outside `/api/v1/forge` the Guild host refuses session credentials outright.
 
 ## The Forge-hosted HTTP endpoint

@@ -805,7 +805,11 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "as operator-authorized steering, not as a verified agent identity, so say who "
             "you are and why in the content. Reuse the same request_id when retrying so it "
             "is never delivered twice (one is generated and returned if you omit it); "
-            "check delivery with message_status."
+            "check delivery with message_status. Who you can reach: any session of your "
+            "owner on your own Forge node; on another node of your Guild, only your parent "
+            "session and the sessions of your own project (your node relays it, and the "
+            "message starts with your session and node). Anything else is refused with the "
+            "reason; a cross-node delivery's status is in this call's answer."
         ),
         input_schema=_object(
             {

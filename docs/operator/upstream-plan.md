@@ -284,6 +284,22 @@ iOS) wins the Dynamic Island.
   With the gateway on, the node gives no "Needs-input pushes" rule, and `push.adapter`
   must stay at its default.
 
+## Follow-ups for Jozef (need his and Damien's sign-off)
+
+- **Node credential for cross-node session relays (LEX-1710, option B).** The fork's
+  relay of a session's message to its parent or project on another node carries no
+  credential. It works where the owning node accepts an unauthenticated caller
+  (mini-mode Guilds on a tailnet), and is refused clearly on a node that requires a
+  login. To make it work on login-requiring clusters:
+  - the home node signs the relayed request with a node key, reusing the Ed25519
+    node-request signing of `niuu join` (today only heartbeat and leave);
+  - member hosts join their Guild with `niuu join`;
+  - the exception in `.claude/rules/architecture.md` is extended with the same
+    enforcement points (FastAPI dependency, middleware exemption, chart Envoy bypass).
+
+  That changes the authentication model, so it is Jozef's and Damien's decision. The
+  relay itself (option A) joins the stack after branch 19 once it is upstream-ready.
+
 ## Left out
 
 These fork commits are records of the fork's own operation, not product changes:

@@ -34,6 +34,7 @@ from niuu.domain.services.token_scope import (
     FORGE_SESSION_LIFECYCLE_SCOPE,
     FORGE_SESSION_MESSAGE_SCOPE,
     FORGE_SESSION_READ_SCOPE,
+    FORGE_SESSION_TOKEN_USE,
     require_scope,
 )
 from niuu.domain.session_description import (
@@ -868,6 +869,46 @@ class SessionStart(BaseModel):
             },
         },
     }
+
+
+class RelayedMessageSender(BaseModel):
+    """The session that sent a relayed message, as its home node attests it (LEX-1710)."""
+
+    session_id: UUID
+    session_name: str = Field(default="", max_length=200)
+    instance_name: str = Field(min_length=1, max_length=200)
+    project_id: UUID | None = None
+    parent_session_id: UUID | None = None
+
+
+class RelayedSessionMessage(BaseModel):
+    """A session-to-session message relayed from another Guild node (LEX-1710)."""
+
+    content: str = Field(min_length=1)
+    request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,200}$")
+    sender: RelayedMessageSender
+
+
+def relay_refusal(sender: RelayedMessageSender, target: Session) -> str | None:
+    """Why a relayed message may not reach ``target``, or ``None`` when it may.
+
+    A worker may message its parent and the sessions of its own project; nothing
+    wider crosses nodes (LEX-1710).
+    """
+    if sender.parent_session_id is not None and sender.parent_session_id == target.id:
+        return None
+    target_project = target.coordination.project_id if target.coordination else None
+    if sender.project_id is not None and sender.project_id == target_project:
+        return None
+    if sender.project_id is None:
+        return (
+            f"Session {sender.session_id} belongs to no project, so it may message only its "
+            "parent on another node; this session is not its parent"
+        )
+    return (
+        f"Session {target.id} is not in the sender's project ({sender.project_id}) and is not "
+        "its parent; across nodes a session may message only those"
+    )
 
 
 class SessionImportRequest(BaseModel):
@@ -4060,6 +4101,68 @@ def create_router(
                 "request_id": req_id,
                 "delivery": str(delivery.get("status") or "delivered"),
             },
+        )
+
+    @router.post(
+        "/sessions/{session_id}/messages/relayed",
+        tags=["Sessions"],
+        responses={
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            502: {"model": ErrorResponse},
+        },
+    )
+    async def relay_session_message(
+        request: Request,
+        data: RelayedSessionMessage,
+        session_id: UUID = Path(description="The session the message is for"),
+    ) -> Response:
+        """Deliver a session-to-session message relayed from another Guild node.
+
+        The sender's home node has verified the sender's session credential and
+        attests who it is; this node allows the message only when the target is the
+        sender's parent or in the sender's project (LEX-1710), then delivers it like
+        ``POST /sessions/{id}/messages``, with the same delivered / pending / failed
+        answer. A session credential cannot call this route: a session sends from its
+        own node, which relays.
+        """
+        principal = await extract_principal(request)
+        if principal.token_use == FORGE_SESSION_TOKEN_USE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A session sends through POST /sessions/{id}/messages on its own node",
+            )
+        target = await forge.get_session(session_id)
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        refusal = relay_refusal(data.sender, target)
+        if refusal is not None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
+        sender = data.sender
+        name = (
+            f"{sender.session_name} ({sender.session_id})"
+            if sender.session_name
+            else str(sender.session_id)
+        )
+        framed = (
+            f"[Message from session {name} on {sender.instance_name}, relayed through the "
+            f"Guild]\n\n{data.content}"
+        )
+        logger.info(
+            "Relayed message from session %s on %s to %s",
+            sender.session_id,
+            _sanitize_log(sender.instance_name),
+            session_id,
+        )
+        return await send_session_message(
+            request,
+            session_id,
+            {"content": framed, "request_id": data.request_id}
+            if data.request_id
+            else {"content": framed},
         )
 
     @router.get(
