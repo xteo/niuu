@@ -212,11 +212,23 @@ class TestNodeFailures:
             await feed_for(guild).newest(THOR, limit=1)
         assert str(excinfo.value) == f"Guild node {THOR}'s feed answered HTTP {status}"
 
-    async def test_a_node_without_the_feed_says_so(self):
-        guild = Guild(httpx.Response(404, json={"detail": "No notifications feed"}))
+    async def test_a_node_the_guild_names_feedless_says_so(self):
+        guild = Guild(
+            httpx.Response(
+                404,
+                json={"detail": "No notifications feed"},
+                headers={"X-Forge-Feedless-Instances": THOR},
+            )
+        )
         with pytest.raises(GuildNodeHasNoFeedError) as excinfo:
             await feed_for(guild).newest(THOR, limit=1)
         assert "an older Forge without the feed" in str(excinfo.value)
+
+    async def test_any_other_404_is_an_ordinary_failure(self):
+        guild = Guild(httpx.Response(404, json={"detail": "Forge instance not found"}))
+        with pytest.raises(GuildFeedError) as excinfo:
+            await feed_for(guild).newest(THOR, limit=1)
+        assert not isinstance(excinfo.value, GuildNodeHasNoFeedError)
 
     async def test_not_json(self):
         guild = Guild(httpx.Response(200, content=b"<html>"))

@@ -625,12 +625,20 @@ How a notification becomes a push:
    event.
 
 Nodes are read one by one, at the same time. A node that does not answer within
-`request_timeout_seconds` (asleep, restarting, an older release without the feed) fails
-only its own read: the gateway keeps pushing for the others, leaves that node alone for
+`request_timeout_seconds` (asleep, restarting) fails only its own read: the gateway keeps pushing for the others, leaves that node alone for
 `node_retry_seconds`, then tries again and catches up from its stored position. While a
 node is away the Live Activity shows the newest notifications of the nodes that answer.
-`GET /push/status` lists such nodes under `unreachable_nodes`, with the reason; the log
-says it once when it starts and once when the node is back.
+`GET /push/status` lists such nodes under `unreachable_nodes`, with the reason, and counts
+each failed read in `node_failures`; the log says it once when it starts and once when the
+node is back.
+
+A node running an older release without the notification feed is not an outage. The Guild
+names it in the `X-Forge-Feedless-Instances` header (only a 404 for the missing route
+counts; any other 404 is an ordinary failure). The gateway lists it under `feedless_nodes`,
+logs it once at info, and asks it again only every `feedless_recheck_seconds` (each recheck
+counts in `feedless_rechecks`). The Guild facade remembers such a node for
+`guild_feedless_recheck_seconds` too, and keeps its cursor position, so its notifications
+are read once it is upgraded.
 
 With `stream_enabled`, the gateway also listens to the Guild's live event stream and
 pushes another node's notification at once. That holds one streaming connection to
@@ -851,7 +859,8 @@ through the Guild facade.
 | `POST /devices` answers 503 | `push.enabled` is off on that node. |
 | `status` shows `last_error`: "The Guild feed is unreachable" | `guild_url` is wrong, or the Guild is not up yet (the gateway reads again every `poll_interval_seconds`). One such warning in the log right after a start is normal when the Guild runs in the same process: the gateway starts before the server accepts connections. |
 | `status` shows `last_error`: "… answered HTTP 401/403" | The Guild needs a credential: set `reader_token_path`. |
-| `unreachable_nodes` names a node | It does not answer its feed read (the reason is given): asleep, restarting, or a release without the notification feed. Its notifications are caught up once it answers. |
+| `unreachable_nodes` names a node | It does not answer its feed read (the reason is given): asleep or restarting. Its notifications are caught up once it answers. |
+| `feedless_nodes` names a node | It runs a release without the notification feed (Spark today). Nothing to push from it; it is asked again every `feedless_recheck_seconds`. |
 | `nodes` lacks a node | It has not answered since the gateway started, or it is not an enabled Forge instance in the Guild registry. A new node is found within `discovery_interval_seconds`. |
 | Test push: `HTTP 403 InvalidProviderToken` | Wrong `team_id` or `key_id`, or the key was revoked. |
 | Test push: `HTTP 400 BadDeviceToken` (the token is then deleted) | The token's `environment` is wrong: a development install registered as production, or the reverse. |
@@ -965,6 +974,7 @@ push:
     origin_label: ""         # this server's name on a Live Activity it pushed
     request_timeout_seconds: 5     # one read of one node
     node_retry_seconds: 30         # a node that did not answer is left alone this long
+    feedless_recheck_seconds: 3600 # a node without the feed is asked again this often
     poll_interval_seconds: 5 # how often the Guild feed is read
     stream_enabled: false    # also listen to the Guild's live events (see above)
     stream_retry_seconds: 5

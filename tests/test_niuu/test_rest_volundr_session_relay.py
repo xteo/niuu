@@ -298,6 +298,7 @@ class TestMemberToHub:
 
         assert response.status_code == 200
         assert "remote" not in response.headers.get("X-Forge-Unavailable-Instances", "")
+        assert response.headers["X-Forge-Feedless-Instances"] == "remote"
 
     @respx.mock
     async def test_a_node_without_the_feed_is_not_asked_again_until_its_recheck(self):
@@ -354,3 +355,32 @@ class TestMemberToHub:
         by_id = {item["id"]: item["instance_id"] for item in response.json()}
         assert by_id == {str(sender.id): "local", TARGET: "hub-1"}
         assert "authorization" not in hub.calls.last.request.headers
+
+    @respx.mock
+    async def test_a_404_that_is_not_a_missing_route_is_an_outage(self):
+        client, _, _ = await _guild(feedless_recheck_seconds=3600.0)
+        respx.get(f"{REMOTE}/api/v1/forge/notifications").mock(
+            return_value=Response(404, json={"detail": "Instance gone"})
+        )
+
+        response = client.get(
+            "/api/v1/forge/notifications",
+            params={"all_instances": "true"},
+            headers={"x-auth-user-id": OWNER, "x-auth-tenant": TENANT},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["X-Forge-Unavailable-Instances"] == "remote"
+        assert "X-Forge-Feedless-Instances" not in response.headers
+
+    @respx.mock
+    async def test_a_guild_that_refuses_the_owner_question_makes_no_claim(self):
+        membership = GuildMembership(guild_url=GUILD, instance=None)
+        client, _, auth = await _guild(membership=membership, with_remote=False)
+        respx.get(f"{GUILD}/api/v1/forge/sessions/{TARGET}").mock(return_value=Response(401))
+
+        response = client.get(f"/api/v1/forge/sessions/{TARGET}", headers=auth)
+
+        assert response.status_code == 404
+        assert "owned by" not in response.json()["detail"]
+        assert "another node" not in response.json()["detail"]

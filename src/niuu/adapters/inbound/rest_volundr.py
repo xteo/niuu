@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -32,6 +33,7 @@ from starlette.types import ASGIApp
 
 from niuu.adapters.inbound.auth import extract_principal, presented_session_claims
 from niuu.adapters.inbound.forge_notification_feed import (
+    FEEDLESS_INSTANCES_HEADER,
     CursorError,
     InstancePage,
     decode_cursor,
@@ -80,6 +82,8 @@ from niuu.domain.services.instances import InstanceService
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
 from niuu.forge_mcp.credentials import token_scopes
 from niuu.ports.instances import InvalidInstanceIdError
+
+logger = logging.getLogger(__name__)
 
 UNAVAILABLE_INSTANCES_HEADER = "X-Forge-Unavailable-Instances"
 #: The Forge-hosted MCP endpoint, under the Forge API prefix on every node.
@@ -506,6 +510,16 @@ def _uses_embedded_transport(instance: RegisteredInstance) -> bool:
     return str(instance.config.get("transport", "")).strip().lower() == "embedded"
 
 
+def _route_is_missing(response: httpx.Response) -> bool:
+    """A 404 for the route itself (an older Forge), not for something the route looked up."""
+    if response.status_code != status.HTTP_404_NOT_FOUND:
+        return False
+    try:
+        return response.json() == {"detail": "Not Found"}
+    except ValueError:
+        return False
+
+
 def _session_list_payload(response: httpx.Response) -> list[dict[str, Any]]:
     """A node's session listing, or ValueError naming what it answered instead."""
     if response.status_code != status.HTTP_200_OK:
@@ -828,8 +842,10 @@ async def _find_runtime_owner(
     if local and len(instances) > 1:
         # This node's own store first (LEX-1738): a resource it holds needs no question
         # to every other node, and a node that lacks it is asked only when needed.
+        # Only "not here" moves on: a local store error must not read as absent.
         instance, response = await probe(local[0])
-        if response.status_code < 400:
+        if response.status_code != status.HTTP_404_NOT_FOUND:
+            _ensure_remote_success(response)
             payload = response.json()
             if isinstance(payload, dict):
                 return instance, _with_instance(
@@ -2548,10 +2564,15 @@ def create_volundr_router(
                 continue
             if _is_client_error(result):
                 _ensure_remote_success(result)
-            if result.status_code == status.HTTP_404_NOT_FOUND:
+            if _route_is_missing(result):
                 feedless.add(instance.id)
                 if feedless_recheck_seconds is not None:
                     feedless_until[instance.id] = now + feedless_recheck_seconds
+                    logger.info(
+                        "Forge instance %s has no notifications feed; asked again in %ss",
+                        instance.id,
+                        feedless_recheck_seconds,
+                    )
                 continue
             page = _instance_page(result, instance) if result.status_code < 400 else None
             if page is None:
@@ -2563,16 +2584,21 @@ def create_volundr_router(
                 status.HTTP_404_NOT_FOUND,
                 "No notifications feed on Forge instance(s) "
                 f"{', '.join(sorted(feedless))} (an older Forge without the feed)",
+                headers={FEEDLESS_INSTANCES_HEADER: ",".join(sorted(feedless))},
             )
         if instances and not pages:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, "No Forge instance answered the notification feed"
             )
         _set_unavailable(response, unavailable)
+        if feedless:
+            response.headers[FEEDLESS_INSTANCES_HEADER] = ",".join(sorted(feedless))
+        # A feedless node keeps its cursor position, so it is read once it has a feed.
+        kept = unavailable | feedless
         merged = (
-            merge_after(pages, previous=after, unavailable=unavailable)
+            merge_after(pages, previous=after, unavailable=kept)
             if after is not None
-            else merge_newest(pages, previous=before or {}, unavailable=unavailable, limit=limit)
+            else merge_newest(pages, previous=before or {}, unavailable=kept, limit=limit)
         )
         return {
             "items": merged.items,
@@ -3903,12 +3929,15 @@ def create_volundr_router(
                 )
         except httpx.RequestError:
             return None
-        if response.status_code in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}:
-            return "on another node of this Guild (it needs a login to say which)"
         if response.status_code != status.HTTP_200_OK:
+            return None  # Refused or not found: no claim about where it is.
+        try:
+            payload = response.json()
+        except ValueError:
             return None
-        payload = response.json()
-        name, instance_id = payload.get("instance_name"), payload.get("instance_id")
+        if not isinstance(payload, dict) or not payload.get("instance_id"):
+            return None
+        name, instance_id = payload.get("instance_name"), payload["instance_id"]
         return f"owned by {name or instance_id} ({instance_id}) in this Guild"
 
     async def _find_session_owner(  # the node-aware lookup for this router's routes
@@ -3949,56 +3978,58 @@ def create_volundr_router(
 
         A session credential stays on its own node, so the other nodes are read without
         it, exactly as an anonymous caller would read them: the members of this host's
-        registry, then the Guild this host belongs to. A node that refuses or does not
-        answer is reported as a source failure; the session's own node already answered.
+        registry, and the Guild this host belongs to, all at once. A node that refuses
+        or does not answer is reported as a source failure; the session's own node
+        already answered.
         """
-        items: list[dict[str, Any]] = []
-        failures: list[SourceFailure] = []
         registry = await service.list_visible(
             principal, kind=InstanceKind.VOLUNDR, enabled_only=True
         )
         listed_ids = {instance.id for instance in listed}
-        for instance in registry:
-            if instance.id in listed_ids or _uses_embedded_transport(instance):
-                continue
-            try:
-                response = await _request_remote(
-                    instance,
-                    request,
-                    method="GET",
-                    path="/sessions",
-                    params=params,
-                    node_relay=True,
-                    timeout=OWNER_HINT_TIMEOUT_SECONDS,
+        others = [
+            instance
+            for instance in registry
+            if instance.id not in listed_ids and not _uses_embedded_transport(instance)
+        ]
+
+        async def read_node(instance: RegisteredInstance) -> list[dict[str, Any]]:
+            response = await _request_remote(
+                instance,
+                request,
+                method="GET",
+                path="/sessions",
+                params=params,
+                node_relay=True,
+                timeout=OWNER_HINT_TIMEOUT_SECONDS,
+            )
+            return [_with_instance(item, instance) for item in _session_list_payload(response)]
+
+        async def read_guild(guild_url: str) -> list[dict[str, Any]]:
+            async with httpx.AsyncClient(timeout=OWNER_HINT_TIMEOUT_SECONDS) as client:
+                response = await client.get(
+                    build_remote_url(guild_url, "/api/v1/forge", "/sessions"), params=params
                 )
-                payload = _session_list_payload(response)
-            except (httpx.RequestError, HTTPException, ValueError) as exc:
+            return _session_list_payload(response)
+
+        sources: list[tuple[str, str]] = [(instance.id, instance.name) for instance in others]
+        reads = [read_node(instance) for instance in others]
+        if guild_membership is not None:
+            sources.append(("guild", guild_membership.guild_url))
+            reads.append(read_guild(guild_membership.guild_url))
+        results = await asyncio.gather(*reads, return_exceptions=True)
+        items: list[dict[str, Any]] = []
+        failures: list[SourceFailure] = []
+        for (source_id, name), result in zip(sources, results, strict=True):
+            if isinstance(result, httpx.RequestError | HTTPException | ValueError):
                 failures.append(
                     source_failure(
-                        instance_id=instance.id,
-                        name=instance.name,
-                        error=describe_remote_failure(exc),
+                        instance_id=source_id, name=name, error=describe_remote_failure(result)
                     )
                 )
                 continue
-            items += [_with_instance(item, instance) for item in payload]
-        if guild_membership is None:
-            return items, failures
-        try:
-            async with httpx.AsyncClient(timeout=OWNER_HINT_TIMEOUT_SECONDS) as client:
-                response = await client.get(
-                    build_remote_url(guild_membership.guild_url, "/api/v1/forge", "/sessions"),
-                    params=params,
-                )
-            items += _session_list_payload(response)
-        except (httpx.RequestError, ValueError) as exc:
-            failures.append(
-                source_failure(
-                    instance_id="guild",
-                    name=guild_membership.guild_url,
-                    error=describe_remote_failure(exc),
-                )
-            )
+            if isinstance(result, BaseException):
+                raise result
+            items += result
         return items, failures
 
     async def _sender_attestation(request: Request, principal: Principal) -> dict[str, Any]:

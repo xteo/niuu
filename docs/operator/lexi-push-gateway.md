@@ -59,9 +59,10 @@ curl -s http://127.0.0.1:8080/api/v1/forge/push/status | python3 -m json.tool
 ```
 
 - `running: true`, with Thor's and mini-m6's ids in `nodes`, is the healthy state.
-- **Spark** (`582bf8d0`) is always in `unreachable_nodes` ("feed answered HTTP 502"): it
-  runs an older Forge without the notifications feed. That only skips Spark; the gateway
-  keeps pushing for the other nodes and retries Spark every `node_retry_seconds`.
+- **Spark** (`582bf8d0`) is in `feedless_nodes`: it runs an older Forge without the
+  notifications feed. That only skips Spark; the gateway keeps pushing for the other nodes
+  and asks Spark again every `feedless_recheck_seconds` (an hour). Before LEX-1738 it showed
+  in `unreachable_nodes` ("feed answered HTTP 502") and was asked every 30 s.
 - The first tick after a restart can count one `loop_errors` ("Guild registry is
   unreachable: ConnectError"), because it runs before the API is listening; the next tick
   reads the Guild.

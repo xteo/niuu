@@ -221,6 +221,7 @@ class PushGatewayStats:
     apns_rejections: int = 0
     stale_settles: int = 0
     node_failures: int = 0
+    feedless_rechecks: int = 0
     loop_errors: int = 0
     stream_reconnects: int = 0
     last_tick_at: datetime | None = None
@@ -289,6 +290,7 @@ class PushGateway:
         self._nodes: list[str] = []
         #: Nodes that did not answer: their last error, and when to try them again.
         self._node_errors: dict[str, str] = {}
+        self._feedless: dict[str, str] = {}
         self._node_retry_at: dict[str, datetime] = {}
         self._discover = True
         self._last_discovery: datetime | None = None
@@ -446,24 +448,27 @@ class PushGateway:
 
     def _node_failed(self, node: str, error: GuildFeedError, now: datetime) -> None:
         text = str(error)
-        feedless = isinstance(error, GuildNodeHasNoFeedError)
-        wait = (
-            self._settings.feedless_recheck_seconds
-            if feedless
-            else self._settings.node_retry_seconds
-        )
-        self._node_retry_at[node] = now + timedelta(seconds=wait)
+        if isinstance(error, GuildNodeHasNoFeedError):
+            # Not an outage: the node has nothing to push until it gets the feed.
+            wait = self._settings.feedless_recheck_seconds
+            self._node_retry_at[node] = now + timedelta(seconds=wait)
+            self.stats.feedless_rechecks += 1
+            self._node_errors.pop(node, None)
+            if node not in self._feedless:
+                logger.info("Push gateway skips Guild node %s: %s", node, text)
+            self._feedless[node] = text
+            return
+        self._feedless.pop(node, None)
+        self._node_retry_at[node] = now + timedelta(seconds=self._settings.node_retry_seconds)
         self.stats.node_failures += 1
         if self._node_errors.get(node) == text:
-            return  # Logged when it started; not again on every retry.
+            return  # Logged when it started; say it once, not on every retry.
         self._node_errors[node] = text
-        if feedless:
-            logger.info("Push gateway skips Guild node %s: %s", node, text)
-            return
         logger.warning("Push gateway cannot read Guild node %s: %s", node, text)
 
     def _node_answered(self, node: str) -> None:
         self._node_retry_at.pop(node, None)
+        self._feedless.pop(node, None)
         if self._node_errors.pop(node, None) is not None:
             logger.info("Push gateway reads Guild node %s again", node)
 
@@ -1066,6 +1071,7 @@ class PushGateway:
             "running": self._task is not None and not self._task.done(),
             "nodes": dict(sorted((self._positions or {}).items())),
             "unreachable_nodes": dict(sorted(self._node_errors.items())),
+            "feedless_nodes": dict(sorted(self._feedless.items())),
             "alerts_enabled": self._settings.alerts.enabled,
             "live_activity_enabled": self._settings.live_activity.enabled,
             "live_activity_start_enabled": self._settings.live_activity.start_enabled,

@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from niuu.adapters.inbound.forge_notification_feed import (
+    FEEDLESS_INSTANCES_HEADER,
     CursorError,
     decode_cursor,
     encode_cursor,
@@ -82,7 +83,8 @@ class HttpGuildFeed(GuildFeed):
             response = await self._client.get(url, params=params, headers=self._headers)
         except httpx.HTTPError as exc:
             raise GuildFeedError(f"{what} is unreachable: {type(exc).__name__}") from None
-        if node_feed and response.status_code == httpx.codes.NOT_FOUND:
+        if node_feed and response.headers.get(FEEDLESS_INSTANCES_HEADER):
+            # The Guild says so explicitly; any other 404 is an error like the rest.
             raise GuildNodeHasNoFeedError(
                 f"{what} does not exist (an older Forge without the feed)"
             )
