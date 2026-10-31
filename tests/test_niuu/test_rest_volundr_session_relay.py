@@ -384,3 +384,27 @@ class TestMemberToHub:
         assert response.status_code == 404
         assert "owned by" not in response.json()["detail"]
         assert "another node" not in response.json()["detail"]
+
+    @respx.mock
+    async def test_read_state_shares_the_feedless_memory(self):
+        client, _, _ = await _guild(feedless_recheck_seconds=3600.0)
+        read_state = respx.get(f"{REMOTE}/api/v1/forge/notifications/read-state").mock(
+            return_value=Response(404, json={"detail": "Not Found"})
+        )
+        feed = respx.get(f"{REMOTE}/api/v1/forge/notifications").mock(
+            return_value=Response(404, json={"detail": "Not Found"})
+        )
+        user = {"x-auth-user-id": OWNER, "x-auth-tenant": TENANT}
+        fleet = {"all_instances": "true"}
+
+        for _ in range(3):
+            response = client.get(
+                "/api/v1/forge/notifications/read-state", params=fleet, headers=user
+            )
+            assert response.status_code == 200
+            assert response.headers["X-Forge-Feedless-Instances"] == "remote"
+            assert "X-Forge-Unavailable-Instances" not in response.headers
+        client.get("/api/v1/forge/notifications", params=fleet, headers=user)
+
+        assert read_state.call_count == 1
+        assert not feed.called

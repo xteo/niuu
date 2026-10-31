@@ -2566,13 +2566,7 @@ def create_volundr_router(
                 _ensure_remote_success(result)
             if _route_is_missing(result):
                 feedless.add(instance.id)
-                if feedless_recheck_seconds is not None:
-                    feedless_until[instance.id] = now + feedless_recheck_seconds
-                    logger.info(
-                        "Forge instance %s has no notifications feed; asked again in %ss",
-                        instance.id,
-                        feedless_recheck_seconds,
-                    )
+                _remember_feedless(instance.id, now)
                 continue
             page = _instance_page(result, instance) if result.status_code < 400 else None
             if page is None:
@@ -2626,8 +2620,11 @@ def create_volundr_router(
             return {**payload, "instance_id": instance.id} if isinstance(payload, dict) else {}
         instances = await _visible_instances(service, principal)
         base = _forward_params(request, drop=_FLEET_SELECTORS)
+        # A node without the feed has no read state either; same memory as the feed.
+        now = time.monotonic()
+        feedless = {i.id for i in instances if feedless_until.get(i.id, 0.0) > now}
         responses, unavailable = await _fan_out(
-            instances,
+            [i for i in instances if i.id not in feedless],
             request,
             method="GET",
             path="/notifications/read-state",
@@ -2635,6 +2632,10 @@ def create_volundr_router(
         )
         states: dict[str, Any] = {}
         for instance_id, result in responses.items():
+            if _route_is_missing(result):
+                _remember_feedless(instance_id, now)
+                feedless.add(instance_id)
+                continue
             payload = _remote_json(result) if result.status_code < 400 else None
             if not isinstance(payload, dict) or type(payload.get("unread_count")) is not int:
                 unavailable.add(instance_id)
@@ -2643,6 +2644,8 @@ def create_volundr_router(
         if instances and not states:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "No Forge instance answered")
         _set_unavailable(response, unavailable)
+        if feedless:
+            response.headers[FEEDLESS_INSTANCES_HEADER] = ",".join(sorted(feedless))
         return {
             "unread_count": sum(state["unread_count"] for state in states.values()),
             "instances": states,
@@ -3915,6 +3918,16 @@ def create_volundr_router(
 
     #: Nodes known to lack the notifications feed: instance id -> monotonic recheck time.
     feedless_until: dict[str, float] = {}
+
+    def _remember_feedless(instance_id: str, now: float) -> None:
+        if feedless_recheck_seconds is None:
+            return
+        feedless_until[instance_id] = now + feedless_recheck_seconds
+        logger.info(
+            "Forge instance %s has no notifications feed; asked again in %ss",
+            instance_id,
+            feedless_recheck_seconds,
+        )
 
     async def _guild_owner_of(session_id: str) -> str | None:
         """Which node of this host's Guild owns a session, for a clear refusal; None if unknown."""
