@@ -58,7 +58,13 @@ docker exec volundr-pg psql -U volundr -d volundr -c \
 curl -s http://127.0.0.1:8080/api/v1/forge/push/status | python3 -m json.tool
 ```
 
-- `running: true` and an empty `unreachable_nodes` are the healthy state.
+- `running: true`, with Thor's and mini-m6's ids in `nodes`, is the healthy state.
+- **Spark** (`582bf8d0`) is always in `unreachable_nodes` ("feed answered HTTP 502"): it
+  runs an older Forge without the notifications feed. That only skips Spark; the gateway
+  keeps pushing for the other nodes and retries Spark every `node_retry_seconds`.
+- The first tick after a restart can count one `loop_errors` ("Guild registry is
+  unreachable: ConnectError"), because it runs before the API is listening; the next tick
+  reads the Guild.
 - `nodes` holds the gateway's position per node. The counters cover alerts sent,
   suppressed and failed, and Live Activity, widget and background pushes.
 - `POST /api/v1/forge/push/test {"kind": "alert", "title": "…", "body": "…"}` pushes once
@@ -92,3 +98,11 @@ to fix. There is no silent fallback to running without push.
 
 The backup taken before the first enable is
 `~/.config/niuu-forge-thor/config.yaml.bak-20261031-push`.
+
+## History
+
+- **2026-10-31 12:26 UTC: enabled** (Thor, `forge-names-39ab05da`), as a config change
+  and an API restart; every session was preserved. The first attempt at 12:22 was rolled
+  back by its own check, which treated Spark's missing feed as a failure.
+- **Test push, 12:29 UTC:** "Forge push is live" to Damien's iPhone. APNs accepted it
+  (production, one alert token).
