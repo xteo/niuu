@@ -15,6 +15,14 @@ _spec = importlib.util.spec_from_file_location(
 release_dist = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(release_dist)
 
+HEALTH = "http://127.0.0.1:9/health"
+
+
+@pytest.fixture(autouse=True)
+def serving_elsewhere(monkeypatch):
+    """The host serves some other release unless a test says otherwise."""
+    monkeypatch.setattr(release_dist, "serving_build", lambda url: "forge-live")
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
@@ -59,7 +67,7 @@ def test_an_unchanged_web_app_is_copied_from_the_previous_release(releases):
     previous, new = release("nine", first), release("ten")
     build(previous)
 
-    assert "dist copied from nine" in release_dist.place(new, previous)
+    assert "dist copied from nine" in release_dist.place(new, previous, health_url=HEALTH)
 
     release_dist.check(new)
     assert (new / release_dist.DIST / "assets" / "app.js").read_text() == "x"
@@ -71,7 +79,7 @@ def test_an_empty_dist_folder_is_replaced_not_trusted(releases):
     build(previous)
     (new / release_dist.DIST).mkdir(parents=True)
 
-    release_dist.place(new, previous)
+    release_dist.place(new, previous, health_url=HEALTH)
 
     release_dist.check(new)
 
@@ -83,7 +91,7 @@ def test_a_changed_web_app_must_be_built(releases):
     build(previous)
 
     with pytest.raises(release_dist.DistError, match="web-next changed since nine"):
-        release_dist.place(new, previous)
+        release_dist.place(new, previous, health_url=HEALTH)
 
 
 def test_a_dist_just_built_is_kept(releases):
@@ -91,7 +99,8 @@ def test_a_dist_just_built_is_kept(releases):
     previous, new = release("nine", first), release("ten")
     build(new)
 
-    assert release_dist.place(new, previous, built=True) == "ten: built dist kept"
+    kept = release_dist.place(new, previous, health_url=HEALTH, built=True)
+    assert kept == "ten: built dist kept"
 
 
 def test_a_stale_dist_is_not_trusted_without_built(releases):
@@ -102,7 +111,7 @@ def test_a_stale_dist_is_not_trusted_without_built(releases):
     build(new)  # e.g. inherited by copying a release dir
 
     with pytest.raises(release_dist.DistError, match="web-next changed since nine"):
-        release_dist.place(new, previous)
+        release_dist.place(new, previous, health_url=HEALTH)
 
 
 @pytest.mark.parametrize("dirty", ["nine", "ten"])
@@ -113,7 +122,7 @@ def test_uncommitted_web_changes_are_refused(releases, dirty):
     (trees[dirty] / "web-next" / "app.ts").write_text("edited in place")
 
     with pytest.raises(release_dist.DistError, match="uncommitted web-next"):
-        release_dist.place(trees["ten"], trees["nine"])
+        release_dist.place(trees["ten"], trees["nine"], health_url=HEALTH)
 
 
 @pytest.mark.parametrize("state", ["missing", "no index", "empty assets"])
@@ -129,3 +138,37 @@ def test_check_refuses_a_release_without_its_web_app(releases, state, capsys):
 
     assert release_dist.main(["check", str(new)]) == 1
     assert "has no web app" in capsys.readouterr().err
+
+
+def test_the_serving_release_is_never_touched(releases, monkeypatch):
+    _, first, release = releases
+    previous, new = release("nine", first), release("ten")
+    build(previous)
+    monkeypatch.setattr(release_dist, "serving_build", lambda url: "ten")
+
+    with pytest.raises(release_dist.DistError, match="ten is the release this host is serving"):
+        release_dist.place(new, previous, health_url=HEALTH)
+    assert not (new / release_dist.DIST).exists()
+
+
+def test_a_release_a_process_runs_in_is_never_touched(releases):
+    _, first, release = releases
+    previous, new = release("nine", first), release("ten")
+    build(previous)
+    (new / "src").mkdir(exist_ok=True)
+    with subprocess.Popen(["sleep", "30"], cwd=new / "src") as running:
+        try:
+            with pytest.raises(release_dist.DistError, match=f"{running.pid}"):
+                release_dist.place(new, previous, health_url=HEALTH)
+        finally:
+            running.kill()
+
+
+def test_an_unreadable_health_refuses_everything(releases, monkeypatch):
+    _, first, release = releases
+    previous, new = release("nine", first), release("ten")
+    build(previous)
+    monkeypatch.undo()  # the real lookup, against a port nothing listens on
+
+    with pytest.raises(release_dist.DistError, match="refusing to touch any release"):
+        release_dist.place(new, previous, health_url=HEALTH)

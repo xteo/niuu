@@ -330,12 +330,21 @@ the pre-GO preflight runs it again (on the mini, the same test of `dist/index.ht
 non-empty `dist/assets` over ssh):
 
 ```bash
-python3 scripts/forge_release_dist.py place "$REL" --previous ~/.local/share/niuu/releases/<previous>
+python3 scripts/forge_release_dist.py place "$REL" --previous ~/.local/share/niuu/releases/<previous> \
+    --health-url http://127.0.0.1:8080/health          # add --built after a pnpm build here
 python3 scripts/forge_release_dist.py check "$REL"      # exit 1: do not write GO
 ```
 
 `place` copies the previous release's dist only when `web-next` is unchanged between the two
-commits; if it changed, it fails and asks for the build. Promotion ten (2026-10-31) was
+commits; if it changed, it fails and asks for the build. It keeps an existing dist only with
+`--built`, and refuses a release with uncommitted `web-next` changes.
+
+**Tooling is never exercised against the release a host is serving.** Try a script on a
+scratch copy or on a staged, non-serving release. `place` enforces this, with no override:
+it refuses a target that `/health` names as the serving build, or that a running process
+has as its working directory, and it refuses everything when `/health` cannot be read. On
+2026-10-31 a test run of `place` replaced the web dist of Thor's serving release (with
+identical files); that is why the guard exists. Promotion ten (2026-10-31) was
 staged with an empty dist; the smoke's `web /` check caught it (404) and the cutover rolled
 back. That smoke check stays as the last line of defence.
 
