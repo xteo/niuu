@@ -43,7 +43,7 @@ def test_a_lane_forge_calls_idle_is_busy_while_its_train_runs():
 
 def test_a_running_tool_command_makes_a_lane_busy():
     reasons, _ = lane_busy.lane_reasons("idle", "400", lane_busy.parse_ps(PS))
-    assert reasons and reasons[0].startswith("tool command running")
+    assert reasons and reasons[0].startswith("pid 401, 00:10, tool command:")
 
 
 def test_a_lane_not_idle_in_forge_is_busy():
@@ -85,3 +85,44 @@ class _Json(io.BytesIO):
 class _Done:
     def __init__(self, stdout):
         self.stdout = stdout
+
+
+WRAP = (
+    "/bin/zsh -c source /Users/x/.claude/shell-snapshots/s.sh 2>/dev/null || true"
+    " && eval '{}' < /dev/null && pwd -P >| /tmp/claude-1-cwd"
+)
+POLLING = """\
+  600     1 05:00 claude --resume
+  601   600 04:56:24 {wait}
+  602   601 00:06 sleep 15
+  610   600 02:35:33 {then}
+  611   610 00:04 sleep 30
+""".format(
+    wait=WRAP.format('until ! pgrep -f "lane LEX-1715-device" >/dev/null; do sleep 15; done'),
+    then=WRAP.format("until grep -q RESULT: /tmp/qa.log; do sleep 30; done; ./tag-release.sh"),
+)
+
+
+def test_blocking_shells_are_named_with_pid_age_command_and_what_they_wait_on():
+    reasons, _ = lane_busy.lane_reasons("idle", "600", lane_busy.parse_ps(POLLING))
+
+    assert reasons == [
+        'pid 601, 04:56:24, polling loop, only waiting: until ! pgrep -f "lane LEX-1715-device"'
+        " >/dev/null; do sleep 15; done (now: sleep 15)",
+        "pid 610, 02:35:33, polling loop, then runs: ./tag-release.sh: until grep -q RESULT:"
+        " /tmp/qa.log; do sleep 30; done; ./tag-release.sh (now: sleep 30)",
+    ]
+
+
+def test_a_shell_that_only_names_a_train_is_not_a_train():
+    ps = "  700     1 01:00 claude\n  701   700 00:30 {}\n  702   701 00:01 sleep 15\n".format(
+        WRAP.format("until ! pgrep -f qa.sh; do sleep 15; done")
+    )
+    reasons, _ = lane_busy.lane_reasons("idle", "700", lane_busy.parse_ps(ps))
+
+    assert len(reasons) == 1 and reasons[0].startswith("pid 701, 00:30, polling loop")
+
+
+def test_quotes_inside_the_agent_command_are_restored():
+    cmd = WRAP.format("grep -E '\"'\"'a|b'\"'\"' log")
+    assert lane_busy.agent_command(cmd) == "grep -E 'a|b' log"

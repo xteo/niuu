@@ -225,6 +225,22 @@ ssh -n xteo@mini-m6 'python3 ~/.local/share/niuu-forge/lane_busy.py \
   http://100.92.69.62:8080 $HOME/.local/share/niuu-forge/tools/bin/tmux'           # m6
 ```
 
+Each reason names one process, so whoever runs the window can clear it at once:
+`pid 601, 04:56:24, polling loop, only waiting: until ! pgrep -f "…"; do sleep 15; done
+(now: sleep 15)`.
+- **The command** is the one the agent ran, without Claude Code's shell wrapper.
+- **"Polling loop, only waiting"** is a loop that does nothing but wait (`until|while …;
+  do sleep N; done`). Stopping it loses only that wait.
+- **"Polling loop, then runs: …"** carries a follow-up step, for example tagging a release
+  once a log shows its result. Stopping it would skip that step, so the gate never ignores
+  either kind by itself: the lane, or the operator, decides.
+- A shell that only mentions a train (`pgrep -f qa.sh`) is not a train; the train is the
+  process that runs it.
+
+On 2026-10-31 two such loops held the mini's window for 40 minutes: a self-matching
+`pgrep -f` loop that could never end, and two loops waiting for `RESULT:` in a qa log
+that would never come.
+
 How the drivers use it:
 
 - A **host switch that stops lanes** (m6) waits until the check passes twice, 20 s

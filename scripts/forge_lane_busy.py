@@ -35,10 +35,47 @@ def parse_ps(text: str) -> dict[str, tuple[str, str, str]]:
     return procs
 
 
+# Claude Code runs a tool command as ``… && eval 'COMMAND' < /dev/null && pwd -P >| …``,
+# with single quotes inside COMMAND written as '"'"'.
+_EVAL = re.compile(r"\beval '(?P<cmd>.*)' < /dev/null && pwd -P", re.S)
+# A loop that only waits: ``until|while CONDITION; do sleep N; done``, maybe followed by more.
+_POLL = re.compile(
+    r"^(?:until|while)\b.*?;\s*do\s+sleep\s+\S+\s*;?\s*done\b\s*;?\s*(?P<after>.*)$", re.S
+)
+
+
+def agent_command(cmd: str) -> str:
+    """The command the agent ran, without the shell wrapper its harness adds."""
+    match = _EVAL.search(cmd)
+    text = match.group("cmd").replace("'\"'\"'", "'") if match else cmd
+    return " ".join(text.split())
+
+
+def describe_tool_command(
+    pid: str, procs: dict[str, tuple[str, str, str]], kids: dict[str, list[str]]
+) -> str:
+    """A blocking tool command, named so an operator can stop it without guessing."""
+    _, elapsed, cmd = procs[pid]
+    command = agent_command(cmd)
+    now = ", ".join(procs[kid][2][:40] for kid in kids.get(pid, [])) or "nothing"
+    poll = _POLL.match(command)
+    if poll is None:
+        kind = "tool command"
+    elif poll.group("after").strip():
+        kind = f"polling loop, then runs: {poll.group('after').strip()[:80]}"
+    else:
+        kind = "polling loop, only waiting"
+    return f"pid {pid}, {elapsed}, {kind}: {command[:160]} (now: {now})"
+
+
 def lane_reasons(
     state: str | None, pane_pid: str | None, procs: dict[str, tuple[str, str, str]]
 ) -> tuple[list[str], set[str]]:
-    """Why one lane is busy (empty when it may be restarted), and the pids in its pane."""
+    """Why one lane is busy (empty when it may be restarted), and the pids in its pane.
+
+    One reason per blocking process: a train (a running process of the train, not a
+    shell that only names one) or a tool command, with its pid, age and command.
+    """
     kids: dict[str, list[str]] = {}
     for pid, (ppid, _, _) in procs.items():
         kids.setdefault(ppid, []).append(pid)
@@ -52,13 +89,17 @@ def lane_reasons(
     reasons = [] if state == "idle" else [f"forge activity {state}"]
     pids: set[str] = set()
     for child in kids.get(pane_pid, []) if pane_pid else []:
-        cmd, sub = procs[child][2], tree(child)
+        sub = tree(child)
         pids.update([child, *sub])
-        trains = [procs[p][2][:80] for p in [child, *sub] if TRAIN.search(procs[p][2])]
-        if trains:
-            reasons.append("train: " + trains[0])
-        elif TOOL_SHELL.search(cmd):
-            reasons.append(f"tool command running {procs[child][1]}: {cmd[:80]}")
+        for pid in [child, *sub]:
+            cmd = procs[pid][2]
+            if TRAIN.search(cmd) and not TOOL_SHELL.search(cmd):
+                reasons.append(f"train: pid {pid}, {procs[pid][1]}: {cmd[:120]}")
+        for pid in [child, *sub]:
+            if TOOL_SHELL.search(procs[pid][2]) and (
+                pid == child or not TOOL_SHELL.search(procs[procs[pid][0]][2])
+            ):
+                reasons.append(describe_tool_command(pid, procs, kids))
     return reasons, pids
 
 
