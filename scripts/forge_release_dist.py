@@ -13,9 +13,10 @@ back. So:
     When it changed, fails: build it. Either release having uncommitted web-next
     changes fails too: its dist would match neither commit.
     ``place`` never touches the release the host is serving: it refuses a target
-    whose name is the build ``--health-url`` reports, or that a running process has
-    as its working directory, and refuses when the health cannot be read. There is
-    no override: try tooling on a scratch copy or a staged, non-serving release.
+    whose name is the build ``--health-url`` reports, or that one of this user's
+    running processes has as its working directory, and refuses when the health
+    cannot be read. There is no override: try tooling on a scratch copy or a staged,
+    non-serving release.
 ``check RELEASE``
     Fails unless the dist has ``index.html`` and a non-empty ``assets`` folder. Run
     it at the end of staging and again in the pre-GO preflight.
@@ -73,19 +74,24 @@ def serving_build(health_url: str) -> str:
     opener = build_opener(ProxyHandler({}))
     try:
         with opener.open(health_url, timeout=10) as response:
-            build = json.load(response).get("build")
+            payload = json.load(response)
     except (URLError, OSError, ValueError) as exc:
         raise DistError(
             f"cannot read the serving build from {health_url} ({exc}); "
             "refusing to touch any release"
         ) from None
+    build = payload.get("build") if isinstance(payload, dict) else None
     if not isinstance(build, str) or not build:
         raise DistError(f"{health_url} names no build; refusing to touch any release")
     return build
 
 
 def _processes_in(release: Path, proc: Path = Path("/proc")) -> list[int]:
-    """Running processes whose working directory is inside ``release``."""
+    """This user's running processes whose working directory is inside ``release``.
+
+    Another user's processes cannot be read; the serving build from ``/health`` is the
+    check that covers a Forge run by a different service user.
+    """
     root = release.resolve()
     found = []
     for entry in proc.glob("[0-9]*"):

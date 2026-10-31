@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import subprocess
 from pathlib import Path
 
@@ -172,3 +173,24 @@ def test_an_unreadable_health_refuses_everything(releases, monkeypatch):
 
     with pytest.raises(release_dist.DistError, match="refusing to touch any release"):
         release_dist.place(new, previous, health_url=HEALTH)
+
+
+@pytest.mark.parametrize("body", [b"[]", b'"ok"', b"{}"])
+def test_a_health_without_a_build_refuses_everything(monkeypatch, body):
+    monkeypatch.undo()
+
+    class Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, url, timeout):
+            return Answer(body)
+
+    monkeypatch.setattr(release_dist, "build_opener", lambda *handlers: Opener())
+
+    with pytest.raises(release_dist.DistError, match="names no build"):
+        release_dist.serving_build(HEALTH)

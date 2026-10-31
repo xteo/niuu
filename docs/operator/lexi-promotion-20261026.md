@@ -341,8 +341,8 @@ commits; if it changed, it fails and asks for the build. It keeps an existing di
 
 **Tooling is never exercised against the release a host is serving.** Try a script on a
 scratch copy or on a staged, non-serving release. `place` enforces this, with no override:
-it refuses a target that `/health` names as the serving build, or that a running process
-has as its working directory, and it refuses everything when `/health` cannot be read. On
+it refuses a target that `/health` names as the serving build, or that one of this user's
+running processes has as its working directory, and it refuses everything when `/health` cannot be read. On
 2026-10-31 a test run of `place` replaced the web dist of Thor's serving release (with
 identical files); that is why the guard exists. Promotion ten (2026-10-31) was
 staged with an empty dist; the smoke's `web /` check caught it (404) and the cutover rolled
