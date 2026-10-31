@@ -104,5 +104,5 @@ The backup taken before the first enable is
 - **2026-10-31 12:26 UTC: enabled** (Thor, `forge-names-39ab05da`), as a config change
   and an API restart; every session was preserved. The first attempt at 12:22 was rolled
   back by its own check, which treated Spark's missing feed as a failure.
-- **Test push, 12:29 UTC:** "Forge push is live" to Damien's iPhone. APNs accepted it
+- **Test push, 12:27 UTC:** "Forge push is live" to Damien's iPhone. APNs accepted it
   (production, one alert token).
