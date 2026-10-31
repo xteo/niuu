@@ -323,6 +323,22 @@ env -i PATH=$HOME/.local/share/pnpm:$HOME/.nvm/versions/node/v22.22.1/bin:$HOME/
 Use `env -i` with an allow-list. A shell on this box carries a live session's
 `SKULD__*`, `PYTHONPATH` and production `DATABASE__*` variables.
 
+**Every release carries its web app.** The API serves it from the release's own
+`web-next/apps/niuu/dist`. When `web-next` is unchanged since the previous release, the
+build may be skipped, but the dist must still be placed. Staging ends with the check, and
+the pre-GO preflight runs it again (on the mini, the same test of `dist/index.html` and a
+non-empty `dist/assets` over ssh):
+
+```bash
+python3 scripts/forge_release_dist.py place "$REL" --previous ~/.local/share/niuu/releases/<previous>
+python3 scripts/forge_release_dist.py check "$REL"      # exit 1: do not write GO
+```
+
+`place` copies the previous release's dist only when `web-next` is unchanged between the two
+commits; if it changed, it fails and asks for the build. Promotion ten (2026-10-31) was
+staged with an empty dist; the smoke's `web /` check caught it (404) and the cutover rolled
+back. That smoke check stays as the last line of defence.
+
 Drill results: `uv sync --frozen --extra dev` took 0.5 s (warm uv cache) and gave
 CPython 3.13.13 with the editable install pointing at the release's own `src`.
 `pnpm install && pnpm build` took 32 s, producing 28 MB in
