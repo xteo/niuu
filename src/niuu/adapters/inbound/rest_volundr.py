@@ -740,6 +740,8 @@ async def _local_session_instance(
     service: InstanceService,
     principal: Principal,
     request: Request,
+    *,
+    honour_selection: bool = True,
 ) -> RegisteredInstance:
     """Resolve this shell's local runtime, never a default/remote guild member.
 
@@ -757,7 +759,7 @@ async def _local_session_instance(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Local sessions require exactly one visible, enabled embedded Forge runtime",
         )
-    selected = request.query_params.get("instance_id")
+    selected = request.query_params.get("instance_id") if honour_selection else None
     if selected and selected != local[0].id:
         raise HTTPException(422, "scope=local cannot select a different guild instance")
     return local[0]
@@ -3827,7 +3829,7 @@ def create_volundr_router(
 
     async def _sender_attestation(request: Request, principal: Principal) -> dict[str, Any]:
         """Who a session principal is, from its own (local) node, for a relay."""
-        local = await _local_session_instance(service, principal, request)
+        local = await _local_session_instance(service, principal, request, honour_selection=False)
         response = await _request_remote(
             local,
             request,
@@ -3878,7 +3880,8 @@ def create_volundr_router(
         if body.get("request_id"):
             relay_body["request_id"] = body["request_id"]
         path = f"/sessions/{session_id}/messages/relayed"
-        local = await _local_session_instance(service, principal, request)
+        # ``instance_id`` names the target's node here, not this one.
+        local = await _local_session_instance(service, principal, request, honour_selection=False)
         # The owner's registry, not the session's local-only view: the relay carries
         # no session credential to these nodes, only the attested sender.
         registry = await service.list_visible(
@@ -3889,6 +3892,16 @@ def create_volundr_router(
             for instance in registry
             if instance.id != local.id and not _uses_embedded_transport(instance)
         ]
+        selected = request.query_params.get("instance_id")
+        if selected:
+            # The caller named the owning node: ask it alone, and say so if it is unknown.
+            remotes = [instance for instance in remotes if instance.id == selected]
+            if not remotes:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    f"Instance {selected} is not a node of this Guild (instance_id names the "
+                    "node that owns the session, from list_sessions)",
+                )
         for instance in remotes:
             probe = await _request_remote(
                 instance,

@@ -90,6 +90,40 @@ class TestRelayToAnotherNode:
         }
 
     @respx.mock
+    async def test_naming_the_owning_node_relays_there(self):
+        """The tool's instance_id names the target's node; it is not a local-scope clash."""
+        client, _, auth = await _guild()
+        relayed = respx.post(f"{REMOTE}/api/v1/forge/sessions/{TARGET}/messages/relayed").mock(
+            return_value=Response(200, json=DELIVERED)
+        )
+        respx.get(f"{REMOTE}/api/v1/forge/sessions/{TARGET}").mock(
+            return_value=Response(200, json={"id": TARGET})
+        )
+
+        response = client.post(
+            f"/api/v1/forge/sessions/{TARGET}/messages",
+            params={"instance_id": "remote"},
+            json={"content": "hi"},
+            headers=auth,
+        )
+
+        assert response.status_code == 200 and response.json()["delivery"] == "delivered"
+        assert relayed.called
+
+    async def test_naming_an_unknown_node_is_a_clear_404(self):
+        client, _, auth = await _guild()
+
+        response = client.post(
+            f"/api/v1/forge/sessions/{TARGET}/messages",
+            params={"instance_id": "elsewhere"},
+            json={"content": "hi"},
+            headers=auth,
+        )
+
+        assert response.status_code == 404
+        assert "elsewhere" in response.json()["detail"]
+
+    @respx.mock
     async def test_a_session_no_registry_node_knows_goes_to_the_hosts_guild(self):
         membership = GuildMembership(guild_url=GUILD, instance=None)
         client, _, auth = await _guild(membership=membership, with_remote=False)
