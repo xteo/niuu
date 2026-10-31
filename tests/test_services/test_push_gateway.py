@@ -1611,3 +1611,44 @@ class TestSettings:
 
     def test_alert_settings_type(self):
         assert isinstance(alert_settings(), AlertSettings)
+
+
+class TestEnvironmentCounts:
+    """Each token goes to its own APNs environment, and the status counts both."""
+
+    async def test_sandbox_and_production_tokens_are_sent_and_counted_apart(self, harness):
+        harness.devices.add(
+            device("prod-1"),
+            device("sand-1", environment=PushEnvironment.SANDBOX),
+        )
+        harness.feed.add(guild_notification("n-1", kind="attention", source="system"))
+
+        await harness.gateway.run_once()
+
+        alerts = harness.apns.of_type("alert")
+        assert {(push.token, push.environment) for push in alerts} == {
+            ("prod-1", PushEnvironment.PRODUCTION),
+            ("sand-1", PushEnvironment.SANDBOX),
+        }
+        by_env = harness.gateway.status()["apns_by_environment"]
+        assert by_env["production"]["accepted"] >= 1
+        assert by_env["sandbox"]["accepted"] >= 1
+
+    async def test_tokens_are_counted_per_environment_and_kind(self, harness):
+        harness.devices.add(
+            device("prod-1"),
+            device("sand-1", environment=PushEnvironment.SANDBOX),
+        )
+
+        counts = await harness.gateway.tokens_by_environment()
+
+        assert counts == {"production": {"alert": 1}, "sandbox": {"alert": 1}}
+
+    def test_assumed_environments_are_counted_by_reason(self, harness):
+        harness.gateway.note_environment_assumed("missing")
+        harness.gateway.note_environment_assumed("unknown")
+        harness.gateway.note_environment_assumed("unknown")
+
+        status = harness.gateway.status()
+        assert status["registrations_environment_missing"] == 1
+        assert status["registrations_environment_unknown"] == 2

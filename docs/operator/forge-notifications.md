@@ -682,10 +682,14 @@ the gateway node directly, with the caller's normal credentials:
   running Live Activity (`activity_id` names it, and a newer token for the same activity
   replaces the earlier one); `live_activity_start` is the push-to-start token; `widget`
   is the widget extension's token. Omitted, it is `alert`.
-- `environment` selects the APNs host. A development install holds **sandbox** tokens;
-  TestFlight and App Store installs hold **production** tokens. Omitted, it is
-  `production`. A token sent to the wrong host is refused by APNs as `BadDeviceToken`
-  and deleted.
+- `environment` selects the APNs host for that token, per registration.
+  - A development-signed install holds **sandbox** tokens; TestFlight and App Store
+    installs hold **production** tokens. The app derives it from its signing (LEX-1734).
+  - `development`, the entitlement's own word, also means sandbox.
+  - Omitted or unknown, the registration is still stored, as `production`, with a warning
+    in the log. The gateway's status counts it (`registrations_environment_missing`,
+    `registrations_environment_unknown`), so a build that forgets it is visible.
+  - A token sent to the wrong host is refused by APNs as `BadDeviceToken` and deleted.
 - `app_bundle_id` is the APNs topic base; without it the gateway uses `push.apns.bundle_id`.
 - `201` with the stored registration. `503` when the node sends no pushes
   (`push.enabled` is off), so a client can tell the token is not in use there.

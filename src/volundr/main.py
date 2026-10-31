@@ -1596,6 +1596,9 @@ def create_app(
                 external_session_service=external_session_service,
                 device_repository=device_repository,
                 on_device_registered=on_device_registered,
+                on_environment_assumed=(
+                    push_gateway.note_environment_assumed if push_gateway is not None else None
+                ),
                 prefix="/api/v1/forge",
                 server_public_host=settings.server_public_host,
                 session_status_host=configured_host(settings),

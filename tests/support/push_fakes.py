@@ -268,6 +268,15 @@ class FakeDeviceRepository(PushTokenRegistry):
         item.last_push_at = None
         self.owed.add(device_id)
 
+    async def count_by_environment(self) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, int]] = {}
+        for item in self.devices.values():
+            env = (item.environment or PushEnvironment.PRODUCTION).value
+            counts.setdefault(env, {})[item.kind.value] = (
+                counts.get(env, {}).get(item.kind.value, 0) + 1
+            )
+        return counts
+
     async def claim_owed_pushes(
         self, kind: PushTokenKind, *, min_interval_seconds: float
     ) -> list[DeviceToken]:

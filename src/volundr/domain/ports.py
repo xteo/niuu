@@ -790,6 +790,10 @@ class PushTokenRegistry(DeviceTokenRepository):
     ) -> list[DeviceToken]:
         """Claim every token of ``kind`` that owes a push and whose interval elapsed."""
 
+    @abstractmethod
+    async def count_by_environment(self) -> dict[str, dict[str, int]]:
+        """Registered tokens per APNs environment and kind (no tokens, only counts)."""
+
 
 class NotificationChannel(ABC):
     """Outbound port for delivering a push to a user's devices.

@@ -115,12 +115,42 @@ class TestDeviceEndpoints:
         assert resp.status_code == 201
         (device,) = device_repo.devices.values()
         assert device.environment is PushEnvironment.SANDBOX
-        bad = client.post(
-            "/api/v1/forge/devices",
-            json={"platform": "ios", "token": "t", "environment": "staging"},
-            headers=self._AUTH,
+
+    @pytest.mark.parametrize(
+        ("sent", "stored", "assumed"),
+        [
+            ("development", "sandbox", []),
+            ("Production", "production", []),
+            (None, "production", ["missing"]),
+            ("staging", "production", ["unknown"]),
+        ],
+    )
+    def test_the_environment_is_normalised_and_an_assumed_one_is_counted(
+        self, repository, pod_manager, stats_repository, pricing_provider, sent, stored, assumed
+    ):
+        """A missing or unknown environment is stored as production and counted, not lost."""
+        noted: list[str] = []
+        device_repo = FakeDeviceRepository(Clock())
+        app = FastAPI()
+        app.state.identity = _StubIdentity()
+        session_service = SessionService(repository=repository, pod_manager=pod_manager)
+        app.include_router(
+            create_router(
+                session_service=session_service,
+                stats_service=StatsService(stats_repository, session_service),
+                pricing_provider=pricing_provider,
+                device_repository=device_repo,
+                on_environment_assumed=noted.append,
+                session_participant_service=make_session_participant_service(session_service),
+            )
         )
-        assert bad.status_code == 422
+        body = {"platform": "ios", "token": "tok-1"} | ({"environment": sent} if sent else {})
+
+        resp = TestClient(app).post("/api/v1/forge/devices", json=body, headers=self._AUTH)
+
+        assert resp.status_code == 201
+        assert resp.json()["environment"] == stored
+        assert noted == assumed
 
     def test_register_rejects_bad_platform(self, client):
         resp = client.post(
@@ -198,9 +228,7 @@ class TestDeviceEndpoints:
         second = client.get("/api/v1/forge/devices", headers={"x-auth-user-id": "user-2"}).json()
         assert [d["token"] for d in second] == ["tok-1"]
 
-    @pytest.mark.parametrize(
-        "field", [{"kind": "voip"}, {"environment": "staging"}, {"activity_id": "x" * 201}]
-    )
+    @pytest.mark.parametrize("field", [{"kind": "voip"}, {"activity_id": "x" * 201}])
     def test_register_rejects_unknown_values(self, client, field):
         resp = client.post(
             "/api/v1/forge/devices",

@@ -72,6 +72,10 @@ def test_status_reports_the_gateway(rig):
     assert body["unreachable_nodes"] == {}
     assert body["alerts_sent"] == 0 and body["ticks"] == 1
     assert body["alerts_enabled"] is True
+    # Counts only, per APNs environment and kind; never a token.
+    assert body["tokens_by_environment"] == {}
+    assert body["apns_by_environment"] == {}
+    assert body["registrations_environment_missing"] == 0
 
 
 def test_status_needs_a_caller(rig):

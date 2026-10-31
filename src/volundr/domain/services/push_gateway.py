@@ -224,6 +224,12 @@ class PushGatewayStats:
     feedless_rechecks: int = 0
     loop_errors: int = 0
     stream_reconnects: int = 0
+    #: APNs answers per environment of the token: {"production": {"accepted": n, ...}}.
+    apns_by_environment: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: Registrations stored as production without saying so: no environment, or an
+    #: unknown one. Each is also logged as a warning.
+    registrations_environment_missing: int = 0
+    registrations_environment_unknown: int = 0
     last_tick_at: datetime | None = None
     last_error: str = ""
 
@@ -939,6 +945,9 @@ class PushGateway:
     async def _send(self, device: DeviceToken, push: ApnsPush) -> ApnsResult:
         """Send one push; a token APNs reports as dead is deleted."""
         result = await self._apns.send(push)
+        counts = self.stats.apns_by_environment.setdefault(push.environment.value, {})
+        outcome = "accepted" if result.accepted else "rejected"
+        counts[outcome] = counts.get(outcome, 0) + 1
         if result.accepted:
             return result
         self.stats.apns_rejections += 1
@@ -1061,6 +1070,17 @@ class PushGateway:
             ),
             expiration=int(now.timestamp()) + alerts.expiration_seconds,
         )
+
+    def note_environment_assumed(self, reason: str) -> None:
+        """Count a registration stored as production without a known environment."""
+        if reason == "missing":
+            self.stats.registrations_environment_missing += 1
+        else:
+            self.stats.registrations_environment_unknown += 1
+
+    async def tokens_by_environment(self) -> dict[str, dict[str, int]]:
+        """Registered tokens per APNs environment and kind: {"sandbox": {"alert": 1}}."""
+        return await self._devices.count_by_environment()
 
     def status(self) -> dict[str, Any]:
         """What the gateway has done since it started (no tokens, no secrets)."""

@@ -256,3 +256,18 @@ def test_device_token_defaults_to_an_alert_token_of_no_stated_environment():
     assert token.kind is PushTokenKind.ALERT
     assert token.environment is None
     assert token.activity_id is None and token.last_push_at is None
+
+
+async def test_count_by_environment_groups_environment_and_kind(repository, mock_pool):
+    mock_pool.fetch = AsyncMock(
+        return_value=[
+            {"environment": "production", "kind": "alert", "n": 1},
+            {"environment": "production", "kind": "live_activity", "n": 3},
+            {"environment": "sandbox", "kind": "alert", "n": 1},
+        ]
+    )
+
+    counts = await repository.count_by_environment()
+
+    assert counts == {"production": {"alert": 1, "live_activity": 3}, "sandbox": {"alert": 1}}
+    assert "GROUP BY" in mock_pool.fetch.call_args[0][0]

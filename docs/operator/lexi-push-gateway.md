@@ -68,6 +68,14 @@ curl -s http://127.0.0.1:8080/api/v1/forge/push/status | python3 -m json.tool
   reads the Guild.
 - `nodes` holds the gateway's position per node. The counters cover alerts sent,
   suppressed and failed, and Live Activity, widget and background pushes.
+- Per APNs environment (each token goes to the host of its own environment):
+  - `tokens_by_environment`: registered tokens, e.g.
+    `{"production": {"alert": 1, "live_activity": 3}, "sandbox": {"alert": 1}}`;
+  - `apns_by_environment`: APNs answers since start, e.g.
+    `{"production": {"accepted": 12}, "sandbox": {"accepted": 1, "rejected": 1}}`;
+  - `registrations_environment_missing` and `registrations_environment_unknown`:
+    registrations stored as production because they did not say which environment.
+  All of these are counts only; no token is ever shown.
 - `POST /api/v1/forge/push/test {"kind": "alert", "title": "…", "body": "…"}` pushes once
   to the caller's own tokens.
 

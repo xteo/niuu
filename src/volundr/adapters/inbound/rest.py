@@ -1055,12 +1055,14 @@ class DeviceRegistration(BaseModel):
         default=PushTokenKind.ALERT,
         description="alert, live_activity, live_activity_start or widget",
     )
-    environment: PushEnvironment | None = Field(
+    environment: str | None = Field(
         default=None,
+        max_length=40,
         description=(
-            "sandbox for a development install, production otherwise; omitted uses the "
-            "registry's default (the push channel's for integrations, production for "
-            "the device_tokens table)"
+            "The APNs environment of the token: sandbox for a development-signed install, "
+            "production otherwise ('development', the entitlement's own word, means sandbox). "
+            "Omitted or unknown, the token is stored as the registry's default (production "
+            "for the device_tokens table), with a warning that the push status counts"
         ),
     )
     activity_id: str | None = Field(
@@ -1068,6 +1070,42 @@ class DeviceRegistration(BaseModel):
         max_length=200,
         description="The Live Activity a live_activity token updates",
     )
+
+
+#: Environment names a registration may use, with Apple's entitlement word for sandbox.
+_ENVIRONMENT_ALIASES = {
+    "sandbox": PushEnvironment.SANDBOX,
+    "development": PushEnvironment.SANDBOX,
+    "production": PushEnvironment.PRODUCTION,
+}
+
+
+def _registered_environment(
+    value: str | None,
+    kind: PushTokenKind,
+    owner_id: str,
+    on_assumed: Callable[[str], None] | None,
+) -> PushEnvironment | None:
+    """The APNs environment to store for a registration.
+
+    A missing or unknown value is not refused (the token would be lost): it is stored as
+    the registry's default (production for the device_tokens table), logged as a warning
+    and counted on the push gateway's status, so a build that forgets it is visible.
+    """
+    if value is not None and value.strip().lower() in _ENVIRONMENT_ALIASES:
+        return _ENVIRONMENT_ALIASES[value.strip().lower()]
+    reason = "missing" if value is None else "unknown"
+    logger.warning(
+        "Push registration of a %s token for owner %s has %s environment (%r); stored as the "
+        "registry's default (production). The app should send sandbox or production.",
+        kind.value,
+        _sanitize_log(owner_id),
+        "no" if value is None else "an unknown",
+        _sanitize_log(value or ""),
+    )
+    if on_assumed is not None:
+        on_assumed(reason)
+    return None
 
 
 class DeviceResponse(BaseModel):
@@ -1982,6 +2020,7 @@ def create_router(
     external_session_service: ExternalSessionService | None = None,
     device_repository: DeviceTokenRepository | None = None,
     on_device_registered: Callable[[str], Awaitable[object]] | None = None,
+    on_environment_assumed: Callable[[str], None] | None = None,
     prefix: str = "/api/v1/forge",
     server_public_host: str = "127.0.0.1",
     openshell_internal_gateway_url: str = DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
@@ -3288,7 +3327,9 @@ def create_router(
             token=data.token,
             app_bundle_id=data.app_bundle_id,
             kind=data.kind,
-            environment=data.environment,
+            environment=_registered_environment(
+                data.environment, data.kind, principal.user_id, on_environment_assumed
+            ),
             # Only a Live Activity update token belongs to one activity.
             activity_id=data.activity_id if data.kind is PushTokenKind.LIVE_ACTIVITY else None,
         )

@@ -70,7 +70,7 @@ def create_push_router(gateway: PushGateway, *, prefix: str = "/api/v1/forge") -
     @router.get("/push/status")
     async def push_status(_principal: Principal = Depends(extract_principal)) -> dict[str, Any]:
         """Counters since start, the nodes being read and the last error."""
-        return gateway.status()
+        return {**gateway.status(), "tokens_by_environment": await gateway.tokens_by_environment()}
 
     @router.post("/push/test", response_model=PushTestResponse)
     async def send_test_push(

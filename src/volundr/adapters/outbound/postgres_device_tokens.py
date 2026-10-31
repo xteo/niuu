@@ -136,6 +136,15 @@ class PostgresDeviceTokenRepository(PushTokenRegistry):
         )
         return [self._row_to_device(row) for row in rows]
 
+    async def count_by_environment(self) -> dict[str, dict[str, int]]:
+        rows = await self._pool.fetch(
+            "SELECT environment, kind, count(*) AS n FROM device_tokens GROUP BY 1, 2"
+        )
+        counts: dict[str, dict[str, int]] = {}
+        for row in rows:
+            counts.setdefault(row["environment"], {})[row["kind"]] = row["n"]
+        return counts
+
     @staticmethod
     def _row_to_device(row: asyncpg.Record) -> DeviceToken:
         created_at = row["created_at"]
