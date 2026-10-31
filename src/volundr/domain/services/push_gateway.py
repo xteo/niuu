@@ -108,7 +108,7 @@ class AlertSettings:
     min_severity: NotificationSeverity
     #: Empty means any source.
     sources: frozenset[str]
-    time_sensitive_kinds: frozenset[str]
+    attention_kinds: frozenset[str]
     low_priority_kinds: frozenset[str]
     body_chars: int
     expiration_seconds: int
@@ -659,11 +659,8 @@ class PushGateway:
         self, notification: GuildNotification, device: DeviceToken, now: datetime
     ) -> ApnsPush:
         alerts = self._settings.alerts
-        level = (
-            InterruptionLevel.TIME_SENSITIVE
-            if notification.kind in alerts.time_sensitive_kinds
-            else InterruptionLevel.ACTIVE
-        )
+        attention = notification.kind in alerts.attention_kinds
+        level = InterruptionLevel.TIME_SENSITIVE if attention else InterruptionLevel.ACTIVE
         priority = (
             APNS_PRIORITY_POWER_SAVING
             if notification.kind in alerts.low_priority_kinds
@@ -691,6 +688,7 @@ class PushGateway:
             category=alerts.category,
             sound=alerts.sound,
             notification=notification,
+            attention=attention,
             image_url=absolute_url(base, notification.image_url),
             image_thumbnail_url=absolute_url(base, notification.image_thumbnail_url),
         )

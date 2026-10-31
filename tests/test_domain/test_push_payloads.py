@@ -501,3 +501,50 @@ class TestApnsPushAndResult:
 def test_shorten_collapses_whitespace_and_marks_the_cut():
     assert shorten("  a\n\nb   c ", 20) == "a b c"
     assert shorten("abcdefghij", 5) == "abcd…"
+
+
+class TestAttentionPayload:
+    """LEX-1186: what the app's notification service extension reads on attention pushes."""
+
+    def _payload(self, **overrides):
+        notification = GuildNotification.from_feed_item(
+            {
+                "id": "n-1",
+                "seq": 1,
+                "kind": "attention",
+                "title": "t",
+                "body": "b",
+                "instance_id": "inst-1",
+                "session_id": overrides.pop("session_id", "sess-1"),
+                "session_name": overrides.pop("session_name", "ios-fixes"),
+                "owner_id": "u",
+            }
+        )
+        return alert_payload(
+            title="t",
+            body="b",
+            deep_link="lexichat://activity/n-1",
+            interruption_level=InterruptionLevel.TIME_SENSITIVE,
+            category="FORGE_ACTIVITY",
+            sound="default",
+            notification=notification,
+            **overrides,
+        )
+
+    def test_an_attention_push_runs_the_extension_and_names_the_agent(self):
+        payload = self._payload(attention=True)
+        assert payload["aps"]["mutable-content"] == 1
+        assert payload["attention"] is True
+        assert payload["agent_id"] == "sess-1"
+        assert payload["agent_name"] == "ios-fixes"
+        assert payload["conversation_id"] == "inst-1:sess-1"
+
+    def test_an_attention_push_without_a_session_names_no_agent(self):
+        payload = self._payload(attention=True, session_id=None, session_name=None)
+        assert payload["attention"] is True
+        assert not {"agent_id", "agent_name", "conversation_id"} & set(payload)
+
+    def test_other_pushes_are_unchanged(self):
+        payload = self._payload()
+        assert "mutable-content" not in payload["aps"]
+        assert not {"attention", "agent_id", "agent_name", "conversation_id"} & set(payload)

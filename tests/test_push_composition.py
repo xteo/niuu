@@ -61,7 +61,7 @@ class TestDefaults:
             NotificationKind.ATTENTION,
             NotificationKind.ERROR,
         ]
-        assert gateway.alerts.time_sensitive_kinds == [
+        assert gateway.alerts.attention_kinds == [
             NotificationKind.ATTENTION,
             NotificationKind.DECISION,
             NotificationKind.ERROR,
@@ -182,7 +182,7 @@ class TestComposition:
                     "kinds": ["error"],
                     "sources": ["agent"],
                     "low_priority_kinds": ["info"],
-                    "time_sensitive_kinds": ["error"],
+                    "attention_kinds": ["error"],
                 },
                 live_activity={
                     "priority": 5,
@@ -198,7 +198,7 @@ class TestComposition:
         assert settings.alerts.kinds == frozenset({"error"})
         assert settings.alerts.sources == frozenset({"agent"})
         assert settings.alerts.low_priority_kinds == frozenset({"info"})
-        assert settings.alerts.time_sensitive_kinds == frozenset({"error"})
+        assert settings.alerts.attention_kinds == frozenset({"error"})
         assert settings.alerts.rate_limit.max_count == 30
         assert settings.live_activity.priority == 5
         assert settings.live_activity.start_enabled is True

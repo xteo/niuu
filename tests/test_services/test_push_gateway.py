@@ -380,6 +380,8 @@ class TestAlerts:
                 "sound": "default",
                 "category": "FORGE_ACTIVITY",
                 "thread-id": "sess-9",
+                # A decision needs the user: the notification service extension runs.
+                "mutable-content": 1,
             },
             "deepLink": (
                 "lexichat://activity/1a97554b-96b1-5fac-baa4-5bf53ba35d92"
@@ -389,6 +391,10 @@ class TestAlerts:
             "notification_id": "1a97554b-96b1-5fac-baa4-5bf53ba35d92",
             "instance_id": MINI,
             "kind": "decision",
+            "attention": True,
+            "agent_id": "sess-9",
+            "agent_name": "horde-coordinator",
+            "conversation_id": f"{MINI}:sess-9",
         }
         row = harness.deliveries.row("1a97554b-96b1-5fac-baa4-5bf53ba35d92", MINI)
         assert row.status is PushDeliveryStatus.SENT
@@ -416,6 +422,30 @@ class TestAlerts:
         assert (
             milestone.payload["deepLink"] == f"lexichat://activity/n-2?inst={THOR}&session=sess-1"
         )
+
+    async def test_only_attention_kinds_are_marked_for_the_extension(self, harness):
+        """LEX-1186: attention, decision and error run the NSE and are time-sensitive."""
+        harness.devices.add(device("alert-1"))
+        harness.feed.add(
+            guild_notification("n-1", kind="attention", source="system"),
+            guild_notification("n-2", seq=2, kind="error"),
+            guild_notification("n-3", seq=3, kind="milestone"),
+        )
+
+        await harness.gateway.run_once()
+
+        attention, error, milestone = harness.apns.of_type("alert")
+        for push in (attention, error):
+            assert push.payload["aps"]["interruption-level"] == "time-sensitive"
+            assert push.payload["aps"]["mutable-content"] == 1
+            assert push.payload["attention"] is True
+        assert attention.payload["conversation_id"] == f"{THOR}:sess-1"
+        for push in (milestone,):
+            assert push.payload["aps"]["interruption-level"] == "active"
+            assert "mutable-content" not in push.payload["aps"]
+            assert not {"attention", "agent_id", "agent_name", "conversation_id"} & set(
+                push.payload
+            )
 
     async def test_image_urls_are_absolute_on_the_public_origin(self, harness):
         harness.devices.add(device("alert-1"))

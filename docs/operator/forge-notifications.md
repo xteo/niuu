@@ -717,10 +717,21 @@ notification id, `apns-expiration` = now + `expiration_seconds`):
 
 `deepLink` carries only the query items that exist, and the id is percent-encoded.
 `subtitle` is the session name when the title does not already contain it.
-`interruption-level` is `time-sensitive` for `time_sensitive_kinds` (attention, decision,
-error by default) and `active` otherwise. `thread-id` and `session_id` are absent for a
-notification without a session. `mutable-content`, `image_url` and `image_thumbnail_url`
-appear only when the notification has an image and `public_api_url` is set; the URLs are
+`interruption-level` is `time-sensitive` only for `attention_kinds` (attention, decision
+and error by default: the kinds that need the user; a failure that stops work breaks
+through like a question) and `active` otherwise. An attention
+push also lets the app's notification service extension show the agent as the sender
+(LEX-1186). It carries:
+
+- `aps.mutable-content: 1` and `attention: true`;
+- `agent_id`, the session id;
+- `agent_name`, the session name;
+- `conversation_id`, `<instance_id>:<session_id>`.
+
+The agent keys are absent when the notification has no session; other kinds carry none
+of these keys. `thread-id` and `session_id` are absent for a notification without a
+session. `image_url` and `image_thumbnail_url` (with `mutable-content`) appear when the
+notification has an image and `public_api_url` is set; the URLs are
 the image route on that origin, routed to the node that holds the image. The alert does
 not wait for the node to copy the image: while the copy is in progress the URLs are
 already named, and the route answers 404 until the copy is stored (or for good, when the
@@ -966,7 +977,7 @@ push:
       kinds: [milestone, decision, attention, error]
       min_severity: info
       sources: []                  # empty = any
-      time_sensitive_kinds: [attention, decision, error]
+      attention_kinds: [attention, decision, error]   # time-sensitive + marked for the app's NSE
       low_priority_kinds: []       # apns-priority 5
       body_chars: 280
       expiration_seconds: 3600

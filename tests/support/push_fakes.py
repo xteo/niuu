@@ -421,7 +421,7 @@ def alert_settings(**overrides) -> AlertSettings:
         "kinds": frozenset({"milestone", "decision", "attention", "error"}),
         "min_severity": NotificationSeverity.INFO,
         "sources": frozenset(),
-        "time_sensitive_kinds": frozenset({"attention", "decision", "error"}),
+        "attention_kinds": frozenset({"attention", "decision", "error"}),
         "low_priority_kinds": frozenset(),
         "body_chars": 280,
         "expiration_seconds": 3600,

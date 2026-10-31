@@ -379,10 +379,17 @@ def alert_payload(
     sound: str,
     subtitle: str | None = None,
     notification: GuildNotification | None = None,
+    attention: bool = False,
     image_url: str | None = None,
     image_thumbnail_url: str | None = None,
 ) -> dict[str, Any]:
-    """The alert push: what iOS shows, plus the keys the app reads on a tap."""
+    """The alert push: what iOS shows, plus the keys the app reads on a tap.
+
+    An ``attention`` push (a kind that needs the user) also lets the app's notification
+    service extension run (``mutable-content``) and carries what it needs to show the
+    agent as the sender (LEX-1186): the ``attention`` marker, ``agent_id`` (the session),
+    ``agent_name`` and ``conversation_id`` (``<instance_id>:<session_id>``).
+    """
     alert: dict[str, Any] = {"title": title, "body": body}
     if subtitle:
         alert["subtitle"] = subtitle
@@ -403,6 +410,14 @@ def alert_payload(
     payload["notification_id"] = notification.id
     payload["instance_id"] = notification.instance_id
     payload["kind"] = notification.kind
+    if attention:
+        aps["mutable-content"] = 1
+        payload["attention"] = True
+        if notification.session_id:
+            payload["agent_id"] = notification.session_id
+            payload["conversation_id"] = f"{notification.instance_id}:{notification.session_id}"
+        if notification.session_name:
+            payload["agent_name"] = notification.session_name
     if image_url:
         # Lets a notification service extension attach the image before display.
         aps["mutable-content"] = 1

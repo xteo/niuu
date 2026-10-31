@@ -89,7 +89,7 @@ def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
             kinds=frozenset(kind.value for kind in alerts.kinds),
             min_severity=alerts.min_severity,
             sources=frozenset(source.value for source in alerts.sources),
-            time_sensitive_kinds=frozenset(kind.value for kind in alerts.time_sensitive_kinds),
+            attention_kinds=frozenset(kind.value for kind in alerts.attention_kinds),
             low_priority_kinds=frozenset(kind.value for kind in alerts.low_priority_kinds),
             body_chars=alerts.body_chars,
             expiration_seconds=alerts.expiration_seconds,

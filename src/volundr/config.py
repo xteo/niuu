@@ -906,13 +906,18 @@ class PushAlertsConfig(BaseModel):
     sources: list[NotificationSource] = Field(
         default_factory=list, description="Sources that alert; empty means any."
     )
-    time_sensitive_kinds: list[NotificationKind] = Field(
+    attention_kinds: list[NotificationKind] = Field(
         default_factory=lambda: [
             NotificationKind.ATTENTION,
             NotificationKind.DECISION,
             NotificationKind.ERROR,
         ],
-        description="Kinds sent with the time-sensitive interruption level; others are active.",
+        description=(
+            "Kinds that need the user (a failure that stops work breaks through like a "
+            "question). Only they are time-sensitive (others are active), and "
+            "only they carry mutable-content, the attention marker and the agent identity, so "
+            "the app's notification service extension runs on them (LEX-1186)."
+        ),
     )
     low_priority_kinds: list[NotificationKind] = Field(
         default_factory=list,
