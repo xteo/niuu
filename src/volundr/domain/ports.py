@@ -545,6 +545,10 @@ class SessionCapacity:
 class PodManager(ABC):
     """Port for managing session pods (Skuld, code-server, terminal)."""
 
+    async def active_session_ids(self) -> list[str]:
+        """Sessions this runtime holds a slot for. Runtimes without slots hold none."""
+        return []
+
     async def capacity(self) -> SessionCapacity | None:
         """The runtime's session capacity, or None when it has no fixed cap."""
         return None

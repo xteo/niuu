@@ -13,6 +13,8 @@ Constructor accepts plain kwargs (dynamic adapter pattern):
     sdk_port_start: 9100
     stop_timeout: 10
     state_file: "~/.niuu/forge-state.json"
+    tmux_socket_dir: ""   # Skuld's tmux socket dir; empty = /tmp/skuld-tmux-<uid>, the same
+                          # default Skuld uses. Set both if SKULD__TMUX_SOCKET_DIR moves it.
 """
 
 from __future__ import annotations
@@ -128,6 +130,41 @@ def _write_scoped_persona_source(workspace: Path, persona: str, yaml_text: str) 
     finally:
         os.close(directory_fd)
     return persona_dir / f"{persona}.yaml"
+
+
+#: How much of a survivor's command line its log line shows (the cut is said, never silent).
+_LOGGED_COMMAND_CHARS = 200
+
+
+def session_runtime_pids(session_id: str, proc: Path = Path("/proc")) -> dict[int, str]:
+    """This user's processes still running for a session, by pid, with their command.
+
+    Matched on the session-scoped names Skuld gives its runtime (the tmux socket and
+    session ``skuld-<id>``, the per-session directory ``/tmp/skuld-<uid>/<id>``), never on
+    the bare id, and never this process itself. Read from ``/proc`` (no shell, so a
+    pattern cannot match the command doing the looking).
+    """
+    markers = (f"skuld-{session_id}", f"/skuld-{os.getuid()}/{session_id}")
+    own = os.getpid()
+    found: dict[int, str] = {}
+    for entry in proc.glob("[0-9]*"):
+        pid = int(entry.name)
+        if pid == own:
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        command = " ".join(part.decode(errors="replace") for part in argv if part)
+        if any(marker in command for marker in markers):
+            found[pid] = (
+                command
+                if len(command) <= _LOGGED_COMMAND_CHARS
+                else f"{command[:_LOGGED_COMMAND_CHARS]}… ({len(command)} chars)"
+            )
+    return found
 
 
 def _public_loopback_host(host: str) -> str:
@@ -534,9 +571,15 @@ class LocalProcessPodManager(PodManager):
         server_public_host: str = "127.0.0.1",
         server_host: str = "127.0.0.1",
         server_port: int = 8080,
+        tmux_socket_dir: str = "",
         **_extra: object,
     ):
         self._workspaces_dir = Path(str(workspaces_dir)).expanduser()
+        # Where each session's tmux server listens (Skuld's own default): stopping a session
+        # ends that server too, since it is daemonized and outlives its broker (LEX-1858).
+        self._tmux_socket_dir = Path(
+            str(tmux_socket_dir) or f"/tmp/skuld-tmux-{os.getuid()}"
+        ).expanduser()
         self._claude_binary = str(claude_binary)
         self._max_concurrent = int(max_concurrent)
         self._stop_timeout = int(stop_timeout)
@@ -713,9 +756,12 @@ class LocalProcessPodManager(PodManager):
         info = self._processes.get(session_id)
 
         if info is None:
+            await self._end_session_runtime(session_id)
             return False
 
         if info.state not in (ProcessState.RUNNING, ProcessState.STARTING):
+            # Its broker is gone, but its tmux and agent may not be (LEX-1858).
+            await self._end_session_runtime(session_id)
             return True
 
         monitor = self._monitors.pop(session_id, None)
@@ -728,6 +774,7 @@ class LocalProcessPodManager(PodManager):
 
         if info.pid is not None:
             await self._terminate_process(info.pid)
+        await self._end_session_runtime(session_id)
 
         if info.port is not None:
             self._port_allocator.release(info.port)
@@ -2075,6 +2122,40 @@ class LocalProcessPodManager(PodManager):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def active_session_ids(self) -> list[str]:
+        """Sessions holding a slot (running or starting with a live process)."""
+        return self._reconcile_active()
+
+    async def _end_session_runtime(self, session_id: str) -> None:
+        """End what a session's broker leaves behind: its tmux server and any process
+        still running for it (the agent CLI, its MCP, the pane logger).
+
+        A broker stops its runtime on a clean exit, but one that dies or is killed leaves
+        them running (LEX-1858). Each survivor is named in the log by its pid.
+        """
+        socket_path = self._tmux_socket_dir / f"skuld-{session_id}.sock"
+        if socket_path.exists():
+            tmux = shutil.which("tmux") or "tmux"
+            with suppress(OSError):
+                ended = await asyncio.create_subprocess_exec(
+                    tmux,
+                    "-S",
+                    str(socket_path),
+                    "kill-server",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await ended.wait()
+        survivors = session_runtime_pids(session_id)
+        for pid, command in survivors.items():
+            logger.warning(
+                "Session %s: stopping a process its broker left running: pid=%d %s",
+                session_id,
+                pid,
+                command,
+            )
+            await self._terminate_process(pid)
 
     def _active_sessions(self) -> list[str]:
         """Return session IDs with active (running/starting) processes."""

@@ -707,6 +707,9 @@ class SessionService:
                 session.id,
                 session.last_active,
             )
+            # Its runtime is NOT stopped here: a quiet broker may be a live session, the
+            # very case the 2026-09-13 startup-cleanup incident killed. The slot it may
+            # still hold is reported by report_orphan_slots (LEX-1858).
             if self._broadcaster is not None:
                 await self._broadcaster.publish_session_updated(result)
         return reconciled
@@ -2235,6 +2238,36 @@ class SessionService:
             await self._emit_session_started(final)
         return final
 
+    async def report_orphan_slots(self) -> int:
+        """Name every runtime slot still held for a session that is stopped, archived or gone.
+
+        Report only: a terminal row with a live runtime can be a live session (the
+        2026-09-13 startup-cleanup incident killed exactly those), so nothing is stopped
+        here. Runs with the active-session reconcile, at API start and on its interval
+        (LEX-1858). Returns how many were found.
+        """
+        found = 0
+        for session_id in await self._pod_manager.active_session_ids():
+            try:
+                session = await self._repository.get(UUID(session_id))
+            except ValueError:
+                continue
+            if session is not None and session.status not in {
+                SessionStatus.STOPPED,
+                SessionStatus.ARCHIVED,
+            }:
+                continue
+            if session is not None and self._spawn_in_flight(session):
+                continue
+            found += 1
+            logger.warning(
+                "Reconcile: session %s is %s but its runtime still holds a slot; "
+                "not stopped automatically (stop it to free the slot)",
+                session_id,
+                session.status.value if session is not None else "unknown to this Forge",
+            )
+        return found
+
     async def reconcile_active_sessions(self) -> int:
         """Reconcile stored session rows against the pod manager.
 
@@ -2272,6 +2305,7 @@ class SessionService:
         sessions = [
             session for status in statuses for session in await self._repository.list(status=status)
         ]
+        await self.report_orphan_slots()
         reconciled = 0
         for session in sessions:
             if self._spawn_in_flight(session):
