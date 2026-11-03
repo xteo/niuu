@@ -482,6 +482,11 @@ class TmuxInteractiveTransport(CLITransport):
         # Assistant texts already emitted via MessageDisplay this turn (re-display dedup +
         # the Stop-hook final-message twin guard) + per-message flush accumulators.
         self._turn_displayed_texts: list[str] = []
+        # The agent's own id for the running turn (from its hooks), and the id of the turn
+        # the last result closed: a display flush of that turn after it ended is dropped,
+        # and both results and frames carry the id so the broker can do the same (LEX-1825).
+        self._hook_turn_id = ""
+        self._finished_hook_turn_id = ""
         #: The pane Claude itself runs in (``main.0``); its death ends the session.
         self._primary_pane_id: str | None = None
         self._display_msg_buffers: dict[str, str] = {}
@@ -1921,23 +1926,26 @@ class TmuxInteractiveTransport(CLITransport):
             self._pending_native_display_texts.append(display_text)
             self._turn_displayed_texts.append(display_text)
 
-    def _is_late_echo(self, message_id: str, text: str) -> bool:
-        """A display flush after the turn ended that only repeats what the turn delivered.
+    def _closing_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """A result's metadata, naming the agent turn it closes; remembers that turn."""
+        self._finished_hook_turn_id = self._hook_turn_id
+        self._hook_turn_id = ""
+        if self._finished_hook_turn_id:
+            return {**metadata, "claude_turn_id": self._finished_hook_turn_id}
+        return metadata
 
-        Checked against the finished turn's own record, kept until the next turn begins:
-        the message ids and texts it displayed, and the result's text (one message of a
-        multi-message reply is contained in it). The broker drops such a frame as well
-        (LEX-1825); stopping it here keeps it out of the stream and opens no phantom turn.
+    def _is_late_flush(self, hook_turn_id: str, text: str) -> bool:
+        """A display flush that landed after its turn ended.
+
+        With both turn ids known it is exact: the turn the last result closed (LEX-1825),
+        whatever the text, while a new turn carries a new id. Otherwise (older CLIs, or a
+        turn that displayed nothing) only an exact echo of the last result's text counts,
+        as before.
         """
-        if message_id != "current" and message_id in self._displayed_message_ids:
-            return True
-        norm = self._normalize_prompt(text)
-        if norm in {self._normalize_prompt(t) for t in self._turn_displayed_texts}:
-            return True
-        last_result_text = self._normalize_prompt(
-            str((self._last_result or {}).get("result") or "")
-        )
-        return bool(norm) and norm in last_result_text
+        if hook_turn_id and self._finished_hook_turn_id:
+            return hook_turn_id == self._finished_hook_turn_id
+        last_result_text = str((self._last_result or {}).get("result") or "")
+        return self._normalize_prompt(text) == self._normalize_prompt(last_result_text)
 
     async def _emit_message_display_from_hook(self, payload: dict[str, Any]) -> None:
         """MessageDisplay hook → a whole-message assistant frame per displayed message, MID-TURN.
@@ -1983,8 +1991,11 @@ class TmuxInteractiveTransport(CLITransport):
         # (apply_result_content), so re-emitting it would fabricate a twin turn — and calling
         # _mark_semantic_turn_started here would open a PHANTOM turn. Drop the echo; only a
         # genuinely novel post-turn message (never carried by the last result) still emits.
-        if not self._turn_active and self._is_late_echo(message_id, text):
+        hook_turn_id = self._coerce_str(payload.get("turn_id"))
+        if not self._turn_active and self._is_late_flush(hook_turn_id, text):
             return
+        if hook_turn_id:
+            self._hook_turn_id = hook_turn_id
         self._mark_semantic_turn_started()
         prompt_id = self._coerce_str(payload.get("prompt_id"))
         if prompt_id:
@@ -2015,6 +2026,7 @@ class TmuxInteractiveTransport(CLITransport):
                     "source": "claude_hook",
                     "hook_event_name": "MessageDisplay",
                     "claude_message_id": message_id,
+                    **({"claude_turn_id": hook_turn_id} if hook_turn_id else {}),
                     "claude_session_id": payload.get("session_id"),
                     "transcript_path": payload.get("transcript_path"),
                 },
@@ -3487,7 +3499,7 @@ class TmuxInteractiveTransport(CLITransport):
                 if content
                 else {}
             ),
-            "metadata": {"source": "claude_hook"},
+            "metadata": self._closing_metadata({"source": "claude_hook"}),
         }
         self._last_result = result
         await self._emit(result)
@@ -4233,7 +4245,7 @@ class TmuxInteractiveTransport(CLITransport):
                 if content
                 else {}
             ),
-            "metadata": {"source": "tmux_interactive"},
+            "metadata": self._closing_metadata({"source": "tmux_interactive"}),
         }
         self._last_result = result
         await self._emit(result)

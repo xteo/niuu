@@ -36,7 +36,8 @@ interleaving case retains its full interval, including the final idle redraw.
 The November 3 late-hook fix (LEX-1825) adds `metadata.message_ids` (the agent's own message
 ids) to seven Claude projections. Their `projection_review` records name exactly the turns
 that gained it; removing that one field reproduces the earlier projection byte-for-value,
-and the new late-duplicate rule removed no turn from any captured session.
+and the new late-frame rule (dropping a hook frame of the turn the last result closed, by
+the agent's turn id) removed no turn from any captured session.
 
 | Case | Frames | Expected turns |
 |---|---:|---:|

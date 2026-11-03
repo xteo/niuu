@@ -1,9 +1,10 @@
-"""LEX-1825: a hook that fires just after a turn ended must not duplicate the saved reply.
+"""LEX-1825: a hook that fires just after its turn ended must not duplicate the saved reply.
 
 The evidence: a late MessageDisplay event 29 ms after turn 1's result refilled the pending
 buffer the flush had just cleared, so the stale text was served as a live turn and saved
-again at the front of turn 2. Both folds (live broker, log rebuild) drop such a frame, and
-each saved reply carries the agent's message ids.
+again at the front of turn 2. The tmux transport stamps its frames and results with the
+agent's own turn id; a frame of the turn the last result closed is dropped by the
+transport, the live broker and the log rebuild alike. Matching is by id, never by text.
 """
 
 from __future__ import annotations
@@ -23,10 +24,14 @@ from volundr.domain.models import SessionLogEntry
 from volundr.domain.services.transcript_rebuild import rebuild_turns
 
 
-def hook_text(text: str, message_id: str | None = "msg-1") -> dict:
-    metadata: dict = {"source": "claude_hook", "hook_event_name": "MessageDisplay"}
-    if message_id is not None:
-        metadata["claude_message_id"] = message_id
+def display(text: str, *, message_id: str = "msg-1", turn_id: str | None = "turn-1") -> dict:
+    metadata: dict = {
+        "source": "claude_hook",
+        "hook_event_name": "MessageDisplay",
+        "claude_message_id": message_id,
+    }
+    if turn_id is not None:
+        metadata["claude_turn_id"] = turn_id
     return {
         "type": "assistant",
         "message": {"model": "interactive", "content": [{"type": "text", "text": text}]},
@@ -34,36 +39,45 @@ def hook_text(text: str, message_id: str | None = "msg-1") -> dict:
     }
 
 
-def result(text: str) -> dict:
-    return {"type": "result", "result": text, "stop_reason": "end_turn", "modelUsage": {}}
+def result(text: str, turn_id: str | None = "turn-1") -> dict:
+    metadata = {"source": "claude_hook", **({"claude_turn_id": turn_id} if turn_id else {})}
+    return {
+        "type": "result",
+        "result": text,
+        "stop_reason": "end_turn",
+        "modelUsage": {},
+        "metadata": metadata,
+    }
 
 
 def user(text: str) -> dict:
     return {"type": "user", "message": {"role": "user", "content": text}}
 
 
-def assistant_turns(turns: list[dict]) -> list[str]:
+def replies(turns: list[dict]) -> list[str]:
     return [turn["content"] for turn in turns if turn["role"] == "assistant"]
 
 
-async def test_a_late_duplicate_is_dropped_live_never_logged_and_rebuilt_alike(tmp_path):
+async def test_a_late_frame_of_the_closed_turn_is_dropped_never_logged_and_rebuilt_alike(
+    tmp_path,
+):
     broker = _broker(tmp_path)
 
     await _drive(
         broker,
         [
             user("are you there?"),
-            hook_text("ready"),
+            display("ready"),
             result("ready"),
-            hook_text("ready"),  # the late hook, same message id
+            display("ready", message_id="msg-1b"),  # the late hook: same turn, any id or text
             user("now do the next thing"),
-            hook_text("done", message_id="msg-2"),
-            result("done"),
+            display("done", message_id="msg-2", turn_id="turn-2"),
+            result("done", turn_id="turn-2"),
         ],
     )
 
     live = _live_turns(broker)
-    assert assistant_turns(live) == ["ready", "done"]  # two replies, not three turns
+    assert replies(live) == ["ready", "done"]  # two replies, not three turns
     assert live[1]["metadata"]["message_ids"] == ["msg-1"]
     assert live[3]["metadata"]["message_ids"] == ["msg-2"]
     logged = [e for e in broker._event_log_buffer if e["kind"] == "assistant"]
@@ -72,35 +86,41 @@ async def test_a_late_duplicate_is_dropped_live_never_logged_and_rebuilt_alike(t
     assert broker._serialize_in_progress_turn() is None
 
 
-async def test_a_late_duplicate_without_an_id_is_matched_by_its_text(tmp_path):
-    broker = _broker(tmp_path)
-
-    await _drive(
-        broker,
-        [user("go"), hook_text("All set.\nready", None), result("All set.\nready")],
-    )
-    await _drive(broker, [hook_text("ready", None)])
-
-    assert assistant_turns(_live_turns(broker)) == ["All set.\nready"]
-    assert broker._serialize_in_progress_turn() is None
-
-
-async def test_a_genuine_repeat_after_a_terminal_prompt_is_kept(tmp_path):
+async def test_a_new_turn_repeating_the_last_reply_is_kept(tmp_path):
     broker = _broker(tmp_path)
 
     await _drive(
         broker,
         [
             user("say ready"),
-            hook_text("ready", None),
+            display("ready"),
             result("ready"),
-            {"type": "terminal_prompt_submitted", "prompt": "say ready again"},
-            hook_text("ready", None),
-            result("ready"),
+            # A new agent turn without a Forge user turn (typed into the terminal, or a
+            # background completion): a new turn id, so the same text is a genuine reply.
+            display("ready", message_id="msg-2", turn_id="turn-2"),
+            result("ready", turn_id="turn-2"),
         ],
     )
 
-    assert assistant_turns(_live_turns(broker)) == ["ready", "ready"]
+    assert replies(_live_turns(broker)) == ["ready", "ready"]
+    assert _rebuilt_turns(broker) == _live_turns(broker)
+
+
+async def test_frames_without_a_turn_id_are_never_dropped(tmp_path):
+    broker = _broker(tmp_path)
+
+    await _drive(
+        broker,
+        [
+            user("go"),
+            display("ok", turn_id=None),
+            result("ok", turn_id=None),
+            display("ok", message_id="msg-2", turn_id=None),
+            result("ok", turn_id=None),
+        ],
+    )
+
+    assert replies(_live_turns(broker)) == ["ok", "ok"]
 
 
 def entry(seq: int, kind: str, payload: dict) -> SessionLogEntry:
@@ -109,37 +129,46 @@ def entry(seq: int, kind: str, payload: dict) -> SessionLogEntry:
     )
 
 
-def test_a_rebuild_of_a_log_written_before_the_guard_drops_the_late_frame():
+def test_a_rebuild_of_raw_frames_drops_a_late_frame_of_the_closed_turn():
     rows = [
         entry(1, "user", user("are you there?")),
-        entry(2, "assistant", hook_text("ready")),
+        entry(2, "assistant", display("ready")),
         entry(3, "result", result("ready")),
-        entry(4, "assistant", hook_text("ready")),  # logged by the old broker
+        entry(4, "assistant", display("ready", message_id="msg-1b")),
         entry(5, "user", user("next")),
-        entry(6, "assistant", hook_text("done", message_id="msg-2")),
-        entry(7, "result", result("done")),
+        entry(6, "assistant", display("done", message_id="msg-2", turn_id="turn-2")),
+        entry(7, "result", result("done", turn_id="turn-2")),
     ]
 
-    turns = rebuild_turns(rows).turns
-
-    assert [t["content"] for t in turns if t["role"] == "assistant"] == ["ready", "done"]
+    assert replies(rebuild_turns(rows).turns) == ["ready", "done"]
 
 
-def transport_state(**overrides) -> SimpleNamespace:
-    state = {
-        "_displayed_message_ids": {"msg-1"},
-        "_turn_displayed_texts": ["Working on it.", "ready"],
+def transport(**state) -> SimpleNamespace:
+    defaults = {
+        "_hook_turn_id": "",
+        "_finished_hook_turn_id": "turn-1",
         "_last_result": {"result": "Working on it.\nready"},
         "_normalize_prompt": TmuxInteractiveTransport._normalize_prompt,
     }
-    state.update(overrides)
-    return SimpleNamespace(**state)
+    return SimpleNamespace(**{**defaults, **state})
 
 
-def test_the_transport_recognises_a_late_echo_of_the_finished_turn():
-    late = TmuxInteractiveTransport._is_late_echo
-    state = transport_state()
-    assert late(state, "msg-1", "anything")  # an id the turn already displayed
-    assert late(state, "msg-9", "ready")  # text the turn displayed
-    assert late(transport_state(_turn_displayed_texts=[]), "current", "ready")  # in the result
-    assert not late(state, "msg-9", "a genuinely new message")
+def test_the_transport_drops_a_late_flush_by_turn_id_and_keeps_new_turns():
+    late = TmuxInteractiveTransport._is_late_flush
+    assert late(transport(), "turn-1", "anything at all")
+    assert not late(transport(), "turn-2", "ready")  # a new turn, even with the same text
+    # Without both ids, only the old exact echo of the last result counts.
+    assert late(transport(_finished_hook_turn_id=""), "turn-9", "Working on it. ready")
+    assert not late(transport(_finished_hook_turn_id=""), "", "ready")
+
+
+def test_a_result_names_the_turn_it_closes_and_remembers_it():
+    state = transport(_hook_turn_id="turn-7", _finished_hook_turn_id="")
+    closing = TmuxInteractiveTransport._closing_metadata
+
+    assert closing(state, {"source": "claude_hook"}) == {
+        "source": "claude_hook",
+        "claude_turn_id": "turn-7",
+    }
+    assert (state._finished_hook_turn_id, state._hook_turn_id) == ("turn-7", "")
+    assert closing(state, {"source": "tmux_interactive"}) == {"source": "tmux_interactive"}

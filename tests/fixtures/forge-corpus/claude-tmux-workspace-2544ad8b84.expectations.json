@@ -344,7 +344,7 @@
     "reviewer": "internal-worker thor:878487d9-1a37-43f7-97cb-c9bc3d4060eb",
     "notes": [
       "Code-contract review, not new user or live-provider acceptance. Only successful-completion metadata.final_output=true was added; removing exactly that new field reproduces every original turn byte-for-value. Original source frames, IDs, text, parts, order, timestamps, partial state and initial review remain unchanged.",
-      "Code-contract review (LEX-1825), not new user or live-provider acceptance. Only metadata.message_ids (the agent's own message ids folded into the turn, for client de-duplication) was added; removing exactly that field reproduces the previously reviewed projection byte-for-value. The late-duplicate rule removed no turn here. Source frames, IDs, text, parts, order, timestamps and partial state are unchanged."
+      "Code-contract review (LEX-1825), not new user or live-provider acceptance. Only metadata.message_ids (the agent's own message ids folded into the turn, for client de-duplication) was added; removing exactly that field reproduces the previously reviewed projection byte-for-value. The late-frame rule (by agent turn id) removed no turn here. Source frames, IDs, text, parts, order, timestamps and partial state are unchanged."
     ],
     "source_frames_sha256": "2544ad8b848178f9f389c2e6d12739e4081b70cd03bf41a6c10c5de90e685211",
     "projection_sha256": "cce23c45da8dbc677c901bdefd7211a2a17337d6508c45ba6494d33165fc1978",

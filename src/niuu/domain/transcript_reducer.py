@@ -18,9 +18,9 @@ the SAME transitions:
 Identical transitions over the same frames ⇒ identical resulting turns ⇒ INV-4 holds by
 construction.
 
-A late duplicate (LEX-1825) is part of the shared fold too: after a result, until a human
-turn or new work starts, an assistant frame that only repeats the reply just saved (same
-message id, or text already in it) is dropped by both paths (``is_late_duplicate``).
+A late hook frame (LEX-1825) is part of the shared fold too: an assistant frame carrying
+the agent turn id (``metadata.claude_turn_id``) of the turn the last result closed is
+dropped by both paths (``is_late_frame``). Matching is by id only, never by text.
 
 niuu is the correct home: both ``skuld`` and ``volundr`` already import ``niuu``, and a pure
 reducer here avoids deepening the skuld↔volundr coupling. This module imports NOTHING from
@@ -259,10 +259,6 @@ def assistant_turn_id(session_id: str, seq: int, role: str = "assistant") -> str
 
 # Frame kinds that carry a user-turn delivery-state transition, keyed by the user-turn id.
 _STEERING_FRAME_KINDS = frozenset({"user_confirmed", "user_active", "user_delivery_failed"})
-#: Frames after which an assistant reply is new work, never a late repeat (LEX-1825).
-_TURN_OPENING_KINDS = frozenset(
-    {"user", "user_confirmed", "user_active", "terminal_prompt_submitted", "user_consumed"}
-)
 
 
 def steering_state_from_frame(kind: str, payload: dict) -> str | None:
@@ -314,48 +310,24 @@ def note_message_id(acc: TurnAccumulator, payload: dict) -> None:
         acc.message_ids.append(message_id)
 
 
-@dataclass
-class ClosedReply:
-    """The reply a result frame just saved, while no human turn or new work has started.
+def frame_turn_id(payload: dict) -> str | None:
+    """The agent's own turn id a frame carries (``metadata.claude_turn_id``), if any."""
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        turn_id = metadata.get("claude_turn_id")
+        if isinstance(turn_id, str) and turn_id:
+            return turn_id
+    return None
 
-    A frame that repeats it in that gap is a late duplicate of the same delivery (a hook
-    that fired after the turn ended), never a new message (LEX-1825).
+
+def is_late_frame(closed_turn_id: str | None, payload: dict) -> bool:
+    """Whether an assistant frame belongs to the turn the last result already closed.
+
+    A hook can fire after its turn ended (LEX-1825); its frame carries that turn's id. A new
+    turn has a new id, so this never touches a genuine message, and frames without a turn id
+    (other transports, older logs) are never dropped.
     """
-
-    content: str
-    message_ids: frozenset[str]
-
-
-def closed_reply_of(turn: dict | None) -> ClosedReply | None:
-    if not turn:
-        return None
-    metadata = turn.get("metadata") if isinstance(turn.get("metadata"), dict) else {}
-    ids = metadata.get("message_ids") if isinstance(metadata.get("message_ids"), list) else []
-    return ClosedReply(str(turn.get("content") or ""), frozenset(str(i) for i in ids))
-
-
-def _squash(text: str) -> str:
-    return " ".join(text.split())
-
-
-def is_late_duplicate(closed: ClosedReply | None, payload: dict) -> bool:
-    """Whether an assistant frame only repeats the reply a result just saved.
-
-    Same agent message id: a duplicate. Without an id, only a frame of pure text that is
-    already part of the saved reply; anything carrying a tool call is new work.
-    """
-    if closed is None:
-        return False
-    message_id = frame_message_id(payload)
-    if message_id is not None:
-        return message_id in closed.message_ids
-    blocks = _content_blocks(payload)
-    if not blocks or any(
-        not isinstance(block, dict) or block.get("type") != "text" for block in blocks
-    ):
-        return False
-    text = _squash("\n".join(str(block.get("text") or "") for block in blocks))
-    return bool(text) and text in _squash(closed.content)
+    return closed_turn_id is not None and frame_turn_id(payload) == closed_turn_id
 
 
 def apply_assistant_blocks(
@@ -911,12 +883,10 @@ def reduce_frames(
     # opt into the additional cross-seed lifecycle reconciliation below.
     steering: dict[str, tuple[int, str]] = {}
 
-    # The tail after saved turns can open with a late hook repeating the last saved reply.
-    closed: ClosedReply | None = (
-        closed_reply_of(turns[-1]) if turns and turns[-1].get("role") == "assistant" else None
-    )
+    # The agent turn id the last result closed (LEX-1825): its late hook frames are dropped.
+    closed_turn_id: str | None = None
 
-    def flush(status: str | None = None, md: dict | None = None) -> dict | None:
+    def flush(status: str | None = None, md: dict | None = None) -> None:
         scrape_text = None
         if scrape is not None and acc.pending_tmux_rows is not None:
             scrape_text = scrape(acc.pending_tmux_rows)
@@ -926,7 +896,6 @@ def reduce_frames(
         if turn is not None:
             turns.append(turn)
         acc.reset()
-        return turn
 
     for r in rows:
         k = r.kind
@@ -948,8 +917,6 @@ def reduce_frames(
             imported_prefix_open = False
         if is_imported:
             imported_prefix_open = True
-        if k in _TURN_OPENING_KINDS:
-            closed = None  # a human turn (also one typed into the terminal) or new work
         if k in NON_BROADCAST_KINDS or k in _IGNORED_KINDS:
             continue
         if r.request_id and r.request_id in folded_request_ids:
@@ -958,7 +925,6 @@ def reduce_frames(
         ts = _ts_of(r)
 
         if k in _STEERING_FRAME_KINDS:
-            closed = None  # a human turn is under way
             _record_steering(steering, k, p, seq)
             # user_confirmed also seeds/dedups the user turn (handled below); user_active /
             # user_delivery_failed carry no content, so they are pure state transitions.
@@ -972,16 +938,14 @@ def reduce_frames(
                 acc.native_import = acc.native_import or dict(metadata["native_import"])
             if _apply_user_frame(acc, turns, seen_ids, session_id, seq, ts, k, p, flush):
                 terminal_span_closed = False
-                closed = None
             continue
 
         if is_imported:
             acc.native_import = acc.native_import or dict(metadata["native_import"])
 
         if k == "assistant":
-            if is_late_duplicate(closed, p):
-                continue  # a late hook repeating the reply the result just saved (LEX-1825)
-            closed = None
+            if is_late_frame(closed_turn_id, p):
+                continue  # a hook of the turn the last result closed (LEX-1825)
             terminal_span_closed = False
             # D1: the frame's durable ts IS the tool_use start stamp — the same instant the
             # live broker passes here as it enqueues the frame, so both planes agree exactly.
@@ -993,7 +957,6 @@ def reduce_frames(
             continue
 
         if k == "content_block_start":
-            closed = None
             terminal_span_closed = False
             part_start = len(acc.parts)
             apply_text_start(acc, p)
@@ -1012,7 +975,6 @@ def reduce_frames(
             delta = p.get("delta", {}) if isinstance(p.get("delta"), dict) else {}
             if delta.get("text") or delta.get("thinking"):
                 terminal_span_closed = False
-                closed = None
             part_start = len(acc.parts)
             if delta.get("type") == "thinking_delta":
                 apply_thinking_delta(acc, delta.get("thinking", ""))
@@ -1037,12 +999,12 @@ def reduce_frames(
             apply_result_content(acc, p)
             stamp_parts(acc.parts, p, start=part_start)
             acc.touch(ts, seq)
-            closed = closed_reply_of(flush(md=result_metadata(p)))
+            flush(md=result_metadata(p))
+            closed_turn_id = frame_turn_id(p)
             terminal_span_closed = True
             continue
 
         if k == "error":
-            closed = None
             flush()
             acc.touch(ts, seq)
             turns.append(build_error_turn(session_id, seq, _error_text(p), ts))
