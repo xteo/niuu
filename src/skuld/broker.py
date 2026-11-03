@@ -31,6 +31,7 @@ from niuu.domain.logging import LoggingConfig
 from niuu.domain.outcome import parse_outcome_block
 from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import (
+    ClosedReply,
     TurnAccumulator,
     apply_assistant_blocks,
     apply_result_content,
@@ -41,6 +42,9 @@ from niuu.domain.transcript_reducer import (
     apply_tool_result_blocks,
     assistant_turn_id,
     build_assistant_turn,
+    closed_reply_of,
+    is_late_duplicate,
+    note_message_id,
     result_metadata,
     steering_state_from_frame,
     steering_target_id,
@@ -702,6 +706,10 @@ class Broker(
         self._live_tool_details: dict[str, dict[str, dict]] = {}
         self._pending_block_type: str = ""
         self._pending_reasoning_text: str = ""
+        # The agent's message ids folded into the open turn, and the reply a result just
+        # saved while no human turn or new work has started (late-hook guard, LEX-1825).
+        self._pending_message_ids: list[str] = []
+        self._closed_reply: ClosedReply | None = None
         # Durable-log seq of the LAST frame folded into the open assistant turn. Drives the
         # SHARED reducer's deterministic turn-id (uuid5(session:seq:role)) so the live turn id
         # equals the id a later log rebuild assigns to the same logical turn (SRD INV-4).
@@ -883,6 +891,8 @@ class Broker(
 
     def _append_turn(self, turn: ConversationTurn) -> dict | None:
         """Append a turn and persist to disk; return its durable-log entry (if logging)."""
+        if turn.role == "user":
+            self._closed_reply = None  # a human turn: later replies are new, not repeats
         self._conversation_turns.append(turn)
         self._save_conversation_history()
         return self._enqueue_event_log(
@@ -944,14 +954,17 @@ class Broker(
             reasoning=self._pending_reasoning_text,
             last_seq=self._pending_assistant_last_seq,
             last_ts=self._pending_assistant_last_ts,
+            message_ids=self._pending_message_ids,
         )
 
-    def _flush_pending_assistant_turn(self, metadata: dict | None = None) -> None:
-        """Save any accumulated assistant content as a conversation turn via the shared reducer."""
+    def _flush_pending_assistant_turn(self, metadata: dict | None = None) -> dict | None:
+        """Save any accumulated assistant content as a conversation turn via the shared reducer.
+
+        Returns the saved turn (None when there was nothing to save)."""
         acc = self._pending_accumulator()
         turn = build_assistant_turn(self.session_id, acc, metadata=metadata)
         if turn is None:
-            return
+            return None
         self._append_turn(
             ConversationTurn(
                 id=turn["id"],
@@ -966,6 +979,8 @@ class Broker(
         self._pending_assistant_parts = []
         self._pending_reasoning_text = ""
         self._pending_assistant_last_ts = None
+        self._pending_message_ids = []
+        return turn
 
     async def _ensure_workflow_prompt_turn(self) -> None:
         """Persist the workflow trigger prompt without executing it locally."""
@@ -3454,6 +3469,13 @@ class Broker(
     async def _handle_cli_event(self, data: dict) -> None:
         """Forward a CLI event to all connected channels."""
         event_type = data.get("type", "unknown")
+        if event_type == "assistant" and is_late_duplicate(self._closed_reply, data):
+            # A hook that fired after the turn ended, repeating the reply the result just
+            # saved. Never logged, broadcast or folded: it would reach clients as a live
+            # line and be saved again at the front of the next turn (LEX-1825). The log
+            # rebuild drops such a frame the same way for logs written before this guard.
+            logger.info("Dropped a late duplicate of the saved reply (session %s)", self.session_id)
+            return
         self._observe_activity_row(data)
 
         # Use one observation instant for both the durable event row and the
@@ -3810,6 +3832,7 @@ class Broker(
         # We also handle the HTTP streaming format (content_block_delta, result)
         # for backward compatibility.
         if event_type == "assistant":
+            self._closed_reply = None
             # ACCUMULATE this assistant frame's blocks (text / thinking / tool_use) across the
             # messages of one turn via the SHARED reducer transition — the SAME fold a later log
             # rebuild applies — so the saved turn carries tool calls + reasoning and reloads
@@ -3821,6 +3844,7 @@ class Broker(
             acc = self._pending_accumulator()
             # D1: ``frame_ts`` (== this frame's durable row ts) is the tool_use start stamp.
             part_start = len(acc.parts)
+            note_message_id(acc, data)
             apply_assistant_blocks(acc, content_blocks, ts=frame_ts)
             stamp_parts(acc.parts, data, start=part_start)
             self._pending_assistant_content = acc.content
@@ -3828,6 +3852,17 @@ class Broker(
             self._pending_assistant_last_ts = frame_ts
 
         # Reserve/close text anchors as part of the same shared fold as raw replay.
+        if event_type in (
+            "content_block_start",
+            "content_block_delta",
+            "error",
+            "user",
+            "terminal_prompt_submitted",
+            "user_consumed",
+        ):
+            # New work or a human turn (also one typed straight into the terminal): a
+            # reply after this may genuinely repeat the last one.
+            self._closed_reply = None
         if event_type in ("content_block_start", "content_block_stop"):
             acc = self._pending_accumulator()
             part_start = len(acc.parts)
@@ -3950,7 +3985,9 @@ class Broker(
                 self._pending_assistant_parts = []
                 self._pending_reasoning_text = ""
             else:
-                self._flush_pending_assistant_turn(metadata=turn_metadata)
+                self._closed_reply = closed_reply_of(
+                    self._flush_pending_assistant_turn(metadata=turn_metadata)
+                )
             self._live_tool_details.clear()
 
             # Emit CLI turn as room_message so it shows participant color

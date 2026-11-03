@@ -1921,6 +1921,24 @@ class TmuxInteractiveTransport(CLITransport):
             self._pending_native_display_texts.append(display_text)
             self._turn_displayed_texts.append(display_text)
 
+    def _is_late_echo(self, message_id: str, text: str) -> bool:
+        """A display flush after the turn ended that only repeats what the turn delivered.
+
+        Checked against the finished turn's own record, kept until the next turn begins:
+        the message ids and texts it displayed, and the result's text (one message of a
+        multi-message reply is contained in it). The broker drops such a frame as well
+        (LEX-1825); stopping it here keeps it out of the stream and opens no phantom turn.
+        """
+        if message_id != "current" and message_id in self._displayed_message_ids:
+            return True
+        norm = self._normalize_prompt(text)
+        if norm in {self._normalize_prompt(t) for t in self._turn_displayed_texts}:
+            return True
+        last_result_text = self._normalize_prompt(
+            str((self._last_result or {}).get("result") or "")
+        )
+        return bool(norm) and norm in last_result_text
+
     async def _emit_message_display_from_hook(self, payload: dict[str, Any]) -> None:
         """MessageDisplay hook → a whole-message assistant frame per displayed message, MID-TURN.
 
@@ -1965,10 +1983,8 @@ class TmuxInteractiveTransport(CLITransport):
         # (apply_result_content), so re-emitting it would fabricate a twin turn — and calling
         # _mark_semantic_turn_started here would open a PHANTOM turn. Drop the echo; only a
         # genuinely novel post-turn message (never carried by the last result) still emits.
-        if not self._turn_active:
-            last_result_text = str((self._last_result or {}).get("result") or "")
-            if self._normalize_prompt(text) == self._normalize_prompt(last_result_text):
-                return
+        if not self._turn_active and self._is_late_echo(message_id, text):
+            return
         self._mark_semantic_turn_started()
         prompt_id = self._coerce_str(payload.get("prompt_id"))
         if prompt_id:
