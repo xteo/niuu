@@ -806,3 +806,29 @@ class TestBrokerFailureReasons:
 
         assert response.status_code == 502
         assert "transport failed (RemoteProtocolError" in caplog.text
+
+
+class TestUnknownSession:
+    """The guard decides before the lookup: an unknown session reads exactly like a session
+    the caller may not attach to (403), whatever the credential, so a probe never learns
+    whether a session id exists. Nothing is proxied, so no broker-failure line is logged."""
+
+    def test_an_unknown_session_is_not_authorized_for_anyone(self, tmp_path, caplog) -> None:
+        caplog.set_level("WARNING", logger="niuu.session_proxy")
+
+        async def guard_like_forge(session_id, user_id, tenant_id, roles) -> bool:
+            return False  # Forge's guard: no session row, so no owner to authorize
+
+        app, _reg = _bare_app(tmp_path, guard=guard_like_forge)
+        app.state.identity = _verifying_identity()
+
+        response = TestClient(app).get(
+            "/s/00000000-0000-4000-8000-000000000000/api/conversation/history",
+            headers=_IMPERSONATION_HEADERS,
+        )
+
+        assert (response.status_code, response.json()["detail"]) == (
+            403,
+            "Not authorized for this session",
+        )
+        assert "broker failed" not in caplog.text
