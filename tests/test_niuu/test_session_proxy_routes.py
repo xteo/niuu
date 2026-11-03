@@ -13,7 +13,9 @@ import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+import respx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
@@ -749,3 +751,49 @@ class TestImmediateCloseHook:
 
         assert len(seen_during_bridge["tracked"].get(("sess", "alice"), ())) == 1
         assert reg._live_connections == {}  # untracked once the connection ended
+
+
+class TestBrokerFailureReasons:
+    """LEX-1847: a failed proxied read says why, so a 5xx count is diagnosable."""
+
+    URL = "http://127.0.0.1:9123/api/conversation/history"
+
+    def _get(self, tmp_path, caplog):
+        caplog.set_level("WARNING", logger="niuu.session_proxy")
+        app, reg = _bare_app(tmp_path)
+        app.state.identity = _verifying_identity()
+        reg.register("sess", 9123)
+        return TestClient(app).get(
+            "/s/sess/api/conversation/history", headers=_IMPERSONATION_HEADERS
+        )
+
+    @respx.mock
+    def test_a_refused_connection_is_named(self, tmp_path, caplog) -> None:
+        respx.get(self.URL).mock(side_effect=httpx.ConnectError("refused"))
+
+        response = self._get(tmp_path, caplog)
+
+        assert response.status_code == 502
+        assert "Session sess broker failed GET /api/conversation/history: connection refused" in (
+            caplog.text
+        )
+
+    @respx.mock
+    def test_a_broker_5xx_is_logged_with_its_detail(self, tmp_path, caplog) -> None:
+        respx.get(self.URL).mock(
+            return_value=httpx.Response(503, json={"detail": "history store busy"})
+        )
+
+        response = self._get(tmp_path, caplog)
+
+        assert response.status_code == 503
+        assert "broker answered 503 (history store busy)" in caplog.text
+
+    @respx.mock
+    def test_a_broker_that_does_not_answer_is_a_504_not_a_crash(self, tmp_path, caplog) -> None:
+        respx.get(self.URL).mock(side_effect=httpx.ReadTimeout("slow"))
+
+        response = self._get(tmp_path, caplog)
+
+        assert response.status_code == 504
+        assert "no answer within the proxy timeout (ReadTimeout)" in caplog.text

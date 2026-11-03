@@ -24,6 +24,24 @@ from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for
 logger = logging.getLogger(__name__)
 
 
+def _log_broker_failure(session_id: str, method: str, path: str, reason: str, detail: str) -> None:
+    """One line saying why a proxied read to a session broker failed (LEX-1847)."""
+    logger.warning(
+        "Session %s broker failed %s %s: %s (%s)", session_id, method, path, reason, detail
+    )
+
+
+def _broker_detail(response: httpx.Response) -> str:
+    """The broker's own error detail, when it gave one."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.reason_phrase or "no detail"
+    if isinstance(payload, dict) and payload.get("detail"):
+        return str(payload["detail"])
+    return response.reason_phrase or "no detail"
+
+
 def _configured_cors_origins() -> list[str]:
     """Return explicitly configured CORS origins for the unified niuu host."""
 
@@ -865,15 +883,38 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
                     headers=headers,
                     content=body if body else None,
                 )
+            if resp.status_code >= 500:
+                _log_broker_failure(
+                    session_id,
+                    request.method,
+                    proxy_path,
+                    f"broker answered {resp.status_code}",
+                    _broker_detail(resp),
+                )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
                 headers=dict(resp.headers),
             )
-        except httpx.ConnectError:
+        except httpx.ConnectError as exc:
+            _log_broker_failure(
+                session_id, request.method, proxy_path, "connection refused", str(exc)
+            )
             return JSONResponse(
                 {"detail": "Skuld broker not ready"},
                 status_code=502,
+            )
+        except httpx.TimeoutException as exc:
+            _log_broker_failure(
+                session_id,
+                request.method,
+                proxy_path,
+                "no answer within the proxy timeout",
+                type(exc).__name__,
+            )
+            return JSONResponse(
+                {"detail": "Skuld broker did not answer in time"},
+                status_code=504,
             )
 
     @app.get("/s/{session_id}/health", include_in_schema=False)
