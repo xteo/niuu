@@ -2,7 +2,7 @@
 
 import pytest
 
-from niuu.domain.session_endpoint import public_origin_for, public_session_endpoint
+from niuu.domain.session_endpoint import public_session_endpoint
 
 
 def test_public_session_endpoint_preserves_empty_and_external_endpoints() -> None:
@@ -65,19 +65,3 @@ def test_an_ipv6_public_host_is_bracketed() -> None:
         public_session_endpoint("ws://0.0.0.0:8080/s/abc/session", public_host="fd7a:115c::5")
         == "ws://[fd7a:115c::5]:8080/s/abc/session"
     )
-
-
-@pytest.mark.parametrize(
-    ("origin", "public_host", "expected"),
-    [
-        ("http://localhost:8080", "100.66.123.128", "http://100.66.123.128:8080"),
-        ("http://0.0.0.0:8080", "thor.tail737f2a.ts.net", "http://thor.tail737f2a.ts.net:8080"),
-        ("http://localhost:8080", "fd7a:115c::5", "http://[fd7a:115c::5]:8080"),
-        ("http://localhost:8080", "127.0.0.1", "http://localhost:8080"),  # nothing better
-        ("http://localhost:8080", None, "http://localhost:8080"),
-        ("https://forge.example", "100.66.123.128", "https://forge.example"),  # already public
-    ],
-)
-def test_the_stored_origin_uses_a_reachable_public_host(origin, public_host, expected) -> None:
-    """LEX-1847: endpoints are stored from this origin when a session starts."""
-    assert public_origin_for(origin, public_host) == expected

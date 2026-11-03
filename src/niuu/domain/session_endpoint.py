@@ -69,19 +69,3 @@ def _url_host(host: str) -> str:
         return f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
     except ValueError:
         return host
-
-
-def public_origin_for(origin: str, public_host: str | None) -> str:
-    """``origin`` with a loopback or bind-all host replaced by a reachable ``public_host``.
-
-    Session endpoints are stored from this origin when a session starts (LEX-1847): a
-    server bound to 0.0.0.0 must not store ``localhost`` for clients elsewhere.
-    """
-    host = str(public_host or "").strip()
-    if not host or is_loopback_or_wildcard(host):
-        return origin
-    parsed = urlsplit(origin)
-    if not is_loopback_or_wildcard(parsed.hostname):
-        return origin
-    netloc = _url_host(host) + (f":{parsed.port}" if parsed.port is not None else "")
-    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))

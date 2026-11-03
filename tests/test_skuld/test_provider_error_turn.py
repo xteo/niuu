@@ -134,3 +134,21 @@ async def test_an_error_frame_text_is_read_the_same_way_on_both_paths(tmp_path):
 
     assert [turn["content"] for turn in assistant_turns(_live_turns(broker))] == ["boom"]
     assert _rebuilt_turns(broker) == _live_turns(broker)
+
+
+async def test_a_new_human_turn_clears_an_error_that_had_no_result(tmp_path):
+    broker = _broker(tmp_path)
+
+    await _drive(
+        broker,
+        [
+            user("hello"),
+            {"type": "error", "error": "rate limit"},  # no result follows
+            user("try again"),
+            failed_result("rate limit"),  # the new turn's own failure must show
+        ],
+    )
+
+    contents = [turn["content"] for turn in assistant_turns(_live_turns(broker))]
+    assert contents == ["rate limit", "rate limit"]
+    assert _rebuilt_turns(broker) == _live_turns(broker)

@@ -23,6 +23,10 @@ from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for
 
 logger = logging.getLogger(__name__)
 
+#: How long the proxy waits for a session broker's HTTP answer (the existing value; a hit
+#: is logged and answered 504).
+PROXY_READ_TIMEOUT_SECONDS = 30.0
+
 
 def _log_broker_failure(session_id: str, method: str, path: str, reason: str, detail: str) -> None:
     """One line saying why a proxied read to a session broker failed (LEX-1847)."""
@@ -875,7 +879,7 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
         body = await request.body()
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=PROXY_READ_TIMEOUT_SECONDS) as client:
                 resp = await client.request(
                     method=request.method,
                     url=url,
@@ -896,25 +900,34 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
                 status_code=resp.status_code,
                 headers=dict(resp.headers),
             )
-        except httpx.ConnectError as exc:
-            _log_broker_failure(
-                session_id, request.method, proxy_path, "connection refused", str(exc)
-            )
-            return JSONResponse(
-                {"detail": "Skuld broker not ready"},
-                status_code=502,
-            )
         except httpx.TimeoutException as exc:
             _log_broker_failure(
                 session_id,
                 request.method,
                 proxy_path,
-                "no answer within the proxy timeout",
+                f"no answer within {PROXY_READ_TIMEOUT_SECONDS:g} s",
                 type(exc).__name__,
             )
             return JSONResponse(
                 {"detail": "Skuld broker did not answer in time"},
                 status_code=504,
+            )
+        except httpx.ConnectError as exc:
+            _log_broker_failure(
+                session_id, request.method, proxy_path, "could not connect", str(exc)
+            )
+            return JSONResponse(
+                {"detail": "Skuld broker not ready"},
+                status_code=502,
+            )
+        except httpx.TransportError as exc:
+            # A broker that dropped mid-response (crash, protocol error): name it too.
+            _log_broker_failure(
+                session_id, request.method, proxy_path, "transport failed", repr(exc)
+            )
+            return JSONResponse(
+                {"detail": "Skuld broker connection failed"},
+                status_code=502,
             )
 
     @app.get("/s/{session_id}/health", include_in_schema=False)

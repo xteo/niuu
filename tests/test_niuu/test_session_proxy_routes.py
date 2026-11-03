@@ -774,7 +774,7 @@ class TestBrokerFailureReasons:
         response = self._get(tmp_path, caplog)
 
         assert response.status_code == 502
-        assert "Session sess broker failed GET /api/conversation/history: connection refused" in (
+        assert "Session sess broker failed GET /api/conversation/history: could not connect" in (
             caplog.text
         )
 
@@ -796,4 +796,13 @@ class TestBrokerFailureReasons:
         response = self._get(tmp_path, caplog)
 
         assert response.status_code == 504
-        assert "no answer within the proxy timeout (ReadTimeout)" in caplog.text
+        assert "no answer within 30 s (ReadTimeout)" in caplog.text
+
+    @respx.mock
+    def test_a_broker_that_drops_mid_response_is_a_logged_502(self, tmp_path, caplog) -> None:
+        respx.get(self.URL).mock(side_effect=httpx.RemoteProtocolError("Server disconnected"))
+
+        response = self._get(tmp_path, caplog)
+
+        assert response.status_code == 502
+        assert "transport failed (RemoteProtocolError" in caplog.text

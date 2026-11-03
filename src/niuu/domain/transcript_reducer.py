@@ -959,6 +959,7 @@ def reduce_frames(
                 acc.native_import = acc.native_import or dict(metadata["native_import"])
             if _apply_user_frame(acc, turns, seen_ids, session_id, seq, ts, k, p, flush):
                 terminal_span_closed = False
+                pending_error = None  # a human turn: an earlier error is not its error
             continue
 
         if is_imported:
@@ -1041,7 +1042,7 @@ def reduce_frames(
             else:
                 acc.reset()
             acc.touch(ts, seq)
-            pending_error = _error_text(p)
+            pending_error = error_text(p)
             turns.append(build_error_turn(session_id, seq, pending_error, ts))
             terminal_span_closed = True
             continue
@@ -1230,10 +1231,6 @@ def _content_blocks(payload: dict) -> list:
 
 def error_text(payload: dict) -> str:
     """An ``error`` frame's visible text: the one rule both folds use."""
-    return _error_text(payload)
-
-
-def _error_text(payload: dict) -> str:
     err = payload.get("error")
     if isinstance(err, dict):
         return str(err.get("message") or "") or "Unknown error"

@@ -897,6 +897,8 @@ class Broker(
 
     def _append_turn(self, turn: ConversationTurn) -> dict | None:
         """Append a turn and persist to disk; return its durable-log entry (if logging)."""
+        if turn.role == "user":
+            self._pending_error_text = None  # a human turn: an earlier error is not its error
         self._conversation_turns.append(turn)
         self._save_conversation_history()
         return self._enqueue_event_log(
@@ -3929,6 +3931,8 @@ class Broker(
                 self._flush_pending_assistant_turn(
                     metadata={"status": "error", "messageType": "error"}
                 )
+            else:
+                self._pending_message_ids = []  # as the rebuild's reset at an error
             # Deterministic id (uuid5(session:error_frame_seq:assistant)) so the live error
             # turn id matches the id a log rebuild assigns to the same error frame (INV-4).
             self._append_turn(
@@ -3964,7 +3968,9 @@ class Broker(
 
             acc = self._pending_accumulator()
             repeats_error = result_repeats_error(self._pending_error_text, acc, data)
-            self._pending_error_text = None
+            if not suppress_channel_broadcast:
+                # Only a logged result ends it, so the rebuild sees the same results.
+                self._pending_error_text = None
             # Inject the result frame's text into the OPEN turn via the SHARED reducer policy —
             # the SAME fold a later log rebuild applies — so a tool_use-only turn closed by a
             # result with text surfaces that text identically on live and rebuild (INV-4/FR-3).
