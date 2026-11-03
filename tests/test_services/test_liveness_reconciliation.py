@@ -519,3 +519,20 @@ class TestOrphanSlots:
         )
         assert f"session {unknown} is unknown to this Forge but its runtime" in caplog.text
         assert str(running.id) not in caplog.text
+
+        caplog.clear()
+        assert await service.report_orphan_slots() == 3
+        assert caplog.text == ""  # named once, not on every pass
+
+    async def test_the_reconcile_pass_reports_orphans(self, service, pod_manager, caplog):
+        caplog.set_level("WARNING", logger="volundr.domain.services.session")
+        unknown = str(uuid4())
+
+        async def holding() -> list[str]:
+            return [unknown]
+
+        pod_manager.active_session_ids = holding
+
+        await service.reconcile_active_sessions()
+
+        assert f"session {unknown} is unknown to this Forge" in caplog.text

@@ -1225,6 +1225,8 @@ class TestProcessSpawning:
         env = mock_exec.call_args.kwargs["env"]
         assert env["SKULD__PORT"] == "9100"
         assert env["SKULD__SESSION__ID"] == str(git_session.id)
+        # One setting decides where the broker's tmux socket lives and where stop looks.
+        assert env["SKULD__TMUX_SOCKET_DIR"] == str(manager._tmux_socket_dir)
 
     async def test_spawn_renders_proxy_room_role_source(
         self,
