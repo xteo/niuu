@@ -51,9 +51,37 @@ def public_session_endpoint(
         return endpoint
 
     normalized_host = str(public_host or "127.0.0.1").strip() or "127.0.0.1"
-    browser_host = "localhost" if is_loopback_or_wildcard(normalized_host) else normalized_host
+    browser_host = (
+        "localhost" if is_loopback_or_wildcard(normalized_host) else _url_host(normalized_host)
+    )
     netloc = browser_host
     if parsed.port is not None:
         netloc = f"{browser_host}:{parsed.port}"
 
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _url_host(host: str) -> str:
+    """A host as it appears in a URL: an IPv6 literal goes in brackets."""
+    if host.startswith("["):
+        return host
+    try:
+        return f"[{host}]" if ipaddress.ip_address(host).version == 6 else host
+    except ValueError:
+        return host
+
+
+def public_origin_for(origin: str, public_host: str | None) -> str:
+    """``origin`` with a loopback or bind-all host replaced by a reachable ``public_host``.
+
+    Session endpoints are stored from this origin when a session starts (LEX-1847): a
+    server bound to 0.0.0.0 must not store ``localhost`` for clients elsewhere.
+    """
+    host = str(public_host or "").strip()
+    if not host or is_loopback_or_wildcard(host):
+        return origin
+    parsed = urlsplit(origin)
+    if not is_loopback_or_wildcard(parsed.hostname):
+        return origin
+    netloc = _url_host(host) + (f":{parsed.port}" if parsed.port is not None else "")
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))

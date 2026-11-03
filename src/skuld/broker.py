@@ -41,11 +41,12 @@ from niuu.domain.transcript_reducer import (
     apply_tool_result_blocks,
     assistant_turn_id,
     build_assistant_turn,
+    error_text,
     frame_turn_id,
     is_late_frame,
     note_message_id,
     result_metadata,
-    result_repeats_error_turn,
+    result_repeats_error,
     steering_state_from_frame,
     steering_target_id,
 )
@@ -712,6 +713,9 @@ class Broker(
         # that one frame live while a rebuild drops it.
         self._pending_message_ids: list[str] = []
         self._closed_turn_id: str | None = None
+        # An error frame's text until the next result: a failed result that repeats it is
+        # not saved as a second error turn (LEX-1847).
+        self._pending_error_text: str | None = None
         # Durable-log seq of the LAST frame folded into the open assistant turn. Drives the
         # SHARED reducer's deterministic turn-id (uuid5(session:seq:role)) so the live turn id
         # equals the id a later log rebuild assigns to the same logical turn (SRD INV-4).
@@ -973,6 +977,10 @@ class Broker(
                 metadata=turn["metadata"],
             )
         )
+        self._discard_pending_assistant_turn()
+
+    def _discard_pending_assistant_turn(self) -> None:
+        """Clear the open assistant turn: after a flush, or when it is not to be saved."""
         self._pending_assistant_content = ""
         self._pending_assistant_parts = []
         self._pending_reasoning_text = ""
@@ -3908,15 +3916,16 @@ class Broker(
 
         # Capture error events
         if event_type == "error":
-            error_msg = (
-                data.get("error", {}).get("message", "")
-                if isinstance(data.get("error"), dict)
-                else data.get("content", str(data.get("error", "Unknown error")))
-            )
-            visible_error = str(error_msg) or "Unknown error"
+            visible_error = error_text(data)  # the same rule the rebuild applies
+            # Held until the next result: a failed result repeating it adds no turn.
+            self._pending_error_text = visible_error
             # The error frame's own seq: flushing streamed text below logs a turn row first.
             error_frame_seq = self._event_log_seq
-            if self._pending_assistant_content or self._pending_assistant_parts:
+            if (
+                self._pending_assistant_content
+                or self._pending_assistant_parts
+                or self._pending_reasoning_text
+            ):
                 self._flush_pending_assistant_turn(
                     metadata={"status": "error", "messageType": "error"}
                 )
@@ -3953,18 +3962,12 @@ class Broker(
             asyncio.create_task(self._report_usage(data))
             explicit_room_reply = self._pending_explicit_human_response_count > 0
 
-            last = self._conversation_turns[-1] if self._conversation_turns else None
-            repeats_error = result_repeats_error_turn(
-                {"role": last.role, "content": last.content, "metadata": last.metadata}
-                if last is not None
-                else None,
-                self._pending_accumulator(),
-                data,
-            )
+            acc = self._pending_accumulator()
+            repeats_error = result_repeats_error(self._pending_error_text, acc, data)
+            self._pending_error_text = None
             # Inject the result frame's text into the OPEN turn via the SHARED reducer policy —
             # the SAME fold a later log rebuild applies — so a tool_use-only turn closed by a
             # result with text surfaces that text identically on live and rebuild (INV-4/FR-3).
-            acc = self._pending_accumulator()
             part_start = len(acc.parts)
             apply_result_content(acc, data)
             stamp_parts(acc.parts, data, start=part_start)
@@ -3977,18 +3980,18 @@ class Broker(
             self._pending_assistant_last_seq = self._event_log_seq
             self._pending_assistant_last_ts = frame_ts
 
-            # Capture content before flush clears it
-            content = self._pending_assistant_content or data.get("result", "")
+            # Capture content before flush clears it. A repeated provider error is not an
+            # agent reply: it is not posted to a room as one or used as the turn's label.
+            content = (
+                "" if repeats_error else self._pending_assistant_content or data.get("result", "")
+            )
             if not suppress_channel_broadcast:
                 # Only a logged result moves it, so the rebuild sees the same results.
                 self._closed_turn_id = frame_turn_id(data)
             if explicit_room_reply or repeats_error:
                 # A room reply is surfaced elsewhere; a failed result that only repeats the
                 # error turn just saved adds nothing (one stored error turn, LEX-1847).
-                self._pending_assistant_content = ""
-                self._pending_assistant_parts = []
-                self._pending_reasoning_text = ""
-                self._pending_message_ids = []
+                self._discard_pending_assistant_turn()
             else:
                 self._flush_pending_assistant_turn(metadata=turn_metadata)
             self._live_tool_details.clear()

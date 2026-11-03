@@ -642,28 +642,22 @@ def apply_result_content(acc: TurnAccumulator, payload: dict) -> None:
         apply_text_message(acc, {"type": "text", "text": text})
 
 
-def result_repeats_error_turn(last_turn: dict | None, acc: TurnAccumulator, payload: dict) -> bool:
-    """Whether a failed result only repeats the error turn just saved (LEX-1847).
+def result_repeats_error(pending_error: str | None, acc: TurnAccumulator, payload: dict) -> bool:
+    """Whether a failed result only repeats the error frame just before it (LEX-1847).
 
     A provider failure arrives as an ``error`` frame (saved as an error turn) and then a
-    failed ``result`` whose text is the same message; saving that text again made two
-    identical error turns. Only an exact repeat with nothing streamed in between counts.
+    failed ``result`` whose text is the same message; saving it again made two identical
+    error turns. ``pending_error`` is that error frame's text, held only until the next
+    result, so an earlier turn's error never swallows a later failure. Only an exact repeat
+    with nothing streamed in between counts.
     """
-    if acc.content or acc.parts or acc.reasoning:
+    if pending_error is None or acc.content or acc.parts or acc.reasoning:
         return False
     if _result_status(payload) != "error":
         return False
-    if not last_turn or last_turn.get("role") != "assistant":
-        return False
-    metadata = last_turn.get("metadata") if isinstance(last_turn.get("metadata"), dict) else {}
-    if metadata.get("status") != "error":
-        return False
     probe = TurnAccumulator()
     apply_result_content(probe, payload)
-    return (
-        bool(probe.content.strip())
-        and probe.content.strip() == str(last_turn.get("content") or "").strip()
-    )
+    return bool(probe.content.strip()) and probe.content.strip() == pending_error.strip()
 
 
 # --------------------------------------------------------------------------- turn builders
@@ -910,6 +904,8 @@ def reduce_frames(
 
     # The agent turn id the last result closed (LEX-1825): its late hook frames are dropped.
     closed_turn_id: str | None = None
+    # The text of an error frame not yet followed by its result (LEX-1847).
+    pending_error: str | None = None
 
     def flush(status: str | None = None, md: dict | None = None) -> None:
         scrape_text = None
@@ -1020,7 +1016,9 @@ def reduce_frames(
             continue
 
         if k == "result":
-            if result_repeats_error_turn(turns[-1] if turns else None, acc, p):
+            repeats = result_repeats_error(pending_error, acc, p)
+            pending_error = None
+            if repeats:
                 acc.touch(ts, seq)
                 acc.reset()
                 closed_turn_id = frame_turn_id(p)
@@ -1036,10 +1034,15 @@ def reduce_frames(
             continue
 
         if k == "error":
-            # Text streamed before the failure is saved as the live broker saves it (INV-4).
-            flush(md={"status": "error", "messageType": "error"})
+            # Streamed content before the failure is saved as the live broker saves it
+            # (INV-4); terminal-scrape rows alone are not a turn there, so not here either.
+            if acc.content or acc.parts or acc.reasoning:
+                flush(md={"status": "error", "messageType": "error"})
+            else:
+                acc.reset()
             acc.touch(ts, seq)
-            turns.append(build_error_turn(session_id, seq, _error_text(p), ts))
+            pending_error = _error_text(p)
+            turns.append(build_error_turn(session_id, seq, pending_error, ts))
             terminal_span_closed = True
             continue
 
@@ -1223,6 +1226,11 @@ def _content_blocks(payload: dict) -> list:
     msg = payload.get("message")
     blocks = msg.get("content") if isinstance(msg, dict) else payload.get("content")
     return blocks if isinstance(blocks, list) else []
+
+
+def error_text(payload: dict) -> str:
+    """An ``error`` frame's visible text: the one rule both folds use."""
+    return _error_text(payload)
 
 
 def _error_text(payload: dict) -> str:

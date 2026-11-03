@@ -26,6 +26,7 @@ from niuu.build_identity import build_identity
 from niuu.cors import apply_cors_middleware
 from niuu.domain.guild_membership import GuildInstance
 from niuu.domain.services.realm import RealmService
+from niuu.domain.session_endpoint import public_origin_for
 from niuu.service_integrations import (
     has_seeded_linear_integration as _has_seeded_linear_integration,
 )
@@ -692,6 +693,9 @@ def create_app(
     """
     if settings is None:
         settings = Settings()
+    # Session endpoints are stored from this origin: never a loopback/bind-all host when
+    # a reachable public host is configured (LEX-1847).
+    public_origin = public_origin_for(public_origin, settings.server_public_host)
 
     app = build_app_shell(settings)
 

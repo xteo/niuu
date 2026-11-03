@@ -82,3 +82,55 @@ async def test_text_streamed_before_the_failure_is_kept(tmp_path):
     contents = [turn["content"] for turn in assistant_turns(_live_turns(broker))]
     assert contents[0] == "Working" and contents.count(MESSAGE) == 1
     assert _rebuilt_turns(broker) == _live_turns(broker)
+
+
+async def test_an_error_after_reasoning_alone_is_still_one_error_turn(tmp_path):
+    broker = _broker(tmp_path)
+
+    await _drive(
+        broker,
+        [
+            user("hello"),
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "Let me try."},
+            },
+            {"type": "error", "error": MESSAGE},
+            failed_result(MESSAGE),
+        ],
+    )
+
+    contents = [turn["content"] for turn in assistant_turns(_live_turns(broker))]
+    assert contents.count(MESSAGE) == 1
+    assert _rebuilt_turns(broker) == _live_turns(broker)
+
+
+async def test_a_later_failure_with_only_a_result_keeps_its_turn(tmp_path):
+    broker = _broker(tmp_path)
+
+    await _drive(
+        broker,
+        [
+            user("hello"),
+            {"type": "error", "error": MESSAGE},
+            failed_result(MESSAGE),
+            # A continuation fails again, this time with a result alone: it must show.
+            failed_result(MESSAGE),
+        ],
+    )
+
+    contents = [turn["content"] for turn in assistant_turns(_live_turns(broker))]
+    assert contents.count(MESSAGE) == 2
+    assert _rebuilt_turns(broker) == _live_turns(broker)
+
+
+async def test_an_error_frame_text_is_read_the_same_way_on_both_paths(tmp_path):
+    broker = _broker(tmp_path)
+
+    await _drive(
+        broker,
+        [user("hello"), {"type": "error", "content": "", "error": "boom"}, failed_result("boom")],
+    )
+
+    assert [turn["content"] for turn in assistant_turns(_live_turns(broker))] == ["boom"]
+    assert _rebuilt_turns(broker) == _live_turns(broker)
