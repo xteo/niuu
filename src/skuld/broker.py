@@ -45,6 +45,7 @@ from niuu.domain.transcript_reducer import (
     is_late_frame,
     note_message_id,
     result_metadata,
+    result_repeats_error_turn,
     steering_state_from_frame,
     steering_target_id,
 )
@@ -3913,6 +3914,8 @@ class Broker(
                 else data.get("content", str(data.get("error", "Unknown error")))
             )
             visible_error = str(error_msg) or "Unknown error"
+            # The error frame's own seq: flushing streamed text below logs a turn row first.
+            error_frame_seq = self._event_log_seq
             if self._pending_assistant_content or self._pending_assistant_parts:
                 self._flush_pending_assistant_turn(
                     metadata={"status": "error", "messageType": "error"}
@@ -3921,7 +3924,7 @@ class Broker(
             # turn id matches the id a log rebuild assigns to the same error frame (INV-4).
             self._append_turn(
                 ConversationTurn(
-                    id=assistant_turn_id(self.session_id, self._event_log_seq),
+                    id=assistant_turn_id(self.session_id, error_frame_seq),
                     role="assistant",
                     content=visible_error,
                     parts=[{"type": "text", "text": visible_error}],
@@ -3950,6 +3953,14 @@ class Broker(
             asyncio.create_task(self._report_usage(data))
             explicit_room_reply = self._pending_explicit_human_response_count > 0
 
+            last = self._conversation_turns[-1] if self._conversation_turns else None
+            repeats_error = result_repeats_error_turn(
+                {"role": last.role, "content": last.content, "metadata": last.metadata}
+                if last is not None
+                else None,
+                self._pending_accumulator(),
+                data,
+            )
             # Inject the result frame's text into the OPEN turn via the SHARED reducer policy —
             # the SAME fold a later log rebuild applies — so a tool_use-only turn closed by a
             # result with text surfaces that text identically on live and rebuild (INV-4/FR-3).
@@ -3971,7 +3982,9 @@ class Broker(
             if not suppress_channel_broadcast:
                 # Only a logged result moves it, so the rebuild sees the same results.
                 self._closed_turn_id = frame_turn_id(data)
-            if explicit_room_reply:
+            if explicit_room_reply or repeats_error:
+                # A room reply is surfaced elsewhere; a failed result that only repeats the
+                # error turn just saved adds nothing (one stored error turn, LEX-1847).
                 self._pending_assistant_content = ""
                 self._pending_assistant_parts = []
                 self._pending_reasoning_text = ""

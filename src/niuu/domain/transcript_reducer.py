@@ -642,6 +642,30 @@ def apply_result_content(acc: TurnAccumulator, payload: dict) -> None:
         apply_text_message(acc, {"type": "text", "text": text})
 
 
+def result_repeats_error_turn(last_turn: dict | None, acc: TurnAccumulator, payload: dict) -> bool:
+    """Whether a failed result only repeats the error turn just saved (LEX-1847).
+
+    A provider failure arrives as an ``error`` frame (saved as an error turn) and then a
+    failed ``result`` whose text is the same message; saving that text again made two
+    identical error turns. Only an exact repeat with nothing streamed in between counts.
+    """
+    if acc.content or acc.parts or acc.reasoning:
+        return False
+    if _result_status(payload) != "error":
+        return False
+    if not last_turn or last_turn.get("role") != "assistant":
+        return False
+    metadata = last_turn.get("metadata") if isinstance(last_turn.get("metadata"), dict) else {}
+    if metadata.get("status") != "error":
+        return False
+    probe = TurnAccumulator()
+    apply_result_content(probe, payload)
+    return (
+        bool(probe.content.strip())
+        and probe.content.strip() == str(last_turn.get("content") or "").strip()
+    )
+
+
 # --------------------------------------------------------------------------- turn builders
 
 
@@ -719,7 +743,8 @@ def build_error_turn(session_id: str, seq: int, text: str, ts: datetime | None =
         role="assistant",
         content=text,
         parts=[{"type": "text", "text": text}] if text else [],
-        metadata={"status": "error"},
+        # The same schema the live broker saves (INV-4): an error stays an error on reload.
+        metadata={"status": "error", "messageType": "error"},
         ts=ts,
     )
 
@@ -995,6 +1020,12 @@ def reduce_frames(
             continue
 
         if k == "result":
+            if result_repeats_error_turn(turns[-1] if turns else None, acc, p):
+                acc.touch(ts, seq)
+                acc.reset()
+                closed_turn_id = frame_turn_id(p)
+                terminal_span_closed = True
+                continue
             part_start = len(acc.parts)
             apply_result_content(acc, p)
             stamp_parts(acc.parts, p, start=part_start)
@@ -1005,7 +1036,8 @@ def reduce_frames(
             continue
 
         if k == "error":
-            flush()
+            # Text streamed before the failure is saved as the live broker saves it (INV-4).
+            flush(md={"status": "error", "messageType": "error"})
             acc.touch(ts, seq)
             turns.append(build_error_turn(session_id, seq, _error_text(p), ts))
             terminal_span_closed = True
