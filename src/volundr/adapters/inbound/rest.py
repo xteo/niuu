@@ -261,6 +261,25 @@ def _execution_catalog_http_error(
     )
 
 
+def _refused_session_launch(error: Exception) -> HTTPException:
+    """A 409 for a create/start Forge cannot do, its reason in the journal too (LEX-1858).
+
+    The reason was only in the response, so a burst of refusals left no trace of whether
+    the host's slot cap or a session's state was the cause.
+    """
+    if isinstance(error, SessionCapacityError):
+        capacity = error.capacity
+        logger.warning(
+            "Session launch refused (409, slot cap): %d of %d running; %s",
+            capacity.active,
+            capacity.limit,
+            error,
+        )
+    else:
+        logger.warning("Session launch refused (409, session state): %s", error)
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+
+
 def _public_session_endpoint(
     endpoint: str | None,
     session_id: str = "",
@@ -2703,16 +2722,8 @@ def create_router(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(e),
             )
-        except SessionCapacityError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            )
-        except SessionStateError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            )
+        except (SessionCapacityError, SessionStateError) as e:
+            raise _refused_session_launch(e)
         except (ExecutionCatalogError, ExecutionSelectionError) as e:
             raise _execution_catalog_http_error(e) from e
         return _session_response(started)
@@ -3171,16 +3182,8 @@ def create_router(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session not found: {session_id}",
             )
-        except SessionCapacityError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            )
-        except SessionStateError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            )
+        except (SessionCapacityError, SessionStateError) as e:
+            raise _refused_session_launch(e)
         except (ExecutionCatalogError, ExecutionSelectionError) as e:
             raise _execution_catalog_http_error(e) from e
 
@@ -5849,10 +5852,7 @@ def create_router(
                 detail=str(e),
             ) from e
         except SessionCapacityError as e:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=str(e),
-            ) from e
+            raise _refused_session_launch(e) from e
         return _session_response(session)
 
     @router.get(
