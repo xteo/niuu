@@ -178,6 +178,8 @@ _WORKSPACE_TRUST_ROW_RE = re.compile(
 # triggers it, `_claude_native_session_id` is never captured, and every later
 # AskUserQuestion in the session fails `_question_native_identity` with
 # ControlRecoveryError("This question has no verifiable native tool identity").
+#: Turn closes the agent made itself (its Stop hooks); every other close is Skuld's own.
+AGENT_ENDED_REASONS = frozenset({"stop", "stop_failure"})
 _PASTED_CONTENT_WRAPPER_RE = re.compile(r'</?pasted_content(?:\s+id="[^"]*")?>')
 
 
@@ -1479,6 +1481,14 @@ class TmuxInteractiveTransport(CLITransport):
         the final assistant message for a turn.
         """
         event_name = self._hook_event_name(payload)
+        reported_turn = self._coerce_str(payload.get("turn_id"))
+        if (
+            reported_turn
+            and self._turn_active
+            and reported_turn != self._finished_hook_turn_id
+            and not self._is_child_hook(payload)
+        ):
+            self._hook_turn_id = reported_turn  # any main-agent hook may name the turn
         await self._emit(
             {
                 "type": "claude_hook",
@@ -1926,8 +1936,16 @@ class TmuxInteractiveTransport(CLITransport):
             self._pending_native_display_texts.append(display_text)
             self._turn_displayed_texts.append(display_text)
 
-    def _closing_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        """A result's metadata, naming the agent turn it closes; remembers that turn."""
+    def _closing_metadata(self, metadata: dict[str, Any], *, agent_ended: bool) -> dict[str, Any]:
+        """A result's metadata; when the agent itself ended its turn, it names that turn.
+
+        Only the agent's Stop ends its turn. A close Skuld makes on its own (the turn cap,
+        idle or no-output timeouts, an interruption) leaves the agent working in the same
+        turn, so its later output must keep flowing: such a result names no turn and the
+        remembered finished turn stays as it was.
+        """
+        if not agent_ended:
+            return metadata
         self._finished_hook_turn_id = self._hook_turn_id
         self._hook_turn_id = ""
         if self._finished_hook_turn_id:
@@ -1937,13 +1955,15 @@ class TmuxInteractiveTransport(CLITransport):
     def _is_late_flush(self, hook_turn_id: str, text: str) -> bool:
         """A display flush that landed after its turn ended.
 
-        With both turn ids known it is exact: the turn the last result closed (LEX-1825),
-        whatever the text, while a new turn carries a new id. Otherwise (older CLIs, or a
-        turn that displayed nothing) only an exact echo of the last result's text counts,
-        as before.
+        With both turn ids known it is exact, also while the next turn runs: the turn the
+        agent's last Stop ended (LEX-1825), whatever the text; a new turn has a new id.
+        Otherwise (older CLIs, a turn that reported no id) only an exact echo of the last
+        result's text while idle counts, as before.
         """
         if hook_turn_id and self._finished_hook_turn_id:
             return hook_turn_id == self._finished_hook_turn_id
+        if self._turn_active:
+            return False
         last_result_text = str((self._last_result or {}).get("result") or "")
         return self._normalize_prompt(text) == self._normalize_prompt(last_result_text)
 
@@ -1992,7 +2012,7 @@ class TmuxInteractiveTransport(CLITransport):
         # _mark_semantic_turn_started here would open a PHANTOM turn. Drop the echo; only a
         # genuinely novel post-turn message (never carried by the last result) still emits.
         hook_turn_id = self._coerce_str(payload.get("turn_id"))
-        if not self._turn_active and self._is_late_flush(hook_turn_id, text):
+        if self._is_late_flush(hook_turn_id, text):
             return
         if hook_turn_id:
             self._hook_turn_id = hook_turn_id
@@ -3499,7 +3519,9 @@ class TmuxInteractiveTransport(CLITransport):
                 if content
                 else {}
             ),
-            "metadata": self._closing_metadata({"source": "claude_hook"}),
+            "metadata": self._closing_metadata(
+                {"source": "claude_hook"}, agent_ended=reason in AGENT_ENDED_REASONS
+            ),
         }
         self._last_result = result
         await self._emit(result)
@@ -4245,7 +4267,7 @@ class TmuxInteractiveTransport(CLITransport):
                 if content
                 else {}
             ),
-            "metadata": self._closing_metadata({"source": "tmux_interactive"}),
+            "metadata": self._closing_metadata({"source": "tmux_interactive"}, agent_ended=False),
         }
         self._last_result = result
         await self._emit(result)

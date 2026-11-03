@@ -706,7 +706,9 @@ class Broker(
         self._pending_block_type: str = ""
         self._pending_reasoning_text: str = ""
         # The agent's message ids folded into the open turn, and the agent turn id the last
-        # result closed: that turn's late hook frames are dropped (LEX-1825).
+        # logged result closed: that turn's late hook frames are dropped (LEX-1825). Held in
+        # memory: a broker restart between a result and its late hook (about 29 ms) keeps
+        # that one frame live while a rebuild drops it.
         self._pending_message_ids: list[str] = []
         self._closed_turn_id: str | None = None
         # Durable-log seq of the LAST frame folded into the open assistant turn. Drives the
@@ -3841,6 +3843,7 @@ class Broker(
             # D1: ``frame_ts`` (== this frame's durable row ts) is the tool_use start stamp.
             part_start = len(acc.parts)
             note_message_id(acc, data)
+            self._pending_message_ids = acc.message_ids
             apply_assistant_blocks(acc, content_blocks, ts=frame_ts)
             stamp_parts(acc.parts, data, start=part_start)
             self._pending_assistant_content = acc.content
@@ -3965,7 +3968,9 @@ class Broker(
 
             # Capture content before flush clears it
             content = self._pending_assistant_content or data.get("result", "")
-            self._closed_turn_id = frame_turn_id(data)
+            if not suppress_channel_broadcast:
+                # Only a logged result moves it, so the rebuild sees the same results.
+                self._closed_turn_id = frame_turn_id(data)
             if explicit_room_reply:
                 self._pending_assistant_content = ""
                 self._pending_assistant_parts = []

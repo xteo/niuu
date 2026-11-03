@@ -147,6 +147,7 @@ def transport(**state) -> SimpleNamespace:
     defaults = {
         "_hook_turn_id": "",
         "_finished_hook_turn_id": "turn-1",
+        "_turn_active": False,
         "_last_result": {"result": "Working on it.\nready"},
         "_normalize_prompt": TmuxInteractiveTransport._normalize_prompt,
     }
@@ -157,18 +158,42 @@ def test_the_transport_drops_a_late_flush_by_turn_id_and_keeps_new_turns():
     late = TmuxInteractiveTransport._is_late_flush
     assert late(transport(), "turn-1", "anything at all")
     assert not late(transport(), "turn-2", "ready")  # a new turn, even with the same text
-    # Without both ids, only the old exact echo of the last result counts.
+    # Without both ids, only the old exact echo of the last result counts, and only idle.
     assert late(transport(_finished_hook_turn_id=""), "turn-9", "Working on it. ready")
     assert not late(transport(_finished_hook_turn_id=""), "", "ready")
+    assert not late(
+        transport(_finished_hook_turn_id="", _turn_active=True), "", "Working on it. ready"
+    )
 
 
-def test_a_result_names_the_turn_it_closes_and_remembers_it():
-    state = transport(_hook_turn_id="turn-7", _finished_hook_turn_id="")
+def test_a_late_flush_is_caught_while_the_next_turn_runs():
+    late = TmuxInteractiveTransport._is_late_flush
+    running = transport(_turn_active=True, _hook_turn_id="turn-2")
+    assert late(running, "turn-1", "ready")  # turn 1's flush, landing in turn 2
+    assert not late(running, "turn-2", "ready")
+
+
+def test_only_the_agents_own_stop_ends_its_turn():
     closing = TmuxInteractiveTransport._closing_metadata
+    state = transport(_hook_turn_id="turn-7", _finished_hook_turn_id="turn-6")
 
-    assert closing(state, {"source": "claude_hook"}) == {
+    # Skuld's own close (turn cap, idle timeout): the agent keeps working in turn-7, so its
+    # later output must still flow. No turn named, nothing remembered.
+    assert closing(state, {"source": "tmux_interactive"}, agent_ended=False) == {
+        "source": "tmux_interactive"
+    }
+    assert (state._hook_turn_id, state._finished_hook_turn_id) == ("turn-7", "turn-6")
+    assert not TmuxInteractiveTransport._is_late_flush(state, "turn-7", "still working")
+
+    # The agent's Stop: the turn is named and remembered.
+    assert closing(state, {"source": "claude_hook"}, agent_ended=True) == {
         "source": "claude_hook",
         "claude_turn_id": "turn-7",
     }
-    assert (state._finished_hook_turn_id, state._hook_turn_id) == ("turn-7", "")
-    assert closing(state, {"source": "tmux_interactive"}) == {"source": "tmux_interactive"}
+    assert (state._hook_turn_id, state._finished_hook_turn_id) == ("", "turn-7")
+
+
+def test_only_stop_hooks_count_as_the_agent_ending_its_turn():
+    from skuld.transports.tmux_interactive import AGENT_ENDED_REASONS
+
+    assert AGENT_ENDED_REASONS == {"stop", "stop_failure"}
