@@ -78,3 +78,17 @@ unit, or a size command and a count command for a log without timestamps). To pa
   - Feedless nodes: 582bf8d0-41fb-4c5d-ad4c-e5cdbbdeb0c8; unreachable: none
 
 - **Promotions**: rolled back 0; completed 1 (11-03 03:05 Thor forge-lateframe-410e5b9c)
+
+## Guild summary 2026-11-04 (2026-11-03 06:30 to 2026-11-04 06:30 UTC)
+
+- **Thor**: ok, forge-orphans-3e2ee9f6 (3e2ee9f6a, not dirty); ledger 118; 78 sessions (12 running); 5xx 147 (0 during cutovers or rollbacks, 0 in known storms, 147 other: GET /s/{id}/api/conversation/history ×109, GET /api/v1/forge/sessions/{id}/conversation ×37, GET /api/v1/forge/notifications ×1)
+- **mini-m6**: ok, forge-m6-projects-4cd719ba (4cd719bad, not dirty); ledger unreadable (CalledProcessError); 17 sessions (6 running); 5xx 0
+
+- **Push gateway** (running), since the gateway started: alerts_sent 2, alerts_suppressed 1, widget_reloads 3, background_wakes 6, apns_rejections 3, tokens_pruned 3, loop_errors 1
+  - Against the previous window: alerts_sent 0 → 2, alerts_suppressed 0 → 1, widget_reloads 0 → 3, background_wakes 0 → 6, apns_rejections 0 → 3, tokens_pruned 0 → 3
+  - APNs answers per environment, since the gateway started: production: accepted 5, rejected 2; sandbox: accepted 8, rejected 1
+  - Rejections by reason in this window (gateway log): HTTP 410 ExpiredToken (token pruned) ×15, HTTP 410 Unregistered (token pruned) ×4, HTTP 400 BadDeviceToken (token pruned) ×1
+  - Registered tokens: production: alert 1, live_activity_start 2, widget_fallback 1; sandbox: alert 1, live_activity_start 1, widget 1
+  - Feedless nodes: 582bf8d0-41fb-4c5d-ad4c-e5cdbbdeb0c8; unreachable: none
+
+- **Promotions**: rolled back 1 (11-03 08:07 Thor forge-errturn-426ec48f); completed 2 (11-03 08:13 Thor forge-errturn-426ec48f; 11-04 02:01 Thor forge-orphans-3e2ee9f6)
