@@ -534,6 +534,23 @@ def _localize_mcp_servers(raw_servers: object, workspace: Path) -> list[dict[str
     return localized
 
 
+def _session_prompt_env(session_vals: dict) -> dict[str, str]:
+    """Skuld's per-session effort, prompts and the initial prompt's sender (LEX-1910)."""
+    env: dict[str, str] = {}
+    effort = session_vals.get("reasoningEffort") or session_vals.get("reasoning_effort")
+    if effort:
+        env["SKULD__SESSION__REASONING_EFFORT"] = str(effort)
+    if session_vals.get("systemPrompt"):
+        env["SKULD__SESSION__SYSTEM_PROMPT"] = session_vals["systemPrompt"]
+    if session_vals.get("initialPrompt"):
+        env["SKULD__SESSION__INITIAL_PROMPT"] = session_vals["initialPrompt"]
+    if session_vals.get("initialPromptSender") is not None:
+        env["SKULD__SESSION__INITIAL_PROMPT_SENDER"] = json.dumps(
+            session_vals["initialPromptSender"]
+        )
+    return env
+
+
 class LocalProcessPodManager(PodManager):
     """Manages Claude Code as local subprocesses.
 
@@ -1273,16 +1290,7 @@ class LocalProcessPodManager(PodManager):
         server_port = self._server_port
         env["SKULD__VOLUNDR_API_URL"] = f"http://{server_host}:{server_port}"
 
-        session_vals = spec.values.get("session", {})
-        system_prompt = session_vals.get("systemPrompt", "")
-        initial_prompt = session_vals.get("initialPrompt", "")
-        effort = session_vals.get("reasoningEffort") or session_vals.get("reasoning_effort")
-        if effort:
-            env["SKULD__SESSION__REASONING_EFFORT"] = str(effort)
-        if system_prompt:
-            env["SKULD__SESSION__SYSTEM_PROMPT"] = system_prompt
-        if initial_prompt:
-            env["SKULD__SESSION__INITIAL_PROMPT"] = initial_prompt
+        env.update(_session_prompt_env(spec.values.get("session", {})))
 
         # Claude transports still need the CLI binary location.
         if env.get("SKULD__CLI_TYPE", "claude") == "claude":

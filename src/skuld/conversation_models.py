@@ -21,6 +21,10 @@ class ConversationTurn:
     participant_meta: dict | None = None
     thread_id: str | None = None
     visibility: str = "public"
+    # Who sent a user-role turn (LEX-1910, ``niuu.domain.message_sender``), set by the
+    # server from the message's path. ``None`` on the model's own turns (the role says
+    # it) and on user turns recorded before senders were labelled.
+    sender: dict | None = None
 
 
 CHRONICLE_SUMMARY_PROMPT = """\

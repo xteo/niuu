@@ -1927,6 +1927,11 @@ class OpenShellGatewayPodManager(
                 )
                 if session_values.get(key)
             ]
+            if session_values.get("initialPromptSender") is not None:
+                prompts.append(
+                    "SKULD__SESSION__INITIAL_PROMPT_SENDER="
+                    + json.dumps(session_values["initialPromptSender"])
+                )
             command = (
                 ["env", *prompts, *self._sandbox_command] if prompts else self._sandbox_command
             )

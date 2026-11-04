@@ -3340,6 +3340,8 @@ class TestDispatchBrowserMessage:
                 "request_id": "req-1",
                 "steering_state": "pending",
                 "created_at": test_broker._conversation_turns[-1].created_at,
+                # With no socket, the message came from the owner's Telegram (LEX-1910).
+                "sender": {"kind": "user"},
             }
         )
         # BUG-3: a delivery ack is emitted so the HTTP /messages bridge can confirm the
@@ -3391,6 +3393,8 @@ class TestDispatchBrowserMessage:
                 "request_id": None,
                 "steering_state": "pending",
                 "created_at": test_broker._conversation_turns[-1].created_at,
+                # With no socket, the message came from the owner's Telegram (LEX-1910).
+                "sender": {"kind": "user"},
             }
         )
 
@@ -3427,6 +3431,8 @@ class TestDispatchBrowserMessage:
                 "request_id": None,
                 "steering_state": "pending",
                 "created_at": test_broker._conversation_turns[-1].created_at,
+                # With no socket, the message came from the owner's Telegram (LEX-1910).
+                "sender": {"kind": "user"},
             }
         )
 
@@ -5430,7 +5436,9 @@ class TestHandleWebSocket:
         mock_ws.headers = {}
         mock_ws.query_params = {}
         # First receive_json returns a message, second raises disconnect
-        mock_ws.receive_json = AsyncMock(side_effect=[{"content": "hello"}, WebSocketDisconnect()])
+        mock_ws.receive_json = AsyncMock(
+            side_effect=[{"content": "hello", "sender": "user"}, WebSocketDisconnect()]
+        )
 
         await test_broker.handle_websocket(mock_ws)
         # send_message runs in a background task; pump the loop so it runs.
@@ -5546,7 +5554,7 @@ class TestHandleWebSocket:
         mock_ws.receive_json = AsyncMock(
             side_effect=[
                 json.JSONDecodeError("Expecting value", "not json", 0),
-                {"content": "still here"},
+                {"content": "still here", "sender": "user"},
                 WebSocketDisconnect(),
             ]
         )

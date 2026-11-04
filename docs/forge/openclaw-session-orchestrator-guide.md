@@ -927,17 +927,44 @@ If your controller does not want to maintain a direct WebSocket, you can still d
 POST /api/v1/forge/sessions/{session_id}/messages
 Content-Type: application/json
 
-{"content":"Implement the requested change."}
+{"content":"Implement the requested change.","sender":"automation"}
 ```
 
 This is a proxy. Under the hood, the platform connects to the live session WebSocket for you and sends the user frame.
+
+#### Who sent it (`sender`)
+
+Every message records its sender, set by the server from the path it took and
+never parsed from its text (LEX-1910, `niuu.domain.message_sender`). The turn,
+its `user_confirmed` frame and the durable log carry it as a top-level `sender`
+object; clients read it before anything else:
+
+| `sender` | Set when |
+|---|---|
+| `{"kind": "user"}` | the owner's Lexi client sends `"sender": "user"`, or (until every client sends it) uses a client request id: iOS UPPERCASE UUID, web/Mac `<epoch ms>-<base36>`, `forge-ios-`/`forge-web-`/`forge-mac-` |
+| `{"kind": "agent", "sub_kind": "session", "id", "name", "host"}` | a session calls Forge MCP `send_message` (its credential says which session; `"via": "guild"` when relayed from another node) |
+| `{"kind": "agent", "sub_kind": "voice_call", "id": <call id>}` | the caller sends `"voice_call"` or that object |
+| `{"kind": "agent", "sub_kind": "automation", "name": <driver>}` | a script or driver sends `"automation"` or that object |
+| `{"kind": "agent", "sub_kind": "unknown"}` | no `sender` and no client request id. Never the user |
+
+A REST body cannot claim a session sender (400: only `send_message` sets it),
+nor `assistant`. For every sender except the user, the text the model receives
+starts with one header line, for example
+`[Message from automation lexi-errturn-m6, not typed by the user]`, then a blank
+line and the message; a slash command (`/clear`) is delivered unheaded so it
+still runs. The stored turn keeps the message as sent. `POST /sessions` takes
+`initial_prompt_sender` the same way for the first prompt; without one, the first
+prompt carries no sender.
 
 Expected response:
 
 ```json
 {
-  "status": "sent",
-  "session_id": "<id>"
+  "status": "delivered",
+  "session_id": "<id>",
+  "request_id": "<id>",
+  "delivery": "delivered",
+  "sender": {"kind": "agent", "sub_kind": "automation"}
 }
 ```
 

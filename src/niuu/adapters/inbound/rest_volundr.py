@@ -70,6 +70,7 @@ from niuu.adapters.outbound.guild_transport import (
     build_guild_httpx_client,
 )
 from niuu.domain.guild_membership import GuildInstance, GuildMembership
+from niuu.domain.message_sender import SENDER_NODE_HEADER
 from niuu.domain.models import InstanceKind, Principal, RegisteredInstance
 from niuu.domain.notifications import notification_image_url, notification_visible_to
 from niuu.domain.presented_files import (
@@ -2144,6 +2145,10 @@ def create_volundr_router(
             method="POST",
             path="/sessions",
             json_body=_strip_instance_hints(body),
+            # The in-process Forge records a creating session's node (LEX-1910).
+            extra_headers=(
+                {SENDER_NODE_HEADER: instance.name} if _uses_embedded_transport(instance) else None
+            ),
             embedded_app=embedded_forge_app,
         )
         _ensure_remote_success(response)
@@ -4521,6 +4526,10 @@ def create_volundr_router(
             method="POST",
             path=f"/sessions/{session_id}/messages",
             json_body=body,
+            # The in-process Forge records a sending session's node from this (LEX-1910).
+            extra_headers=(
+                {SENDER_NODE_HEADER: instance.name} if _uses_embedded_transport(instance) else None
+            ),
             embedded_app=embedded_forge_app,
         )
         _ensure_remote_success(response)

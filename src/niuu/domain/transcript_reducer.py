@@ -60,6 +60,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from niuu.domain.conversation_timeline import TIMELINE_KEY, project_timeline, stamp_parts, timeline
 from niuu.domain.history_control import is_history_control
+from niuu.domain.message_sender import SENDER_KEY, parse_recorded_sender
 
 # Deterministic namespace for folded-turn ids (stable across reloads AND across paths).
 _TURN_NAMESPACE = uuid.UUID("6f2d2e2a-7b1c-4e8a-9d3f-0a1b2c3d4e5f")
@@ -718,6 +719,7 @@ def build_user_turn(
     turn_id: str | None = None,
     metadata: dict | None = None,
     ts: datetime | None = None,
+    sender: dict | None = None,
 ) -> dict:
     """Build a user turn. Uses the carried ``turn_id`` (so live==rebuild) or the seq-based id."""
     tid = turn_id or assistant_turn_id(session_id, seq, "user")
@@ -728,6 +730,7 @@ def build_user_turn(
         parts=[],
         metadata=dict(metadata or {}),
         ts=ts,
+        sender=sender,
     )
 
 
@@ -1175,13 +1178,28 @@ def _apply_user_frame(acc, turns, seen_ids, session_id, seq, ts, kind, payload, 
     if timeline(payload) is not None:
         metadata[TIMELINE_KEY] = dict(timeline(payload))
     turns.append(
-        build_user_turn(session_id, seq, content, turn_id=uid or None, ts=ts, metadata=metadata)
+        build_user_turn(
+            session_id,
+            seq,
+            content,
+            turn_id=uid or None,
+            ts=ts,
+            metadata=metadata,
+            sender=parse_recorded_sender(payload.get(SENDER_KEY)),
+        )
     )
     return True
 
 
 def _turn_dict(
-    *, id: str, role: str, content: str, parts: list[dict], metadata: dict, ts: datetime | None
+    *,
+    id: str,
+    role: str,
+    content: str,
+    parts: list[dict],
+    metadata: dict,
+    ts: datetime | None,
+    sender: dict | None = None,
 ) -> dict:
     return {
         "id": id,
@@ -1191,6 +1209,9 @@ def _turn_dict(
         "created_at": _iso(ts),
         "metadata": metadata,
         "visibility": "public",
+        # The sender the live broker stored on a user turn (LEX-1910), when its frame
+        # recorded one; transcripts from before senders were labelled stay as they were.
+        **({SENDER_KEY: sender} if sender is not None else {}),
     }
 
 

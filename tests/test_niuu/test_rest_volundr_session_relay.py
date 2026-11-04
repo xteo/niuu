@@ -424,3 +424,58 @@ class TestMemberToHub:
         )
 
         assert response.status_code == 422
+
+
+class TestSenderOnTheLocalNode:
+    """LEX-1910: a session's message on its own node carries its name and node."""
+
+    async def test_send_message_is_labelled_with_the_sending_session_and_node(self):
+        from unittest.mock import patch
+
+        from tests.test_adapters.test_rest import TestSessionMessages
+        from volundr.domain.models import SessionStatus
+
+        forge = build_forge_app()
+        local = _instance(
+            "local",
+            base_url="embedded://local-forge",
+            tenant_id=TENANT,
+            is_default=True,
+            config={"transport": "embedded"},
+        )
+        app = FastAPI()
+        app.state.identity = AllowAllIdentityAdapter(user_repository=AsyncMock())
+        app.include_router(
+            create_volundr_router(StubInstanceService([local]), embedded_forge_app=forge.app)
+        )
+        sender = await forge.session(
+            "voice", workload_config={"forge_mcp": {"grants": ["message"]}}
+        )
+        credential = await forge.start(sender)
+        target = await forge.session(
+            "ios-coordinator",
+            status=SessionStatus.RUNNING,
+            chat_endpoint="ws://localhost:8080/s/ios-coordinator/session",
+        )
+        fake = TestSessionMessages._ack_connect({"type": "user_delivered", "status": "delivered"})
+
+        with patch("websockets.asyncio.client.connect", new=fake):
+            response = TestClient(app).post(
+                f"/api/v1/forge/sessions/{target.id}/messages",
+                json={"content": "READY", "request_id": "fmcp-1"},
+                # A caller cannot name the node; the gateway sets it.
+                headers={**bearer(credential.token), "x-niuu-sender-node": "forged"},
+            )
+
+        assert response.status_code == 200, response.text
+        frame = json.loads(fake.ws.sent[0])
+        assert frame["sender"] == {
+            "kind": "agent",
+            "sub_kind": "session",
+            "id": str(sender.id),
+            "name": "voice",
+            "host": "Instance local",
+        }
+        assert frame["content"] == (
+            f"[Message from session voice ({sender.id}) on Instance local]\n\nREADY"
+        )

@@ -194,6 +194,7 @@ class ForgeService:
             resource_config=data.resource_config or None,
             system_prompt=data.system_prompt,
             initial_prompt=data.initial_prompt,
+            initial_prompt_sender=getattr(data, "initial_prompt_sender", None),
             workload_type=data.workload_type,
             workload_config=workload_config or None,
         )

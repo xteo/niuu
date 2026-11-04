@@ -34,6 +34,8 @@ session:
   systemPrompt: ""
   # -- Initial user message sent when the CLI starts
   initialPrompt: ""
+  # -- Who wrote initialPrompt (LEX-1910), set by Forge: {kind, sub_kind, name, id, host}
+  initialPromptSender: null
 
 # -- MCP server configurations supplied by session contributors. Use credential references, not tokens.
 mcpServers: []

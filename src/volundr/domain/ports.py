@@ -2005,6 +2005,8 @@ class SessionContext:
     resource_config: dict = field(default_factory=dict)
     system_prompt: str = ""
     initial_prompt: str = ""
+    # Who wrote the initial prompt (LEX-1910); ``None`` when the creator named no one.
+    initial_prompt_sender: dict | None = None
     workload_type: str = "session"
     workload_config: dict = field(default_factory=dict)
 

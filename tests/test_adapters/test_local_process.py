@@ -3288,3 +3288,18 @@ class TestLocalFlockMeshMode:
             "auth_token": "runtime-only-token",
         }
         assert node_config["permission"]["workspace_root"] == str(repo_workspace)
+
+
+def test_the_initial_prompts_sender_reaches_skuld_as_json():
+    """LEX-1910: SkuldSessionConfig parses the sender from its env as JSON."""
+    from volundr.adapters.outbound.local_process import _session_prompt_env
+
+    sender = {"kind": "agent", "sub_kind": "automation", "name": "guild-daily"}
+
+    env = _session_prompt_env({"initialPrompt": "summary", "initialPromptSender": sender})
+
+    assert env == {
+        "SKULD__SESSION__INITIAL_PROMPT": "summary",
+        "SKULD__SESSION__INITIAL_PROMPT_SENDER": json.dumps(sender),
+    }
+    assert _session_prompt_env({"initialPrompt": "hi"}) == {"SKULD__SESSION__INITIAL_PROMPT": "hi"}

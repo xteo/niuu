@@ -9,6 +9,7 @@ import os
 import uuid
 from pathlib import Path
 
+from niuu.domain.message_sender import SENDER_KEY, text_for_model
 from niuu.ports.cli import CLITransport
 from niuu.utils import import_class, resolve_secret_kwargs
 from skuld.broker_api import _rebuild_presented_registry, _resume_presented_uploads
@@ -97,7 +98,7 @@ class TransportLifecycleMixin:
             "agent_teams": self._settings.agent_teams,
             "system_prompt": self._settings.session.system_prompt,
             "initial_prompt": (
-                "" if self._has_workflow_trigger() else self._settings.session.initial_prompt
+                "" if self._has_workflow_trigger() else self._initial_prompt_for_model()
             ),
             # Configured servers plus the built-in forge MCP (merged by name).
             "mcp_servers": self._effective_mcp_servers(),
@@ -185,6 +186,14 @@ class TransportLifecycleMixin:
             mode,
         )
 
+    def _initial_prompt_for_model(self) -> str:
+        """The initial prompt as the model receives it: headed when not the user's."""
+        prompt = self._settings.session.initial_prompt
+        sender = self._settings.session.initial_prompt_sender
+        if not prompt or sender is None:
+            return prompt
+        return text_for_model(sender, prompt)
+
     async def _ensure_transport_started(self) -> None:
         """Join any in-flight startup before accepting messages on any channel."""
         async with self._transport_start_lock:
@@ -208,13 +217,21 @@ class TransportLifecycleMixin:
             t.role == "user" and t.content == prompt for t in self._conversation_turns
         ):
             turn_id = str(uuid.uuid4())
-            self._append_turn(ConversationTurn(id=turn_id, role="user", content=prompt))
+            sender = self._settings.session.initial_prompt_sender
+            self._append_turn(
+                ConversationTurn(id=turn_id, role="user", content=prompt, sender=sender)
+            )
             # The initial prompt is a human turn too — persist it to the durable
             # log so log-only replay opens with the operator's first message.
-            self._enqueue_human_turn_event(prompt, turn_id)
+            self._enqueue_human_turn_event(prompt, turn_id, sender=sender)
             try:
                 await self._emit_broker_frame(
-                    {"type": "user_confirmed", "id": turn_id, "content": prompt}
+                    {
+                        "type": "user_confirmed",
+                        "id": turn_id,
+                        "content": prompt,
+                        **({SENDER_KEY: sender} if sender else {}),
+                    }
                 )
             except Exception:
                 logger.debug("Initial-prompt user_confirmed broadcast failed", exc_info=True)

@@ -1252,6 +1252,7 @@ class SessionService:
         resource_config: dict | None = None,
         system_prompt: str = "",
         initial_prompt: str = "",
+        initial_prompt_sender: dict | None = None,
         workload_type: str = "session",
         workload_config: dict | None = None,
     ) -> Session:
@@ -1367,6 +1368,7 @@ class SessionService:
                 resource_config=resource_config,
                 system_prompt=system_prompt,
                 initial_prompt=initial_prompt,
+                initial_prompt_sender=initial_prompt_sender,
                 workload_type=workload_type,
                 # Contributors never see the credential bookkeeping: an otherwise
                 # empty workload config must still read as empty to them.
@@ -1391,6 +1393,7 @@ class SessionService:
         resource_config: dict | None = None,
         system_prompt: str = "",
         initial_prompt: str = "",
+        initial_prompt_sender: dict | None = None,
         workload_type: str = "session",
         workload_config: dict | None = None,
     ) -> None:
@@ -1407,6 +1410,7 @@ class SessionService:
                 resource_config=resource_config,
                 system_prompt=system_prompt,
                 initial_prompt=initial_prompt,
+                initial_prompt_sender=initial_prompt_sender,
                 workload_type=workload_type,
                 workload_config=workload_config,
             )
@@ -1491,6 +1495,7 @@ class SessionService:
         resource_config: dict | None = None,
         system_prompt: str = "",
         initial_prompt: str = "",
+        initial_prompt_sender: dict | None = None,
         workload_type: str = "session",
         workload_config: dict | None = None,
     ):
@@ -1571,6 +1576,7 @@ class SessionService:
             resource_config=resource_config or {},
             system_prompt=system_prompt,
             initial_prompt=initial_prompt,
+            initial_prompt_sender=initial_prompt_sender,
             workload_type=workload_type,
             # Contributors never see the credential bookkeeping: an otherwise
             # empty workload config must still read as empty to them.

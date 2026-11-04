@@ -75,6 +75,9 @@ data:
       {{- if .Values.session.initialPrompt }}
       initial_prompt: {{ .Values.session.initialPrompt | quote }}
       {{- end }}
+      {{- if .Values.session.initialPromptSender }}
+      initial_prompt_sender: {{ .Values.session.initialPromptSender | toJson }}
+      {{- end }}
 
     mcp_servers: {{ .Values.mcpServers | default list | toJson }}
     transport: {{ .Values.broker.transport | default "sdk" | quote }}

@@ -23,6 +23,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
+from niuu.domain.message_sender import (
+    SENDER_NODE_HEADER,
+    SenderError,
+    parse_claimed_sender,
+    sender_for_request_id,
+    session_sender,
+    text_for_model,
+)
 from niuu.domain.notifications import notification_visible_to
 from niuu.domain.presented_files import (
     PRESENTED_FILE_DURABLE_CACHE,
@@ -708,6 +716,14 @@ class SessionCreate(BaseModel):
         max_length=100_000,
         description="Initial user message sent when the CLI starts",
     )
+    initial_prompt_sender: str | dict | None = Field(
+        default=None,
+        description=(
+            "Who wrote initial_prompt (LEX-1910): 'user', 'voice_call', 'automation', "
+            "'unknown' or a sender object. A session creating a session is recorded as "
+            "that session and must omit it."
+        ),
+    )
     issue_id: str | None = Field(
         default=None,
         max_length=255,
@@ -912,6 +928,25 @@ class RelayedSessionMessage(BaseModel):
     content: str = Field(min_length=1)
     request_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{1,200}$")
     sender: RelayedMessageSender
+
+
+def _sender_frame(content: str, request_id: str, sender: dict[str, Any]) -> dict[str, Any]:
+    """The broker frame for a posted message (LEX-1910).
+
+    ``content`` is what the model receives: the sender's header line first when the
+    sender is not the user. ``display_content`` is the message as sent, which a broker
+    that reads ``sender`` records on the turn; a broker that predates it ignores both
+    keys and still hands the model the header.
+    """
+    frame: dict[str, Any] = {
+        "type": "user",
+        "content": text_for_model(sender, content),
+        "request_id": request_id,
+        "sender": sender,
+    }
+    if frame["content"] != content:
+        frame["display_content"] = content
+    return frame
 
 
 def relay_refusal(sender: RelayedMessageSender, target: Session) -> str | None:
@@ -2711,6 +2746,14 @@ def create_router(
         ordinary human PATs and workload tokens are unaffected.
         """
         principal = await _optional_principal(request)
+        if data.initial_prompt:
+            data = data.model_copy(
+                update={
+                    "initial_prompt_sender": await _named_sender(
+                        request, principal, data.initial_prompt_sender
+                    )
+                }
+            )
         try:
             started = await project_result(
                 forge.create_and_start_session(data, principal=principal)
@@ -3949,7 +3992,12 @@ def create_router(
         session_id: UUID = Path(description="Unique session identifier"),
         body: dict = ...,
     ) -> Response:
-        """Send a user message to a running session via its WebSocket.
+        """Send a message to a running session via its WebSocket.
+
+        The message records its sender (LEX-1910): a session credential is that
+        session; otherwise the body's ``sender`` (``user``, ``voice_call``,
+        ``automation``, ``unknown`` or an object). With no ``sender``, a request id
+        a Lexi client mints is the user's and anything else is an unknown sender.
 
         INV-7 delivery contract: the response distinguishes delivered from
         not-delivered. 200 ``status=delivered`` means the transport accepted the
@@ -3958,10 +4006,6 @@ def create_router(
         rejection raises 502; an unreachable pod raises 409. ``unconfirmed`` is never
         returned as success.
         """
-        import ssl
-
-        from websockets.asyncio.client import connect
-
         content = body.get("content", "")
         if not isinstance(content, str) or not content.strip():
             raise HTTPException(
@@ -3976,8 +4020,60 @@ def create_router(
         if not isinstance(req_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", req_id):
             raise HTTPException(status_code=400, detail="Invalid request_id")
 
-        # Verify the caller owns this session
         principal = await extract_principal(request)
+        sender = await _named_sender(
+            request, principal, body.get("sender")
+        ) or sender_for_request_id(req_id)
+        return await _deliver_session_message(
+            request, principal, session_id, content=content, req_id=req_id, sender=sender
+        )
+
+    async def _named_sender(
+        request: Request, principal: Principal | None, claimed: object
+    ) -> dict[str, Any] | None:
+        """Who is writing to a session, set from the path and never from the text.
+
+        A session credential is that session; otherwise the sender the caller names,
+        or ``None`` when it names none.
+        """
+        if principal is not None and principal.token_use == FORGE_SESSION_TOKEN_USE:
+            if claimed is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A session's messages are sent as that session; omit sender",
+                )
+            caller = await forge.get_session(UUID(principal.bound_session_id))
+            if caller is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Sending session not found: {principal.bound_session_id}",
+                )
+            return session_sender(
+                session_id=str(caller.id),
+                name=caller.name or "",
+                host=request.headers.get(SENDER_NODE_HEADER, ""),
+            )
+        if claimed is None:
+            return None
+        try:
+            return parse_claimed_sender(claimed)
+        except SenderError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    async def _deliver_session_message(
+        request: Request,
+        principal: Principal,
+        session_id: UUID,
+        *,
+        content: str,
+        req_id: str,
+        sender: dict[str, Any],
+    ) -> Response:
+        import ssl
+
+        from websockets.asyncio.client import connect
+
+        # Verify the caller owns this session
         try:
             session, _ = await forge.get_session_proxy_target(session_id)
         except LookupError:
@@ -4046,9 +4142,7 @@ def create_router(
                 # delay or drop the first user turn for transports that emit
                 # welcome or capability events while still coming online.
                 dispatch_attempted = True
-                await ws.send(
-                    json.dumps({"type": "user", "content": content, "request_id": req_id})
-                )
+                await ws.send(json.dumps(_sender_frame(content, req_id, sender)))
 
                 # Hold the socket open until the broker ACKs delivery for THIS request_id,
                 # or a bounded grace elapses. Draining other frames meanwhile lets a
@@ -4090,6 +4184,7 @@ def create_router(
                         "delivery": "pending",
                         "session_id": str(session_id),
                         "request_id": req_id,
+                        "sender": sender,
                         "message": "Delivery is unconfirmed; check this request before retrying.",
                     },
                 )
@@ -4121,6 +4216,7 @@ def create_router(
                     "status": "failed",
                     "delivery": "failed",
                     "request_id": req_id,
+                    "sender": sender,
                     "session_id": str(session_id),
                     "code": code,
                     "message": delivery.get("content") or "Message was not accepted",
@@ -4148,6 +4244,7 @@ def create_router(
                     "status": "pending",
                     "session_id": str(session_id),
                     "request_id": req_id,
+                    "sender": sender,
                     "delivery": "pending",
                 },
             )
@@ -4160,6 +4257,7 @@ def create_router(
                 "status": "delivered",
                 "session_id": str(session_id),
                 "request_id": req_id,
+                "sender": sender,
                 "delivery": str(delivery.get("status") or "delivered"),
             },
         )
@@ -4202,28 +4300,29 @@ def create_router(
         refusal = relay_refusal(data.sender, target)
         if refusal is not None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
-        sender = data.sender
-        name = (
-            f"{sender.session_name} ({sender.session_id})"
-            if sender.session_name
-            else str(sender.session_id)
-        )
-        framed = (
-            f"[Message from session {name} on {sender.instance_name}, relayed through the "
-            f"Guild]\n\n{data.content}"
-        )
+        attested = data.sender
+        try:
+            sender = session_sender(
+                session_id=str(attested.session_id),
+                name=attested.session_name,
+                host=attested.instance_name,
+                relayed=True,
+            )
+        except SenderError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         logger.info(
             "Relayed message from session %s on %s to %s",
-            sender.session_id,
-            _sanitize_log(sender.instance_name),
+            attested.session_id,
+            _sanitize_log(attested.instance_name),
             session_id,
         )
-        return await send_session_message(
+        return await _deliver_session_message(
             request,
+            principal,
             session_id,
-            {"content": framed, "request_id": data.request_id}
-            if data.request_id
-            else {"content": framed},
+            content=data.content,
+            req_id=data.request_id or str(uuid4()),
+            sender=sender,
         )
 
     @router.get(

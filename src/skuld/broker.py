@@ -28,6 +28,14 @@ from fastapi import WebSocket, WebSocketDisconnect  # noqa: F401
 
 from niuu.domain.conversation_timeline import TIMELINE_KEY, project_timeline, stamp_parts, timeline
 from niuu.domain.logging import LoggingConfig
+from niuu.domain.message_sender import (
+    SENDER_KEY,
+    SenderError,
+    parse_recorded_sender,
+    sender_for_request_id,
+    text_for_model,
+    user_sender,
+)
 from niuu.domain.outcome import parse_outcome_block
 from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import (
@@ -305,6 +313,29 @@ def _describe_browser_content_block(block: dict[str, Any]) -> str | None:
     if block_type == "file":
         return "file attachment"
     return f"{block_type} attachment"
+
+
+def _browser_message_sender(
+    data: dict, content: str, request_id: str | None, *, from_telegram: bool
+) -> tuple[dict[str, Any], str, str]:
+    """Return ``(sender, turn text, model text)`` for an inbound message (LEX-1910).
+
+    Forge's ``POST /messages`` names the sender and, when it wrote the sender's
+    header into ``content``, sends the message as written in ``display_content``.
+    A frame without a sender comes from a client socket: the owner's Telegram
+    channel or a client request id is the user, anything else an unknown sender.
+    """
+    sender = parse_recorded_sender(data.get(SENDER_KEY))
+    if sender is None:
+        sender = user_sender() if from_telegram else sender_for_request_id(request_id)
+    display = data.get("display_content")
+    if data.get(SENDER_KEY) is not None and isinstance(display, str) and display.strip():
+        return sender, display, content
+    return sender, content, text_for_model(sender, content)
+
+
+def _sender_kind(sender: dict[str, Any]) -> str:
+    return sender.get("sub_kind") or sender["kind"]
 
 
 def _normalize_browser_message_content(content: object) -> str:
@@ -872,6 +903,7 @@ class Broker(
                     participant_meta=t.get("participant_meta"),
                     thread_id=t.get("thread_id"),
                     visibility=t.get("visibility", "public"),
+                    sender=t.get("sender"),
                 )
                 for t in turns
             ]
@@ -999,14 +1031,16 @@ class Broker(
             return
 
         turn_id = str(uuid.uuid4())
+        sender = self._settings.session.initial_prompt_sender
         self._append_turn(
             ConversationTurn(
                 id=turn_id,
                 role="user",
                 content=prompt,
+                sender=sender,
             )
         )
-        self._enqueue_human_turn_event(prompt, turn_id)
+        self._enqueue_human_turn_event(prompt, turn_id, sender=sender)
         await self._complete_trace_span(
             kind="turn.user",
             name=prompt[:120] or "workflow prompt",
@@ -1023,6 +1057,7 @@ class Broker(
                 "type": "user_confirmed",
                 "id": turn_id,
                 "content": prompt,
+                **({SENDER_KEY: sender} if sender else {}),
             }
         )
 
@@ -4606,6 +4641,17 @@ class Broker(
                 msg_id = str(uuid.uuid4())
                 request_id = data.get("request_id")
                 request_id = request_id if isinstance(request_id, str) and request_id else None
+                try:
+                    sender, content_str, model_content = _browser_message_sender(
+                        data, content_str, request_id, from_telegram=sender_ws is None
+                    )
+                except SenderError as exc:
+                    logger.info("_dispatch_browser_message: refused sender: %s", exc)
+                    if sender_ws:
+                        await self._send_broker_frame_to(
+                            sender_ws, control_error_frame(str(exc), data, code="invalid_sender")
+                        )
+                    return
                 if request_id and self.volundr_api_url:
                     msg_id = str(
                         uuid.uuid5(uuid.NAMESPACE_URL, f"{self.session_id}:message:{request_id}")
@@ -4632,7 +4678,7 @@ class Broker(
                     self._message_claim_tokens[request_id] = token
                 now = datetime.now(UTC)
                 input_timeline = self._enqueue_human_turn_event(
-                    content_str, msg_id, request_id=request_id, ts=now
+                    content_str, msg_id, request_id=request_id, ts=now, sender=sender
                 )
                 self._append_turn(
                     ConversationTurn(
@@ -4640,6 +4686,7 @@ class Broker(
                         role="user",
                         content=content_str,
                         created_at=now.isoformat(),
+                        sender=sender,
                         # The message has been accepted but not yet consumed by the
                         # agent. It rides as "pending" (the client renders it greyed /
                         # italic) until the correlated UserPromptSubmit flips it to
@@ -4661,7 +4708,7 @@ class Broker(
                     actor_type="user",
                     actor_id=request_id or msg_id,
                     actor_label="user",
-                    attributes={"source": "browser"},
+                    attributes={"source": "browser", "sender_kind": _sender_kind(sender)},
                     started_at=now,
                     ended_at=now,
                 )
@@ -4677,6 +4724,7 @@ class Broker(
                         "request_id": request_id,
                         "steering_state": "pending",
                         "created_at": now.isoformat(),
+                        SENDER_KEY: sender,
                         **({TIMELINE_KEY: input_timeline} if input_timeline else {}),
                     }
                 )
@@ -4691,7 +4739,7 @@ class Broker(
                 # boundary that moves between accept and delivery routes correctly.
                 asyncio.create_task(
                     self._deliver_user_message_and_ack(
-                        content_str,
+                        model_content,
                         request_id=request_id,
                         msg_id=msg_id,
                     ),

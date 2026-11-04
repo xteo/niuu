@@ -29,6 +29,7 @@ from pydantic_settings import (
 
 from identity.authz_config import AuthorizationAdapterConfig
 from niuu.config import DynamicAdapterConfig
+from niuu.domain.message_sender import parse_recorded_sender
 from niuu.domain.observability import ObservabilityConfig
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.mesh.config import DEFAULT_RPC_REPLY_CACHE_SIZE, MeshNatsConfig
@@ -329,6 +330,15 @@ class SkuldSessionConfig(BaseModel):
     workspace_dir: str | None = Field(default=None)
     system_prompt: str = Field(default="")
     initial_prompt: str = Field(default="")
+    initial_prompt_sender: dict | None = Field(
+        default=None,
+        description=(
+            "Who wrote initial_prompt (LEX-1910, niuu.domain.message_sender): set by Forge "
+            "when the session's creator is known. Recorded on the first turn; a sender "
+            "other than the user also heads the prompt the model receives. Empty records "
+            "no sender."
+        ),
+    )
     saga_id: str | None = Field(default=None)
     run_id: str | None = Field(default=None)
     resume_session_id: str = Field(
@@ -338,6 +348,11 @@ class SkuldSessionConfig(BaseModel):
             "Volundr for sessions imported from an external harness."
         ),
     )
+
+    @field_validator("initial_prompt_sender", mode="after")
+    @classmethod
+    def _valid_initial_prompt_sender(cls, value: dict | None) -> dict | None:
+        return parse_recorded_sender(value)
 
 
 class ObservationRelayConfig(BaseModel):

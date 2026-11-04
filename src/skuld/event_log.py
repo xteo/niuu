@@ -548,6 +548,7 @@ class EventLogMixin:
         *,
         request_id: str | None = None,
         ts: datetime | None = None,
+        sender: dict | None = None,
     ) -> dict | None:
         """Persist a HUMAN message to the durable event log as a user frame.
 
@@ -568,6 +569,7 @@ class EventLogMixin:
             "message": {"role": "user", "content": content},
             **({"request_id": request_id} if request_id else {}),
             **({"created_at": ts.isoformat()} if ts else {}),
+            **({"sender": sender} if sender else {}),
         }
         self._enqueue_event_log(frame, ts=ts)
         return timeline(frame)
