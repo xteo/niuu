@@ -96,6 +96,7 @@ from skuld.conversation_models import (  # noqa: F401
     CONVERSATION_HISTORY_FILE,
     SUMMARY_TIMEOUT_SECONDS,
     ConversationTurn,
+    turn_record,
 )
 from skuld.conversation_read import history_write
 from skuld.delivery_claims import claim_message, settle_message
@@ -316,22 +317,33 @@ def _describe_browser_content_block(block: dict[str, Any]) -> str | None:
 
 
 def _browser_message_sender(
-    data: dict, content: str, request_id: str | None, *, from_telegram: bool
+    data: dict, content: str, request_id: str | None, *, role: str, from_telegram: bool
 ) -> tuple[dict[str, Any], str, str]:
     """Return ``(sender, turn text, model text)`` for an inbound message (LEX-1910).
 
     Forge's ``POST /messages`` names the sender and, when it wrote the sender's
     header into ``content``, sends the message as written in ``display_content``.
-    A frame without a sender comes from a client socket: the owner's Telegram
-    channel or a client request id is the user, anything else an unknown sender.
+    Only an owner connection (Forge's own, or the owner's client) may name a sender,
+    and ``content`` must be exactly ``display_content`` as the sender's header
+    heads it, so the stored turn is always what the model received. A frame
+    without a sender is the owner's Telegram channel or a client request id (the
+    user), or an unknown sender.
     """
-    sender = parse_recorded_sender(data.get(SENDER_KEY))
-    if sender is None:
-        sender = user_sender() if from_telegram else sender_for_request_id(request_id)
+    named = data.get(SENDER_KEY)
     display = data.get("display_content")
-    if data.get(SENDER_KEY) is not None and isinstance(display, str) and display.strip():
-        return sender, display, content
-    return sender, content, text_for_model(sender, content)
+    if (named is not None or display is not None) and role != "owner":
+        raise SenderError(f"a {role} connection cannot name a message's sender")
+    sender = parse_recorded_sender(named)
+    if sender is None:
+        if display is not None:
+            raise SenderError("display_content needs the sender that heads it")
+        sender = user_sender() if from_telegram else sender_for_request_id(request_id)
+        return sender, content, text_for_model(sender, content)
+    if display is None:
+        return sender, content, text_for_model(sender, content)
+    if not isinstance(display, str) or text_for_model(sender, display) != content:
+        raise SenderError("content must be display_content headed by its sender")
+    return sender, display, content
 
 
 def _sender_kind(sender: dict[str, Any]) -> str:
@@ -920,7 +932,7 @@ class Broker(
         path = self._conversation_history_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            turns = [asdict(t) for t in self._conversation_turns]
+            turns = [turn_record(t) for t in self._conversation_turns]
             turns = project_timeline(turns, self.session_id)
             data = {"turns": turns, "projection_revision": projection_revision(turns)}
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -936,7 +948,7 @@ class Broker(
         return self._enqueue_event_log(
             {
                 "type": "conversation.turn",
-                "turn": asdict(turn),
+                "turn": turn_record(turn),
             }
         )
 
@@ -4641,9 +4653,16 @@ class Broker(
                 msg_id = str(uuid.uuid4())
                 request_id = data.get("request_id")
                 request_id = request_id if isinstance(request_id, str) and request_id else None
+                # The claim keeps the text as this frame carried it, as brokers before
+                # LEX-1910 recorded it, so a retry across an upgrade is the same claim.
+                frame_content = content_str
                 try:
                     sender, content_str, model_content = _browser_message_sender(
-                        data, content_str, request_id, from_telegram=sender_ws is None
+                        data,
+                        content_str,
+                        request_id,
+                        role=actual_role,
+                        from_telegram=sender_ws is None,
                     )
                 except SenderError as exc:
                     logger.info("_dispatch_browser_message: refused sender: %s", exc)
@@ -4661,7 +4680,7 @@ class Broker(
                         await self._get_http_client(),
                         session_id=self.session_id,
                         request_id=request_id,
-                        content=content_str,
+                        content=frame_content,
                         token=token,
                         timeout=self._settings.delivery.attempt_timeout_seconds,
                         attempts=self._settings.delivery.max_attempts,
@@ -5745,7 +5764,7 @@ class Broker(
                 on_frames=self._restore_durable_runtime_state,
             )
             merged = merge_history_turns(
-                durable, [asdict(turn) for turn in self._conversation_turns]
+                durable, [turn_record(turn) for turn in self._conversation_turns]
             )
             hydrated = [ConversationTurn(**turn) for turn in merged]
         except Exception as exc:

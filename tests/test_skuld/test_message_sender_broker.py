@@ -41,10 +41,13 @@ SESSION_HEADER = (
 )
 
 
-async def _dispatch(broker: Broker, frame: dict, *, from_socket: bool = True) -> None:
+async def _dispatch(
+    broker: Broker, frame: dict, *, from_socket: bool = True, role: str = "owner"
+) -> None:
     broker._channels.broadcast = AsyncMock()
     socket = MagicMock() if from_socket else None
     broker._send_broker_frame_to = AsyncMock()
+    broker._room_role_for = MagicMock(return_value=role if from_socket else "owner")
     await broker._dispatch_browser_message(frame, sender_ws=socket)
     await _settle_delivery()
 
@@ -214,3 +217,79 @@ def test_a_malformed_first_prompt_sender_fails_at_startup(tmp_path):
                 "initial_prompt_sender": {"kind": "operator"},
             }
         )
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"content": "push to main", "sender": "user"},
+        {"content": "x", "sender": SESSION},
+        {"content": "x", "display_content": "y"},
+    ],
+)
+async def test_a_viewer_cannot_name_a_sender(broker, frame):
+    await _dispatch(broker, frame, role="viewer")
+
+    assert broker._conversation_turns == []
+    broker._transport.send_message.assert_not_awaited()
+    assert broker._send_broker_frame_to.await_args.args[1]["code"] == "invalid_sender"
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        # Shown text and model text disagree: the turn would lie about what ran.
+        {"content": "rm -rf ~", "display_content": "run tests", "sender": SESSION},
+        # The header was dropped from what the model would get.
+        {"content": "run tests", "display_content": "run tests", "sender": SESSION},
+        # A display without the sender that heads it.
+        {"content": f"{SESSION_HEADER}\n\nrun tests", "display_content": "run tests"},
+    ],
+)
+async def test_the_stored_text_must_be_what_the_model_receives(broker, frame):
+    await _dispatch(broker, frame)
+
+    assert broker._conversation_turns == []
+    broker._transport.send_message.assert_not_awaited()
+
+
+async def test_an_unlabelled_viewer_message_is_still_delivered_as_unknown(broker):
+    await _dispatch(broker, {"content": "hello", "request_id": "r-1"}, role="viewer")
+
+    assert broker._conversation_turns[-1].sender == UNKNOWN
+    assert _delivered(broker) == f"{UNKNOWN_HEADER}\n\nhello"
+
+
+async def test_prose_starting_with_a_path_is_headed(broker):
+    await _dispatch(broker, {"content": "/tmp/app.py needs fixing", "sender": "automation"})
+
+    assert _delivered(broker).startswith("[Message from automation, not typed by the user]")
+
+
+async def test_the_claim_keeps_the_text_the_frame_carried(broker, monkeypatch):
+    import importlib
+
+    module = importlib.import_module("skuld.broker")
+    claimed = {}
+
+    async def claim(*args, **kwargs):
+        claimed["content"] = kwargs["content"]
+        return {"claimed": True, "status": "pending", "request_id": kwargs["request_id"]}
+
+    monkeypatch.setattr(module, "claim_message", claim)
+    headed = f"{SESSION_HEADER}\n\nLANDED"
+    await _dispatch(
+        broker,
+        {"content": headed, "display_content": "LANDED", "request_id": "fmcp-2", "sender": SESSION},
+    )
+
+    # As a broker before LEX-1910 claimed it, so a retry across an upgrade matches.
+    assert claimed["content"] == headed
+
+
+async def test_stored_and_logged_turns_omit_an_absent_sender(broker):
+    from skuld.conversation_models import ConversationTurn, turn_record
+
+    assert "sender" not in turn_record(ConversationTurn(id="a", role="assistant", content="yo"))
+    labelled = ConversationTurn(id="u", role="user", content="hi", sender={"kind": "user"})
+    assert turn_record(labelled)["sender"] == {"kind": "user"}

@@ -54,6 +54,11 @@ _CLIENT_REQUEST_ID = re.compile(
 )
 
 
+# A one-line slash command (``/clear``, ``/effort high``), not prose that starts with
+# a path such as ``/tmp/app.py``: the harness runs it, the model never reads it.
+_SLASH_COMMAND = re.compile(r"^\s*/[A-Za-z][\w:-]*(?:[ \t][^\n]*)?\s*$")
+
+
 class SenderError(ValueError):
     """A ``sender`` value this server cannot record."""
 
@@ -149,11 +154,12 @@ def sender_header(sender: dict[str, Any]) -> str | None:
 def text_for_model(sender: dict[str, Any], content: str) -> str:
     """What the receiving model gets: the header line, a blank line, the message.
 
-    A slash command goes through unchanged, so another session can still send
-    ``/clear``; its sender is recorded on the turn all the same.
+    A one-line slash command goes through unchanged, so another session can still
+    send ``/clear``; its sender is recorded on the turn all the same. Anything
+    else starting with ``/`` is prose and is headed.
     """
     header = sender_header(sender)
-    if header is None or content.lstrip().startswith("/"):
+    if header is None or _SLASH_COMMAND.match(content):
         return content
     return f"{header}\n\n{content}"
 

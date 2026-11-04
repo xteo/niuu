@@ -41,9 +41,9 @@ def conversation_rows(broker: object, *, omit_empty_participants: bool = False) 
     # Do not asdict/deep-copy every historical tool result to serve fifteen rows.
     turns = [vars(turn).copy() for turn in broker._conversation_turns]
     for turn in turns:
-        # An unlabelled turn has no sender key, as a rebuild from the log has none.
-        if turn.get("sender") is None:
-            turn.pop("sender", None)
+        # An unlabelled turn has no sender key, as its rebuild from the log has none.
+        if turn["sender"] is None:
+            del turn["sender"]
     for turn in turns if omit_empty_participants else []:
         for key in ("participant_id", "participant_meta", "thread_id"):
             if turn.get(key) is None:

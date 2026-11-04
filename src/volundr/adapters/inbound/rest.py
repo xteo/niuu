@@ -2746,14 +2746,15 @@ def create_router(
         ordinary human PATs and workload tokens are unaffected.
         """
         principal = await _optional_principal(request)
-        if data.initial_prompt:
-            data = data.model_copy(
-                update={
-                    "initial_prompt_sender": await _named_sender(
-                        request, principal, data.initial_prompt_sender
-                    )
-                }
-            )
+        # Always, prompt or not: a flock derives its first prompt later, and the
+        # body's value must never reach the session unchecked.
+        data = data.model_copy(
+            update={
+                "initial_prompt_sender": await _named_sender(
+                    request, principal, data.initial_prompt_sender
+                )
+            }
+        )
         try:
             started = await project_result(
                 forge.create_and_start_session(data, principal=principal)

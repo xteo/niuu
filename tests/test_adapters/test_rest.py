@@ -2513,3 +2513,18 @@ class TestInitialPromptSender:
 
         assert response.status_code == 400
         assert data is None
+
+
+def test_a_flock_without_a_prompt_still_has_its_sender_checked(client):
+    """LEX-1910: a flock derives its first prompt later; the body's sender is still checked."""
+    response, data = TestInitialPromptSender()._create(
+        client,
+        {
+            "workload_type": "ravn_flock",
+            "workload_config": {"initiative_context": "go"},
+            "initial_prompt_sender": {"kind": "agent", "sub_kind": "session", "id": "x"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert data is None

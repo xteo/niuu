@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import socket
 import uuid
-from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -15,7 +14,7 @@ from niuu.domain.services.forge_session_token import SESSION_ID_CLAIM
 from niuu.forge_mcp.credentials import is_forge_session_claims, token_scopes, unverified_claims
 from niuu.forge_mcp.models import ForgeApiError
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
-from skuld.conversation_models import ConversationTurn
+from skuld.conversation_models import ConversationTurn, turn_record
 
 if TYPE_CHECKING:
     from skuld.broker import Broker
@@ -149,7 +148,7 @@ class BrokerForgeMcpHost(ForgeMcpHost):
         if entry is None:
             raise ForgeApiError("the durable log refused the notification turn", status=503)
         receipt = broker._watch_event_log_entry(entry)
-        await broker._channels.broadcast({"type": "conversation.turn", "turn": asdict(turn)})
+        await broker._channels.broadcast({"type": "conversation.turn", "turn": turn_record(turn)})
         stored = await broker._await_event_log_receipt(
             receipt, broker._settings.forge_mcp.notify_confirm_timeout_s
         )
@@ -183,7 +182,7 @@ class BrokerForgeMcpHost(ForgeMcpHost):
         if entry is None:
             raise ForgeApiError("the durable log refused the report turn", status=503)
         receipt = broker._watch_event_log_entry(entry)
-        await broker._channels.broadcast({"type": "conversation.turn", "turn": asdict(turn)})
+        await broker._channels.broadcast({"type": "conversation.turn", "turn": turn_record(turn)})
         stored = await broker._await_event_log_receipt(
             receipt, broker._settings.forge_mcp.notify_confirm_timeout_s
         )

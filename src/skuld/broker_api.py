@@ -35,7 +35,7 @@ from niuu.domain.presented_files import (
 )
 from niuu.domain.text_projection import projection_revision
 from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for_route
-from skuld.conversation_models import ConversationTurn
+from skuld.conversation_models import ConversationTurn, turn_record
 from skuld.conversation_read import conversation_rows, wait_history_quiet
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turn, is_elided_input
 from skuld.conversation_snapshot import ConversationSnapshotTooLargeError, prepare_history_page
@@ -1183,7 +1183,7 @@ async def present_file(body: dict) -> dict:
 
     turn = _build_present_file_turn(file_id, name, mime, size, caption, url=url)
     broker._append_turn(turn)
-    await broker._channels.broadcast({"type": "conversation.turn", "turn": asdict(turn)})
+    await broker._channels.broadcast({"type": "conversation.turn", "turn": turn_record(turn)})
     logger.info(
         "present-file: staged %s (%d bytes) as %s",
         repr(name),
