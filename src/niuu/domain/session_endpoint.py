@@ -6,6 +6,10 @@ import ipaddress
 from urllib.parse import quote, urlsplit, urlunsplit
 
 OPENSHELL_SERVICE_HOST_SUFFIX = ".openshell.localhost"
+#: Set by the session proxy on its own answers when the session's broker is not serving
+#: (not listening yet, gone, or silent), so a caller can tell them from the broker's
+#: typed answers. The value says how: ``connect``, ``transport`` or ``timeout``.
+BROKER_UNAVAILABLE_HEADER = "x-niuu-broker-unavailable"
 
 
 def is_loopback_or_wildcard(host: str | None) -> bool:

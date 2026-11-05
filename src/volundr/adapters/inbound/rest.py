@@ -51,7 +51,7 @@ from niuu.domain.session_description import (
     SHORT_DESCRIPTION_MAX_CHARS,
     SessionDescriptionPatch,
 )
-from niuu.domain.session_endpoint import public_session_endpoint
+from niuu.domain.session_endpoint import BROKER_UNAVAILABLE_HEADER, public_session_endpoint
 from niuu.domain.text_projection import projection_revision
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.room_access import ROOM_ROLE_HEADER
@@ -1698,6 +1698,13 @@ class QuestionAnswerRequest(BaseModel):
     answers: list[dict[str, Any]] | None = Field(
         default=None, description="The structured answer per ask item, kept as sent."
     )
+
+
+class _BrokerNotServingError(Exception):
+    """The session proxy says the broker is not serving (``x-niuu-broker-unavailable``)."""
+
+    def __str__(self) -> str:
+        return f"broker not serving ({self.args[0]})"
 
 
 class ErrorResponse(BaseModel):
@@ -4887,6 +4894,20 @@ def create_router(
                         params=params,
                     )
                     if history_protocol == 2 and response.status_code != 200:
+                        unavailable = response.headers.get(BROKER_UNAVAILABLE_HEADER)
+                        if unavailable and not cursor:
+                            # The broker is not serving (starting, restarting, gone): a
+                            # first page keeps no turn space yet, so the durable log
+                            # serves it, as it does an unpaged read.
+                            raise _BrokerNotServingError(unavailable)
+                        if unavailable:
+                            # A cursor belongs to the broker's turn space: no other
+                            # source may answer it. Typed, so the client retries.
+                            raise HTTPException(
+                                status.HTTP_503_SERVICE_UNAVAILABLE,
+                                {"code": "history_busy", "recovery": "retry"},
+                                headers={"Retry-After": "1"},
+                            )
                         # A typed stale/busy response must not silently select a
                         # different history source and pretend its cursor worked.
                         try:
@@ -5029,7 +5050,12 @@ def create_router(
                         "falling through to durable-log rebuild",
                         _sanitize_log(session_id),
                     )
-        except (ValueError, httpx.HTTPStatusError, httpx.RequestError) as e:
+        except (
+            ValueError,
+            httpx.HTTPStatusError,
+            httpx.RequestError,
+            _BrokerNotServingError,
+        ) as e:
             logger.info(
                 "Falling back to workspace transcript for session %s: %s",
                 _sanitize_log(session_id),

@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from niuu.domain.models import Principal
+from niuu.domain.session_endpoint import BROKER_UNAVAILABLE_HEADER
 from skuld.conversation_snapshot import prepare_history_page
 from tests.conftest import (
     InMemorySessionRepository,
@@ -22,7 +23,9 @@ from volundr.domain.models import Session, SessionStatus
 from volundr.domain.services import SessionService
 
 
-async def setup_api(monkeypatch, *, mode="archive", source=None, upstream_status=200):
+async def setup_api(
+    monkeypatch, *, mode="archive", source=None, upstream_status=200, unavailable=None
+):
     session = Session(
         id=uuid4(),
         name="synthetic-history",
@@ -51,6 +54,13 @@ async def setup_api(monkeypatch, *, mode="archive", source=None, upstream_status
 
     def upstream(request):
         captures.append(dict(request.url.params))
+        if unavailable is not None:
+            # The session proxy's own answer: the broker is not serving.
+            return httpx.Response(
+                504 if unavailable == "timeout" else 502,
+                json={"detail": "Skuld broker not ready"},
+                headers={BROKER_UNAVAILABLE_HEADER: unavailable},
+            )
         if upstream_status != 200:
             return httpx.Response(
                 upstream_status,
@@ -202,3 +212,53 @@ async def test_source_alias_resolves_exact_absolute_index_on_every_read_path(mon
         assert anchor["turn"]["id"] == projected[-1]["id"]
         page = client.get(url, params={"detail": "shallow", "after": anchor["index"] - 1}).json()
         assert page["turns"][0]["id"] == anchor["turn"]["id"]
+
+
+@pytest.mark.parametrize("how", ["connect", "transport", "timeout"])
+async def test_a_first_page_while_the_broker_is_not_serving_comes_from_the_log(monkeypatch, how):
+    """A session starting or restarting has no broker for a few seconds (Thor 5xx,
+    2026-11-04): its first page is the durable log's, as an unpaged read already is."""
+    app, session, _, archive, _, _ = await setup_api(monkeypatch, mode="gateway", unavailable=how)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/forge/sessions/{session.id}/conversation",
+            params={"history_protocol": 2, "limit": 5},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["history_protocol"] == 2 and body["total_turns"] == 50
+    assert [t["id"] for t in body["turns"]] == list(map(str, range(45, 50)))
+    archive.get_transcript.assert_awaited()
+
+
+async def test_a_cursor_page_while_the_broker_is_not_serving_is_a_typed_retry(monkeypatch):
+    app, session, _, archive, _, _ = await setup_api(monkeypatch, mode="gateway")
+    url = f"/api/v1/forge/sessions/{session.id}/conversation"
+    with TestClient(app) as client:
+        first = client.get(url, params={"history_protocol": 2}).json()
+    monkeypatch.undo()  # a second Forge, whose broker is not serving
+    app2, session2, _, archive2, _, _ = await setup_api(
+        monkeypatch, mode="gateway", unavailable="connect"
+    )
+    with TestClient(app2) as client:
+        response = client.get(
+            f"/api/v1/forge/sessions/{session2.id}/conversation",
+            params={"history_protocol": 2, "cursor": first["older_cursor"]},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == {"code": "history_busy", "recovery": "retry"}
+    assert response.headers["retry-after"] == "1"
+    archive2.get_transcript.assert_not_awaited()
+
+
+async def test_a_broker_answer_without_the_marker_still_passes_through(monkeypatch):
+    """Only the proxy's own marker means "not serving": a broker's 502 is its answer."""
+    app, session, _, archive, _, _ = await setup_api(
+        monkeypatch, mode="gateway", upstream_status=502
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/forge/sessions/{session.id}/conversation", params={"history_protocol": 2}
+        )
+    assert response.status_code == 502
+    archive.get_transcript.assert_not_awaited()
