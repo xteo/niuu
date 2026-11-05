@@ -30,6 +30,7 @@ from niuu.domain.message_sender import (
     sender_for_request_id,
     session_sender,
     text_for_model,
+    user_sender,
 )
 from niuu.domain.notifications import notification_visible_to
 from niuu.domain.presented_files import (
@@ -115,6 +116,7 @@ from volundr.domain.models import (
     UsageTokenCounts,
     WorkspaceStatus,
 )
+from volundr.domain.notifications import NotificationNotFoundError
 from volundr.domain.ports import (
     DeviceTokenRepository,
     EventBroadcaster,
@@ -130,6 +132,14 @@ from volundr.domain.push import (
     PushTokenKind,
     UnsupportedTokenKindError,
     token_fingerprint,
+)
+from volundr.domain.questions import (
+    MAX_DEVICE_ID_CHARS,
+    MAX_DEVICE_LABEL_CHARS,
+    AnsweredBy,
+    NotAQuestionError,
+    QuestionAnsweredError,
+    QuestionClosedError,
 )
 from volundr.domain.services import (
     ChronicleAccessDeniedError,
@@ -163,6 +173,7 @@ from volundr.domain.services.forge_session_launch import (
     ForgeMcpGrantChangeRefusedError,
     ForgeMcpGrantEscalationError,
 )
+from volundr.domain.services.notifications import QuestionStoreUnavailableError
 from volundr.domain.services.permission_auto_approval import (
     evaluate_permission_auto_approval,
 )
@@ -1656,6 +1667,37 @@ class HelpAnswerRequest(BaseModel):
 
     answer: str
     source: str = "external"
+
+
+class QuestionAnswerRequest(BaseModel):
+    """Body of ``POST /notifications/{id}/answer`` (LEX-1932)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(
+        pattern=r"^[A-Za-z0-9._:-]{1,200}$",
+        description="The answer's message id at the asking session; the same id is a retry.",
+    )
+    device_id: str = Field(
+        min_length=1,
+        max_length=MAX_DEVICE_ID_CHARS,
+        pattern=r"^[^\x00]+$",
+        description="The answering install's opaque id (the app keeps one per install).",
+    )
+    device_label: str = Field(
+        min_length=1,
+        max_length=MAX_DEVICE_LABEL_CHARS,
+        pattern=r"^[^\x00]*\S[^\x00]*$",
+        description='What the app shows: "iPhone", "iPad", "Mac".',
+    )
+    content: str = Field(
+        min_length=1,
+        pattern=r"\S",
+        description="The message the asking session receives, as the app writes it.",
+    )
+    answers: list[dict[str, Any]] | None = Field(
+        default=None, description="The structured answer per ask item, kept as sent."
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -4027,6 +4069,157 @@ def create_router(
         ) or sender_for_request_id(req_id)
         return await _deliver_session_message(
             request, principal, session_id, content=content, req_id=req_id, sender=sender
+        )
+
+    @router.post(
+        "/notifications/{notification_id}/answer",
+        dependencies=[Depends(require_scope(FORGE_SESSION_MESSAGE_SCOPE))],
+        tags=["Notifications"],
+        responses={
+            404: {"model": ErrorResponse},
+            409: {"description": "question_answered (with the first answer) or question_closed"},
+            422: {"model": ErrorResponse},
+            502: {"model": ErrorResponse},
+        },
+    )
+    async def answer_question(
+        request: Request,
+        body: QuestionAnswerRequest,
+        notification_id: UUID = Path(description="The question's notification id"),
+    ) -> Response:
+        """Answer a notice question once, for every device (LEX-1932).
+
+        The first answer is recorded, the question's notification is resolved
+        ("Answered on <device_label>") and ``content`` is delivered to the asking
+        session as a message with ``request_id`` (the delivery contract of
+        ``POST /sessions/{id}/messages``). Repeating the same ``request_id`` delivers
+        that answer again, idempotently. A different answer is refused with 409
+        ``question_answered`` carrying the first; a resolved or withdrawn question
+        with 409 ``question_closed``. The response's ``question`` is its state.
+        """
+        principal = await extract_principal(request)
+        if principal.token_use == FORGE_SESSION_TOKEN_USE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A question is answered by its user, not by a session",
+            )
+        service = getattr(request.app.state, "notification_service", None)
+        if service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Notifications are not enabled on this Forge",
+            )
+        device = AnsweredBy(device_id=body.device_id, device_label=body.device_label)
+
+        async def deliverable(notification: Any) -> None:
+            # Refused before anything is recorded: an answer that could never reach the
+            # asking session must not close the question for every device.
+            try:
+                asker, _ = await forge.get_session_proxy_target(notification.session_id)
+            except LookupError:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"The asking session {notification.session_id} no longer exists",
+                ) from None
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"The asking session {notification.session_id} is not running; "
+                        "nothing was recorded, answer again once it runs"
+                    ),
+                ) from None
+            if asker.owner_id and asker.owner_id != principal.user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to message the asking session",
+                )
+
+        try:
+            notification, record, _ = await service.answer_question(
+                principal,
+                notification_id,
+                request_id=body.request_id,
+                device=device,
+                content=body.content,
+                answers=body.answers,
+                before_claim=deliverable,
+            )
+        except NotificationNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except NotAQuestionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        except QuestionStoreUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        except QuestionAnsweredError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "detail": {
+                        "code": "question_answered",
+                        "message": "This question is already answered; the first answer stands",
+                        "question": exc.record.wire(service.question_ref(notification_id)),
+                    }
+                },
+            )
+        except QuestionClosedError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "detail": {
+                        "code": "question_closed",
+                        "message": str(exc),
+                        "question": (
+                            exc.record.wire(service.question_ref(notification_id))
+                            if exc.record is not None
+                            else None
+                        ),
+                    }
+                },
+            )
+        question = record.wire(service.question_ref(notification_id))
+        if notification.session_id is None or record.answer is None or not record.answer.content:
+            raise ValueError("answer_question returned a question without an answer to deliver")
+        try:
+            # The recorded answer, so a retry delivers exactly what every device was told.
+            delivered = await _deliver_session_message(
+                request,
+                principal,
+                notification.session_id,
+                content=record.answer.content,
+                req_id=body.request_id,
+                sender=user_sender(),
+            )
+        except HTTPException as exc:
+            # Recorded but not delivered: the same request_id delivers it again.
+            logger.error(
+                "Answer to question %s is recorded but not delivered to session %s (%s): "
+                "the answering device must retry with request_id %s",
+                notification_id,
+                notification.session_id,
+                exc.detail,
+                body.request_id,
+            )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={
+                    "code": "answer_not_delivered",
+                    "message": (
+                        f"The answer is recorded but not delivered ({exc.detail}); "
+                        "retry with the same request_id"
+                    ),
+                    "question": question,
+                },
+                headers=exc.headers,
+            ) from exc
+        payload = json.loads(bytes(delivered.body)) if delivered.body else {}
+        return JSONResponse(
+            status_code=delivered.status_code,
+            content={**(payload if isinstance(payload, dict) else {}), "question": question},
         )
 
     async def _named_sender(

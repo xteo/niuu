@@ -124,6 +124,7 @@ def push_gateway_settings(push: PushNotificationConfig) -> PushGatewaySettings:
             enabled=background.enabled,
             priority=background.priority,
             min_interval_seconds=background.min_interval_seconds,
+            questions=background.questions,
         ),
     )
 

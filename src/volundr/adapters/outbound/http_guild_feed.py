@@ -33,12 +33,13 @@ from niuu.adapters.inbound.forge_notification_feed import (
 )
 from niuu.adapters.inbound.forge_session_stream import remote_events
 from niuu.adapters.inbound.remote_urls import build_remote_url
-from volundr.domain.push import GuildNotification
+from volundr.domain.push import GuildNotification, GuildQuestionEvent
 from volundr.domain.push_ports import (
     GuildFeed,
     GuildFeedError,
     GuildFeedPage,
     GuildNodeHasNoFeedError,
+    GuildQuestionPage,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 FORGE_API_PREFIX = "/api/v1/forge"
 REGISTRY_API_PREFIX = "/api/v1/niuu"
 NOTIFICATIONS_PATH = "/notifications"
+QUESTION_EVENTS_PATH = "/notifications/questions/events"
 INSTANCES_PATH = "/instances"
 STREAM_PATH = "/sessions/stream"
 NOTIFICATION_EVENT = "session_notification"
@@ -68,6 +70,7 @@ class HttpGuildFeed(GuildFeed):
         if not guild_url:
             raise ValueError("The push gateway needs the Guild API origin (push.gateway.guild_url)")
         self._feed_url = build_remote_url(guild_url, FORGE_API_PREFIX, NOTIFICATIONS_PATH)
+        self._questions_url = build_remote_url(guild_url, FORGE_API_PREFIX, QUESTION_EVENTS_PATH)
         self._instances_url = build_remote_url(guild_url, REGISTRY_API_PREFIX, INSTANCES_PATH)
         self._stream_url = (
             build_remote_url(guild_url, FORGE_API_PREFIX, STREAM_PATH) + "?all_instances=true"
@@ -168,6 +171,45 @@ class HttpGuildFeed(GuildFeed):
         return GuildFeedPage(
             items=self._items(node, payload),
             position=advanced if advanced is not None else position,
+        )
+
+    async def question_events(self, node: str, position: int, *, limit: int) -> GuildQuestionPage:
+        what = f"Guild node {node}'s question events"
+        try:
+            response = await self._client.get(
+                self._questions_url,
+                params=[("instance_id", node), ("after", str(position)), ("limit", str(limit))],
+                headers=self._headers,
+            )
+        except httpx.HTTPError as exc:
+            raise GuildFeedError(f"{what} are unreachable: {type(exc).__name__}") from None
+        if response.status_code == httpx.codes.NOT_FOUND:
+            # The node has no such route: a Forge older than LEX-1932.
+            raise GuildNodeHasNoFeedError(f"{what} do not exist (a Forge older than LEX-1932)")
+        if response.status_code >= httpx.codes.BAD_REQUEST:
+            raise GuildFeedError(f"{what} answered HTTP {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise GuildFeedError(f"{what} answered with invalid JSON") from None
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("items"), list)
+            or type(payload.get("next_after")) is not int
+            or type(payload.get("head_seq")) is not int
+        ):
+            raise GuildFeedError(f"{what} answered with an unexpected shape")
+        items: list[GuildQuestionEvent] = []
+        for raw in payload["items"]:
+            if not isinstance(raw, Mapping):
+                raise GuildFeedError(f"{what} answered with a non-object item")
+            try:
+                items.append(GuildQuestionEvent.from_item(raw, node))
+            except ValueError as exc:
+                # Skipping one would advance past it and lose that change for good.
+                raise GuildFeedError(f"{what} answered with a malformed item: {exc}") from None
+        return GuildQuestionPage(
+            items=items, position=payload["next_after"], head=payload["head_seq"]
         )
 
     async def notification_events(self) -> AsyncIterator[str]:

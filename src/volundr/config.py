@@ -1055,6 +1055,14 @@ class PushBackgroundConfig(BaseModel):
         le=10,
         description="apns-priority of a background push. APNs refuses 10 for this type.",
     )
+    questions: bool = Field(
+        default=True,
+        description=(
+            "LEX-1932: with enabled, a silent push to every iOS device of the owner for "
+            "each question state change (answered, resolved, withdrawn), so every device "
+            "drops the question. Event-driven, not spaced by min_interval_seconds."
+        ),
+    )
 
 
 class PushGatewayConfig(BaseModel):
