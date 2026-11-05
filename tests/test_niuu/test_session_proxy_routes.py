@@ -774,6 +774,7 @@ class TestBrokerFailureReasons:
         response = self._get(tmp_path, caplog)
 
         assert response.status_code == 502
+        assert response.headers["x-niuu-broker-unavailable"] == "connect"
         assert "Session sess broker failed GET /api/conversation/history: could not connect" in (
             caplog.text
         )
@@ -787,6 +788,7 @@ class TestBrokerFailureReasons:
         response = self._get(tmp_path, caplog)
 
         assert response.status_code == 503
+        assert "x-niuu-broker-unavailable" not in response.headers  # the broker's own answer
         assert "broker answered 503 (history store busy)" in caplog.text
 
     @respx.mock
@@ -796,7 +798,17 @@ class TestBrokerFailureReasons:
         response = self._get(tmp_path, caplog)
 
         assert response.status_code == 504
+        assert response.headers["x-niuu-broker-unavailable"] == "timeout"
         assert "no answer within 30 s (ReadTimeout)" in caplog.text
+
+    @respx.mock
+    def test_a_dropped_connection_is_marked_too(self, tmp_path, caplog) -> None:
+        respx.get(self.URL).mock(side_effect=httpx.RemoteProtocolError("dropped"))
+
+        response = self._get(tmp_path, caplog)
+
+        assert response.status_code == 502
+        assert response.headers["x-niuu-broker-unavailable"] == "transport"
 
     @respx.mock
     def test_a_broker_that_drops_mid_response_is_a_logged_502(self, tmp_path, caplog) -> None:

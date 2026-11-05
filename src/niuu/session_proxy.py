@@ -18,6 +18,7 @@ from starlette.responses import JSONResponse, Response
 from identity.adapters.http_auth import extract_principal
 from niuu.config import NiuuSettings
 from niuu.domain.models import Principal
+from niuu.domain.session_endpoint import BROKER_UNAVAILABLE_HEADER
 from niuu.ports.session_proxy import SessionProxyTarget
 from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for_route
 
@@ -911,6 +912,7 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
             return JSONResponse(
                 {"detail": "Skuld broker did not answer in time"},
                 status_code=504,
+                headers={BROKER_UNAVAILABLE_HEADER: "timeout"},
             )
         except httpx.ConnectError as exc:
             _log_broker_failure(
@@ -919,6 +921,7 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
             return JSONResponse(
                 {"detail": "Skuld broker not ready"},
                 status_code=502,
+                headers={BROKER_UNAVAILABLE_HEADER: "connect"},
             )
         except httpx.TransportError as exc:
             # A broker that dropped mid-response (crash, protocol error): name it too.
@@ -928,6 +931,7 @@ def register_session_proxy_routes(app: FastAPI, skuld_reg: SkuldPortRegistry) ->
             return JSONResponse(
                 {"detail": "Skuld broker connection failed"},
                 status_code=502,
+                headers={BROKER_UNAVAILABLE_HEADER: "transport"},
             )
 
     @app.get("/s/{session_id}/health", include_in_schema=False)
