@@ -11,9 +11,10 @@ ROOT = Path(__file__).resolve().parents[2]
 NAME = "000096_push_gateway"
 
 
-def test_it_is_the_newest_volundr_migration():
+def test_it_follows_the_resolved_notifications_migration():
     names = sorted(path.name for path in (ROOT / "migrations").glob("*.up.sql"))
-    assert names[-1] == f"{NAME}.up.sql"
+    index = names.index(f"{NAME}.up.sql")
+    assert names[index - 1] == "000095_forge_notification_resolved.up.sql"
 
 
 def test_the_branch_name_of_the_same_sql_is_adopted():

@@ -121,6 +121,7 @@ from volundr.adapters.outbound.postgres_notifications import (
     PostgresNotificationRuleRepository,
 )
 from volundr.adapters.outbound.postgres_prompts import PostgresPromptRepository
+from volundr.adapters.outbound.postgres_questions import PostgresQuestionRepository
 from volundr.adapters.outbound.postgres_resident_runtimes import (
     PostgresResidentRuntimeRepository,
 )
@@ -337,6 +338,8 @@ def _create_notification_service(
         engine_resolver=engine_resolver_for(cli_types, settings.default_definition),
         integration_repository=integration_repository,
         guild_instance=guild_instance,
+        questions=PostgresQuestionRepository(pool),
+        question_host=resolve_host(settings),
     )
     return service, image_worker
 

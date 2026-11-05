@@ -358,6 +358,21 @@ def _route_missing(response: httpx.Response) -> bool:
     return isinstance(payload, dict) and payload.get("detail") == "Not Found"
 
 
+#: A node's structured answer refusals (LEX-1932): passed through whole, so the app
+#: reads the first answer, the close, or that it must retry with the same request_id.
+_ANSWER_CODES = frozenset({"question_answered", "question_closed", "answer_not_delivered"})
+
+
+def _answer_code(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _ensure_remote_success(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
@@ -2934,6 +2949,50 @@ def create_volundr_router(
         if not isinstance(payload, dict):
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid notification response")
         return _tag_notification(payload, instance)
+
+    @router.post("/notifications/{notification_id}/answer")
+    async def answer_question(
+        request: Request,
+        notification_id: UUID,
+        body: dict[str, Any] = Body(...),
+        principal: Principal = Depends(extract_principal),
+    ) -> JSONResponse:
+        """Answer a question on the node that holds it (LEX-1932).
+
+        The node's answer passes through as it is, its structured refusals included:
+        ``question_answered`` / ``question_closed`` (409, with the first answer or the
+        close) and ``answer_not_delivered`` (recorded; retry with the same request_id)."""
+        instance = await _notification_target(request, principal)
+        remote = await _request_remote(
+            instance,
+            request,
+            method="POST",
+            path=f"/notifications/{notification_id}/answer",
+            params=_forward_params(request, drop=_FLEET_SELECTORS),
+            json_body=body,
+            embedded_app=embedded_forge_app,
+        )
+        if remote.status_code >= 400 and _answer_code(remote) not in _ANSWER_CODES:
+            _ensure_remote_success(remote)
+        payload = _remote_json(remote)
+        if not isinstance(payload, dict):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid question answer response")
+        return JSONResponse({**payload, "instance_id": instance.id}, status_code=remote.status_code)
+
+    @router.get("/notifications/questions/events")
+    async def list_question_events(
+        request: Request, principal: Principal = Depends(extract_principal)
+    ) -> dict[str, Any]:
+        """One node's question state changes, oldest first (LEX-1932)."""
+        instance = await _notification_target(request, principal)
+        remote = await _proxy_to(
+            instance, request, method="GET", path="/notifications/questions/events"
+        )
+        _ensure_remote_success(remote)
+        payload = _remote_json(remote)
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Invalid question events response")
+        return {**payload, "instance_id": instance.id}
 
     @router.get("/notifications/rules")
     async def list_notification_rules(
