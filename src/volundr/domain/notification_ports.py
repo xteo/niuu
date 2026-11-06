@@ -249,8 +249,12 @@ class NotificationRecorder(ABC):
         kind: str,
         prompt: str,
         request_id: str,
+        urgent: bool = False,
     ) -> Notification | None:
-        """Record (idempotently) that ``session`` is waiting for its owner."""
+        """Record (idempotently) that ``session`` is waiting for its owner.
+
+        ``urgent`` marks a request that expires by itself shortly (critical severity).
+        """
 
     @abstractmethod
     async def retire_attention(self, session: Session) -> int:

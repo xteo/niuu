@@ -61,6 +61,7 @@ from skuld.conversation_snapshot import (
     prepare_history_page,
     prepare_recent_snapshot,
 )
+from skuld.delivery_errors import NATIVE_CONTROL_PENDING_CODE
 from skuld.tool_result_preview import (
     PREVIEW_EDGE_LIMIT,
     PREVIEW_MAX_EDGE,
@@ -202,6 +203,9 @@ WORKFLOW_GATE_INTENT_HEADER = "x-niuu-workflow-gate-intent"
 # number; the broker — not this grace — owns the delivery durability guarantee, so
 # a short grace is correct: a no-ACK is reported as pending/accepted, never "sent".
 SEND_MESSAGE_ACK_GRACE_SECONDS = 3.0
+# Bound on a Forge → broker native-control call (list or dismiss, LEX-1936): both are
+# in-memory on the broker except one menu observation (Skuld's menu render wait).
+NATIVE_CONTROL_CALL_TIMEOUT_SECONDS = 20.0
 
 # Default disk root for generated tool-result image previews (the mini-mode
 # host's ~/.niuu tree). volundr.main passes Settings.preview_cache_dir instead;
@@ -4053,8 +4057,10 @@ def create_router(
         not-delivered. 200 ``status=delivered`` means the transport accepted the
         message; 202 ``status=pending`` means the broker accepted it and its bounded
         retry is still driving delivery (NOT a confirmed send); a terminal transport
-        rejection raises 502; an unreachable pod raises 409. ``unconfirmed`` is never
-        returned as success.
+        rejection raises 502; an unreachable pod raises 409. While the agent waits on a
+        native control (a terminal permission menu or question) nothing is typed and the
+        answer is 409 ``detail.code=native_control_pending`` naming the card
+        (``control_request_id``). ``unconfirmed`` is never returned as success.
         """
         content = body.get("content", "")
         if not isinstance(content, str) or not content.strip():
@@ -4421,6 +4427,33 @@ def create_router(
                     "session_id": str(session_id),
                     "code": code,
                     "message": delivery.get("content") or "Message was not accepted",
+                },
+            )
+
+        # Refused because a native control (permission menu, question) is open: the
+        # broker typed nothing. 409 with the card that blocks it, never 202 (LEX-1936).
+        if (
+            isinstance(delivery, dict)
+            and delivery.get("type") == "user_delivery_failed"
+            and delivery.get("code") == NATIVE_CONTROL_PENDING_CODE
+        ):
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "status": "failed",
+                    "delivery": "failed",
+                    "session_id": str(session_id),
+                    "request_id": req_id,
+                    "sender": sender,
+                    "detail": {
+                        "code": NATIVE_CONTROL_PENDING_CODE,
+                        "message": delivery.get("error")
+                        or "The session is waiting on a native control",
+                        "control_request_id": delivery.get("control_request_id") or None,
+                        "control_kind": delivery.get("control_kind"),
+                        "control_opened_at": delivery.get("control_opened_at"),
+                        "menu_state": delivery.get("menu_state"),
+                    },
                 },
             )
 
@@ -5716,6 +5749,124 @@ def create_router(
                     f"Gate not resolved: {e}"
                 ),
             )
+
+    async def _native_controls_target(request: Request, session_id: UUID) -> tuple[Principal, str]:
+        """Owner or admin of a live session; never a session credential (LEX-1936).
+
+        Inspecting or dismissing another agent's terminal controls is the operator's
+        decision, so a ``forge_session`` token is refused here even with grants (the
+        routes are also absent from the session-token allow-list).
+        """
+        principal = await extract_principal(request)
+        if principal.token_use == FORGE_SESSION_TOKEN_USE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Native controls are handled by the session's owner, not by a session",
+            )
+        try:
+            session, base_url = await forge.get_session_proxy_target(session_id)
+        except LookupError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            ) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Session {session_id} is not running",
+            ) from None
+        try:
+            await forge.ensure_access(session, principal, "update")
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the session owner or an admin may handle its native controls",
+            ) from None
+        return principal, base_url
+
+    async def _native_controls_call(
+        request: Request,
+        session_id: UUID,
+        base_url: str,
+        method: str,
+        *parts: str,
+        json_body: dict[str, Any] | None = None,
+    ) -> Response:
+        headers = {ROOM_ROLE_HEADER: "owner"}
+        auth = request.headers.get("authorization")
+        if auth:
+            headers["Authorization"] = auth
+        proxy_url, routing_headers = _http_proxy_target(
+            _session_proxy_url(base_url, "api", "native-controls", *parts)
+        )
+        headers.update(routing_headers)
+        try:
+            async with httpx.AsyncClient(timeout=NATIVE_CONTROL_CALL_TIMEOUT_SECONDS) as client:
+                response = await client.request(method, proxy_url, headers=headers, json=json_body)
+        except httpx.RequestError as e:
+            reconciled = await forge.reconcile_session(session_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Session {session_id} is no longer reachable; reconciled to "
+                    f"{reconciled.status.value if reconciled else 'unknown'}: {e}"
+                ),
+            ) from e
+        try:
+            content = response.json()
+        except ValueError:
+            content = {"detail": response.text}
+        return JSONResponse(status_code=response.status_code, content=content)
+
+    @router.get(
+        "/sessions/{session_id}/native-controls",
+        tags=["Sessions"],
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def list_native_controls(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> Response:
+        """Open native-control cards of a live session: age and menu state (LEX-1936)."""
+        _, base_url = await _native_controls_target(request, session_id)
+        return await _native_controls_call(request, session_id, base_url, "GET")
+
+    @router.post(
+        "/sessions/{session_id}/native-controls/{request_id}/dismiss",
+        tags=["Sessions"],
+        responses={
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+        },
+    )
+    async def dismiss_native_control(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+        request_id: str = Path(description="The native control card's request_id"),
+    ) -> Response:
+        """Dismiss a native-control card the automatic checks keep open (audited).
+
+        Owner or admin only. The card closes for every client with
+        ``dismiss_reason=dismissed_by_operator``. A menu that is still on screen keeps
+        refusing messages; answer it in the terminal.
+        """
+        principal, base_url = await _native_controls_target(request, session_id)
+        logger.warning(
+            "AUDIT native control %s on session %s: dismissal requested by %s",
+            _sanitize_log(request_id),
+            session_id,
+            _sanitize_log(principal.user_id),
+        )
+        return await _native_controls_call(
+            request,
+            session_id,
+            base_url,
+            "POST",
+            request_id,
+            "dismiss",
+            json_body={"dismissed_by": principal.user_id},
+        )
 
     @router.get(
         "/sessions/{session_id}/help/requests",
