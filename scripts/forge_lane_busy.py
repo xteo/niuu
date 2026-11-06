@@ -112,8 +112,8 @@ def host_trains(procs: dict[str, tuple[str, str, str]], lane_pids: set[str]) -> 
     ]
 
 
-def main(argv: list[str]) -> int:
-    base, tmux, *only = argv
+def judge(base: str, tmux: str, only: list[str]) -> dict:
+    """{lanes, busy, host_trains} for the running local lanes (only those in ``only``)."""
     url = f"{base}/api/v1/forge/sessions?scope=local"
     rows = json.load(urllib.request.urlopen(url, timeout=20))
     lanes = [r for r in rows if r.get("status") == "running" and (not only or r["id"] in only)]
@@ -134,9 +134,14 @@ def main(argv: list[str]) -> int:
         lane_pids |= pids
         if reasons:
             busy.append({"id": sid, "name": lane.get("name"), "reasons": reasons})
-    host = host_trains(procs, lane_pids)
-    print(json.dumps({"lanes": len(lanes), "busy": busy, "host_trains": host}))
-    return 1 if busy else 0
+    return {"lanes": len(lanes), "busy": busy, "host_trains": host_trains(procs, lane_pids)}
+
+
+def main(argv: list[str]) -> int:
+    base, tmux, *only = argv
+    verdict = judge(base, tmux, only)
+    print(json.dumps(verdict))
+    return 1 if verdict["busy"] else 0
 
 
 if __name__ == "__main__":

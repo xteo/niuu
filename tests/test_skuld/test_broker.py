@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import WebSocketDisconnect
 
+from niuu.domain.broker_contract import BROKER_CONTRACT
 from niuu.domain.models import SecretType
 from niuu.domain.workflow_kickoff import (
     WORKFLOW_KICKOFF_ACK_EVENT_TYPE,
@@ -4172,6 +4173,7 @@ class TestFastAPIEndpoints:
         assert data["revision"]
         assert isinstance(data["dirty"], bool)
         assert data["build"]
+        assert data["broker_contract"] == BROKER_CONTRACT
 
     def test_ready_endpoint_not_ready(self, client):
         broker._transport = None

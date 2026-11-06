@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Res
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from niuu.domain.broker_contract import BROKER_CONTRACT, contract_state
 from niuu.domain.conversation_timeline import resolve_timeline_turn
 from niuu.domain.history_paging import InvalidHistoryCursorError
 from niuu.domain.json_text import json_text_safe
@@ -2929,7 +2930,12 @@ def create_router(
 
     @router.get("/sessions/{session_id}/runtime-version", tags=["Sessions"])
     async def get_runtime_version(request: Request, session_id: UUID) -> dict:
-        """Inspect the loaded gateway, without restarting it or trusting stored activity."""
+        """Inspect the loaded gateway, without restarting it or trusting stored activity.
+
+        ``contract`` says whether the loaded broker meets this release's broker contract
+        (``niuu.domain.broker_contract``): ``met``, ``below`` (restart it onto this
+        release), ``not_running`` (its next start is current) or ``unknown`` (no probe).
+        """
         session = await forge.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -2938,9 +2944,15 @@ def create_router(
             await forge.ensure_access(session, principal, "read")
         except SessionAccessDeniedError:
             raise HTTPException(status_code=403, detail="Access denied") from None
-        result = {"available": runtime_build, "current": None, "state": "unavailable"}
+        result = {
+            "available": runtime_build,
+            "current": None,
+            "state": "unavailable",
+            "contract": {"required": BROKER_CONTRACT, "state": "unknown"},
+        }
         if not session.chat_endpoint:
             result["state"] = "not_running"
+            result["contract"]["state"] = "not_running"
             return result
         _, base_url = await forge.get_session_proxy_target(session_id)
         url, headers = _http_proxy_target(_session_proxy_url(base_url, "health"))
@@ -2956,7 +2968,12 @@ def create_router(
                     status_code=502, detail="Gateway identity does not match session"
                 )
             result["current"] = {
-                key: health.get(key) for key in ("revision", "build", "source_sha256", "dirty")
+                key: health.get(key)
+                for key in ("revision", "build", "source_sha256", "dirty", "broker_contract")
+            }
+            result["contract"] = {
+                "required": BROKER_CONTRACT,
+                "state": contract_state(health.get("broker_contract")),
             }
             current_hash = health.get("source_sha256")
             available_hash = (runtime_build or {}).get("source_sha256")
