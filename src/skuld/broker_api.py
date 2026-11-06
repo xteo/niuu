@@ -35,6 +35,7 @@ from niuu.domain.presented_files import (
 )
 from niuu.domain.text_projection import projection_revision
 from niuu.room_access import ROOM_ROLE_HEADER, ROOM_ROLE_RANK, required_role_for_route
+from skuld.control_errors import NativeControlsUnsupportedError
 from skuld.conversation_models import ConversationTurn, turn_record
 from skuld.conversation_read import conversation_rows, wait_history_quiet
 from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turn, is_elided_input
@@ -1690,6 +1691,48 @@ async def resolve_workflow_gate(
         raise HTTPException(503, str(exc))
 
     return {"status": "resolved", "gate": gate}
+
+
+class _NativeControlDismissRequest(BaseModel):
+    """Who dismisses a native-control card; Forge sets it to the verified caller."""
+
+    dismissed_by: str = Field(default="", max_length=256)
+
+
+@app.get("/api/native-controls")
+async def list_native_controls(request: Request) -> dict:
+    """Open native-control cards: age, menu state (live/gone/unknown) and counters."""
+    if await _room_role_from_state(request) != "owner":
+        raise HTTPException(403, "Only the session owner may inspect native controls")
+    try:
+        return broker.list_native_controls()
+    except NativeControlsUnsupportedError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/native-controls/{request_id}/dismiss")
+async def dismiss_native_control(
+    request: Request, request_id: str, body: _NativeControlDismissRequest
+) -> dict:
+    """Dismiss one native-control card without answering it (owner only, audited).
+
+    The escape hatch for a card the automatic checks keep open. A verified identity
+    header names the operator; otherwise the body's ``dismissed_by`` (Forge sets it
+    from the caller it authenticated), else "session owner".
+    """
+    if await _room_role_from_state(request) != "owner":
+        raise HTTPException(403, "Only the session owner may dismiss a native control")
+    identity = _resolve_http_principal(request, broker._settings.ws_auth)
+    dismissed_by = (identity[0] if identity else "") or body.dismissed_by.strip()
+    try:
+        control = await broker.dismiss_native_control(
+            request_id, dismissed_by=dismissed_by or "session owner"
+        )
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except NativeControlsUnsupportedError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"status": "dismissed", "control": control}
 
 
 @app.get("/api/communication/routes")

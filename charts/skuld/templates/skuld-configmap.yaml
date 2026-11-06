@@ -88,6 +88,8 @@ data:
     tmux_question_result_history_limit: {{ .Values.broker.tmuxQuestionResultHistoryLimit | default 128 }}
     tmux_native_text_wait_s: {{ .Values.broker.tmuxNativeTextWaitSeconds | default 0.1 }}
     tmux_native_text_poll_s: {{ .Values.broker.tmuxNativeTextPollSeconds | default 0.005 }}
+    tmux_native_control_sweep_interval_s: {{ .Values.broker.tmuxNativeControlSweepIntervalSeconds | default 30.0 }}
+    tmux_person_only_prompt_timeout_s: {{ .Values.broker.tmuxPersonOnlyPromptTimeoutSeconds | default 120.0 }}
     remote_control_permission_mode: {{ .Values.broker.remoteControlPermissionMode | default "" | quote }}
     skip_permissions: {{ .Values.broker.skipPermissions }}
     agent_teams: {{ .Values.broker.agentTeams | default false }}

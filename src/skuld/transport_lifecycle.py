@@ -120,6 +120,10 @@ class TransportLifecycleMixin:
             "question_result_history_limit": self._settings.tmux_question_result_history_limit,
             "native_text_wait_s": self._settings.tmux_native_text_wait_s,
             "native_text_poll_s": self._settings.tmux_native_text_poll_s,
+            "native_control_sweep_interval_s": (
+                self._settings.tmux_native_control_sweep_interval_s
+            ),
+            "person_only_prompt_timeout_s": self._settings.tmux_person_only_prompt_timeout_s,
             "codex_receive_max_bytes": self._settings.codex_receive_max_bytes,
             "live_frame_max_bytes": self._settings.live_frame_max_bytes,
             "dsh_runtime_bin": self._settings.dsh.runtime_bin,

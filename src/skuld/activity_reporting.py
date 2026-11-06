@@ -297,16 +297,18 @@ class ActivityReportingMixin:
         *,
         prompt: str = "",
         options: list | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Mark the session blocked on the user and report awaiting_input.
 
         ``kind`` is one of ``question`` | ``confirmation`` | ``permission``.
         The metadata travels to Volundr, which (re-)emits the high-urgency
-        needs-input event a notification / push fan-out reacts to.
+        needs-input event a notification / push fan-out reacts to. ``extra`` adds
+        fields such as ``person_only`` / ``auto_deny_after_seconds`` (LEX-1936).
         """
         if request_id:
             self._pending_attention[request_id] = kind
-        extra: dict[str, Any] = {"kind": kind, "request_id": request_id}
+        extra = {**(extra or {}), "kind": kind, "request_id": request_id}
         if prompt:
             extra["prompt"] = prompt
         if options is not None:
@@ -346,6 +348,23 @@ class ActivityReportingMixin:
                 if text:
                     return str(text)
         return "The agent is asking a question"
+
+    @staticmethod
+    def _person_only_attention(data: dict) -> dict[str, Any] | None:
+        """A card only a person may answer before the CLI denies it by itself.
+
+        The tmux bridge marks Claude's built-in safety prompts under
+        bypassPermissions; they time out (LEX-1936), so attention is urgent.
+        """
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("person_only") is not True:
+            return None
+        timeout = metadata.get("auto_deny_after_seconds")
+        if not isinstance(timeout, int | float) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError(
+                "A person-only native control must carry a positive auto_deny_after_seconds"
+            )
+        return {"person_only": True, "urgent": True, "auto_deny_after_seconds": float(timeout)}
 
     @staticmethod
     def _attention_prompt_from_permission(request: dict) -> str:
