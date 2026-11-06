@@ -55,7 +55,7 @@ from niuu.domain.session_endpoint import BROKER_UNAVAILABLE_HEADER, public_sessi
 from niuu.domain.text_projection import projection_revision
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.room_access import ROOM_ROLE_HEADER
-from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns, is_elided_input
+from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turn, elide_turns, is_elided_input
 from skuld.conversation_snapshot import (
     ConversationSnapshotTooLargeError,
     prepare_history_page,
@@ -4575,7 +4575,9 @@ def create_router(
             0,
             ge=0,
             description="Optional recent-activity byte budget; 0 returns the complete page. "
-            "Oversized single turns are marked history_preview and remain loadable on demand.",
+            "The budget only drops older WHOLE turns: every returned turn is complete. A single "
+            "turn larger than the budget is returned whole, or paged by part ranges with "
+            "`part_paging=1` (LEX-1937).",
         ),
         after_id: str | None = Query(
             None,
@@ -4591,6 +4593,16 @@ def create_router(
         history_protocol: int = Query(0),
         cursor: str | None = Query(None),
         turn_id: str | None = Query(None),
+        part_paging: bool = Query(
+            False,
+            description=(
+                "history_protocol=2 only (LEX-1937): page WITHIN a turn larger than the byte "
+                "budget instead of returning it whole. Such a page holds one turn whose "
+                "`part_window` {offset, end, total} names the complete parts it carries; its "
+                "`older_cursor` continues with the turn's preceding parts. `content` rides "
+                "only the fragment that holds the turn's last part."
+            ),
+        ),
         tail: int = Query(
             0,
             ge=0,
@@ -4646,6 +4658,7 @@ def create_router(
                 history_protocol=0,
                 cursor=None,
                 turn_id=None,
+                part_paging=False,
                 tail=limit,
                 since_turn=None,
             )
@@ -4664,6 +4677,8 @@ def create_router(
             limit = 0
         if cursor and history_protocol != 2:
             raise HTTPException(400, "cursor requires history_protocol=2")
+        if part_paging and history_protocol != 2:
+            raise HTTPException(400, "part_paging requires history_protocol=2")
         if history_protocol == 2 and (before or after >= 0 or after_id or turn_id):
             raise HTTPException(
                 400, "Protocol2 cursors cannot be mixed with legacy seek parameters"
@@ -4691,7 +4706,7 @@ def create_router(
                 if turn is None:
                     raise HTTPException(404, "History item no longer exists in this projection")
                 return {
-                    "turn": json_text_safe(turn),
+                    "turn": json_text_safe(elide_turn(turn) if shallow else turn),
                     "projection_revision": payload.get("projection_revision")
                     or projection_revision(all_turns),
                 }
@@ -4713,6 +4728,7 @@ def create_router(
                         max_turns=limit,
                         max_bytes=max_bytes,
                         cursor=cursor,
+                        part_paging=part_paging,
                     )
                 except InvalidHistoryCursorError as exc:
                     raise HTTPException(
@@ -4883,6 +4899,8 @@ def create_router(
                     )
                 if history_protocol == 2:
                     params.update(history_protocol=2, limit=limit, max_bytes=max_bytes)
+                    if part_paging:
+                        params["part_paging"] = 1
                     if cursor:
                         params["cursor"] = cursor
                 if turn_id is not None:
@@ -5172,6 +5190,7 @@ def create_router(
             history_protocol=0,
             cursor=None,
             turn_id=turn_id,
+            part_paging=False,
             tail=0,
             since_turn=None,
         )
@@ -5188,6 +5207,7 @@ def create_router(
             history_protocol=0,
             cursor=None,
             turn_id=None,
+            part_paging=False,
             tail=0,
             since_turn=None,
         )

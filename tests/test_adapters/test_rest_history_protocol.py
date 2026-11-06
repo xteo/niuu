@@ -17,7 +17,7 @@ from tests.conftest import (
     MockPodManager,
     make_session_participant_service,
 )
-from tests.test_skuld.test_history_paging import rows
+from tests.test_skuld.test_history_paging import rows, tool_turn
 from volundr.adapters.inbound import rest
 from volundr.domain.models import Session, SessionStatus
 from volundr.domain.services import SessionService
@@ -85,6 +85,7 @@ async def setup_api(
                 max_turns=int(request.url.params["limit"]),
                 max_bytes=int(request.url.params["max_bytes"]),
                 cursor=request.url.params.get("cursor"),
+                part_paging=request.url.params.get("part_paging") == "1",
             )
         return httpx.Response(200, json=payload)
 
@@ -156,20 +157,49 @@ async def test_new_gateway_gap_or_busy_cannot_switch_to_stale_archive(monkeypatc
     archive.get_transcript.assert_not_awaited()
 
 
-@pytest.mark.parametrize("mode", ["archive", "legacy_gateway"])
-async def test_huge_item_preview_then_explicit_full_expansion(monkeypatch, mode):
-    source = rows(1, content="😀" * 100_000)
-    app, session, _, _, _, _ = await setup_api(monkeypatch, mode=mode, source=source)
+@pytest.mark.parametrize("mode", ["archive", "legacy_gateway", "gateway"])
+async def test_huge_turn_is_whole_or_paged_by_complete_parts_never_previewed(monkeypatch, mode):
+    source = [*rows(2), tool_turn(60)]
+    app, session, _, _, _, captures = await setup_api(monkeypatch, mode=mode, source=source)
     url = f"/api/v1/forge/sessions/{session.id}/conversation"
     with TestClient(app) as client:
-        response = client.get(url, params={"history_protocol": 2})
-        assert len(response.content) <= 8192
-        preview = response.json()["turns"][0]
-        assert preview["history_ref"] == {"turn_id": "0"}
-        full = client.get(url + "/turns/0")
-        assert full.status_code == 200
-        assert full.json()["turn"] == source[0]
-        assert client.get(url + "/turns/missing").status_code == 404
+        whole = client.get(url, params={"history_protocol": 2}).json()
+        assert whole["turns"] == [source[-1]]
+        assert "history_preview" not in whole and "history_preview" not in whole["turns"][0]
+        params = {"history_protocol": 2, "part_paging": 1}
+        current = client.get(url, params=params)
+        parts, pages = [], 0
+        while True:
+            pages += 1
+            assert current.status_code == 200 and len(current.content) <= 8192
+            body = current.json()
+            turn = body["turns"][-1]
+            assert turn["id"] == "long" and "history_preview" not in turn
+            parts = turn["parts"] + parts
+            if not turn.get("part_window") or turn["part_window"]["offset"] == 0:
+                break
+            current = client.get(url, params={**params, "cursor": body["older_cursor"]})
+        assert pages > 2
+        assert parts == source[-1]["parts"]
+        assert turn.get("content", "final answer") == "final answer"
+        full = client.get(url + "/turns/long")
+        assert full.status_code == 200 and full.json()["turn"] == source[-1]
+        assert client.get(url, params={"part_paging": 1}).status_code == 400
+    if mode == "gateway":
+        assert any(capture.get("part_paging") == "1" for capture in captures)
+
+
+async def test_shallow_item_read_keeps_heavy_tool_results_lazy(monkeypatch):
+    source = [tool_turn(3, result_bytes=5000)]
+    app, session, _, _, _, _ = await setup_api(monkeypatch, source=source)
+    url = f"/api/v1/forge/sessions/{session.id}/conversation"
+    with TestClient(app) as client:
+        item = client.get(url, params={"turn_id": "long", "detail": "shallow"}).json()["turn"]
+        full = client.get(url, params={"turn_id": "long"}).json()["turn"]
+    results = [part for part in item["parts"] if part["type"] == "tool_result"]
+    assert len(results) == 3
+    assert all(part["truncated"] and "content" not in part for part in results)
+    assert full == source[0]
 
 
 async def test_history_and_expansion_use_existing_authorization_adapter(monkeypatch):
