@@ -662,6 +662,7 @@ async def _proxy_ws(
                 ("history", {"recent"}),
                 ("history_protocol", {"2"}),
                 ("history_delivery", {"none"}),
+                ("part_paging", {"1"}),
             ):
                 value = websocket.query_params.get(key)
                 if value in allowed:
