@@ -359,8 +359,16 @@ class NotificationService(NotificationRecorder):
         context = self._context(session)
         draft = NotificationDraft(
             kind=NotificationKind.ATTENTION,
-            severity=NotificationSeverity.CRITICAL if urgent else NotificationSeverity.WARNING,
-            title=_bounded(f"{context.session_name} needs your input", MAX_TITLE_CHARS),
+            # An urgent request (one the CLI denies by itself in about two minutes)
+            # says so in its title. Its severity stays warning, so the owner's quiet
+            # hours still apply: the prompt fails closed, and no one should be woken
+            # for a decision that has expired by the time they could answer.
+            severity=NotificationSeverity.WARNING,
+            title=_bounded(
+                f"{context.session_name} needs your input"
+                + (" now (denied by itself in about 2 minutes)" if urgent else ""),
+                MAX_TITLE_CHARS,
+            ),
             body=_bounded(
                 prompt.strip() or _DEFAULT_ATTENTION_PROMPTS.get(kind, _DEFAULT_ATTENTION_PROMPT),
                 MAX_BODY_CHARS,
