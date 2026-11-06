@@ -354,11 +354,12 @@ class NotificationService(NotificationRecorder):
         kind: str,
         prompt: str,
         request_id: str,
+        urgent: bool = False,
     ) -> Notification | None:
         context = self._context(session)
         draft = NotificationDraft(
             kind=NotificationKind.ATTENTION,
-            severity=NotificationSeverity.WARNING,
+            severity=NotificationSeverity.CRITICAL if urgent else NotificationSeverity.WARNING,
             title=_bounded(f"{context.session_name} needs your input", MAX_TITLE_CHARS),
             body=_bounded(
                 prompt.strip() or _DEFAULT_ATTENTION_PROMPTS.get(kind, _DEFAULT_ATTENTION_PROMPT),

@@ -11,6 +11,7 @@ from niuu.domain.models import IntegrationConnection, IntegrationType, Principal
 from niuu.domain.notifications import (
     NotificationDraft,
     NotificationKind,
+    NotificationSeverity,
     build_notification_turn,
     notification_id,
     turn_dedupe_key,
@@ -294,6 +295,27 @@ class TestAttention:
             request_id="",
         )
         assert len(created.title) == 200 and len(created.body) == 4000
+
+    async def test_urgent_attention_is_critical(self):
+        """LEX-1936: a prompt that auto-denies in ~2 minutes must not wait for quiet hours."""
+        service, _ = _service()
+        urgent = await service.record_attention(
+            _session(),
+            state_since=datetime.now(UTC),
+            kind="permission",
+            prompt="Only a person may approve this",
+            request_id="tty-1-x",
+            urgent=True,
+        )
+        assert urgent.severity == NotificationSeverity.CRITICAL
+        normal = await service.record_attention(
+            _session(),
+            state_since=datetime.now(UTC),
+            kind="permission",
+            prompt="Run ls?",
+            request_id="tty-2-x",
+        )
+        assert normal.severity == NotificationSeverity.WARNING
 
 
 class TestAttentionPushRule:
