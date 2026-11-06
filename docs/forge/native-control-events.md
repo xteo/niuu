@@ -237,3 +237,12 @@ terminal.
 | `tmux_question_transcript_max_bytes` | 1 MiB | The transcript read bound, shared with question answers. |
 
 The menu render window is the existing `SKULD__TMUX_MENU_RENDER_WAIT_SECONDS` (1.5 s).
+
+## Through the Guild facade
+
+On a Guild host (Thor) the public `/api/v1/forge` is the Guild facade. It proxies
+`GET /sessions/{id}/native-controls` and `POST /sessions/{id}/native-controls/{request_id}/dismiss`
+to the session's owning Forge, which authorizes and audits; its answer is passed through. An owning
+Forge without these routes answers 501 ("Update this session's Forge host"). A message refused for a
+pending native control keeps its structured 409 `detail` (`code: native_control_pending`) through
+the facade.

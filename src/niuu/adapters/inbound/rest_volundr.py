@@ -379,6 +379,17 @@ def _ensure_remote_success(response: httpx.Response) -> None:
     raise HTTPException(status_code=response.status_code, detail=_upstream_detail(response)[:1000])
 
 
+#: A node's refusal of a message while a native control is pending (LEX-1936): passed
+#: through whole, so a sender reads which card blocks it and what the screen shows.
+_NATIVE_CONTROL_CODES = frozenset({"native_control_pending"})
+
+
+def _ensure_message_delivered(response: httpx.Response) -> None:
+    if response.status_code >= 400 and _answer_code(response) in _NATIVE_CONTROL_CODES:
+        raise HTTPException(response.status_code, response.json()["detail"])
+    _ensure_remote_success(response)
+
+
 def _ensure_history_success(response: httpx.Response) -> None:
     """Preserve machine-readable history recovery through the aggregate facade."""
     if response.status_code < 400:
@@ -3795,6 +3806,50 @@ def create_volundr_router(
         """
         return await _forward_forge_mcp(request, principal, session_id, "PUT", body)
 
+    async def _forward_native_controls(
+        request: Request, principal: Principal, session_id: str, method: str, suffix: str = ""
+    ) -> JSONResponse:
+        """A session's native-control cards on its owning host (LEX-1936).
+
+        The owning Forge decides who may see or dismiss them (owner or admin, never a
+        session credential) and audits each dismissal; its answer is passed through.
+        """
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method=method,
+            path=f"/sessions/{session_id}/native-controls{suffix}",
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, "Update this session's Forge host to handle native controls")
+        _ensure_remote_success(response)
+        return JSONResponse(content=response.json(), status_code=response.status_code)
+
+    @router.get("/sessions/{session_id}/native-controls")
+    async def list_session_native_controls(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> JSONResponse:
+        """The native-control cards a session's broker holds, from its owning host."""
+        return await _forward_native_controls(request, principal, session_id, "GET")
+
+    @router.post("/sessions/{session_id}/native-controls/{request_id}/dismiss")
+    async def dismiss_session_native_control(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        request_id: str = Path(description="The card's request_id"),
+        principal: Principal = Depends(extract_principal),
+    ) -> JSONResponse:
+        """Dismiss a stale native-control card on the session's owning host (audited there)."""
+        return await _forward_native_controls(
+            request, principal, session_id, "POST", f"/{quote(request_id, safe='')}/dismiss"
+        )
+
     @router.put("/sessions/{session_id}")
     async def update_session(
         request: Request,
@@ -4591,7 +4646,7 @@ def create_volundr_router(
             ),
             embedded_app=embedded_forge_app,
         )
-        _ensure_remote_success(response)
+        _ensure_message_delivered(response)
         payload = response.json()
         return JSONResponse(
             content=payload if isinstance(payload, dict) else {}, status_code=response.status_code
