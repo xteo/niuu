@@ -34,6 +34,9 @@ class TransportCapabilities:
     terminal_keys: bool = False
     terminal_resize: bool = False
     terminal_panes: bool = False
+    # Native-control cards (a terminal permission menu or question bridged to clients)
+    # that can be listed with their menu state and dismissed by an operator.
+    native_controls: bool = False
 
 
 class CLITransport(ABC):
@@ -104,6 +107,14 @@ class CLITransport(ABC):
         transports must not advertise an empty catalog as a successful discovery.
         """
         raise NotImplementedError("This transport does not expose runtime options")
+
+    def list_native_controls(self) -> dict:
+        """Open native-control cards. Adapters advertising native_controls implement it."""
+        raise NotImplementedError("This transport has no native-control cards")
+
+    async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:
+        """Close one open card without answering it (operator escape hatch)."""
+        raise NotImplementedError("This transport has no native-control cards")
 
     @property
     @abstractmethod

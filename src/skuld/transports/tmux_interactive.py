@@ -22,7 +22,7 @@ import signal
 import tempfile
 import time
 import uuid
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -40,7 +40,7 @@ from skuld.claude_permission import (
     resolve_claude_permission_mode,
 )
 from skuld.control_errors import ControlRecoveryError
-from skuld.delivery_errors import DeliveryNotAcceptedError
+from skuld.delivery_errors import DeliveryNotAcceptedError, NativeControlPendingError
 from skuld.session_runtime import write_private_file
 from skuld.transports.claude_env import claude_spawn_env
 from skuld.transports.claude_text_order import preceding_tool_text
@@ -114,6 +114,27 @@ _KEY_ALIASES = {
 # Claude modes that render no gate of their own for AskUserQuestion: its
 # PermissionRequest hook still fires, but only the question menu is on screen.
 _NO_GATE_PERMISSION_MODES = frozenset({"auto", "bypassPermissions"})
+#: A permission prompt under this mode is one Claude Code shows despite bypassing
+#: permissions (its built-in "only a person may approve" safety checks). It denies the
+#: command by itself when nobody answers in time (LEX-1936).
+_PERSON_ONLY_PERMISSION_MODE = "bypassPermissions"
+
+#: Why a native-control card was dismissed without an answer from a client (LEX-1936).
+#: Carried as ``dismiss_reason`` on ``ask_user_resolved``; see docs/forge/native-control-events.md.
+DISMISS_RESOLVED_IN_TERMINAL = "resolved_in_terminal"
+DISMISS_MENU_NOT_SHOWN = "menu_not_shown"
+DISMISS_BY_OPERATOR = "dismissed_by_operator"
+DISMISS_TURN_ENDED = "turn_ended"
+_DISMISS_DETAILS = {
+    DISMISS_RESOLVED_IN_TERMINAL: "resolved in terminal",
+    DISMISS_MENU_NOT_SHOWN: "menu no longer shown",
+    DISMISS_TURN_ENDED: "turn ended",
+}
+#: What the pane shows for an open native control: its menu (``live``), the empty chat
+#: composer and no menu (``gone``), or neither / both (``unknown``, never cleared).
+MENU_LIVE = "live"
+MENU_GONE = "gone"
+MENU_UNKNOWN = "unknown"
 
 #: The env knob (and constructor kwarg ``turn_max_seconds``) bounding how long a turn
 #: may run without a completion signal before Forge stops waiting for it.
@@ -162,6 +183,8 @@ _SLASH_COMMAND_ROW_RE = re.compile(r"^(/\S+)\s{2,}(.+?)\s*$")
 # the tmux test harness (tests/support/forge/tmux_page.py) imports this so it
 # parses menus exactly the way the shipped transport does.
 _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
+# The highlighted row of a live Claude selection menu, e.g. "❯ 1. Yes".
+_SELECTED_MENU_ROW_RE = re.compile(r"^\s*❯\s*[1-9][.)]\s+\S")
 # Claude Code fills an empty composer with a dimmed suggestion, e.g.
 # `❯ Try "how does work?"` (v2.1.x). It is not input: the composer is empty.
 _COMPOSER_SUGGESTION_RE = re.compile(r'Try "[^"\n]*"')
@@ -285,6 +308,8 @@ class TmuxInteractiveTransport(CLITransport):
         question_result_history_limit: int = 128,
         native_text_wait_s: float = 0.1,
         native_text_poll_s: float = 0.005,
+        native_control_sweep_interval_s: float = 30.0,
+        person_only_prompt_timeout_s: float = 120.0,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
         session_tools: SessionTools | None = None,
@@ -389,6 +414,19 @@ class TmuxInteractiveTransport(CLITransport):
             raise ValueError("Native text wait and poll intervals must be positive")
         self._native_text_wait_s = native_text_wait_s
         self._native_text_poll_s = native_text_poll_s
+        if native_control_sweep_interval_s <= 0 or person_only_prompt_timeout_s <= 0:
+            raise ValueError(
+                "tmux_native_control_sweep_interval_s and tmux_person_only_prompt_timeout_s "
+                "must be positive"
+            )
+        # LEX-1936: re-check open native-control cards on this interval so one the CLI
+        # resolved by itself (a timed-out safety prompt) stops blocking messages.
+        self._native_control_sweep_interval_s = native_control_sweep_interval_s
+        self._person_only_prompt_timeout_s = person_only_prompt_timeout_s
+        self._native_control_sweep_task: asyncio.Task[None] | None = None
+        # Dismissals by reason, transcript read failures and sweep failures; served by
+        # GET /api/native-controls so a stuck or misjudged card is counted, not discovered.
+        self._native_control_counts: Counter[str] = Counter()
         # Initial-prompt fix: the REPL isn't ready to accept input the instant the
         # CLI is spawned — pasting the seed prompt into a still-booting Claude makes
         # it land mid-startup (it was being parsed as a slash command). Wait for a
@@ -589,6 +627,7 @@ class TmuxInteractiveTransport(CLITransport):
             terminal_keys=True,
             terminal_resize=True,
             terminal_panes=True,
+            native_controls=True,
             # Behind a model gateway the CLI's models are the gateway's, not this catalog.
             set_model=not self._model_gateway_url,
             runtime_options=not self._model_gateway_url,
@@ -816,6 +855,11 @@ class TmuxInteractiveTransport(CLITransport):
                     self._run_socket_sweep_loop(),
                     name=f"tmux-socket-sweep-{self._session_name}",
                 )
+            if self._native_control_sweep_task is None or self._native_control_sweep_task.done():
+                self._native_control_sweep_task = asyncio.create_task(
+                    self._run_native_control_sweep_loop(),
+                    name=f"tmux-native-control-sweep-{self._session_name}",
+                )
             await self._emit_system_init()
 
     def _hook_binding(self) -> str:
@@ -904,6 +948,11 @@ class TmuxInteractiveTransport(CLITransport):
             self._panes.clear()
             if self._turn_done is not None:
                 self._turn_done.set()
+            if self._native_control_sweep_task is not None:
+                self._native_control_sweep_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await self._native_control_sweep_task
+                self._native_control_sweep_task = None
             if self._sweep_task is not None:
                 self._sweep_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -1126,14 +1175,26 @@ class TmuxInteractiveTransport(CLITransport):
             if not self.is_alive:
                 await self._ensure_started()
             if self._pending_tty_prompts:
-                raise DeliveryNotAcceptedError(
-                    "Claude is waiting on a native control; answer it before "
-                    "sending another message"
-                )
-            if not self._startup_ready or self._workspace_trust_pending(
-                await self._capture_pane_text()
-            ):
+                # A card the CLI already resolved (its tool has a result, or its menu
+                # is gone) must not block this message (LEX-1936).
+                await self._retire_stale_tty_prompts_locked(trigger="delivery")
+            if self._pending_tty_prompts:
+                raise self._native_control_pending_error()
+            screen = await self._capture_pane_text()
+            if not self._startup_ready or self._workspace_trust_pending(screen):
                 await self._wait_for_repl_ready()
+                screen = await self._capture_pane_text()
+            if self._native_menu_state(screen) == MENU_LIVE:
+                # A menu with no card (dismissed by an operator, or one no hook
+                # surfaced). Enter would confirm its highlighted row, so type nothing.
+                raise NativeControlPendingError(
+                    "A Claude menu is on screen; answer it in the terminal before "
+                    "sending another message (nothing was typed)",
+                    control_request_id="",
+                    control_kind="unknown",
+                    opened_at=None,
+                    menu_state=MENU_LIVE,
+                )
             if self._turn_active:
                 # Mid-turn steer: keep the SAME turn alive. Refresh the idle
                 # clock so the completion watchdog doesn't fire in the gap
@@ -1558,6 +1619,10 @@ class TmuxInteractiveTransport(CLITransport):
 
         if event_name == "PermissionRequest":
             await self._emit_permission_request_from_hook(payload)
+            return True
+
+        if event_name == "PermissionDenied":
+            await self._close_denied_permission(payload)
             return True
 
         if event_name == "MessageDisplay":
@@ -2153,10 +2218,12 @@ class TmuxInteractiveTransport(CLITransport):
             )
             if orphan is not None and not orphan[1].get("answer_in_flight"):
                 await self._resolve_tty_answer(orphan[0], "completed_elsewhere", accepted=False)
+        if matched is None and not self._is_child_hook(payload):
+            matched = self._unbound_permission_for(payload)
         request_id, question = matched if matched else (None, None)
         if tool_use_id in self._question_result_ids:
             if question is not None and not question.get("answer_in_flight"):
-                await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
+                await self._close_completed_card(request_id, question, trigger="tool_result")
             return
         # Parent attribution: compute BEFORE popping so the Task's OWN result carries parent=None
         # (a main-agent action) while a child result nests under the stack top.
@@ -2218,7 +2285,75 @@ class TmuxInteractiveTransport(CLITransport):
             return
         await self._emit(frame)
         if question is not None and not question.get("answer_in_flight"):
-            await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
+            await self._close_completed_card(request_id, question, trigger="tool_result")
+
+    async def _close_completed_card(
+        self, request_id: str | None, pending: dict[str, Any], *, trigger: str
+    ) -> None:
+        """The card's tool call finished without a client answer: close the card.
+
+        A permission card is dismissed as resolved in the terminal; a question keeps
+        its answer-receipt path. ``decision`` stays ``completed_elsewhere`` for both.
+        """
+        if pending.get("kind") == "permission" and request_id:
+            await self._dismiss_tty_prompt(
+                request_id,
+                DISMISS_RESOLVED_IN_TERMINAL,
+                trigger=trigger,
+                decision="completed_elsewhere",
+            )
+            return
+        await self._resolve_tty_answer(request_id, "completed_elsewhere", accepted=False)
+
+    def _unbound_permission_for(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        """A main-agent permission card with no tool id, for this exact tool call.
+
+        PermissionRequest carries no tool_use_id; when no PreToolUse bound one, the
+        same tool name and input from the main agent's result still identify it.
+        """
+        key = self._tool_key(self._coerce_str(payload.get("tool_name")), payload.get("tool_input"))
+        native = self._coerce_str(payload.get("session_id"))
+        return next(
+            (
+                (rid, pending)
+                for rid, pending in self._pending_tty_prompts.items()
+                if pending.get("kind") == "permission"
+                and not pending.get("native_tool_use_id")
+                and not pending.get("child")
+                and pending.get("tool_key") == key
+                and (
+                    not native
+                    or not pending.get("native_session_id")
+                    or pending.get("native_session_id") == native
+                )
+            ),
+            None,
+        )
+
+    async def _close_denied_permission(self, payload: dict[str, Any]) -> None:
+        """Claude denied a tool call itself (``PermissionDenied``): its card is moot."""
+        tool_use_id = self._coerce_str(payload.get("tool_use_id"))
+        matched = next(
+            (
+                (rid, pending)
+                for rid, pending in self._pending_tty_prompts.items()
+                if pending.get("kind") == "permission"
+                and tool_use_id
+                and pending.get("native_tool_use_id") == tool_use_id
+                and pending.get("native_session_id") == payload.get("session_id")
+            ),
+            None,
+        )
+        if matched is None and not self._is_child_hook(payload):
+            matched = self._unbound_permission_for(payload)
+        if matched is None or matched[1].get("answer_in_flight"):
+            return
+        await self._dismiss_tty_prompt(
+            matched[0],
+            DISMISS_RESOLVED_IN_TERMINAL,
+            trigger="PermissionDenied",
+            decision="completed_elsewhere",
+        )
 
     async def _emit_permission_request_from_hook(self, payload: dict[str, Any]) -> None:
         tool_input = payload.get("tool_input")
@@ -2476,10 +2611,15 @@ class TmuxInteractiveTransport(CLITransport):
         self._cancel_submit_confirmations()
         native_tool_use_id = self._coerce_str(payload.get("tool_use_id"))
         native_session_id = self._coerce_str(payload.get("session_id"))
-        if not native_tool_use_id and not self._is_child_hook(payload):
+        child = self._is_child_hook(payload)
+        if not native_tool_use_id and not child:
             bound = self._main_tool_ids.pop(self._tool_key(tool_name, tool_input), None)
             if bound and (not native_session_id or bound[1] == native_session_id):
                 native_tool_use_id, native_session_id = bound
+        person_only = (
+            tool_name != "AskUserQuestion"
+            and self._permission_mode(payload) == _PERSON_ONLY_PERMISSION_MODE
+        )
         self._pending_tty_prompts[request_id] = {
             "kind": "permission",
             "tool_name": tool_name,
@@ -2488,7 +2628,30 @@ class TmuxInteractiveTransport(CLITransport):
             # their cleanup to the exact tool and native session, never its name.
             "native_tool_use_id": native_tool_use_id,
             "native_session_id": native_session_id,
+            # An unbound card can still close on the main agent's result for this
+            # exact tool call (same tool and input), never on its name alone.
+            "tool_key": self._tool_key(tool_name, tool_input),
+            "child": child,
+            "person_only": person_only,
+            **self._card_opened(),
+            **(
+                self._transcript_anchor(payload, native_session_id)
+                if native_tool_use_id
+                and native_session_id
+                and not child
+                and native_session_id == self._claude_native_session_id
+                else {}
+            ),
         }
+        if person_only:
+            logger.warning(
+                "Claude shows a person-only permission prompt under %s (%s, card %s): "
+                "it denies the command by itself after ~%.0fs unless someone answers",
+                _PERSON_ONLY_PERMISSION_MODE,
+                detail,
+                request_id,
+                self._person_only_prompt_timeout_s,
+            )
         await self._emit_ask_user_question(request_id, [question])
         task = asyncio.create_task(
             self._refine_permission_options(request_id),
@@ -2556,6 +2719,22 @@ class TmuxInteractiveTransport(CLITransport):
             return mode in _NO_GATE_PERMISSION_MODES
         return self._skip_permissions
 
+    def _permission_mode(self, payload: dict[str, Any]) -> str:
+        """Claude's live mode from the hook; Skuld's own launch flag when it is absent."""
+        mode = self._coerce_str(payload.get("permission_mode"))
+        if mode:
+            return mode
+        return _PERSON_ONLY_PERMISSION_MODE if self._skip_permissions else ""
+
+    @staticmethod
+    def _card_opened() -> dict[str, Any]:
+        return {
+            "opened_at": datetime.now(UTC).isoformat(),
+            "opened_monotonic": time.monotonic(),
+            "menu_state": MENU_UNKNOWN,
+            "menu_checked_at": None,
+        }
+
     def _rows_show_pending_question(self, request_id: str, rows: list[tuple[int, str]]) -> bool:
         """Whether the live menu is another pending question rather than this permission."""
         live = {label.strip().casefold() for _, label in rows}
@@ -2591,6 +2770,7 @@ class TmuxInteractiveTransport(CLITransport):
             "kind": "question",
             "questions": questions,
             **native,
+            **self._card_opened(),
         }
         await self._emit_ask_user_question(request_id, questions)
 
@@ -2609,30 +2789,37 @@ class TmuxInteractiveTransport(CLITransport):
             native_id = str(uuid.UUID(native_id))
         except ValueError:
             return {}
-        result: dict[str, Any] = {
+        return {
             "native_tool_use_id": tool_id,
             "native_session_id": native_id,
+            **self._transcript_anchor(payload, native_id),
         }
+
+    def _transcript_anchor(self, payload: dict[str, Any], native_id: str) -> dict[str, Any]:
+        """Anchor a later result read to this native transcript, from its current end.
+
+        Only the main conversation's own ``<native_id>.jsonl`` qualifies; the inode and
+        offset keep an old result or a replaced file from resolving a newer card.
+        """
         path_text = self._coerce_str(payload.get("transcript_path"))
         if not path_text:
-            return result
+            return {}
         path = Path(path_text)
         if not path.is_absolute() or path.name != f"{native_id}.jsonl":
-            return result
+            return {}
         try:
             path = path.resolve(strict=True)
             stat = path.stat()
         except OSError:
-            return result
+            return {}
         if path.name != f"{native_id}.jsonl" or not S_ISREG(stat.st_mode):
-            return result
-        result.update(
-            transcript_path=str(path),
-            transcript_offset=stat.st_size,
-            transcript_device=stat.st_dev,
-            transcript_inode=stat.st_ino,
-        )
-        return result
+            return {}
+        return {
+            "transcript_path": str(path),
+            "transcript_offset": stat.st_size,
+            "transcript_device": stat.st_dev,
+            "transcript_inode": stat.st_ino,
+        }
 
     def _read_native_question_result(self, pending: dict[str, Any]) -> dict[str, Any] | None:
         """Read only a bounded suffix added after this question was surfaced."""
@@ -2763,6 +2950,7 @@ class TmuxInteractiveTransport(CLITransport):
                     "source": "tmux_tty_bridge",
                     "control_kind": self._pending_tty_prompts[request_id]["kind"],
                     "requires_all_answers": True,
+                    **self._card_wire_metadata(self._pending_tty_prompts[request_id]),
                     **(
                         {"answerable": False, "recovery_required": True}
                         if self._tty_prompt_unanswerable(self._pending_tty_prompts[request_id])
@@ -2771,6 +2959,16 @@ class TmuxInteractiveTransport(CLITransport):
                 },
             }
         )
+
+    def _card_wire_metadata(self, pending: dict[str, Any]) -> dict[str, Any]:
+        """Card age and urgency fields every card frame carries (LEX-1936)."""
+        meta: dict[str, Any] = {}
+        if pending.get("opened_at"):
+            meta["opened_at"] = pending["opened_at"]
+        if pending.get("person_only"):
+            meta["person_only"] = True
+            meta["auto_deny_after_seconds"] = self._person_only_prompt_timeout_s
+        return meta
 
     @staticmethod
     def _tty_prompt_unanswerable(pending: dict[str, Any]) -> bool:
@@ -3452,7 +3650,12 @@ class TmuxInteractiveTransport(CLITransport):
         return ""
 
     async def _emit_ask_user_resolved(
-        self, request_id: str | None, decision: str, *, accepted: bool = True
+        self,
+        request_id: str | None,
+        decision: str,
+        *,
+        accepted: bool = True,
+        dismissal: dict[str, Any] | None = None,
     ) -> None:
         await self._emit(
             {
@@ -3461,9 +3664,65 @@ class TmuxInteractiveTransport(CLITransport):
                 "request_id": request_id or "",
                 "decision": decision,
                 "accepted": accepted,
+                **(dismissal or {}),
                 "metadata": {"source": "tmux_tty_bridge"},
             }
         )
+
+    def _dismissal_fields(
+        self, pending: dict[str, Any], reason: str, detail: str, *, trigger: str
+    ) -> dict[str, Any]:
+        """The ``ask_user_resolved`` fields that say a card closed without an answer."""
+        opened = pending.get("opened_monotonic")
+        return {
+            "dismissed": True,
+            "dismiss_reason": reason,
+            "dismiss_detail": detail,
+            "dismiss_trigger": trigger,
+            "control_kind": pending.get("kind"),
+            "tool_use_id": pending.get("native_tool_use_id"),
+            "opened_at": pending.get("opened_at"),
+            "age_seconds": (
+                round(time.monotonic() - opened, 3) if isinstance(opened, float) else None
+            ),
+            "menu_state": pending.get("menu_state", MENU_UNKNOWN),
+        }
+
+    async def _dismiss_tty_prompt(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        trigger: str,
+        detail: str | None = None,
+        decision: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a card nobody answered from a client, and tell every client why.
+
+        The event is emitted before the entry leaves the map: a failed emission keeps
+        the card (and the refusal it causes) rather than hiding it from clients.
+        """
+        pending = self._pending_tty_prompts.get(request_id)
+        if pending is None:
+            raise LookupError(f"No open native control {request_id}")
+        fields = self._dismissal_fields(
+            pending, reason, detail or _DISMISS_DETAILS[reason], trigger=trigger
+        )
+        logger.info(
+            "Native control %s (%s, tool_use_id=%s, open %ss) dismissed: %s [%s]",
+            request_id,
+            pending.get("kind"),
+            pending.get("native_tool_use_id"),
+            fields["age_seconds"],
+            fields["dismiss_detail"],
+            trigger,
+        )
+        await self._emit_ask_user_resolved(
+            request_id, decision or reason, accepted=False, dismissal=fields
+        )
+        self._pending_tty_prompts.pop(request_id, None)
+        self._native_control_counts[f"dismissed.{reason}"] += 1
+        return {"request_id": request_id, **fields}
 
     async def _clear_pending_tty_prompts(self, reason: str) -> None:
         """Resolve + drop any unanswered TTY prompts (turn ended / answered in-terminal) so a remote
@@ -3476,8 +3735,254 @@ class TmuxInteractiveTransport(CLITransport):
             if not pending.get("answer_in_flight")
         ]
         for request_id in stale:
-            self._pending_tty_prompts.pop(request_id, None)
-            await self._emit_ask_user_resolved(request_id, reason, accepted=False)
+            pending = self._pending_tty_prompts.pop(request_id, None) or {}
+            await self._emit_ask_user_resolved(
+                request_id,
+                reason,
+                accepted=False,
+                dismissal=self._dismissal_fields(
+                    pending, reason, _DISMISS_DETAILS.get(reason, reason), trigger=reason
+                ),
+            )
+            self._native_control_counts[f"dismissed.{reason}"] += 1
+
+    # -- Native-control cards the CLI resolved by itself (LEX-1936) ---------------------
+
+    @classmethod
+    def _native_menu_state(cls, text: str) -> str:
+        """Whether the pane shows a live Claude menu, only the empty composer, or neither.
+
+        A Claude permission or question menu replaces the chat composer while it waits,
+        so a recognizable menu with no composer is ``live`` and the empty composer with
+        no menu is ``gone``. Anything else (a failed capture, text typed in the
+        composer, both at once) is ``unknown`` and never clears a card.
+        """
+        rows = cls._normalize_terminal_rows(text)
+        if not rows:
+            return MENU_UNKNOWN
+        menu = cls._menu_rows("\n".join(rows))
+        shaped = bool(menu) and (
+            cls._permission_menu_digit("allow", menu) is not None
+            or cls._custom_confirmation(menu)
+            or any(_SELECTED_MENU_ROW_RE.match(row) for row in rows)
+        )
+        composer = any(cls._is_empty_prompt_row(row) for row in rows)
+        if shaped and not composer:
+            return MENU_LIVE
+        if composer and not shaped:
+            return MENU_GONE
+        return MENU_UNKNOWN
+
+    async def _observe_native_menu(self) -> str:
+        """Watch the main pane for the menu render window; ``gone`` only if it stayed gone.
+
+        A menu draws a beat after its hook, so a single empty capture is not proof.
+        Callers hold the input lock, so nothing typed by Skuld changes the screen.
+        """
+        deadline = time.monotonic() + max(self._menu_render_wait_s, 0.0)
+        while True:
+            state = self._native_menu_state(await self._capture_pane_text(self._target_pane()))
+            if state != MENU_GONE or time.monotonic() >= deadline:
+                return state
+            await asyncio.sleep(self._menu_poll_step_s)
+
+    async def _permission_result_in_transcript(
+        self, request_id: str, pending: dict[str, Any]
+    ) -> bool:
+        """Whether the native transcript already holds this permission's tool result.
+
+        A timed-out prompt ("the permission prompt timed out … The command was NOT
+        run") fires no PostToolUse hook; its result is only in the transcript.
+        """
+        if not pending.get("transcript_path") or not pending.get("native_tool_use_id"):
+            return False
+        try:
+            result = await asyncio.to_thread(self._read_native_question_result, pending)
+        except ControlRecoveryError as exc:
+            self._native_control_counts["transcript_unreadable"] += 1
+            logger.error(
+                "Native control %s: its transcript result cannot be read (%s); raise "
+                "tmux_question_transcript_max_bytes if the transcript outgrew it. The "
+                "on-screen menu check still applies",
+                request_id,
+                exc,
+            )
+            return False
+        if result is None:
+            return False
+        frame = {
+            "type": "user",
+            "message": {"content": [result["block"]]},
+            "metadata": {
+                "source": "claude_native_transcript",
+                "claude_session_id": pending["native_session_id"],
+                "claude_message_id": result.get("uuid"),
+                "transcript_path": pending.get("transcript_path"),
+            },
+        }
+        # The tool card closes too: no hook ever reported this result.
+        await self._emit_question_result_once(pending["native_tool_use_id"], frame)
+        return True
+
+    async def _retire_stale_tty_prompts_locked(self, *, trigger: str) -> list[str]:
+        """Dismiss permission cards the CLI already settled. Callers hold the input lock.
+
+        First the precise proof (the tool's result in the transcript), then the screen:
+        no menu and the empty composer for the whole render window. Questions keep
+        their own answer proof; a card being answered, or whose answer is uncertain,
+        is left alone.
+        """
+        candidates = [
+            (rid, pending)
+            for rid, pending in list(self._pending_tty_prompts.items())
+            if pending.get("kind") == "permission"
+            and not pending.get("answer_in_flight")
+            and not pending.get("answer_uncertain")
+        ]
+        retired: list[str] = []
+        for rid, pending in candidates:
+            if await self._permission_result_in_transcript(rid, pending):
+                if self._pending_tty_prompts.get(rid) is pending:
+                    await self._dismiss_tty_prompt(
+                        rid,
+                        DISMISS_RESOLVED_IN_TERMINAL,
+                        trigger=trigger,
+                        decision="completed_elsewhere",
+                    )
+                retired.append(rid)
+        remaining = [(r, p) for r, p in candidates if self._pending_tty_prompts.get(r) is p]
+        if not remaining:
+            return retired
+        state = await self._observe_native_menu()
+        checked_at = datetime.now(UTC).isoformat()
+        for rid, pending in remaining:
+            changed = pending.get("menu_state") != state
+            pending["menu_state"] = state
+            pending["menu_checked_at"] = checked_at
+            if changed and state != MENU_GONE:
+                await self._emit_native_control_state(rid, pending)
+        if state != MENU_GONE:
+            return retired
+        for rid, pending in remaining:
+            if self._pending_tty_prompts.get(rid) is pending:
+                await self._dismiss_tty_prompt(rid, DISMISS_MENU_NOT_SHOWN, trigger=trigger)
+                retired.append(rid)
+        return retired
+
+    async def _emit_native_control_state(self, request_id: str, pending: dict[str, Any]) -> None:
+        await self._emit(
+            {
+                "type": "native_control_state",
+                "event_type": "native_control.state",
+                "request_id": request_id,
+                **self._native_control_view(request_id, pending),
+                "metadata": {"source": "tmux_tty_bridge"},
+            }
+        )
+
+    async def sweep_native_controls(self) -> list[str]:
+        """One sweep: dismiss every permission card the CLI has already settled."""
+        if not self._pending_tty_prompts:
+            return []
+        async with self._answer_lock:
+            async with self._send_lock:
+                return await self._retire_stale_tty_prompts_locked(trigger="sweep")
+
+    async def _run_native_control_sweep_loop(self) -> None:
+        """Re-check open cards every ``tmux_native_control_sweep_interval_s``."""
+        while True:
+            await asyncio.sleep(self._native_control_sweep_interval_s)
+            try:
+                await self.sweep_native_controls()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # The loop must outlive one failed sweep, or every later stale card
+                # blocks again; each failure is logged at error and counted.
+                self._native_control_counts["sweep_failures"] += 1
+                logger.error("Native-control sweep failed", exc_info=True)
+
+    def _native_control_view(self, request_id: str, pending: dict[str, Any]) -> dict[str, Any]:
+        opened = pending.get("opened_monotonic")
+        return {
+            "request_id": request_id,
+            "control_kind": pending.get("kind"),
+            "tool_name": pending.get("tool_name"),
+            "tool_use_id": pending.get("native_tool_use_id"),
+            "opened_at": pending.get("opened_at"),
+            "age_seconds": (
+                round(time.monotonic() - opened, 3) if isinstance(opened, float) else None
+            ),
+            "menu_state": pending.get("menu_state", MENU_UNKNOWN),
+            "menu_checked_at": pending.get("menu_checked_at"),
+            "person_only": bool(pending.get("person_only")),
+            "auto_deny_after_seconds": (
+                self._person_only_prompt_timeout_s if pending.get("person_only") else None
+            ),
+            "answer_in_flight": bool(pending.get("answer_in_flight")),
+            "answerable": not self._tty_prompt_unanswerable(pending),
+        }
+
+    def list_native_controls(self) -> dict[str, Any]:
+        """The open native-control cards with their age and menu state, plus counters."""
+        return {
+            "controls": [
+                self._native_control_view(rid, pending)
+                for rid, pending in self._pending_tty_prompts.items()
+            ],
+            "counts": dict(self._native_control_counts),
+            "sweep_interval_seconds": self._native_control_sweep_interval_s,
+        }
+
+    async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:
+        """An operator closes a card the automatic checks did not (audited).
+
+        Dismissal only closes the card. If its menu is in fact still on screen,
+        messages stay refused (Enter would confirm the menu's highlighted row); the
+        menu must then be answered in the terminal.
+        """
+        if not dismissed_by.strip():
+            raise ValueError("A dismissal must name who dismissed the card")
+        async with self._answer_lock:
+            async with self._send_lock:
+                pending = self._pending_tty_prompts.get(request_id)
+                if pending is None:
+                    raise LookupError(f"No open native control {request_id}")
+                view = self._native_control_view(request_id, pending)
+                logger.warning(
+                    "AUDIT native control %s dismissed by operator %s at %s "
+                    "(kind=%s, tool=%s, tool_use_id=%s, opened_at=%s, menu_state=%s)",
+                    request_id,
+                    dismissed_by,
+                    datetime.now(UTC).isoformat(),
+                    view["control_kind"],
+                    view["tool_name"],
+                    view["tool_use_id"],
+                    view["opened_at"],
+                    view["menu_state"],
+                )
+                return await self._dismiss_tty_prompt(
+                    request_id,
+                    DISMISS_BY_OPERATOR,
+                    trigger="operator",
+                    detail=f"dismissed by operator {dismissed_by}",
+                )
+
+    def _native_control_pending_error(self) -> NativeControlPendingError:
+        request_id, pending = min(
+            self._pending_tty_prompts.items(),
+            key=lambda item: item[1].get("opened_monotonic") or 0.0,
+        )
+        view = self._native_control_view(request_id, pending)
+        return NativeControlPendingError(
+            f"Claude is waiting on a native control ({request_id}, {view['control_kind']}, "
+            f"menu {view['menu_state']}); answer it, or dismiss it if it is no longer "
+            "shown, before sending another message (nothing was typed)",
+            control_request_id=request_id,
+            control_kind=str(view["control_kind"]),
+            opened_at=view["opened_at"],
+            menu_state=view["menu_state"],
+        )
 
     async def _finish_hook_turn(
         self,

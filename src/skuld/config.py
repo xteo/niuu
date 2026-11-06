@@ -1180,6 +1180,27 @@ class SkuldSettings(BaseSettings):
         gt=0,
         description="Interval between native transcript reads while that wait is open.",
     )
+    tmux_native_control_sweep_interval_s: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "How often a Claude tmux session re-checks its open native-control cards "
+            "(permission menus): a card whose tool call already has a result in the native "
+            "transcript, or whose menu is no longer on screen while the composer is, is "
+            "dismissed so it stops blocking messages (LEX-1936). Bounds how long a card the "
+            "CLI resolved by itself (a timed-out safety prompt) can block steering."
+        ),
+    )
+    tmux_person_only_prompt_timeout_s: float = Field(
+        default=120.0,
+        gt=0,
+        description=(
+            "Claude Code's own timeout for a permission prompt it shows even under "
+            'bypassPermissions ("only a person may approve"); it denies the command after '
+            "it. Skuld does not enforce it: the value is only stated in the immediate "
+            "attention notification so the reader knows how long they have."
+        ),
+    )
     codex_receive_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
     # Unified internal-visibility default for a freshly-connected live channel
     # (SRD FR-7 / INV-10). The read paths thread the SAME configured default

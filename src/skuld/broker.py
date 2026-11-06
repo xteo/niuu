@@ -83,7 +83,11 @@ from skuld.channels import (
 from skuld.chronicle import ChronicleMixin
 from skuld.chronicle_watcher import ChronicleWatcher
 from skuld.config import SkuldSettings
-from skuld.control_errors import ControlRecoveryError, control_error_frame
+from skuld.control_errors import (
+    ControlRecoveryError,
+    NativeControlsUnsupportedError,
+    control_error_frame,
+)
 from skuld.control_state import (
     load_control_state,
     pending_controls,
@@ -100,7 +104,7 @@ from skuld.conversation_models import (  # noqa: F401
 )
 from skuld.conversation_read import history_write
 from skuld.delivery_claims import claim_message, settle_message
-from skuld.delivery_errors import DeliveryNotAcceptedError
+from skuld.delivery_errors import DeliveryNotAcceptedError, NativeControlPendingError
 from skuld.effort import EffortControlMixin, effort_argument
 from skuld.event_log import EventLogMixin
 from skuld.file_routes import (  # noqa: F401
@@ -206,6 +210,7 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
+
 logger = logging.getLogger("skuld.broker")
 
 FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
@@ -3639,14 +3644,24 @@ class Broker(
             # the assistant tool_use frame that the tmux bridge emits right after
             # this question cannot schedule an "active" report that clobbers the
             # awaiting_input below — the assistant branch checks _pending_attention.
+            urgency = self._person_only_attention(data)
+            kind = "permission" if urgency else "question"
             if ask_request_id:
-                self._pending_attention[ask_request_id] = "question"
+                self._pending_attention[ask_request_id] = kind
+            prompt = self._attention_prompt_from_questions(data)
+            if urgency:
+                prompt = (
+                    f"Only a person may approve this: {prompt} Claude Code denies it by "
+                    f"itself after about {urgency['auto_deny_after_seconds']:.0f} seconds "
+                    "unless someone answers."
+                )
             asyncio.create_task(
                 self._enter_attention(
                     ask_request_id,
-                    "question",
-                    prompt=self._attention_prompt_from_questions(data),
+                    kind,
+                    prompt=prompt,
                     options=data.get("questions"),
+                    extra=urgency,
                 )
             )
 
@@ -4906,6 +4921,31 @@ class Broker(
             except Exception:
                 logger.debug("Failed to broadcast transport error to channels", exc_info=True)
 
+    def list_native_controls(self) -> dict[str, Any]:
+        """Open native-control cards (age, live/stale menu state) and their counters."""
+        transport = self._transport
+        if transport is None or not transport.capabilities.native_controls:
+            raise NativeControlsUnsupportedError(
+                "This session's transport has no native-control cards"
+            )
+        return transport.list_native_controls()
+
+    async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:
+        """Close one card for an operator (audited by the transport and here)."""
+        transport = self._transport
+        if transport is None or not transport.capabilities.native_controls:
+            raise NativeControlsUnsupportedError(
+                "This session's transport has no native-control cards"
+            )
+        dismissed = await transport.dismiss_native_control(request_id, dismissed_by=dismissed_by)
+        logger.warning(
+            "AUDIT session %s: native control %s dismissed by operator %s",
+            self.session_id,
+            _sanitize_log(request_id),
+            _sanitize_log(dismissed_by),
+        )
+        return dismissed
+
     def _resolve_delivery_routing(self) -> bool:
         """Decide redirect-vs-send for an inbound message AT DELIVERY TIME (INV-7).
 
@@ -5033,8 +5073,12 @@ class Broker(
                         _sanitize_log(request_id),
                         _sanitize_log(str(exc)),
                     )
-                    if attempt >= attempts or (
-                        claimed_delivery and not isinstance(exc, DeliveryNotAcceptedError)
+                    if (
+                        attempt >= attempts
+                        or (claimed_delivery and not isinstance(exc, DeliveryNotAcceptedError))
+                        # A live native control refuses every attempt until a human
+                        # acts; retrying only hides the refusal behind "pending".
+                        or isinstance(exc, NativeControlPendingError)
                     ):
                         break
                     await asyncio.sleep(backoff)
@@ -5068,18 +5112,35 @@ class Broker(
     ) -> None:
         """Terminal delivery failure: flip the turn to a VISIBLE ``failed`` state and
         surface it. The turn is NEVER left silently ``pending`` (INV-7)."""
-        logger.exception(
-            "user message delivery failed after retries (request_id=%s)",
-            _sanitize_log(request_id),
-            exc_info=error,
-        )
+        details = error.details() if isinstance(error, NativeControlPendingError) else None
+        if details is not None:
+            logger.warning(
+                "user message refused: native control %s (%s, menu %s) is open "
+                "(request_id=%s); nothing was typed",
+                details["control_request_id"] or "<no card>",
+                details["control_kind"],
+                details["menu_state"],
+                _sanitize_log(request_id),
+            )
+        else:
+            logger.exception(
+                "user message delivery failed after retries (request_id=%s)",
+                _sanitize_log(request_id),
+                exc_info=error,
+            )
         if self._mark_user_turn_failed(msg_id):
             self._save_conversation_history()
-        await self._emit_delivery_ack(request_id, msg_id, "failed", error=str(error))
+        await self._emit_delivery_ack(
+            request_id, msg_id, "failed", error=str(error), details=details
+        )
         try:
-            await self._emit_broker_frame(
-                control_error_frame(error, {"request_id": request_id}, code="user_delivery_failed")
+            frame = control_error_frame(
+                error, {"request_id": request_id}, code="user_delivery_failed"
             )
+            if details is not None:
+                frame.update({k: v for k, v in details.items() if k != "code"})
+                frame["reason_code"] = details["code"]
+            await self._emit_broker_frame(frame)
         except Exception:
             logger.debug("Failed to broadcast delivery error", exc_info=True)
 
@@ -5108,6 +5169,7 @@ class Broker(
         error: str | None = None,
         pending_questions: int = 0,
         settle_claim: bool = True,
+        details: dict[str, Any] | None = None,
     ) -> None:
         """Broadcast a steering delivery ACK (BUG-3).
 
@@ -5148,6 +5210,10 @@ class Broker(
             event["error"] = error
         if pending_questions:
             event["pending_questions"] = pending_questions
+        if details:
+            # Why it was refused (e.g. code=native_control_pending and the blocking
+            # card's control_request_id), so Forge can answer 409, not a bare failure.
+            event.update(details)
         try:
             await self._emit_broker_frame(event)
         except Exception:

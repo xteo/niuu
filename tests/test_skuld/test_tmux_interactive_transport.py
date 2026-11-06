@@ -335,8 +335,10 @@ async def test_paste_confirm_never_presses_enter_into_open_menu(tmp_path: Path) 
     await _collect_events(transport)
     await transport.start()
 
-    transport.capture_stdout = "Do you want to proceed?\n❯ 1. Allow\n  2. Deny\n"
+    # The menu opens right after the paste (a menu already on screen refuses the
+    # message before anything is typed: LEX-1936).
     await transport.send_message("run the migration")
+    transport.capture_stdout = "Do you want to proceed?\n❯ 1. Allow\n  2. Deny\n"
     await asyncio.sleep(1.0)  # past the first two backoff hops
     enters = [
         args

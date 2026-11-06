@@ -278,6 +278,12 @@ broker:
   tmuxNativeTextWaitSeconds: 0.1
   # -- Interval between native transcript reads while that wait is open
   tmuxNativeTextPollSeconds: 0.005
+  # -- How often open native-control cards are re-checked; a card the CLI already
+  # resolved (tool result in the transcript) or whose menu is gone is dismissed
+  tmuxNativeControlSweepIntervalSeconds: 30.0
+  # -- Claude Code's own auto-deny timeout for a person-only safety prompt (stated in the
+  # attention notification; not enforced by Skuld)
+  tmuxPersonOnlyPromptTimeoutSeconds: 120.0
   museBin: ""
   # -- (DEPRECATED) AI CLI backend: "claude" (Claude Code, default) or "codex" (OpenAI Codex).
   # Use broker.transportAdapter instead. Kept for backward compatibility during rollout.
