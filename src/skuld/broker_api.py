@@ -533,8 +533,13 @@ async def get_conversation_history(
     max_bytes: int = 0,
     cursor: str | None = None,
     turn_id: str | None = None,
+    part_paging: bool = False,
 ) -> dict:
     """Return the conversation history with activity state.
+
+    ``history_protocol=2`` pages drop older whole turns to fit the byte budget and
+    never cut a turn; ``part_paging`` pages within a turn larger than the budget
+    (``docs/forge/openclaw-session-orchestrator-guide.md``, "Bounded history pages").
 
     ``detail=shallow`` elides heavy ``tool_result`` content to lazy-load
     placeholders (see ``conversation_shallow``); the client fetches an
@@ -626,6 +631,8 @@ async def get_conversation_history(
     if history_protocol != 2:
         if cursor:
             raise HTTPException(400, "cursor requires history_protocol=2")
+        if part_paging:
+            raise HTTPException(400, "part_paging requires history_protocol=2")
         return json_text_safe(result)
     if turn_id is not None or limit < 0 or max_bytes < 0:
         raise HTTPException(400, "Invalid history page request")
@@ -642,6 +649,7 @@ async def get_conversation_history(
                 broker._settings.conversation_recent_max_bytes,
             ),
             cursor=cursor,
+            part_paging=part_paging,
         )
     except InvalidHistoryCursorError as exc:
         raise HTTPException(
