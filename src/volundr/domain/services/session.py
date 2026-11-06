@@ -633,7 +633,7 @@ class SessionService:
                 prompt=metadata.get("prompt", "") or "",
                 request_id=metadata.get("request_id", "") or "",
                 # A prompt the agent's CLI denies by itself after a short timeout
-                # (Claude's person-only safety prompt, LEX-1936) is critical.
+                # (Claude's person-only safety prompt, LEX-1936) is flagged as urgent.
                 urgent=metadata.get("urgent") is True,
             )
             return

@@ -253,7 +253,8 @@ class NotificationRecorder(ABC):
     ) -> Notification | None:
         """Record (idempotently) that ``session`` is waiting for its owner.
 
-        ``urgent`` marks a request that expires by itself shortly (critical severity).
+        ``urgent`` marks a request that expires by itself shortly; its title says so
+        (severity stays warning, so quiet hours apply).
         """
 
     @abstractmethod

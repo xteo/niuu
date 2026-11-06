@@ -42,8 +42,9 @@ The session enters `activity_state=awaiting_input` at once. For a person-only pr
 activity metadata is `kind=permission`, `person_only=true`, `urgent=true` and
 `auto_deny_after_seconds`, and the prompt says, for example: "Only a person may approve
 this: Run `rm $V/$n`? Claude Code denies it by itself after about 120 seconds unless someone
-answers." Forge records that attention notification with severity `critical`, not `warning`,
-so quiet hours set to pass only critical items still deliver it.
+answers." Forge records that attention notification at once, titled "<session> needs your
+input now (denied by itself in about 2 minutes)". Its severity stays `warning`: the prompt
+fails closed (the CLI denies the command), so it does not override the owner's quiet hours.
 
 ## Menu state: `native_control_state`
 
