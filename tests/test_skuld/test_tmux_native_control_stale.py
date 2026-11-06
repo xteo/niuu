@@ -124,13 +124,14 @@ class Session:
             }
         )
         await self.hook("PreToolUse", tool_name="Bash", tool_input=RM, tool_use_id=TOOL)
+        # Claude draws the menu as soon as the hook returns; the card waits for it.
+        self.transport.capture_stdout = PERSON_ONLY_MENU
         await self.hook(
             "PermissionRequest",
             tool_name="Bash",
             tool_input=RM,
             permission_mode="bypassPermissions",
         )
-        self.transport.capture_stdout = PERSON_ONLY_MENU
         [card] = _ask_user_questions(self.events)
         return card["request_id"]
 

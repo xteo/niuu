@@ -1,7 +1,7 @@
 # Native-control cards: events, staleness and dismissal (LEX-1936)
 
 A Claude Code session in tmux shows some controls in its terminal: a permission menu
-(Allow / Allow & don't ask again / Deny) or an `AskUserQuestion` menu. Skuld bridges each
+("Yes / Yes, and don't ask again for … / No") or an `AskUserQuestion` menu. Skuld bridges each
 one to clients as a **native-control card** (`request_id` `tty-<n>-<hex>`). While a card is
 open, Claude cannot take typed input safely, so Skuld refuses messages to the session.
 
@@ -45,6 +45,37 @@ this: Run `rm $V/$n`? Claude Code denies it by itself after about 120 seconds un
 answers." Forge records that attention notification at once, titled "<session> needs your
 input now (denied by itself in about 2 minutes)". Its severity stays `warning`: the prompt
 fails closed (the CLI denies the command), so it does not override the owner's quiet hours.
+
+### A permission card's options are the live menu's rows (LEX-1950)
+
+Claude Code draws a permission menu only after its `PermissionRequest` hook returns. Skuld
+registers the card at the hook (messages are refused from then on) and sends it once the menu
+is on screen, at most `SKULD__TMUX_MENU_RENDER_WAIT_SECONDS` (default 1.5 s) later. Its
+`options` are the menu's own rows, in order, as Claude Code 2.1.319 draws them:
+
+| Prompt | Options |
+|---|---|
+| Bash | Yes · Yes, and don’t ask again for: python3 \* · Yes, and switch to auto mode · auto mode handles these prompts for you · No |
+| Bash outside the project | Yes · Yes, and always allow access to /home/thor/tmp from this project · Yes, and switch to auto mode · … · No |
+| Edit | Yes · Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab) · No |
+| WebFetch | Yes · Yes, and don't ask again for example.com · No, and tell Claude what to do differently (esc) |
+| MCP tool | Yes · Yes, and don't ask again for gbrain — Get Stats commands in /home/thor/proj · No |
+| Person-only check (any mode) | Yes · No |
+
+Answer with an option's label. The generic answers `Allow`, `Allow & don't ask again` and
+`Deny` are accepted on every card too (Telegram's buttons, and a card sent with them because
+its menu had not rendered in time). Skuld maps them onto the live menu: `Allow` is the
+one-time "Yes" row, `Deny` and every "No" row decline with Escape, and `Allow & don't ask
+again` is the first row that keeps allowing this kind of request ("don't ask again", with a
+straight or typographic apostrophe; "always allow"; "allow all"; "accept edits"; "for this
+session"). "Switch to auto mode" is never that row: it lets Claude approve every later prompt
+by itself.
+
+A choice the live menu does not have is refused with no keys sent, and the message names the
+menu's own options, for example: `The live Claude menu has no "Allow & don't ask again"; no
+keys were sent. It offers "Yes", "No": choose one of those`. When the card still showed the
+generic options, Skuld sends it again with the live rows (same `request_id`). A client should
+replace an open card's options when the same `request_id` arrives again.
 
 ## Menu state: `native_control_state`
 

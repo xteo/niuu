@@ -179,12 +179,31 @@ _OPTIONAL_HIGH_VOLUME_HOOK_EVENTS = [
 
 _SLASH_COMMAND_ROW_RE = re.compile(r"^(/\S+)\s{2,}(.+?)\s*$")
 # A numbered selection row in an interactive Claude menu, e.g. " 1. Allow" or
-# "❯ 2. Allow & don't ask again". The single source of truth for menu parsing —
+# "❯ 2. Yes, and don't ask again for …". The single source of truth for menu parsing —
 # the tmux test harness (tests/support/forge/tmux_page.py) imports this so it
 # parses menus exactly the way the shipped transport does.
 _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
 # The highlighted row of a live Claude selection menu, e.g. "❯ 1. Yes".
 _SELECTED_MENU_ROW_RE = re.compile(r"^\s*❯\s*[1-9][.)]\s+\S")
+# The generic permission answers Skuld accepts for any permission card (Telegram's
+# buttons, cards sent before the live menu rendered). Each maps onto the live menu's
+# equivalent row, in `_menu_label_key` form.
+_GENERIC_PERMISSION_ANSWERS = frozenset({"allow", "allow & don't ask again", "deny"})
+# Rows that grant a one-time Allow in Claude's permission menu.
+_ONE_TIME_ALLOW_ROWS = frozenset({"yes", "allow", "yes, allow this time", "allow once"})
+# A second affirmative row that keeps allowing this kind of request, as Claude Code
+# 2.1.319 words it: "Yes, and don't ask again for …", "Yes, and always allow access to
+# <dir> from this project", "Yes, and switch to accept edits (…) for this session".
+_PERSISTENT_ALLOW_RE = re.compile(
+    r"don't ask again|always allow|allow all|accept edits|(for|during) this session"
+)
+# "Yes, and switch to auto mode" lets Claude approve every later prompt by itself: a
+# change of the whole session's mode, never the persistent Allow for this request.
+_AUTO_MODE_ROW_RE = re.compile(r"\bauto mode\b")
+# Typographic quotes Claude Code draws in menu rows ("don’t ask again").
+_MENU_QUOTES = str.maketrans(
+    {"\u2018": "'", "\u2019": "'", "\u02bc": "'", "\u201c": '"', "\u201d": '"'}
+)
 # Claude Code fills an empty composer with a dimmed suggestion, e.g.
 # `❯ Try "how does work?"` (v2.1.x). It is not input: the composer is empty.
 _COMPOSER_SUGGESTION_RE = re.compile(r'Try "[^"\n]*"')
@@ -204,6 +223,11 @@ _WORKSPACE_TRUST_ROW_RE = re.compile(
 #: Turn closes the agent made itself (its Stop hooks); every other close is Skuld's own.
 AGENT_ENDED_REASONS = frozenset({"stop", "stop_failure"})
 _PASTED_CONTENT_WRAPPER_RE = re.compile(r'</?pasted_content(?:\s+id="[^"]*")?>')
+
+
+def _menu_label_key(label: str) -> str:
+    """A menu label as compared: straight quotes, single spaces, case-folded."""
+    return " ".join(label.translate(_MENU_QUOTES).split()).casefold()
 
 
 def _replace_text_atomically(path: Path, text: str) -> None:
@@ -518,7 +542,7 @@ class TmuxInteractiveTransport(CLITransport):
         self._confirm_submit_tasks: set[asyncio.Task[None]] = set()
         # Re-read a permission gate's live menu once it draws (e.g. Workflow's own
         # "Yes, run it / View raw script / No") so its real rows become answerable.
-        self._permission_refinements: set[asyncio.Task[None]] = set()
+        self._permission_cards: set[asyncio.Task[None]] = set()
         # Assistant texts already emitted via MessageDisplay this turn (re-display dedup +
         # the Stop-hook final-message twin guard) + per-message flush accumulators.
         self._turn_displayed_texts: list[str] = []
@@ -930,9 +954,9 @@ class TmuxInteractiveTransport(CLITransport):
             for task in list(self._confirm_submit_tasks):
                 task.cancel()
             self._confirm_submit_tasks.clear()
-            for task in list(self._permission_refinements):
+            for task in list(self._permission_cards):
                 task.cancel()
-            self._permission_refinements.clear()
+            self._permission_cards.clear()
             for task in list(self._tail_tasks.values()):
                 task.cancel()
             for task in list(self._frame_tasks.values()):
@@ -2570,10 +2594,12 @@ class TmuxInteractiveTransport(CLITransport):
     async def _surface_tty_permission(self, payload: dict[str, Any]) -> None:
         """Surface a Claude-CLI permission gate as a structured `ask_user_question`.
 
-        The on-screen rows aren't reliably available yet at hook time (they render a beat later), so
-        we offer Claude's stable 3-option shape (Allow / Allow & don't ask again / Deny) and resolve
-        the actual keystroke against the LIVE menu at answer time (`_answer_tty_prompt`) — race-free
-        (the menu is on screen while the human deliberates) and tolerant of 2-row menus.
+        Claude draws the menu only after this HTTP hook returns, so the card is registered now
+        (messages to the session are refused from this moment) and sent by
+        `_open_permission_card` once the live menu is on screen, with the menu's own labels
+        (LEX-1950): a person-only prompt offers just Yes / No, an edit offers "accept edits for
+        this session", and a card must never offer a row the menu does not have. The answer is
+        still resolved against the LIVE menu (`_answer_tty_prompt`).
         """
         tool_name = self._coerce_str(payload.get("tool_name")) or "this action"
         tool_input = payload.get("tool_input")
@@ -2652,45 +2678,91 @@ class TmuxInteractiveTransport(CLITransport):
                 request_id,
                 self._person_only_prompt_timeout_s,
             )
-        await self._emit_ask_user_question(request_id, [question])
         task = asyncio.create_task(
-            self._refine_permission_options(request_id),
+            self._open_permission_card(request_id),
             name=f"tmux-permission-menu-{self._session_name}",
         )
-        self._permission_refinements.add(task)
-        task.add_done_callback(self._permission_refinements.discard)
+        self._permission_cards.add(task)
+        task.add_done_callback(self._permission_cards.discard)
 
-    async def _refine_permission_options(self, request_id: str) -> None:
-        """Replace the generic Allow/Deny card with a custom gate's real menu rows.
+    async def _open_permission_card(self, request_id: str) -> None:
+        """Send a permission card once, offering the live menu's own rows (LEX-1950).
 
-        Most gates render Claude's standard permission menu, which the generic card
-        already maps. Some tools draw their own confirmation (Workflow: "Yes, run it /
-        View raw script / No"); without its real labels no client could answer it.
+        Waits up to ``_menu_render_wait_s`` for a permission menu (Claude's standard
+        Yes / … / No, or a tool's own confirmation such as Workflow's "Yes, run it / View
+        raw script / No") and offers exactly its rows. A menu that has not rendered by
+        then leaves the generic Allow / Allow & don't ask again / Deny card, and the
+        answer is mapped onto the live menu when it arrives; a choice the menu does not
+        have is refused with the menu's own options (`_answer_tty_prompt_locked`).
         """
-        rows = await self._capture_menu_rows_wait()
+        deadline = time.monotonic() + max(self._menu_render_wait_s, 0.0)
+        while True:
+            rows = await self._capture_menu_rows()
+            if self._permission_menu_shape(rows) or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(self._menu_poll_step_s)
         pending = self._pending_tty_prompts.get(request_id)
-        if (
-            not rows
-            or pending is None
-            or pending.get("kind") != "permission"
-            or pending.get("answer_in_flight")
-            or pending.get("answer_uncertain")
-            or self._rows_show_pending_question(request_id, rows)
-            or not self._custom_confirmation(rows)
-        ):
+        if pending is None or pending.get("answer_in_flight") or pending.get("answer_uncertain"):
+            # Closed or answered (a generic Telegram answer) before the menu rendered.
             return
+        if not self._adopt_live_permission_rows(request_id, pending, rows):
+            logger.info(
+                "Claude's permission menu for card %s was not on screen after %.1fs; "
+                "the card offers the generic choices and the answer is mapped onto the menu",
+                request_id,
+                self._menu_render_wait_s,
+            )
+        await self._emit_ask_user_question(request_id, pending["questions"])
+
+    def _adopt_live_permission_rows(
+        self, request_id: str, pending: dict[str, Any], rows: list[tuple[int, str]]
+    ) -> bool:
+        """Make the card offer the live menu's rows; False when they are not this menu."""
+        if not self._permission_menu_shape(rows) or self._rows_show_pending_question(
+            request_id, rows
+        ):
+            return False
         labels = [label for _, label in rows]
         question = {**pending["questions"][0], "options": [{"label": label} for label in labels]}
         pending["questions"] = [question]
         pending["live_labels"] = labels
-        await self._emit_ask_user_question(request_id, pending["questions"])
+        return True
+
+    @classmethod
+    def _permission_menu_shape(cls, rows: list[tuple[int, str]]) -> bool:
+        """Whether the rows are a permission menu: Claude's standard one or a tool's own."""
+        return bool(rows) and (
+            cls._permission_menu_choices(rows) is not None or cls._custom_confirmation(rows)
+        )
+
+    async def _offer_live_permission_rows(
+        self, request_id: str, pending: dict[str, Any], rows: list[tuple[int, str]]
+    ) -> None:
+        """Re-send the card with the live menu's rows after an answer it could not take."""
+        if pending.get("live_labels") == [label for _, label in rows]:
+            return
+        if self._adopt_live_permission_rows(request_id, pending, rows):
+            await self._emit_ask_user_question(request_id, pending["questions"])
+
+    def _permission_mismatch_message(self, chosen: str, rows: list[tuple[int, str]]) -> str:
+        """Why an answer was refused, naming what the live menu offers instead."""
+        if not self._permission_menu_shape(rows):
+            return (
+                f'The live Claude menu is not a permission menu, so "{chosen}" was not sent '
+                "and no keys were sent. Open the session to see what Claude is showing"
+            )
+        offered = ", ".join(f'"{label}"' for _, label in rows)
+        return (
+            f'The live Claude menu has no "{chosen}"; no keys were sent. '
+            f"It offers {offered}: choose one of those"
+        )
 
     @classmethod
     def _custom_confirmation(cls, rows: list[tuple[int, str]]) -> bool:
         """A yes/no-style menu that is not Claude's standard permission menu."""
-        if cls._permission_menu_digit("allow", rows) is not None:
+        if cls._permission_menu_choices(rows) is not None:
             return False
-        labels = [label.strip().casefold() for _, label in rows]
+        labels = [_menu_label_key(label) for _, label in rows]
         return (
             len(set(labels)) == len(labels)
             and any(re.match(r"(yes|allow)\b", label) for label in labels)
@@ -2706,7 +2778,7 @@ class TmuxInteractiveTransport(CLITransport):
         """
         if chosen != "deny" or not cls._custom_confirmation(rows):
             return None
-        matches = [d for d, label in rows if re.match(r"(no|deny)\b", label.strip().casefold())]
+        matches = [d for d, label in rows if re.match(r"(no|deny)\b", _menu_label_key(label))]
         return matches[0] if len(matches) == 1 else None
 
     @staticmethod
@@ -3017,10 +3089,10 @@ class TmuxInteractiveTransport(CLITransport):
         kind = pending.get("kind")
         if kind == "permission":
             chosen = self._first_answer_text(answers)
-            low = chosen.strip().casefold()
-            live = {label.strip().casefold(): label for label in pending.get("live_labels") or ()}
-            standard = low in {"allow", "allow & don't ask again", "deny"}
-            if not standard and low not in live:
+            low = _menu_label_key(chosen)
+            live = {_menu_label_key(label) for label in pending.get("live_labels") or ()}
+            generic = low in _GENERIC_PERMISSION_ANSWERS
+            if not generic and low not in live:
                 raise ValueError("The requested answer is not a declared Claude permission option")
             # Claimed for the rest of this branch (see the question-path comment below):
             # `_capture_menu_rows_wait` is a bounded poll with real `await`s, and a
@@ -3038,21 +3110,26 @@ class TmuxInteractiveTransport(CLITransport):
                         "The live Claude menu is a pending question, not this permission; "
                         "no keys were sent. Answer the question instead"
                     )
-                standard_menu = self._permission_menu_digit(low, rows) if standard else None
-                if standard_menu is not None:
-                    digit = standard_menu
-                elif standard:
-                    digit = self._custom_confirmation_digit(low, rows)
+                choices = self._permission_menu_choices(rows)
+                row = next(((d, label) for d, label in rows if _menu_label_key(label) == low), None)
+                if row is not None:
+                    digit, decision = row
+                elif generic and choices is not None:
+                    digit, decision = choices.get(low), chosen
+                elif generic:
+                    digit, decision = self._custom_confirmation_digit(low, rows), chosen
                 else:
-                    digit = next((d for d, label in rows if label.strip().casefold() == low), None)
+                    digit = None
                 if digit is None:
-                    raise ValueError("The requested answer does not match the live Claude menu")
+                    await self._offer_live_permission_rows(request_id, pending, rows)
+                    raise ValueError(self._permission_mismatch_message(chosen, rows))
                 pending["answer_uncertain"] = True
                 # Claude's standard menu declines with Escape; a custom menu uses its own row.
-                escape = low == "deny" and standard_menu is not None
+                escape = choices is not None and choices.get("deny") == digit
                 await self._send_key("Escape" if escape else str(digit), pane_id=pane_id)
-                decision = "deny" if low == "deny" else (live.get(low) or chosen)
-                await self._resolve_tty_answer(request_id, decision)
+                await self._resolve_tty_answer(
+                    request_id, "deny" if escape or low == "deny" else decision
+                )
             finally:
                 pending.pop("answer_in_flight", None)
             return
@@ -3616,24 +3693,34 @@ class TmuxInteractiveTransport(CLITransport):
             None,
         )
 
-    @staticmethod
-    def _permission_menu_digit(chosen: str, rows: list[tuple[int, str]]) -> int | None:
+    @classmethod
+    def _permission_menu_digit(cls, chosen: str, rows: list[tuple[int, str]]) -> int | None:
         """Resolve only a recognizable permission menu, never an arbitrary first row."""
+        choices = cls._permission_menu_choices(rows)
+        return choices.get(_menu_label_key(chosen)) if choices is not None else None
+
+    @staticmethod
+    def _permission_menu_choices(rows: list[tuple[int, str]]) -> dict[str, int] | None:
+        """The generic answers a standard permission menu's rows stand for, or None.
+
+        ``allow`` is the one-time row, ``deny`` the No row and ``allow & don't ask again``
+        the first row that keeps allowing this kind of request (`_PERSISTENT_ALLOW_RE`).
+        Any other affirmative row (switching to auto mode, an unknown scope) stands for
+        none of them: a client can still choose it by its own label.
+        """
         choices: dict[str, int] = {}
         for digit, label in rows:
-            low = label.strip().casefold()
+            low = _menu_label_key(label)
             if re.match(r"^(yes|allow)(?:$|[, &])", low):
-                if "don't ask" in low:
-                    choices.setdefault("allow & don't ask again", digit)
-                elif low in {"yes", "allow", "yes, allow this time", "allow once"}:
-                    # A second affirmative row may grant a session-wide policy.
-                    # Unknown scopes must not overwrite the one-time Allow row.
+                if low in _ONE_TIME_ALLOW_ROWS:
                     choices.setdefault("allow", digit)
+                elif _PERSISTENT_ALLOW_RE.search(low) and not _AUTO_MODE_ROW_RE.search(low):
+                    choices.setdefault("allow & don't ask again", digit)
             elif re.match(r"^(no|deny)(?:$|[, ])", low):
                 choices["deny"] = digit
         if "allow" not in choices or "deny" not in choices:
             return None
-        return choices.get(chosen)
+        return choices
 
     @staticmethod
     def _first_answer_text(answers: object) -> str:
