@@ -120,3 +120,17 @@ unit, or a size command and a count command for a log without timestamps). To pa
   - Feedless nodes: 582bf8d0-41fb-4c5d-ad4c-e5cdbbdeb0c8; unreachable: none
 
 - **Promotions**: rolled back 0; completed 0
+
+## Guild summary 2026-11-07 (2026-11-06 06:30 to 2026-11-07 06:30 UTC)
+
+- **Thor**: ok, forge-contract-b456e6d3 (b456e6d3b, not dirty); ledger 119; 85 sessions (16 running); 5xx 14 (0 during cutovers or rollbacks, 0 in known storms, 14 other: GET /s/{id}/api/conversation/history ×8, GET /s/{id}/health ×6)
+- **mini-m6**: ok, forge-m6-questions-2607a181 (2607a181b, not dirty); ledger 141|44; 17 sessions (6 running); 5xx 0
+
+- **Push gateway** (running), since the gateway started: alerts_sent 11, alerts_suppressed 3, live_activity_updates 83, widget_reloads 14, background_wakes 24, apns_rejections 7, tokens_pruned 7, loop_errors 1
+  - Against the previous window: alerts_sent 2 → 11, alerts_suppressed 1 → 3, live_activity_updates 2 → 83, widget_reloads 3 → 14, background_wakes 4 → 24, apns_rejections 0 → 7, tokens_pruned 0 → 7
+  - APNs answers per environment, since the gateway started: production: accepted 107, rejected 7; sandbox: accepted 38
+  - Rejections by reason in this window (gateway log): HTTP 410 ExpiredToken (token pruned) ×13, HTTP 410 Unregistered (token pruned) ×1
+  - Registered tokens: production: alert 1, live_activity 2, live_activity_start 3, widget_fallback 1; sandbox: alert 1, live_activity_start 1, widget 1
+  - Feedless nodes: 582bf8d0-41fb-4c5d-ad4c-e5cdbbdeb0c8; unreachable: none
+
+- **Promotions**: rolled back 0; completed 0
