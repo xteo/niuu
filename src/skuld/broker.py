@@ -719,6 +719,8 @@ class Broker(
         # connected, and any client can replay the full transcript from a cursor.
         self._event_log_seq = 0
         self._event_log_buffer: list[dict] = []
+        # Each pane's newest repaint, not yet logged (LEX-1984).
+        self._held_pane_frames: dict[str, tuple[dict, datetime]] = {}
         self._event_log_lock = asyncio.Lock()
         self._event_log_task: asyncio.Task[None] | None = None
         self._event_log_stopping = False

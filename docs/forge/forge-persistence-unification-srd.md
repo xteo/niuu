@@ -108,7 +108,7 @@ Each frame carries: `seq` (canonical order), `kind`, `role`, `request_id`/correl
 
 ## 6. Functional requirements
 
-**FR-1 — Single funnel / superset.** Every frame delivered to `channels.broadcast` (or any per-channel send) MUST have been appended to the durable log first. No code path may broadcast a frame that was not logged. Broker-originated frames (errors, permission_*, user_*, available_commands, agents, plan/workflow) are included.
+**FR-1 — Single funnel / superset.** Every frame delivered to `channels.broadcast` (or any per-channel send) MUST have been appended to the durable log first. No code path may broadcast a frame that was not logged. Broker-originated frames (errors, permission_*, user_*, available_commands, agents, plan/workflow) are included. Exception (LEX-1984): a tmux pane repaint (`terminal_frame`) is broadcast at once and logged only if it is its pane's newest when the next other frame is logged; see `forge-chronicle-vs-event-log.md`.
 
 **FR-2 — Capture-everything.** All event kinds in §5 are persisted across all transports (Claude SDK/tmux, Codex, Grok, OpenCode), not only those that happen to be folded into turns.
 

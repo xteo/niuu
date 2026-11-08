@@ -31,7 +31,18 @@ reducer. Never read the chronicle for that purpose.
 The durable, append-only, per-session event log. The broker writes **every**
 event that any client can ever see to this log first, in order, exactly once,
 with a monotonic per-session `seq`. It is a *complete superset* of every live
-broadcast (SRD §4, objective 1).
+broadcast (SRD §4, objective 1), with one exception below.
+
+**The one exception: tmux pane repaints** (LEX-1984). A tmux session repaints its pane
+many times a second, and each repaint (`terminal_frame`) carries the whole pane, about
+3.4 KB; on the mini they were 79% of the log. A rebuild reads only the last repaint of a
+run of terminal frames (its rows as the last-resort scrape of a span with nothing
+streamed, and its seq and time). So the broker holds each pane's newest repaint and logs
+it in its place just before the next other frame, or at shutdown
+(`event_log_terminal_frames: latest`, the default). Live viewers still get every repaint;
+the log keeps each pane's last screen of every run, and a rebuild gives the same turns
+(`tests/test_skuld/test_pane_frame_log.py`). `event_log_terminal_frames: all` logs every
+repaint. A broker killed without a shutdown loses its held repaints, not a turn.
 
 The canonical transcript is produced by folding these log frames with the
 single shared reducer:

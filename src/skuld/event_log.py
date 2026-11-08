@@ -13,6 +13,7 @@ import httpx
 from fastapi import WebSocket
 
 from niuu.domain.conversation_timeline import TIMELINE_KEY, observation, timeline
+from niuu.domain.transcript_reducer import TERMINAL_FRAME_KIND
 from niuu.observability import get_observability
 from skuld.conversation_models import ConversationTurn
 from skuld.session_artifacts import SessionArtifacts
@@ -376,6 +377,36 @@ class EventLogMixin:
         """
         if not self._settings.event_log_enabled or not self.volundr_api_url:
             return None
+        if (
+            data.get("type") == TERMINAL_FRAME_KIND
+            and self._settings.event_log_terminal_frames == "latest"
+        ):
+            self._hold_pane_frame(data, ts or datetime.now(UTC))
+            return None
+        self._log_held_pane_frames()
+        return self._append_event_log_entry(data, ts)
+
+    def _hold_pane_frame(self, data: dict, ts: datetime) -> None:
+        """Keep a pane's newest repaint until the next other frame is logged (LEX-1984).
+
+        A rebuild reads only the last repaint of a run of terminal frames (its rows and
+        its seq), so logging just that one, in its place before the next frame, gives
+        the same turns. One per pane, so a replay still shows every pane's last screen.
+        """
+        held = self._held_pane_frames
+        key = str(data.get("pane_id") or "")
+        held.pop(key, None)
+        held[key] = (data, ts)
+
+    def _log_held_pane_frames(self) -> None:
+        """Log the held repaints, oldest pane first, so the newest is last as it was."""
+        held = self._held_pane_frames
+        while held:
+            key = next(iter(held))
+            data, ts = held.pop(key)
+            self._append_event_log_entry(data, ts)
+
+    def _append_event_log_entry(self, data: dict, ts: datetime | None) -> dict:
         self._event_log_seq += 1
         observed_at = (ts or datetime.now(UTC)).isoformat()
         caps = getattr(self._transport, "capabilities", None)
@@ -842,6 +873,7 @@ class EventLogMixin:
 
     async def _stop_event_log(self) -> None:
         """Drain remaining frames and stop the worker on shutdown."""
+        self._log_held_pane_frames()  # the panes' last screens (LEX-1984)
         self._event_log_stopping = True
         if self._event_log_task is not None:
             self._event_log_task.cancel()

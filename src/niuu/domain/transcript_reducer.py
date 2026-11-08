@@ -119,6 +119,10 @@ NON_BROADCAST_KINDS: frozenset[str] = frozenset(
 # like any broker frame, so live, replay and cold reads carry it alike (INV-5).
 TURN_INTERRUPTED_KIND = "turn_interrupted"
 
+# A tmux pane repaint. A rebuild reads only the last one of a run (its rows, as the
+# last-resort scrape, and its seq and time), so the broker logs only that one (LEX-1984).
+TERMINAL_FRAME_KIND = "terminal_frame"
+
 # Per-connect handshake/preamble frames: addressed to ONE freshly-connecting
 # socket, NOT the canonical shared stream (SRD FR-7 / INV-5). On every browser
 # connect the broker emits a ``system`` "Connected to session …" welcome and a
@@ -1038,7 +1042,12 @@ def reduce_frames(
             if not isinstance(rows_text, list):
                 rows_text = str(p.get("text", "")).split("\n")
             apply_tmux_rows(acc, rows_text)
-            acc.touch(ts, seq)
+            if not (acc.content or acc.parts or acc.reasoning):
+                # Only a span with nothing streamed is made of its repaints (the scrape).
+                # Once it has content, its seq and time are its content's, as the live
+                # broker keeps them: a trailing repaint must not change the turn's id
+                # when a human message closes it (LEX-1984).
+                acc.touch(ts, seq)
             continue
 
         if k == "result":

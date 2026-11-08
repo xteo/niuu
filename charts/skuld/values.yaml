@@ -252,6 +252,10 @@ broker:
   # (/api/v1/forge/sessions/<id>/log). Off for a runtime with no Forge session
   # (a resident, whose history lives in its own conversation file).
   eventLogEnabled: true
+  # -- Which tmux pane repaints the event log keeps: "latest" logs a pane's newest
+  # repaint just before the next other frame (a rebuild reads only that one; live
+  # viewers still get every repaint, LEX-1984); "all" logs every repaint.
+  eventLogTerminalFrames: latest
   # -- Report activity state to the Forge session
   # (/api/v1/forge/sessions/<id>/activity). Off for a runtime with no Forge session.
   activityReportingEnabled: true

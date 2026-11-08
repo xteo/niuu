@@ -103,6 +103,7 @@ data:
     live_frame_max_bytes: {{ .Values.broker.liveFrameMaxBytes | toJson }}
     codex_receive_max_bytes: {{ .Values.broker.codexReceiveMaxBytes | toJson }}
     event_log_enabled: {{ .Values.broker.eventLogEnabled | toJson }}
+    event_log_terminal_frames: {{ .Values.broker.eventLogTerminalFrames | toJson }}
     activity_reporting_enabled: {{ .Values.broker.activityReportingEnabled | toJson }}
     history_hydration_enabled: {{ .Values.broker.historyHydrationEnabled | toJson }}
     history_hydration_timeout_seconds: {{ .Values.broker.historyHydrationTimeoutSeconds | toJson }}

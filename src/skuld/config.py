@@ -1092,6 +1092,16 @@ class SkuldSettings(BaseSettings):
     # Volundr session_event_log so any client can replay the full transcript
     # (including the in-flight turn) regardless of whether a socket is attached.
     event_log_enabled: bool = Field(default=True)
+    event_log_terminal_frames: Literal["latest", "all"] = Field(
+        default="latest",
+        description=(
+            "Which tmux pane repaints (terminal_frame) the durable log keeps. 'latest' "
+            "holds each repaint and logs only a pane's newest one, just before the next "
+            "other frame (or at shutdown): a rebuild reads only the last repaint of a "
+            "run, so it gives the same turns, and live viewers still get every repaint "
+            "(LEX-1984). 'all' logs every repaint."
+        ),
+    )
     activity_reporting_enabled: bool = Field(
         default=True,
         description=(
