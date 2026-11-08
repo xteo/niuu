@@ -182,6 +182,22 @@ def last_ordinal(path: Path, end: int | None = None, chunk: int = 1 << 20) -> in
     return None
 
 
+def record_boundary(path: Path, size: int) -> int:
+    """The end of the last complete record within ``size`` bytes (a newline ends one), so a
+    recorded offset never lands inside a record still being written."""
+    with open(path, "rb") as stream:
+        pos = size
+        while pos > 0:
+            step = min(1 << 16, pos)
+            stream.seek(pos - step)
+            block = stream.read(step)
+            cut = block.rfind(b"\n")
+            if cut >= 0:
+                return pos - step + cut + 1
+            pos -= step
+    return 0
+
+
 def prefix_digest(path: Path, size: int, chunk: int = 1 << 20) -> str:
     """A digest of the file's first ``size`` bytes: an append keeps it, a rewrite does not."""
     digest = hashlib.sha256()
@@ -211,7 +227,8 @@ def codex_baseline(api: str, sid: str, resume_id: str, app: str) -> dict | str:
     if len(files) != 1:
         return f"not restarted: {len(files)} rollout files for Codex thread {resume_id} in {home}"
     stat = files[0].stat()
-    ordinal = last_ordinal(files[0], stat.st_size)
+    size = record_boundary(files[0], stat.st_size)
+    ordinal = last_ordinal(files[0], size)
     if ordinal is None:
         return f"not restarted: {files[0].name} has no record ordinals to prove an append with"
     return {
@@ -220,9 +237,9 @@ def codex_baseline(api: str, sid: str, resume_id: str, app: str) -> dict | str:
         "app_server_pid": app,
         "codex_home": str(home),
         "rollout": str(files[0].resolve()),
-        "prefix_digest": prefix_digest(files[0], stat.st_size),
+        "prefix_digest": prefix_digest(files[0], size),
         "inode": stat.st_ino,
-        "size": stat.st_size,
+        "size": size,
         "last_ordinal": ordinal,
         "turns": turn_count(api, sid),
     }
@@ -349,7 +366,7 @@ def _start_codex_again(
     if failed:
         return failed.replace("started, but", f"started, then within {args.settle:g}s")
     turns = turn_count(api, sid)
-    size = rollout.stat().st_size
+    size = record_boundary(rollout, rollout.stat().st_size)
     PROOF[sid]["after"] = {
         "app_server_pid": app,
         "size": size,
@@ -402,10 +419,17 @@ def codex_appended(evidence: str, sid: str) -> int:
     files = [f.resolve() for f in codex_rollouts(Path(before["codex_home"]), before["thread"])]
     if files != [rollout]:
         problems.append(f"the thread has rollouts {[f.name for f in files]}")
-    ordinals, turns = [], 0
+    ordinals, after_restart, turns = [], 0, 0
     with open(rollout, "rb") as stream:
-        stream.seek(after["size"])  # only what the resumed app-server wrote
-        for raw in stream:
+        stream.seek(before["size"])  # everything since the stop: during and after the restart
+        while True:
+            offset = stream.tell()
+            raw = stream.readline()
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):
+                break  # a record still being written
+            written_after = offset >= after["size"]
             try:
                 record = json.loads(raw)
             except ValueError:
@@ -414,16 +438,21 @@ def codex_appended(evidence: str, sid: str) -> int:
                 continue
             if isinstance(record.get("ordinal"), int):
                 ordinals.append(record["ordinal"])
+                after_restart += written_after
             payload = record.get("payload")
-            if isinstance(payload, dict) and payload.get("type") == "task_complete":
+            if (
+                written_after
+                and isinstance(payload, dict)
+                and payload.get("type") == "task_complete"
+            ):
                 turns += 1
-    if not ordinals:
+    if not after_restart:
         problems.append(f"nothing was appended to {rollout.name} since the restart")
-    elif after.get("last_ordinal") is None or ordinals != list(
-        range(after["last_ordinal"] + 1, after["last_ordinal"] + 1 + len(ordinals))
+    elif ordinals != list(
+        range(before["last_ordinal"] + 1, before["last_ordinal"] + 1 + len(ordinals))
     ):
         problems.append(
-            f"ordinals do not continue from {after.get('last_ordinal')}: {ordinals[:3]}..."
+            f"ordinals do not continue from {before['last_ordinal']}: {ordinals[:3]}..."
         )
     if not turns:
         problems.append("no turn has completed in it since the restart")
@@ -433,6 +462,7 @@ def codex_appended(evidence: str, sid: str) -> int:
                 "rollout": str(rollout),
                 "appended_bytes": stat.st_size - after["size"],
                 "records": len(ordinals),
+                "records_after_restart": after_restart,
                 "first_ordinal": ordinals[0] if ordinals else None,
                 "completed_turns": turns,
                 "problems": problems,

@@ -391,65 +391,55 @@ def _descendants(root: str, procs: dict[str, tuple[str, str, str]]) -> list[str]
     return out
 
 
-def _toml_list(text: str) -> list[str] | None:
-    """A TOML array of plain strings (``["-y", "pkg"]``), or None for anything else."""
-    try:
-        value = json.loads(text)
-    except ValueError:
-        return None
-    return value if isinstance(value, list) and all(isinstance(v, str) for v in value) else None
-
-
 def mcp_commands(app_command: str, home: Path) -> list[list[str]]:
-    """The full argv of each MCP server the app-server starts (command plus args), from its
-    ``-c mcp_servers.<name>.command/args`` overrides and its config.toml sections."""
-    servers: dict[str, dict] = {}
-    for name, key, value in re.findall(
-        r'mcp_servers\.([\w-]+)\.(command|args)=("[^"]*"|\[[^\]]*\])', app_command
-    ):
-        servers.setdefault(name, {})[key] = value
+    """The full argv of each MCP server the app-server starts (command plus args): its
+    ``-c mcp_servers.<name>.command/args`` overrides over its config.toml sections.
+
+    Codex lanes exist only on Linux hosts, whose python3 has ``tomllib`` (3.11+).
+    """
+    import tomllib  # noqa: PLC0415 - only Codex lanes need it; the mini's 3.9 never does
+
     try:
-        text = (home / "config.toml").read_text(errors="replace")
-    except OSError:
-        text = ""
-    section, pending = None, None
-    for line in text.splitlines():
-        line = line.strip()
-        if pending is not None:  # a multi-line args array
-            pending[1].append(line)
-            if line.endswith("]"):
-                servers.setdefault(section, {}).setdefault("args", " ".join(pending[1]))
-                pending = None
-            continue
-        header = re.match(r"\[mcp_servers\.([\w-]+)\]$", line)
-        if line.startswith("["):
-            section = header.group(1) if header else None
-            continue
-        if section is None:
-            continue
-        match = re.match(r"(command|args)\s*=\s*(.+)$", line)
-        if not match:
-            continue
-        if match.group(1) == "args" and not match.group(2).rstrip().endswith("]"):
-            pending = (section, [match.group(2)])
-            continue
-        servers.setdefault(section, {}).setdefault(match.group(1), match.group(2))
+        config = tomllib.loads((home / "config.toml").read_text(errors="replace"))
+    except FileNotFoundError:
+        config = {}
+    servers = {
+        name: dict(server)
+        for name, server in (config.get("mcp_servers") or {}).items()
+        if isinstance(server, dict)
+    }
+    for name, key, value in re.findall(
+        r"mcp_servers\.([\w-]+)\.(command|args)=(\"[^\"]*\"|\[[^\]]*\])", app_command
+    ):
+        servers.setdefault(name, {})[key] = tomllib.loads(f"v = {value}")["v"]
     out = []
     for server in servers.values():
-        command = _toml_list(f"[{server.get('command', '')}]")
-        args = _toml_list(server.get("args", "[]"))
-        if command and len(command) == 1 and args is not None:
-            out.append([command[0], *args])
+        command, args = server.get("command"), server.get("args", [])
+        if (
+            isinstance(command, str)
+            and isinstance(args, list)
+            and all(isinstance(a, str) for a in args)
+        ):
+            out.append([command, *args])
     return out
 
 
-def _is_helper(command: str, mcp: list[list[str]]) -> bool:
+def _argv(pid: str, proc: Path) -> list[str] | None:
+    """The process's exact argv (``ps`` joins it with spaces, losing argument boundaries)."""
+    try:
+        raw = (proc / pid / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return [part.decode(errors="replace") for part in raw.rstrip(b"\0").split(b"\0")]
+
+
+def _is_helper(command: str, mcp: list[list[str]], argv: list[str] | None = None) -> bool:
     """One of the app-server's own processes: its code-mode host, a Forge MCP server, or a
     process whose whole argv is a configured MCP server's (an interpreter may run it)."""
     if _CODEX_HELPER.search(command):
         return True
-    words = command.split()
-    return any(words == argv or words[1:] == argv for argv in mcp)
+    words = argv if argv is not None else command.split()
+    return any(words == server or words[1:] == server for server in mcp)
 
 
 def codex_reasons(
@@ -474,7 +464,8 @@ def codex_reasons(
         # its helpers (a tool command, or a worker it detached), and anything the code-mode
         # host runs (code the agent executes). What runs under either is its.
         parent = procs.get(ppid, ("", "", ""))[2]
-        if (ppid == app and not _is_helper(command, mcp)) or "codex-code-mode-host" in parent:
+        helper = _is_helper(command, mcp, _argv(pid, proc))
+        if (ppid == app and not helper) or "codex-code-mode-host" in parent:
             reasons.append(f"pid {pid}, {elapsed}, under the Codex app-server: {command[:120]}")
     rollouts = open_rollouts(app, proc)
     if not cli_session_id or not any(r.name.endswith(f"-{cli_session_id}.jsonl") for r in rollouts):

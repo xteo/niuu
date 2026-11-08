@@ -475,3 +475,37 @@ def test_last_ordinal_reads_within_the_recorded_size_and_past_huge_records(tmp_p
     with open(path, "a") as stream:
         stream.write(_rollout_line(6) + "\n")
     assert catchup.last_ordinal(path, size) == 5 and catchup.last_ordinal(path) == 6
+
+
+def test_a_recorded_size_never_lands_inside_a_record(tmp_path):
+    path = tmp_path / "rollout-x.jsonl"
+    path.write_text(_rollout_line(1) + "\n" + '{"ordinal": 2, "pay')
+    whole = len(_rollout_line(1)) + 1
+    assert catchup.record_boundary(path, path.stat().st_size) == whole
+    assert catchup.record_boundary(path, whole) == whole
+    assert catchup.record_boundary(path, 3) == 0
+
+
+def test_codex_appended_checks_the_records_written_during_the_restart(codex, capsys, tmp_path):
+    fake = codex()
+    evidence = tmp_path / "ev.json"
+    _run(capsys, "--only", "cx", "--evidence", str(evidence))
+    record = json.loads(evidence.read_text())
+    # A record written while restarting that resets the numbering, then a turn after it.
+    before = record["cx"]["proof"]["before"]
+    with open(fake.rollout, "a") as stream:
+        stream.write(_rollout_line(0) + "\n")
+    size = fake.rollout.stat().st_size
+    record["cx"]["proof"]["after"].update(
+        size=size,
+        last_ordinal=0,
+        prefix_digest=catchup.prefix_digest(fake.rollout, size),
+    )
+    evidence.write_text(json.dumps(record))
+    with open(fake.rollout, "a") as stream:
+        stream.write(_rollout_line(1, "task_complete") + "\n")
+    code, verdict = _appended(capsys, evidence)
+    assert code == 1
+    assert verdict["problems"] == [
+        f"ordinals do not continue from {before['last_ordinal']}: [0, 1]..."
+    ]

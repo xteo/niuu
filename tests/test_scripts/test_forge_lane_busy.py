@@ -462,3 +462,25 @@ def test_mcp_servers_match_on_their_whole_argv(tmp_path):
     assert sorted(mcp) == [["/bin/google", "--port", "1"], ["/venv/python"]]
     assert lane_busy._is_helper("node /bin/google --port 1", mcp)
     assert not lane_busy._is_helper("/venv/python worker.py", mcp)
+
+
+def test_mcp_config_is_read_as_toml(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "# servers\n[mcp_servers.google]\ncommand = '/bin/google'  # literal string\n"
+        'args = [\n  "--label",\n  "two words",\n]\n'
+    )
+    assert lane_busy.mcp_commands("codex app-server", tmp_path) == [
+        ["/bin/google", "--label", "two words"]
+    ]
+
+
+def test_an_mcp_server_with_a_spaced_argument_is_a_helper(tmp_path):
+    (tmp_path / "codex").mkdir()
+    ps = CODEX_PS.replace("node /home/x/.local/bin/lexi-google", "/bin/google --label two words")
+    procs, proc = _codex_host(tmp_path, ps)
+    (tmp_path / "codex/config.toml").write_text(
+        '[mcp_servers.google]\ncommand = "/bin/google"\nargs = ["--label", "two words"]\n'
+    )
+    (proc / "2926457" / "cmdline").write_bytes(b"/bin/google\0--label\0two words\0")
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == []
