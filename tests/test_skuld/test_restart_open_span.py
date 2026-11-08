@@ -324,3 +324,57 @@ async def test_a_nested_event_inside_a_handler_is_not_held(tmp_path):
 
     assert seen == ["inner", "outer"]
     assert broker._cli_events_in_flight == 0
+
+
+async def test_a_task_that_outlives_its_handler_is_gated(tmp_path):
+    broker = _broker(tmp_path)
+    spawned: list[asyncio.Task] = []
+    go = asyncio.Event()
+    real = broker._handle_cli_event_now
+
+    async def later():
+        await go.wait()
+        await broker._handle_cli_event(_assistant({"type": "text", "text": "from a child"}))
+
+    async def handler(data):
+        if data.get("type") == "spawn":
+            spawned.append(asyncio.create_task(later()))
+            return
+        await real(data)
+
+    broker._handle_cli_event_now = handler
+    await broker._handle_cli_event({"type": "spawn"})  # the handler returns; its task lives on
+    await _run_open_turn(broker)
+    broker._cli_events_open.clear()  # shutdown is saving
+    go.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not spawned[0].done()  # held at the gate, not run past it
+    broker._cli_events_open.set()
+    await spawned[0]
+    assert "from a child" in broker._pending_assistant_content
+
+
+async def test_no_event_reaches_a_client_before_the_boundary(tmp_path):
+    broker = _broker(tmp_path)
+    await _run_open_turn(broker)
+    sent: list[str] = []
+    release = asyncio.Event()
+
+    async def broadcast(frame):
+        if frame.get("type") == TURN_INTERRUPTED_KIND:
+            await release.wait()
+        sent.append(frame.get("type"))
+
+    broker._channels.broadcast = broadcast
+    save = asyncio.create_task(broker._interrupt_open_turn("broker_shutdown"))
+    await asyncio.sleep(0)
+    after = asyncio.create_task(
+        broker._handle_cli_event(_assistant({"type": "text", "text": "After the boundary"}))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(save, after)
+
+    assert sent.index(TURN_INTERRUPTED_KIND) < sent.index("assistant")

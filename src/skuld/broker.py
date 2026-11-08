@@ -219,8 +219,11 @@ _configure_logging()
 
 logger = logging.getLogger("skuld.broker")
 
-# Set while a CLI event is being handled, so a nested one skips the shutdown gate.
-_IN_CLI_EVENT: contextvars.ContextVar[bool] = contextvars.ContextVar("in_cli_event", default=False)
+# The task handling a CLI event, set for the code (and the tasks it starts) that runs
+# under it: a nested event skips the shutdown gate only while that handler is still running.
+_CLI_EVENT_TASK: contextvars.ContextVar[asyncio.Task | None] = contextvars.ContextVar(
+    "cli_event_task", default=None
+)
 
 FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
 FORGE_CHRONICLES_PATH = "/api/v1/forge/chronicles"
@@ -765,6 +768,7 @@ class Broker(
         self._cli_events_settled = asyncio.Event()
         self._cli_events_settled.set()
         self._cli_events_in_flight = 0
+        self._cli_event_tasks: set[asyncio.Task] = set()
         self._pending_assistant_content: str = ""
         self._pending_assistant_parts: list[dict] = []
         # Tool details are available before their live preview is sent, including
@@ -1097,9 +1101,10 @@ class Broker(
             self._pending_assistant_last_seq = self._event_log_seq
             self._pending_assistant_last_ts = observed_at
             self._flush_pending_assistant_turn(metadata={"status": "interrupted"})
+            # Reach every client before the next event can, as in the log.
+            await self._channels.broadcast(frame)
         finally:
             self._cli_events_open.set()
-        await self._channels.broadcast(frame)
 
     def _discard_pending_assistant_turn(self) -> None:
         """Clear the open assistant turn: after a flush, or when it is not to be saved."""
@@ -3602,19 +3607,23 @@ class Broker(
         An event is logged before it is folded into the open span, with awaits between.
         Shutdown closes the gate and waits for the events in flight, so the turn it
         saves holds every frame logged before its ``turn_interrupted`` frame and none
-        after. A nested call (made while handling an event) runs at once.
+        after. A nested call, made while its handler still runs (in its task or in a
+        task it started), runs at once; a task that outlives its handler is gated.
         """
-        if _IN_CLI_EVENT.get():
+        if _CLI_EVENT_TASK.get() in self._cli_event_tasks:
             await self._handle_cli_event_now(data)
             return
         await self._cli_events_open.wait()
+        task = asyncio.current_task()
         self._cli_events_in_flight += 1
         self._cli_events_settled.clear()
-        token = _IN_CLI_EVENT.set(True)
+        self._cli_event_tasks.add(task)
+        token = _CLI_EVENT_TASK.set(task)
         try:
             await self._handle_cli_event_now(data)
         finally:
-            _IN_CLI_EVENT.reset(token)
+            _CLI_EVENT_TASK.reset(token)
+            self._cli_event_tasks.discard(task)
             self._cli_events_in_flight -= 1
             if self._cli_events_in_flight == 0:
                 self._cli_events_settled.set()
