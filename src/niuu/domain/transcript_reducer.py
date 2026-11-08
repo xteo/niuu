@@ -1038,7 +1038,12 @@ def reduce_frames(
             if not isinstance(rows_text, list):
                 rows_text = str(p.get("text", "")).split("\n")
             apply_tmux_rows(acc, rows_text)
-            acc.touch(ts, seq)
+            if not (acc.content or acc.parts or acc.reasoning):
+                # Only a span with nothing streamed is made of its repaints (the scrape).
+                # Once it has content, its seq and time are its content's, as the live
+                # broker keeps them: a trailing repaint must not change the turn's id
+                # when a human message closes it.
+                acc.touch(ts, seq)
             continue
 
         if k == "result":
