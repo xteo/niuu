@@ -289,3 +289,131 @@ def test_a_detached_process_carrying_the_session_is_busy(tmp_path):
     proc(16, "vite preview", sid="other")
     reasons = lane_busy.stray_session_processes("s1", {"14"}, proc=tmp_path)
     assert reasons == ["pid 15 outside the panes carries the session: Xorg :7 -seat seat-trickle "]
+
+
+# -- Codex lanes (LEX-1967) ---------------------------------------------------------------
+
+SID = "03f94fdb-468d-424d-9c28-127f443e7832"
+THREAD = "01a16c47-e530-77d1-b461-aa851eb59245"
+SUB = "01a1ba7d-461d-78b2-bbf7-45fc93bbe5cd"
+CODEX_PS = """\
+ 2925740  2625 8-07:03:49 /rel/.venv/bin/python -m skuld
+ 2926124 2925740 8-07:03:44 /x/bin/codex app-server -c mcp_servers.forge.command="/rel/py"
+ 2926460 2926124 8-07:03:40 /rel/.venv/bin/python -P -m skuld.forge_mcp --broker-url http://127.0.0.1:9100
+ 2926457 2926124 8-07:03:40 node /home/x/.local/bin/lexi-google
+  326336 2926124 8-01:16:38 /home/x/.codex/packages/bin/codex-code-mode-host
+"""
+
+
+def _record(ordinal: int, kind: str | None = None, turn: str = "t1") -> str:
+    payload = {"type": kind, "turn_id": turn} if kind else {"type": "item_completed"}
+    return json.dumps(
+        {
+            "timestamp": "2026-11-08T13:22:36Z",
+            "ordinal": ordinal,
+            "type": "event_msg",
+            "payload": payload,
+        }
+    )
+
+
+def _codex_host(
+    tmp_path, ps: str = CODEX_PS, *, main_last="task_complete", sub_last="task_complete"
+):
+    """A fake /proc and CODEX_HOME: the app-server holds its main and one sub-thread rollout."""
+    home = tmp_path / "codex"
+    sessions = home / "sessions/2026/11/08"
+    sessions.mkdir(parents=True)
+    (home / "config.toml").write_text(
+        '[mcp_servers.google]\ncommand = "/home/x/.local/bin/lexi-google"\n'
+        '[other]\ncommand = "/bin/no"\n'
+    )
+    rollouts = {}
+    for thread, last in ((THREAD, main_last), (SUB, sub_last)):
+        path = sessions / f"rollout-2026-11-08T09-28-54-{thread}.jsonl"
+        lines = [_record(1, "task_started"), _record(2), _record(3, "task_complete")]
+        if last == "task_started":
+            lines += [_record(4, "task_started", "t2"), _record(5)]
+        path.write_text("\n".join(lines) + "\n")
+        rollouts[thread] = path
+    proc = tmp_path / "proc"
+    procs = lane_busy.parse_ps(ps)
+    for pid, (_, _, command) in procs.items():
+        (proc / pid / "fd").mkdir(parents=True)
+        env = [b"HOME=/home/x"]
+        if pid in ("2925740", "2926124", "2344517", "777"):
+            env.append(f"SKULD__SESSION__ID={SID}".encode())
+        if pid == "2926124":
+            env.append(f"CODEX_HOME={home}".encode())
+            for n, path in enumerate(rollouts.values()):
+                (proc / pid / "fd" / str(30 + n)).symlink_to(path)
+        (proc / pid / "environ").write_bytes(b"\0".join(env))
+        (proc / pid / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+    return procs, proc
+
+
+def test_an_idle_codex_lane_with_only_its_helpers_may_restart(tmp_path):
+    procs, proc = _codex_host(tmp_path)
+    reasons, pids = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == []
+    assert {"2926124", "2926460", "2926457", "326336"} <= pids
+
+
+def test_a_worker_the_codex_agent_detached_makes_it_busy(tmp_path):
+    ps = CODEX_PS + " 2344517 2926124 5-15:12:00 python3 -u /tmp/lex1836-watch-proof.py\n"
+    procs, proc = _codex_host(tmp_path, ps)
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == [
+        "pid 2344517, 5-15:12:00, under the Codex app-server: "
+        "python3 -u /tmp/lex1836-watch-proof.py"
+    ]
+
+
+def test_a_running_exec_tool_command_makes_it_busy_once(tmp_path):
+    ps = (
+        CODEX_PS
+        + " 500 2926124 00:12 /bin/bash -lc pytest -q\n 501 500 00:11 python -m pytest -q\n"
+    )
+    procs, proc = _codex_host(tmp_path, ps)
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert len(reasons) == 1 and reasons[0].startswith("pid 500, 00:12, under the Codex app-server")
+
+
+def test_a_thread_mid_turn_makes_it_busy_even_a_sub_thread(tmp_path):
+    procs, proc = _codex_host(tmp_path, sub_last="task_started")
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == [f"thread {SUB} turn t2 running since 2026-11-08T13:22:36Z"]
+
+
+def test_a_codex_lane_whose_main_thread_is_not_open_is_busy(tmp_path):
+    procs, proc = _codex_host(tmp_path)
+    reasons, _ = lane_busy.codex_reasons(SID, "another-thread", procs, proc)
+    assert reasons == [
+        "the app-server has no rollout open for thread another-thread: its turns cannot be seen"
+    ]
+
+
+def test_a_lane_without_an_app_server_is_not_judged_as_codex(tmp_path):
+    procs, proc = _codex_host(tmp_path)
+    assert lane_busy.codex_reasons("someone-else", THREAD, procs, proc) is None
+
+
+def test_the_last_turn_marker_is_found_across_read_chunks(tmp_path):
+    path = tmp_path / "rollout-x.jsonl"
+    filler = [_record(n) for n in range(2, 400)]
+    path.write_text("\n".join([_record(1, "task_started", "early"), *filler]) + "\n")
+    assert lane_busy.last_turn_marker(path, chunk=97) == (
+        "task_started",
+        "early",
+        "2026-11-08T13:22:36Z",
+    )
+    assert lane_busy.last_turn_marker(tmp_path / "rollout-x.jsonl", chunk=1 << 20)[1] == "early"
+
+
+def test_mcp_commands_come_from_the_overrides_and_config_sections(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.google]\ncommand = "/bin/google"\n'
+        '[mcp_servers.hgx.oauth]\ncommand = "/bin/no"\n'
+    )
+    app = 'codex app-server -c mcp_servers.forge.command="/venv/python" -c x=1'
+    assert lane_busy.mcp_commands(app, tmp_path) == {"/venv/python", "/bin/google"}

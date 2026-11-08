@@ -18,6 +18,13 @@ after it (a background shell that ``exec``ed a worker), and any process outside 
 that carries the session's id (a detached worker Forge's stop would also kill). A lane
 whose pane, task directory or transcript cannot be found is busy, because its background
 work cannot be seen.
+
+A Codex lane (LEX-1967) has no pane: its broker runs ``codex app-server``. It is busy when
+any thread the app-server has open is mid-turn (its rollout file, the app-server's own
+record, ends in ``task_started``), when a process under the app-server is not one of its
+helpers (an ``exec`` tool command, or a worker one detached), or when a process elsewhere
+carries the session id. A Codex lane whose app-server or main thread's rollout cannot be
+found is busy.
 """
 
 from __future__ import annotations
@@ -275,6 +282,160 @@ def stray_session_processes(sid: str, in_panes: set[str], proc: Path = Path("/pr
     return reasons
 
 
+# What runs under a Codex app-server and is not work: its MCP servers (started with it, or
+# again for a thread) and its code-mode host.
+_CODEX_HELPER = re.compile(r"codex-code-mode-host$|-m skuld\.forge_mcp(\s|$)")
+# The app-server's own record of a thread's turns (``event_msg`` payload types).
+_TURN_MARKERS = ("task_started", "task_complete", "turn_aborted")
+
+
+def _environ(pid: str, proc: Path) -> list[bytes] | None:
+    try:
+        return (proc / pid / "environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+
+
+def codex_app_server(sid: str, procs: dict[str, tuple[str, str, str]], proc: Path) -> str | None:
+    """The pid of the session's ``codex app-server``, or None."""
+    marker = f"SKULD__SESSION__ID={sid}".encode()
+    for pid, (_, _, command) in procs.items():
+        if " app-server" in f" {command}" and "codex" in command.split()[0]:
+            env = _environ(pid, proc)
+            if env is not None and marker in env:
+                return pid
+    return None
+
+
+def codex_home(app_pid: str, proc: Path = Path("/proc")) -> Path:
+    """The app-server's ``CODEX_HOME`` (where its rollout files live)."""
+    for item in _environ(app_pid, proc) or []:
+        if item.startswith(b"CODEX_HOME="):
+            return Path(item.split(b"=", 1)[1].decode())
+    return Path.home() / ".codex"
+
+
+def open_rollouts(app_pid: str, proc: Path = Path("/proc")) -> list[Path]:
+    """The rollout files (one per loaded thread) the app-server holds open."""
+    out = set()
+    try:
+        fds = list((proc / app_pid / "fd").iterdir())
+    except OSError:
+        return []
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        name = Path(target).name
+        if name.startswith("rollout-") and name.endswith(".jsonl"):
+            out.add(Path(target))
+    return sorted(out)
+
+
+def last_turn_marker(path: Path, chunk: int = 1 << 20) -> tuple[str, str, str] | None:
+    """(type, turn id, timestamp) of the rollout's last turn record, read from its end."""
+    needles = [f'"{kind}"'.encode() for kind in _TURN_MARKERS]
+    with open(path, "rb") as stream:
+        pos = stream.seek(0, 2)
+        carry = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            stream.seek(pos)
+            lines = (stream.read(step) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""
+            for raw in reversed(lines):
+                if not any(needle in raw for needle in needles):
+                    continue
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if isinstance(payload, dict) and payload.get("type") in _TURN_MARKERS:
+                    return (
+                        payload["type"],
+                        str(payload.get("turn_id")),
+                        str(record.get("timestamp")),
+                    )
+    return None
+
+
+def _descendants(root: str, procs: dict[str, tuple[str, str, str]]) -> list[str]:
+    kids: dict[str, list[str]] = {}
+    for pid, (ppid, _, _) in procs.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, todo = [], [root]
+    while todo:
+        for kid in kids.get(todo.pop(), []):
+            out.append(kid)
+            todo.append(kid)
+    return out
+
+
+def mcp_commands(app_command: str, home: Path) -> set[str]:
+    """Executables the app-server starts as MCP servers: its ``-c mcp_servers.<name>.command``
+    overrides and the ``command =`` of each ``[mcp_servers.<name>]`` in its config.toml."""
+    found = set(re.findall(r'mcp_servers\.[\w-]+\.command="?([^\s"]+)', app_command))
+    try:
+        text = (home / "config.toml").read_text(errors="replace")
+    except OSError:
+        return found
+    section = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+            continue
+        match = re.match(r'command\s*=\s*"([^"]+)"', line)
+        if match and re.match(r"\[mcp_servers\.[\w-]+\]$", section):
+            found.add(match.group(1))
+    return found
+
+
+def _is_helper(command: str, mcp: set[str]) -> bool:
+    words = command.split()
+    return bool(_CODEX_HELPER.search(command)) or bool(set(words[:2]) & mcp)
+
+
+def codex_reasons(
+    sid: str,
+    cli_session_id: str | None,
+    procs: dict[str, tuple[str, str, str]],
+    proc: Path = Path("/proc"),
+) -> tuple[list[str], set[str]] | None:
+    """Why a Codex lane is busy, and the pids it owns; None when the lane is not Codex."""
+    app = codex_app_server(sid, procs, proc)
+    if app is None:
+        return None
+    reasons = []
+    tree = _descendants(app, procs)
+    mcp = mcp_commands(procs[app][2], codex_home(app, proc))
+    for pid in tree:
+        ppid, elapsed, command = procs[pid]
+        # One reason per piece of work: a direct child of the app-server that is not one of
+        # its helpers (a tool command, or a worker it detached); what runs under it is its.
+        if ppid == app and not _is_helper(command, mcp):
+            reasons.append(f"pid {pid}, {elapsed}, under the Codex app-server: {command[:120]}")
+    rollouts = open_rollouts(app, proc)
+    if not cli_session_id or not any(r.name.endswith(f"-{cli_session_id}.jsonl") for r in rollouts):
+        reasons.append(
+            f"the app-server has no rollout open for thread {cli_session_id}: its turns "
+            "cannot be seen"
+        )
+    for rollout in rollouts:
+        try:
+            marker = last_turn_marker(rollout)
+        except OSError as exc:
+            reasons.append(f"cannot read {rollout.name}: {exc}")
+            continue
+        if marker is not None and marker[0] == "task_started":
+            thread = rollout.stem[-36:]
+            reasons.append(f"thread {thread} turn {marker[1]} running since {marker[2]}")
+    return reasons, {app, *tree}
+
+
 def _proc_link(pid: str, name: str) -> str | None:
     try:
         return os.readlink(f"/proc/{pid}/{name}")
@@ -359,6 +520,18 @@ def judge(
     busy, lane_pids = [], set()
     for lane in lanes:
         sid = lane["id"]
+        codex = codex_reasons(sid, lane.get("cli_session_id"), procs)
+        if codex is not None:
+            # A Codex lane has no pane; with or without --background its app-server shows
+            # what it is doing (LEX-1967).
+            reasons, pids = codex
+            if lane.get("activity_state") != "idle":
+                reasons.insert(0, f"forge activity {lane.get('activity_state')}")
+            reasons += stray_session_processes(sid, pids)
+            lane_pids |= pids
+            if reasons:
+                busy.append({"id": sid, "name": lane.get("name"), "reasons": reasons})
+            continue
         sock = f"{socket_dir}/skuld-{sid}.sock"
         listed = subprocess.run(
             [tmux, "-S", sock, "list-panes", "-s", "-t", f"skuld-{sid}", "-F", "#{pane_pid}"],

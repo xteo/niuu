@@ -302,3 +302,123 @@ def test_an_error_after_the_stop_is_reported_as_possibly_stopped(forge, capsys):
     assert code == 1
     assert outcome["a"]["result"].startswith("STOPPED? RuntimeError after the stop")
     assert outcome["b"]["result"] == "restarted"
+
+
+# -- Codex sessions (LEX-1967) ------------------------------------------------------------
+
+
+def _rollout_line(ordinal: int, kind: str = "item_completed") -> str:
+    return json.dumps({"ordinal": ordinal, "type": "event_msg", "payload": {"type": kind}})
+
+
+@pytest.fixture
+def codex(forge, monkeypatch, tmp_path):
+    """One Codex session: an app-server per broker start, holding the thread's rollout."""
+
+    def install(state="below", *, reopens=True, replace=False, turns_after=None):
+        fake = forge(("cx", "agent-service", state))
+        thread = fake.rows["cx"]["cli_session_id"]
+        home = tmp_path / "codex"
+        rollout = home / f"sessions/2026/10/24/rollout-2026-10-24T05-00-13-{thread}.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("\n".join(_rollout_line(n) for n in range(1, 4)) + "\n")
+        fake.app = {"n": 0}
+        fake.turns = [7, 7 if turns_after is None else turns_after]
+
+        def app_server(sid, procs, proc):
+            if fake.rows[sid]["status"] != "running":
+                return None
+            if fake.calls.count("POST /sessions/cx/start") and fake.app["n"] == 0:
+                fake.app["n"] = 1
+                if replace:
+                    rollout.unlink()
+                    rollout.write_text(_rollout_line(1) + "\n")
+            return f"app-{fake.app['n']}"
+
+        monkeypatch.setattr(catchup.forge_lane_busy, "codex_app_server", app_server)
+        monkeypatch.setattr(catchup.forge_lane_busy, "codex_home", lambda app: home)
+        monkeypatch.setattr(
+            catchup.forge_lane_busy,
+            "open_rollouts",
+            lambda app: [rollout] if (app == "app-0" or reopens) else [],
+        )
+        monkeypatch.setattr(catchup, "_procs", lambda: {})
+        monkeypatch.setattr(
+            catchup, "turn_count", lambda api, sid: fake.turns[min(fake.app["n"], 1)]
+        )
+        monkeypatch.setattr(
+            catchup, "transcript_exists", lambda cid: pytest.fail("a Codex thread is not Claude's")
+        )
+        fake.rollout = rollout
+        return fake
+
+    return install
+
+
+def test_a_codex_session_resumes_its_thread_with_proof(codex, capsys, tmp_path):
+    fake = codex()
+    evidence = tmp_path / "ev.json"
+    code, outcome = _run(capsys, "--only", "cx", "--evidence", str(evidence))
+    assert code == 0 and outcome["cx"]["result"] == "restarted"
+    proof = outcome["cx"]["proof"]
+    assert proof["before"]["rollout"] == str(fake.rollout)
+    assert proof["before"]["last_ordinal"] == 3 and proof["before"]["turns"] == 7
+    assert proof["after"]["app_server_pid"] == "app-1" and proof["after"]["turns"] == 7
+    assert json.loads(evidence.read_text())["cx"]["proof"] == proof
+
+
+def test_a_codex_session_whose_thread_is_not_reopened_fails(codex, capsys):
+    codex(reopens=False)
+    code, outcome = _run(capsys, "--only", "cx", "--start-timeout", "0")
+    assert code == 1
+    assert "no new Codex app-server reopened" in outcome["cx"]["result"]
+
+
+def test_a_codex_rollout_replaced_on_resume_fails(codex, capsys):
+    codex(replace=True)
+    code, outcome = _run(capsys, "--only", "cx")
+    assert code == 1 and "was replaced or shrank" in outcome["cx"]["result"]
+
+
+def test_a_codex_session_whose_turns_drop_fails(codex, capsys):
+    codex(turns_after=6)
+    code, outcome = _run(capsys, "--only", "cx")
+    assert code == 1 and outcome["cx"]["result"] == "started, but its turns dropped 7 -> 6"
+
+
+def test_even_if_met_restarts_a_named_session_on_the_contract(codex, capsys):
+    codex(state="met")
+    code, outcome = _run(capsys, "--only", "cx")
+    assert outcome["cx"]["result"] == "not restarted: already meets the contract"
+    code, outcome = _run(capsys, "--only", "cx", "--even-if-met")
+    assert code == 0 and outcome["cx"]["result"] == "restarted"
+
+
+def _appended(capsys, evidence) -> tuple[int, dict]:
+    code = catchup.main(["codex-appended", str(evidence), "cx"])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_codex_appended_proves_the_next_turn_continues_the_same_file(codex, capsys, tmp_path):
+    fake = codex()
+    evidence = tmp_path / "ev.json"
+    _run(capsys, "--only", "cx", "--evidence", str(evidence))
+    with open(fake.rollout, "a") as stream:
+        stream.write(
+            _rollout_line(4, "task_started") + "\n" + _rollout_line(5, "task_complete") + "\n"
+        )
+    code, verdict = _appended(capsys, evidence)
+    assert code == 0 and verdict["problems"] == []
+    assert verdict["first_ordinal"] == 4 and verdict["completed_turns"] == 1
+
+
+def test_codex_appended_fails_on_a_gap_or_nothing_new(codex, capsys, tmp_path):
+    fake = codex()
+    evidence = tmp_path / "ev.json"
+    _run(capsys, "--only", "cx", "--evidence", str(evidence))
+    code, verdict = _appended(capsys, evidence)
+    assert code == 1 and "nothing was appended" in verdict["problems"][0]
+    with open(fake.rollout, "a") as stream:
+        stream.write(_rollout_line(9, "task_complete") + "\n")
+    code, verdict = _appended(capsys, evidence)
+    assert code == 1 and verdict["problems"] == ["ordinals do not continue from 3: [9]..."]

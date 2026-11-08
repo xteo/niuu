@@ -19,11 +19,19 @@ usage:
       restarted; ``--only`` restricts the run to the named sessions (an owner's GO), and
       a held session named there is restarted. Busy sessions are retried until
       ``--until``. Exit 0 when no session outside ``--hold`` is left below the contract.
+      ``--even-if-met`` also restarts a named ``--only`` session that meets the contract (a
+      proof on a scratch session).
+  forge_broker_catchup.py codex-appended EVIDENCE SESSION_ID
+      After a restarted Codex session's next turn: its thread's rollout is the same file,
+      grown, with the records' ordinals continuing from before the restart. Exit 1 if not.
 
 A restart is stop then start. The broker resumes the engine's own conversation id, so a
 session keeps its context; a session with no recorded conversation id cannot resume and
 is never restarted. A restart counts only when the session runs again, its broker meets
 the contract, and it kept the same conversation id. A failure is reported, never retried.
+A Codex session (LEX-1967) counts only when its new app-server reopened the same rollout
+file (same inode, no smaller), no second rollout exists for its thread, it stays up, and
+its turn count is not lower; ``codex-appended`` checks the append after its next turn.
 Run it detached (``systemd-run``): a run started from inside a session's pane is busy
 work in that pane, so the gate never restarts the session that runs it.
 """
@@ -133,6 +141,66 @@ def live_resume(tmux: str, socket_dir: str, sid: str) -> tuple[str, str] | None:
     return (pids[0], match.group(1)) if match else None
 
 
+# Per-session resume evidence for the run's outcome file (a Codex session's rollout).
+PROOF: dict[str, dict] = {}
+
+
+def _procs() -> dict[str, tuple[str, str, str]]:
+    ps = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True, check=True
+    )
+    return forge_lane_busy.parse_ps(ps.stdout)
+
+
+def codex_rollouts(home: Path, thread_id: str) -> list[Path]:
+    """Every rollout file of a Codex thread under ``home``/sessions (one, normally)."""
+    return sorted((home / "sessions").glob(f"*/*/*/rollout-*-{thread_id}.jsonl"))
+
+
+def last_ordinal(path: Path) -> int | None:
+    """The ``ordinal`` of the rollout's last complete record."""
+    with open(path, "rb") as stream:
+        end = stream.seek(0, 2)
+        stream.seek(max(0, end - (1 << 20)))
+        lines = [line for line in stream.read().split(b"\n") if line.strip()]
+    for raw in reversed(lines):
+        try:
+            value = json.loads(raw).get("ordinal")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def turn_count(api: str, sid: str) -> int:
+    code, body = _call("GET", f"{api}/sessions/{sid}/conversation?detail=shallow")
+    turns = body.get("turns") if isinstance(body, dict) else body
+    if code != 200 or not isinstance(turns, list):
+        raise RuntimeError(f"reading {sid}'s conversation failed: HTTP {code}")
+    return sum(1 for turn in turns if turn.get("id") != "in-progress")
+
+
+def codex_baseline(api: str, sid: str, resume_id: str, app: str) -> dict | str:
+    """What the Codex session's thread looks like before the stop, or why it cannot resume."""
+    home = forge_lane_busy.codex_home(app)
+    files = codex_rollouts(home, resume_id)
+    if len(files) != 1:
+        return f"not restarted: {len(files)} rollout files for Codex thread {resume_id} in {home}"
+    stat = files[0].stat()
+    return {
+        "engine": "codex",
+        "thread": resume_id,
+        "app_server_pid": app,
+        "codex_home": str(home),
+        "rollout": str(files[0]),
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "last_ordinal": last_ordinal(files[0]),
+        "turns": turn_count(api, sid),
+    }
+
+
 def restart_one(base: str, row: dict, args: argparse.Namespace) -> str:
     """Re-check, stop and start one session; ``restarted`` or why it did not count.
 
@@ -143,7 +211,13 @@ def restart_one(base: str, row: dict, args: argparse.Namespace) -> str:
     resume_id = row.get("cli_session_id")
     if not resume_id:
         return "not restarted: no recorded conversation id to resume"
-    if not transcript_exists(resume_id):
+    app = forge_lane_busy.codex_app_server(sid, _procs(), Path("/proc"))
+    baseline = None
+    if app is not None:
+        baseline = codex_baseline(api, sid, resume_id, app)
+        if isinstance(baseline, str):
+            return baseline
+    elif not transcript_exists(resume_id):
         return f"not restarted: no transcript for conversation {resume_id}, so it cannot resume"
     verdict = forge_lane_busy.judge(
         base, args.tmux, [sid], background=True, socket_dir=args.socket_dir
@@ -156,6 +230,9 @@ def restart_one(base: str, row: dict, args: argparse.Namespace) -> str:
     if code != 200:
         return f"stop failed: HTTP {code} {body}"
     try:
+        if baseline is not None:
+            PROOF[sid] = {"before": baseline}
+            return _start_codex_again(api, sid, resume_id, baseline, args)
         return _start_again(api, sid, resume_id, args)
     except Exception as exc:  # noqa: BLE001 - a stopped session must be reported, never lost
         return f"STOPPED? {type(exc).__name__} after the stop: {exc}; check it and start it by hand"
@@ -192,6 +269,124 @@ def _start_again(api: str, sid: str, resume_id: str, args: argparse.Namespace) -
     return "restarted"
 
 
+def _started(api: str, sid: str, args: argparse.Namespace) -> str | None:
+    """Wait for the stop, start, and wait for a running broker that meets the contract."""
+    deadline = time.monotonic() + args.start_timeout
+    if not _wait(lambda: _session(api, sid).get("status") == "stopped", deadline, args.poll):
+        return f"did not stop within {args.start_timeout:g}s; check it and start it by hand"
+    code, body = _call("POST", f"{api}/sessions/{sid}/start")
+    if code != 200:
+        return f"STOPPED, start failed: HTTP {code} {body}; start it by hand"
+    deadline = time.monotonic() + args.start_timeout
+
+    def contract_met():
+        code, version = _call("GET", f"{api}/sessions/{sid}/runtime-version")
+        return (
+            code == 200
+            and isinstance(version, dict)
+            and (version.get("contract") or {}).get("state") == "met"
+        )
+
+    if not _wait(contract_met, deadline, args.poll):
+        return f"started, but its broker did not meet the contract within {args.start_timeout:g}s"
+    if not _wait(lambda: _session(api, sid).get("status") == "running", deadline, args.poll):
+        return f"started, but it was not running within {args.start_timeout:g}s"
+    return None
+
+
+def _start_codex_again(
+    api: str, sid: str, resume_id: str, before: dict, args: argparse.Namespace
+) -> str:
+    """Start a stopped Codex session and prove it resumed its own thread (LEX-1967)."""
+    failed = _started(api, sid, args)
+    if failed:
+        return failed
+    rollout = Path(before["rollout"])
+    deadline = time.monotonic() + args.start_timeout
+
+    def reopened():
+        app = forge_lane_busy.codex_app_server(sid, _procs(), Path("/proc"))
+        if app is None or app == before["app_server_pid"]:
+            return None
+        return app if rollout in forge_lane_busy.open_rollouts(app) else None
+
+    app = _wait(reopened, deadline, args.poll)
+    if app is None:
+        return f"started, but no new Codex app-server reopened {rollout.name}: context lost?"
+    now = _session(api, sid).get("cli_session_id")
+    if now != resume_id:
+        return f"started, but its thread is {now}, not {resume_id}: context lost?"
+    stat = rollout.stat()
+    if stat.st_ino != before["inode"] or stat.st_size < before["size"]:
+        return (
+            f"started, but {rollout.name} was replaced or shrank (inode {before['inode']} -> "
+            f"{stat.st_ino}, size {before['size']} -> {stat.st_size})"
+        )
+    files = codex_rollouts(Path(before["codex_home"]), resume_id)
+    if files != [rollout]:
+        return f"started, but thread {resume_id} now has rollouts {[f.name for f in files]}"
+    time.sleep(args.settle)
+    if forge_lane_busy.codex_app_server(sid, _procs(), Path("/proc")) != app:
+        return f"started, but its resumed app-server (pid {app}) exited within {args.settle:g}s"
+    turns = turn_count(api, sid)
+    PROOF[sid]["after"] = {"app_server_pid": app, "size": stat.st_size, "turns": turns}
+    if turns < before["turns"]:
+        return f"started, but its turns dropped {before['turns']} -> {turns}"
+    return "restarted"
+
+
+def codex_appended(evidence: str, sid: str) -> int:
+    """After the restarted session's next turn: the same rollout grew, ordinals continuing."""
+    proof = (json.loads(Path(evidence).read_text()).get(sid) or {}).get("proof") or {}
+    before = proof.get("before")
+    if not before:
+        raise SystemExit(f"{evidence} holds no Codex resume proof for {sid}")
+    rollout = Path(before["rollout"])
+    problems = []
+    stat = rollout.stat()
+    if stat.st_ino != before["inode"]:
+        problems.append(f"{rollout.name} was replaced (inode {before['inode']} -> {stat.st_ino})")
+    files = codex_rollouts(Path(before["codex_home"]), before["thread"])
+    if files != [rollout]:
+        problems.append(f"the thread has rollouts {[f.name for f in files]}")
+    ordinals, turns = [], 0
+    with open(rollout, "rb") as stream:
+        stream.seek(before["size"])
+        for raw in stream:
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(record.get("ordinal"), int):
+                ordinals.append(record["ordinal"])
+            if (record.get("payload") or {}).get("type") == "task_complete":
+                turns += 1
+    if not ordinals:
+        problems.append(f"nothing was appended to {rollout.name} since the restart")
+    elif before.get("last_ordinal") is not None and ordinals != list(
+        range(before["last_ordinal"] + 1, before["last_ordinal"] + 1 + len(ordinals))
+    ):
+        problems.append(
+            f"ordinals do not continue from {before['last_ordinal']}: {ordinals[:3]}..."
+        )
+    if not turns:
+        problems.append("no turn has completed in it since the restart")
+    print(
+        json.dumps(
+            {
+                "rollout": str(rollout),
+                "appended_bytes": stat.st_size - before["size"],
+                "records": len(ordinals),
+                "first_ordinal": ordinals[0] if ordinals else None,
+                "completed_turns": turns,
+                "problems": problems,
+            },
+            indent=2,
+        )
+    )
+    return 1 if problems else 0
+
+
 def _resolve_holds(rows: list[dict], holds: list[str]) -> set[str]:
     """Session ids for ``--hold`` values (an id, or a name naming exactly one running session)."""
     ids = set()
@@ -219,7 +414,8 @@ def restart(args: argparse.Namespace) -> int:
             outcome[r["id"]] = {**r, "result": "held: restart only on its owner's GO"}
     for r in rows:
         if r["id"] in only and r["contract"] == "met" and r["id"] not in outcome:
-            outcome[r["id"]] = {**r, "result": "not restarted: already meets the contract"}
+            if not args.even_if_met:
+                outcome[r["id"]] = {**r, "result": "not restarted: already meets the contract"}
 
     def record():
         if args.evidence:
@@ -229,7 +425,8 @@ def restart(args: argparse.Namespace) -> int:
     while True:
         last, waiting = waiting, {}
         for r in audit(args.base):
-            if r["id"] in outcome or r["contract"] != "below" or (only and r["id"] not in only):
+            wanted = r["contract"] == "below" or (args.even_if_met and r["contract"] == "met")
+            if r["id"] in outcome or not wanted or (only and r["id"] not in only):
                 continue
             if datetime.now(UTC) >= until:
                 waiting[r["id"]] = last.get(r["id"]) or {
@@ -242,6 +439,8 @@ def restart(args: argparse.Namespace) -> int:
                 waiting[r["id"]] = {**r, "result": "busy until the deadline: " + result[6:]}
                 continue
             outcome[r["id"]] = {**r, "result": result}
+            if r["id"] in PROOF:
+                outcome[r["id"]]["proof"] = PROOF[r["id"]]
             print(f"{datetime.now(UTC):%FT%TZ} {r['name']} ({r['id']}): {result}", flush=True)
             record()
         left_s = (until - datetime.now(UTC)).total_seconds()
@@ -287,12 +486,22 @@ def main(argv: list[str]) -> int:
         "--settle", type=float, default=15.0, help="seconds a resumed Claude must stay up"
     )
     r.add_argument("--evidence", help="write the per-session outcome here as it goes")
+    r.add_argument(
+        "--even-if-met",
+        action="store_true",
+        help="also restart a named --only session that meets the contract (a proof run)",
+    )
     r.add_argument("--poll", type=float, default=3.0, help="seconds between state checks")
     r.add_argument("--retry", type=float, default=60.0, help="seconds between busy re-checks")
     r.add_argument(
         "--start-timeout", type=float, default=180.0, help="seconds to stop or start a session"
     )
+    c = sub.add_parser("codex-appended")
+    c.add_argument("evidence")
+    c.add_argument("session_id")
     args = parser.parse_args(argv)
+    if args.command == "codex-appended":
+        return codex_appended(args.evidence, args.session_id)
     if args.command == "audit":
         rows = audit(args.base)
         print(json.dumps(rows, indent=2))
