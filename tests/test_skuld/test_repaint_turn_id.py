@@ -77,6 +77,16 @@ def _user(text: str) -> dict:
 _RESULT = {"type": "result", "result": "", "stop_reason": "end_turn"}
 
 
+def _delta(kind: str, text: str) -> dict:
+    field = "thinking" if kind == "thinking_delta" else "text"
+    return {"type": "content_block_delta", "delta": {"type": kind, field: text}}
+
+
+def _tool_result(tool_id: str) -> dict:
+    block = {"type": "tool_result", "tool_use_id": tool_id, "content": "out"}
+    return {"type": "user", "message": {"role": "user", "content": [block]}}
+
+
 async def _play(broker: Broker, events: list) -> None:
     for event in events:
         if event == "interrupt":
@@ -97,6 +107,7 @@ def _shape(turns: list[dict]) -> list[tuple]:
             t["content"],
             [p.get("type") for p in t["parts"]],
             t["metadata"].get("status"),
+            t["created_at"],
         )
         for t in turns
     ]
@@ -134,11 +145,17 @@ def _random_session(rng: random.Random) -> list:
         pick = rng.random()
         if pick < 0.45:
             events.append(_pane(rng.choice(["%0", "%1"]), str(rng.randint(0, 9))))
-        elif pick < 0.65:
+        elif pick < 0.55:
             events.append(_text(f"text {len(events)}"))
-        elif pick < 0.78:
+        elif pick < 0.6:
+            events.append(_delta("text_delta", f"delta {len(events)} "))
+        elif pick < 0.64:
+            events.append(_delta("thinking_delta", f"thought {len(events)} "))
+        elif pick < 0.72:
             tools += 1
             events.append(_tool(f"t{tools}"))
+        elif pick < 0.78 and tools:
+            events.append(_tool_result(f"t{tools}"))
         elif pick < 0.88:
             events.append(_RESULT)
         elif pick < 0.95:
