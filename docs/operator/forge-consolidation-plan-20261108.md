@@ -24,6 +24,10 @@ Recommendation, in order:
    (2) below, then attach the Horde runners to Home, keep Work read-only for 2 weeks, retire
    it. Never merge the databases.
 
+> **Note, 2026-11-08 (after the LOADGAP round 2 close at 17:15 London):** A1's earliest clean
+> window is after Damien has reviewed PRs #5262 and #5357. Until then, lanes P (5e4cea90) and
+> R (d7b7c24b) keep running, and kse-node11 and work-kitbuild32-gke48-05 stay up.
+
 ## Today
 
 | | Home Forge | Work Forge | Spark Forge |
