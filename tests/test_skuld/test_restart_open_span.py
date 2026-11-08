@@ -10,6 +10,7 @@ closes the span at the same frame, so both give the same turn.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -94,12 +95,13 @@ async def test_shutdown_saves_the_open_span_as_an_interrupted_turn(tmp_path):
     broker = _broker(tmp_path)
     await _run_open_turn(broker)
     assert broker._serialize_in_progress_turn() is not None
-    last_span_seq = broker._event_log_seq
+    frame_seq = broker._event_log_seq + 1
 
-    broker._interrupt_open_turn("broker_shutdown")
+    await broker._interrupt_open_turn("broker_shutdown")
 
     span = turn_record(broker._conversation_turns[-1])
-    assert span["id"] == assistant_turn_id(_SID, last_span_seq)
+    assert broker._event_log_buffer[-2]["seq"] == frame_seq
+    assert span["id"] == assistant_turn_id(_SID, frame_seq)
     assert span["content"] == "Watching the release"
     assert [p["type"] for p in span["parts"]] == ["text", "tool_use"]
     assert span["metadata"]["status"] == "interrupted"
@@ -108,12 +110,15 @@ async def test_shutdown_saves_the_open_span_as_an_interrupted_turn(tmp_path):
     assert kinds[-2:] == [TURN_INTERRUPTED_KIND, "conversation.turn"]
     saved = json.loads(broker._conversation_history_path().read_text())["turns"]
     assert saved[-1]["id"] == span["id"]
+    broker._channels.broadcast.assert_awaited_with(
+        {"type": TURN_INTERRUPTED_KIND, "reason": "broker_shutdown"}
+    )
 
 
 async def test_a_rebuild_of_the_log_gives_the_turns_the_broker_saved(tmp_path):
     broker = _broker(tmp_path)
     await _run_open_turn(broker)
-    broker._interrupt_open_turn("broker_shutdown")
+    await broker._interrupt_open_turn("broker_shutdown")
     # After the restart the agent resumes and finishes new work in a new span.
     await broker._handle_cli_event(_assistant({"type": "text", "text": "Back after restart"}))
     await broker._handle_cli_event({"type": "result", "result": "", "stop_reason": "end_turn"})
@@ -133,7 +138,7 @@ async def test_without_the_frame_a_rebuild_runs_the_span_into_the_next_one(tmp_p
     """The failure the frame prevents: the span and the next work fold into one turn."""
     broker = _broker(tmp_path)
     await _run_open_turn(broker)
-    broker._interrupt_open_turn("broker_shutdown")
+    await broker._interrupt_open_turn("broker_shutdown")
     await broker._handle_cli_event(_assistant({"type": "text", "text": "Back after restart"}))
     await broker._handle_cli_event({"type": "result", "result": "", "stop_reason": "end_turn"})
     frames = [f for f in _logged_frames(broker) if f.kind != TURN_INTERRUPTED_KIND]
@@ -153,7 +158,7 @@ async def test_an_idle_broker_logs_nothing_at_shutdown(tmp_path):
     logged = len(broker._event_log_buffer)
     turns = len(broker._conversation_turns)
 
-    broker._interrupt_open_turn("broker_shutdown")
+    await broker._interrupt_open_turn("broker_shutdown")
 
     assert len(broker._event_log_buffer) == logged
     assert len(broker._conversation_turns) == turns
@@ -180,7 +185,7 @@ async def test_a_restart_that_cannot_read_the_whole_log_keeps_the_span(tmp_path)
     """ios-release's case: the full read is over budget, so the local cache is kept."""
     before = _broker(tmp_path)
     await _run_open_turn(before)
-    before._interrupt_open_turn("broker_shutdown")
+    await before._interrupt_open_turn("broker_shutdown")
 
     async def handle(request):
         if request.url.path.endswith("/head"):
@@ -201,3 +206,62 @@ async def test_a_restart_that_cannot_read_the_whole_log_keeps_the_span(tmp_path)
         "Watching the release",
     ]
     assert after._conversation_turns[-1].metadata["status"] == "interrupted"
+
+
+async def test_terminal_repaints_in_the_span_do_not_change_its_id(tmp_path):
+    """tmux sessions log pane repaints the live span never folds; ids must still agree."""
+    broker = _broker(tmp_path)
+    await _run_open_turn(broker)
+    await broker._handle_cli_event({"type": "terminal_frame", "rows": ["Running..."]})
+    await broker._interrupt_open_turn("broker_shutdown")
+    await broker._handle_cli_event(_assistant({"type": "text", "text": "Back after restart"}))
+    await broker._handle_cli_event({"type": "terminal_frame", "rows": ["Done"]})
+    await broker._handle_cli_event({"type": "result", "result": "", "stop_reason": "end_turn"})
+
+    live = [turn_record(t) for t in broker._conversation_turns]
+    rebuilt = reduce_frames(_logged_frames(broker)).turns
+
+    assert _shape(rebuilt) == _shape(live)
+
+
+async def test_a_full_hydration_after_an_interrupt_merges_with_the_cache(tmp_path, caplog):
+    """The next restart that can read the whole log agrees with the cache: no skip."""
+    before = _broker(tmp_path)
+    await _run_open_turn(before)
+    await before._handle_cli_event({"type": "terminal_frame", "rows": ["Running..."]})
+    await before._interrupt_open_turn("broker_shutdown")
+    rows = [
+        {
+            "session_id": _SID,
+            "seq": e["seq"],
+            "kind": e["kind"],
+            "payload": e["payload"],
+            "ts": e["ts"],
+        }
+        for e in before._event_log_buffer
+        if e["kind"] != "conversation.turn"  # the server never serves seeds on /log
+    ]
+    head = before._event_log_seq
+
+    async def handle(request):
+        if request.url.path.endswith("/head"):
+            return httpx.Response(200, json={"latest_seq": head})
+        after_seq = int(request.url.params["after"])
+        return httpx.Response(200, json=[r for r in rows if r["seq"] > after_seq])
+
+    after = _broker(tmp_path)
+    after._load_conversation_history()
+    async with httpx.AsyncClient(
+        base_url="http://forge.test", transport=httpx.MockTransport(handle)
+    ) as client:
+        after._http_client = client
+        with caplog.at_level(logging.INFO, logger="skuld.broker"):
+            await after._hydrate_conversation_history()
+
+    assert "hydration skipped" not in caplog.text
+    assert f"Hydrated {len(before._conversation_turns)} conversation turns" in caplog.text
+    assert _shape([turn_record(t) for t in after._conversation_turns]) == _shape(
+        [turn_record(t) for t in before._conversation_turns]
+    )
+    hydrated = json.loads(after._conversation_history_path().read_text())["turns"]
+    assert len(hydrated) == len(before._conversation_turns)

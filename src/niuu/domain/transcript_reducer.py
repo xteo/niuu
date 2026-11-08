@@ -115,8 +115,8 @@ NON_BROADCAST_KINDS: frozenset[str] = frozenset(
 
 # A broker that stops while its agent's turn is open logs this frame, then saves the open
 # span as an interrupted turn (LEX-1982). A rebuild closes the span at the same frame, so
-# the turn the broker saved and the one a rebuild gives agree (INV-4). Logged, never
-# broadcast live.
+# the turn the broker saved and the one a rebuild gives agree (INV-4). Logged and broadcast
+# like any broker frame, so live, replay and cold reads carry it alike (INV-5).
 TURN_INTERRUPTED_KIND = "turn_interrupted"
 
 # Per-connect handshake/preamble frames: addressed to ONE freshly-connecting
@@ -949,11 +949,6 @@ def reduce_frames(
             imported_prefix_open = False
         if is_imported:
             imported_prefix_open = True
-        if k == TURN_INTERRUPTED_KIND:
-            # The broker stopped mid-turn and saved the open span as interrupted (LEX-1982).
-            flush(status="interrupted")
-            terminal_span_closed = True
-            continue
         if k == "ask_user_resolved":
             # The live broker closes a dismissed question as this frame arrives (LEX-1979).
             apply_question_closure(acc.parts, turns, p, _stamp_iso(_ts_of(r)))
@@ -964,6 +959,16 @@ def reduce_frames(
             continue
         seq = int(r.seq)
         ts = _ts_of(r)
+
+        if k == TURN_INTERRUPTED_KIND:
+            # The broker stopped mid-turn and saved the open span as interrupted, stamped
+            # with this frame's seq and time (LEX-1982); the broker after it starts afresh.
+            acc.touch(ts, seq)
+            flush(status="interrupted")
+            terminal_span_closed = True
+            closed_turn_id = None
+            pending_error = None
+            continue
 
         if k in _STEERING_FRAME_KINDS:
             _record_steering(steering, k, p, seq)

@@ -1066,18 +1066,24 @@ class Broker(
         )
         self._discard_pending_assistant_turn()
 
-    def _interrupt_open_turn(self, reason: str) -> None:
+    async def _interrupt_open_turn(self, reason: str) -> None:
         """Save the open assistant span as an interrupted turn before the broker stops.
 
         The span lives only in memory until its turn ends, so a restart would drop it
         from the record whenever the durable log is too large to read back (LEX-1982).
-        The ``turn_interrupted`` frame goes first: a rebuild closes the span at it,
-        giving the same turn, with the same id, as the one saved here.
+        The ``turn_interrupted`` frame is logged first and the turn is stamped with its
+        seq and time: a rebuild closes the span at that frame the same way, so both give
+        the same turn, whatever frames (terminal repaints) the span held.
         """
         if build_assistant_turn(self.session_id, self._pending_accumulator()) is None:
             return
-        self._enqueue_event_log({"type": TURN_INTERRUPTED_KIND, "reason": reason})
+        frame = {"type": TURN_INTERRUPTED_KIND, "reason": reason}
+        observed_at = datetime.now(UTC)
+        self._enqueue_event_log(frame, ts=observed_at)
+        self._pending_assistant_last_seq = self._event_log_seq
+        self._pending_assistant_last_ts = observed_at
         self._flush_pending_assistant_turn(metadata={"status": "interrupted"})
+        await self._channels.broadcast(frame)
 
     def _discard_pending_assistant_turn(self) -> None:
         """Clear the open assistant turn: after a flush, or when it is not to be saved."""
