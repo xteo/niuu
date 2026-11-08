@@ -125,11 +125,16 @@ DISMISS_RESOLVED_IN_TERMINAL = "resolved_in_terminal"
 DISMISS_MENU_NOT_SHOWN = "menu_not_shown"
 DISMISS_BY_OPERATOR = "dismissed_by_operator"
 DISMISS_TURN_ENDED = "turn_ended"
+DISMISS_SUPERSEDED = "superseded"
 _DISMISS_DETAILS = {
     DISMISS_RESOLVED_IN_TERMINAL: "resolved in terminal",
     DISMISS_MENU_NOT_SHOWN: "menu no longer shown",
     DISMISS_TURN_ENDED: "turn ended",
+    DISMISS_SUPERSEDED: "the CLI moved on past it",
 }
+#: Main-agent hooks that prove the CLI is no longer waiting on a menu opened before
+#: them: Claude cannot submit a prompt or start another tool while a menu waits (LEX-1979).
+_SUPERSEDING_HOOKS = frozenset({"UserPromptSubmit", "PreToolUse", "PostToolUse"})
 #: What the pane shows for an open native control: its menu (``live``), the empty chat
 #: composer and no menu (``gone``), or neither / both (``unknown``, never cleared).
 MENU_LIVE = "live"
@@ -333,6 +338,7 @@ class TmuxInteractiveTransport(CLITransport):
         native_text_wait_s: float = 0.1,
         native_text_poll_s: float = 0.005,
         native_control_sweep_interval_s: float = 30.0,
+        native_control_absent_checks: int = 3,
         person_only_prompt_timeout_s: float = 120.0,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
@@ -446,6 +452,12 @@ class TmuxInteractiveTransport(CLITransport):
         # LEX-1936: re-check open native-control cards on this interval so one the CLI
         # resolved by itself (a timed-out safety prompt) stops blocking messages.
         self._native_control_sweep_interval_s = native_control_sweep_interval_s
+        if native_control_absent_checks < 1:
+            raise ValueError("tmux_native_control_absent_checks must be at least 1")
+        # LEX-1979: a question card closes after this many checks in a row that saw no
+        # menu and the empty composer (a question's menu can take longer to draw).
+        self._native_control_absent_checks = native_control_absent_checks
+        self._native_control_followups: set[asyncio.Task[Any]] = set()
         self._person_only_prompt_timeout_s = person_only_prompt_timeout_s
         self._native_control_sweep_task: asyncio.Task[None] | None = None
         # Dismissals by reason, transcript read failures and sweep failures; served by
@@ -977,6 +989,10 @@ class TmuxInteractiveTransport(CLITransport):
                 with suppress(asyncio.CancelledError, Exception):
                     await self._native_control_sweep_task
                 self._native_control_sweep_task = None
+            for followup in list(self._native_control_followups):
+                followup.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await followup
             if self._sweep_task is not None:
                 self._sweep_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -1585,6 +1601,7 @@ class TmuxInteractiveTransport(CLITransport):
         )
         if event_name != "UserPromptSubmit":
             self._schedule_native_usage(payload)
+        self._note_superseding_hook(event_name, payload)
 
         if event_name == "UserPromptSubmit":
             if not self._is_child_hook(payload):
@@ -3911,18 +3928,69 @@ class TmuxInteractiveTransport(CLITransport):
         await self._emit_question_result_once(pending["native_tool_use_id"], frame)
         return True
 
-    async def _retire_stale_tty_prompts_locked(self, *, trigger: str) -> list[str]:
-        """Dismiss permission cards the CLI already settled. Callers hold the input lock.
+    def _note_superseding_hook(self, event_name: str, payload: dict[str, Any]) -> None:
+        """Mark open cards a later main-agent hook shows the CLI has moved past (LEX-1979).
 
-        First the precise proof (the tool's result in the transcript), then the screen:
-        no menu and the empty composer for the whole render window. Questions keep
-        their own answer proof; a card being answered, or whose answer is uncertain,
-        is left alone.
+        Claude cannot take a prompt or start another tool while a menu waits, so such a
+        hook for another tool call, arriving after the card's menu had time to draw, is
+        evidence the card's menu is gone (an auto-compaction can drop the tool it asked
+        about). The card still closes only when the screen does not show a live menu;
+        the check runs at once instead of waiting for the next sweep.
+        """
+        if event_name not in _SUPERSEDING_HOOKS or self._is_child_hook(payload):
+            return
+        tool_id = self._coerce_str(payload.get("tool_use_id"))
+        settled_before = time.monotonic() - max(self._menu_render_wait_s, 0.0)
+        marked = False
+        for pending in self._pending_tty_prompts.values():
+            opened = pending.get("opened_monotonic")
+            if (
+                pending.get("superseded_by")
+                or pending.get("answer_in_flight")
+                or pending.get("answer_uncertain")
+                or not isinstance(opened, float)
+                or opened > settled_before
+                or (tool_id and tool_id == pending.get("native_tool_use_id"))
+            ):
+                continue
+            pending["superseded_by"] = {
+                "hook": event_name,
+                "tool_use_id": tool_id or None,
+                "at": datetime.now(UTC).isoformat(),
+            }
+            marked = True
+        if not marked:
+            return
+        task = asyncio.create_task(
+            self._sweep_after_superseding_hook(),
+            name=f"tmux-native-control-superseded-{self._session_name}",
+        )
+        self._native_control_followups.add(task)
+        task.add_done_callback(self._native_control_followups.discard)
+
+    async def _sweep_after_superseding_hook(self) -> None:
+        try:
+            await self.sweep_native_controls(trigger="hook")
+        except Exception:
+            # The periodic sweep and the next delivery retry the same check; this
+            # failure is logged at error and counted like a failed sweep.
+            self._native_control_counts["sweep_failures"] += 1
+            logger.error("Native-control check after a superseding hook failed", exc_info=True)
+
+    async def _retire_stale_tty_prompts_locked(self, *, trigger: str) -> list[str]:
+        """Dismiss cards the CLI already settled. Callers hold the input lock.
+
+        First the precise proof (the tool's result in the transcript), then the screen,
+        watched for the whole render window. A permission card closes on one check with
+        no menu and the empty composer; a question card needs
+        ``tmux_native_control_absent_checks`` such checks in a row (LEX-1979). A card a
+        later main-agent hook superseded closes on any check that does not show a live
+        menu. A card being answered, or whose answer is uncertain, is left alone.
         """
         candidates = [
             (rid, pending)
             for rid, pending in list(self._pending_tty_prompts.items())
-            if pending.get("kind") == "permission"
+            if pending.get("kind") in {"permission", "question"}
             and not pending.get("answer_in_flight")
             and not pending.get("answer_uncertain")
         ]
@@ -3946,12 +4014,39 @@ class TmuxInteractiveTransport(CLITransport):
             changed = pending.get("menu_state") != state
             pending["menu_state"] = state
             pending["menu_checked_at"] = checked_at
+            if state == MENU_GONE:
+                pending["absent_checks"] = pending.get("absent_checks", 0) + 1
+            elif state == MENU_LIVE:
+                pending["absent_checks"] = 0
             if changed and state != MENU_GONE:
                 await self._emit_native_control_state(rid, pending)
-        if state != MENU_GONE:
-            return retired
         for rid, pending in remaining:
-            if self._pending_tty_prompts.get(rid) is pending:
+            if self._pending_tty_prompts.get(rid) is not pending:
+                continue
+            if pending.get("superseded_by") and state != MENU_LIVE:
+                superseded = pending["superseded_by"]
+                await self._dismiss_tty_prompt(
+                    rid,
+                    DISMISS_SUPERSEDED,
+                    trigger=trigger,
+                    detail=(
+                        f"the CLI moved on past it ({superseded['hook']}"
+                        + (
+                            f" for {superseded['tool_use_id']}"
+                            if superseded.get("tool_use_id")
+                            else ""
+                        )
+                        + f" at {superseded['at']})"
+                    ),
+                )
+                retired.append(rid)
+                continue
+            if state != MENU_GONE:
+                continue
+            needed = (
+                1 if pending.get("kind") == "permission" else self._native_control_absent_checks
+            )
+            if pending["absent_checks"] >= needed:
                 await self._dismiss_tty_prompt(rid, DISMISS_MENU_NOT_SHOWN, trigger=trigger)
                 retired.append(rid)
         return retired
@@ -3967,13 +4062,13 @@ class TmuxInteractiveTransport(CLITransport):
             }
         )
 
-    async def sweep_native_controls(self) -> list[str]:
-        """One sweep: dismiss every permission card the CLI has already settled."""
+    async def sweep_native_controls(self, *, trigger: str = "sweep") -> list[str]:
+        """One check: dismiss every card the CLI has already settled."""
         if not self._pending_tty_prompts:
             return []
         async with self._answer_lock:
             async with self._send_lock:
-                return await self._retire_stale_tty_prompts_locked(trigger="sweep")
+                return await self._retire_stale_tty_prompts_locked(trigger=trigger)
 
     async def _run_native_control_sweep_loop(self) -> None:
         """Re-check open cards every ``tmux_native_control_sweep_interval_s``."""
@@ -4002,6 +4097,8 @@ class TmuxInteractiveTransport(CLITransport):
             ),
             "menu_state": pending.get("menu_state", MENU_UNKNOWN),
             "menu_checked_at": pending.get("menu_checked_at"),
+            "absent_checks": pending.get("absent_checks", 0),
+            "superseded_by": pending.get("superseded_by"),
             "person_only": bool(pending.get("person_only")),
             "auto_deny_after_seconds": (
                 self._person_only_prompt_timeout_s if pending.get("person_only") else None
@@ -4019,6 +4116,7 @@ class TmuxInteractiveTransport(CLITransport):
             ],
             "counts": dict(self._native_control_counts),
             "sweep_interval_seconds": self._native_control_sweep_interval_s,
+            "absent_checks_to_close_question": self._native_control_absent_checks,
         }
 
     async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:

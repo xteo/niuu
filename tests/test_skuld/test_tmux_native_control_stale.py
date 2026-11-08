@@ -26,6 +26,7 @@ from skuld.transports.tmux_interactive import (
     DISMISS_BY_OPERATOR,
     DISMISS_MENU_NOT_SHOWN,
     DISMISS_RESOLVED_IN_TERMINAL,
+    DISMISS_SUPERSEDED,
     MENU_GONE,
     MENU_LIVE,
     MENU_UNKNOWN,
@@ -299,10 +300,15 @@ async def test_13oct_unbound_card_the_cli_let_through_is_dismissed_once_its_menu
         )
         assert rid in s.transport._pending_tty_prompts  # not this card's exact call
 
-        assert await s.transport.sweep_native_controls() == [rid]
+        # That result is for another tool call after the menu had time to draw, so the
+        # check it starts closes the card (LEX-1979); the screen shows no menu.
+        await _wait_until(lambda: bool(s.dismissals()), timeout=5.0)
         [dismissal] = s.dismissals()
-        assert dismissal["dismiss_reason"] == DISMISS_MENU_NOT_SHOWN
-        assert dismissal["dismiss_detail"] == "menu no longer shown"
+        assert dismissal["dismiss_reason"] == DISMISS_SUPERSEDED
+        assert dismissal["dismiss_detail"].startswith(
+            "the CLI moved on past it (PostToolUse for toolu_other at "
+        )
+        assert dismissal["dismiss_trigger"] == "hook"
         assert dismissal["menu_state"] == MENU_GONE
         await s.transport.send_message("carry on")
         assert s.typed() == ["carry on"]
@@ -403,19 +409,124 @@ async def test_an_unknown_screen_never_clears_a_card(tmp_path, screen):
         assert s.typed() == []
 
 
-async def test_a_question_card_is_never_cleared_by_the_screen_check(tmp_path):
-    async with Session(tmp_path) as s:
-        await s.hook(
-            "PreToolUse",
-            tool_name="AskUserQuestion",
-            tool_input={"questions": [{"question": "Which DB?", "options": [{"label": "PG"}]}]},
-            tool_use_id="toolu_q",
-        )
+QUESTION = {"questions": [{"question": "Which DB?", "options": [{"label": "PG"}]}]}
+QUESTION_MENU = "Which DB?\n❯ 1. PG\n  2. Type something.\n"
+
+
+async def _question_card(s: Session, *, settled: bool = True) -> str:
+    await s.hook(
+        "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION, tool_use_id="toolu_q"
+    )
+    [card] = _ask_user_questions(s.events)
+    rid = card["request_id"]
+    if settled:  # the menu has had its render window
+        s.transport._pending_tty_prompts[rid]["opened_monotonic"] -= 60.0
+    return rid
+
+
+async def test_a_question_card_closes_only_after_the_configured_absent_checks(tmp_path):
+    """LEX-1979: the sweep checks question cards too (menu_checked_at was null for 6 h)."""
+    async with Session(tmp_path, native_control_absent_checks=3) as s:
+        rid = await _question_card(s)
         assert await s.transport.sweep_native_controls() == []
-        assert s.transport._pending_tty_prompts
+        [view] = s.transport.list_native_controls()["controls"]
+        assert view["menu_state"] == MENU_GONE and view["menu_checked_at"]
+        assert view["absent_checks"] == 1
         with pytest.raises(NativeControlPendingError) as refused:
-            await s.transport.send_message("steer")
+            await s.transport.send_message("steer")  # a refused delivery is check 2
         assert refused.value.control_kind == "question"
+        assert s.transport._pending_tty_prompts[rid]["absent_checks"] == 2
+        assert await s.transport.sweep_native_controls() == [rid]
+        [dismissal] = s.dismissals()
+        assert dismissal["dismiss_reason"] == DISMISS_MENU_NOT_SHOWN
+        assert dismissal["control_kind"] == "question"
+        await s.transport.send_message("steer")
+        assert s.typed() == ["steer"]
+
+
+async def test_a_live_question_menu_resets_the_absent_count_and_keeps_the_card(tmp_path):
+    async with Session(tmp_path, native_control_absent_checks=2) as s:
+        rid = await _question_card(s)
+        await s.transport.sweep_native_controls()
+        s.transport.capture_stdout = QUESTION_MENU
+        for _ in range(3):
+            assert await s.transport.sweep_native_controls() == []
+        assert s.transport._pending_tty_prompts[rid]["absent_checks"] == 0
+        s.transport.capture_stdout = WORKING
+        assert await s.transport.sweep_native_controls() == []
+        assert rid in s.transport._pending_tty_prompts
+
+
+async def test_8nov_a_question_dropped_by_compaction_closes_on_the_next_main_tool_hook(
+    tmp_path,
+):
+    """8 Nov 02:21Z (ios-coordinator, Thor): a card opened at an auto-compaction for a
+    tool call that never ran; hundreds of later PreToolUse hooks, every message refused
+    for 6 h. The first later main-agent hook now closes it."""
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        await s.hook(
+            "PreToolUse", tool_name="Bash", tool_input={"command": "ls"}, tool_use_id="toolu_next"
+        )
+        await _wait_until(lambda: bool(s.dismissals()), timeout=5.0)
+        [dismissal] = s.dismissals()
+        assert dismissal["request_id"] == rid
+        assert dismissal["dismiss_reason"] == DISMISS_SUPERSEDED
+        assert dismissal["dismiss_trigger"] == "hook"
+        assert "PreToolUse for toolu_next" in dismissal["dismiss_detail"]
+        await s.transport.send_message("Damien: are you there?")
+        assert s.typed() == ["Damien: are you there?"]
+
+
+async def test_7nov_a_prompt_typed_into_the_pane_supersedes_a_stranded_card(tmp_path):
+    """7 Nov (ios-release, mini-m6): the coordinator typed into the pane to get past a
+    card the broker kept; that prompt's UserPromptSubmit now closes it."""
+    async with Session(tmp_path) as s:
+        rid = await s.person_only_prompt()
+        s.transport._pending_tty_prompts[rid]["opened_monotonic"] -= 60.0
+        s.transport.capture_stdout = WORKING
+        await s.hook("UserPromptSubmit", prompt="/clear")
+        await _wait_until(lambda: bool(s.dismissals()), timeout=5.0)
+        assert s.dismissals()[0]["dismiss_reason"] == DISMISS_SUPERSEDED
+
+
+async def test_a_superseded_card_whose_menu_is_live_is_kept(tmp_path):
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        s.transport.capture_stdout = QUESTION_MENU
+        await s.hook("UserPromptSubmit", prompt="typed")
+        await asyncio.sleep(0.2)
+        assert await s.transport.sweep_native_controls() == []
+        assert s.transport._pending_tty_prompts[rid]["superseded_by"]["hook"] == "UserPromptSubmit"
+        assert not s.dismissals()
+
+
+@pytest.mark.parametrize(
+    ("payload", "why"),
+    [
+        ({"tool_use_id": "toolu_q"}, "the card's own tool call"),
+        ({"tool_use_id": "toolu_sub", "agent_id": "sub-1"}, "a subagent"),
+        ({"tool_use_id": "toolu_mate", "session_id": "teammate-native"}, "a teammate"),
+    ],
+)
+async def test_hooks_that_never_supersede_a_card(tmp_path, payload, why):
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        await s.hook("PostToolUse", tool_name="Read", tool_input={}, tool_response={}, **payload)
+        await asyncio.sleep(0.2)
+        assert "superseded_by" not in s.transport._pending_tty_prompts.get(rid, {}), why
+
+
+async def test_a_parallel_tool_hook_within_the_render_window_does_not_supersede(tmp_path):
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s, settled=False)
+        await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_par")
+        assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+
+
+async def test_absent_checks_must_be_positive(tmp_path):
+    with pytest.raises(ValueError, match="tmux_native_control_absent_checks"):
+        FakeTmuxInteractiveTransport(str(tmp_path), native_control_absent_checks=0)
 
 
 async def test_an_unreadable_transcript_is_loud_and_the_screen_check_still_applies(

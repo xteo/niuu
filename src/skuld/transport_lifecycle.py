@@ -123,6 +123,7 @@ class TransportLifecycleMixin:
             "native_control_sweep_interval_s": (
                 self._settings.tmux_native_control_sweep_interval_s
             ),
+            "native_control_absent_checks": self._settings.tmux_native_control_absent_checks,
             "person_only_prompt_timeout_s": self._settings.tmux_person_only_prompt_timeout_s,
             "codex_receive_max_bytes": self._settings.codex_receive_max_bytes,
             "live_frame_max_bytes": self._settings.live_frame_max_bytes,

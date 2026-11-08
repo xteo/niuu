@@ -281,6 +281,9 @@ broker:
   # -- How often open native-control cards are re-checked; a card the CLI already
   # resolved (tool result in the transcript) or whose menu is gone is dismissed
   tmuxNativeControlSweepIntervalSeconds: 30.0
+  # -- Checks in a row that must see no menu before a question card is dismissed (a
+  # permission card closes on one); each sweep or refused delivery is one check
+  tmuxNativeControlAbsentChecks: 3
   # -- Claude Code's own auto-deny timeout for a person-only safety prompt (stated in the
   # attention notification; not enforced by Skuld)
   tmuxPersonOnlyPromptTimeoutSeconds: 120.0

@@ -1191,6 +1191,18 @@ class SkuldSettings(BaseSettings):
             "CLI resolved by itself (a timed-out safety prompt) can block steering."
         ),
     )
+    tmux_native_control_absent_checks: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "How many native-control checks in a row must see no menu and the empty chat "
+            "composer before a question card the CLI no longer shows is dismissed (LEX-1979). "
+            "A permission card closes on one such check. Each check is a sweep "
+            "(tmux_native_control_sweep_interval_s) or a refused delivery, so with the "
+            "defaults a stranded question blocks messages for about a minute and a half; "
+            "a later hook from the main agent closes it at once."
+        ),
+    )
     tmux_person_only_prompt_timeout_s: float = Field(
         default=120.0,
         gt=0,
