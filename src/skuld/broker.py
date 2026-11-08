@@ -769,6 +769,9 @@ class Broker(
         self._cli_events_settled.set()
         self._cli_events_in_flight = 0
         self._cli_event_tasks: set[asyncio.Task] = set()
+        # Questions already counted as closed (LEX-1979 f), so a second close frame for
+        # one question does not count it again.
+        self._counted_question_closes: set[str] = set()
         self._pending_assistant_content: str = ""
         self._pending_assistant_parts: list[dict] = []
         # Tool details are available before their live preview is sent, including
@@ -3792,10 +3795,14 @@ class Broker(
             self._close_question_in_conversation(data, frame_ts)
             if data.get("dismissed") and data.get("control_kind") == "question":
                 # Every close, whichever stage made it: the menu check, a hook, the
-                # reconcile, an operator (LEX-1979 f).
-                stage = data.get("dismiss_trigger") or "unattributed"
-                reason = data.get("dismiss_reason") or "unattributed"
-                self.question_reconcile_counts[f"closed.{stage}.{reason}"] += 1
+                # reconcile, an operator (LEX-1979 f). A question counts once, at the
+                # first stage to close it, however many close frames follow.
+                question = resolved_request_id or str(data.get("tool_use_id") or "")
+                if question not in self._counted_question_closes:
+                    self._counted_question_closes.add(question)
+                    stage = data.get("dismiss_trigger") or "unattributed"
+                    reason = data.get("dismiss_reason") or "unattributed"
+                    self.question_reconcile_counts[f"closed.{stage}.{reason}"] += 1
 
         # Plan + running-agents surfacing: keep the latest plan and the live agent
         # set so reconnects + GET /api/plan|agents can answer. The frames are still

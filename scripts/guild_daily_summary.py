@@ -20,6 +20,7 @@ secret: health, counts, build names and reasons only.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -456,8 +457,8 @@ def _native_controls(url: str, session_id: str, timeout: float) -> tuple[int, An
         body = _get_json(f"{url}/api/v1/forge/sessions/{session_id}/native-controls", timeout)
     except HTTPError as exc:
         return exc.code, None
-    except (URLError, OSError, ValueError):
-        return 0, None
+    except (URLError, OSError, ValueError, http.client.HTTPException):
+        return 0, None  # counted as unreadable, never as no closes
     return 200, body
 
 

@@ -289,3 +289,14 @@ def test_the_host_line_carries_its_question_closes():
         "  - Questions closed without an answer, by stage.reason, since each broker "
         "started: reconcile_start.never_shown 3"
     ) in text
+
+
+def test_a_truncated_answer_is_unreadable_not_a_failed_summary(monkeypatch):
+    import http.client
+
+    def truncated(url, timeout):
+        raise http.client.IncompleteRead(b"{", 10)
+
+    monkeypatch.setattr(daily, "_get_json", truncated)
+    assert daily._native_controls("http://forge", "s", 1.0) == (0, None)
+    assert daily.question_closes([(0, None)]) == "none; 1 unreadable"

@@ -581,3 +581,21 @@ async def test_every_question_close_is_counted_by_stage_and_reason(session, monk
     health = await api.health()
     assert health["question_counts"]["closed.delivery.superseded"] == 1
     assert health["question_counts"]["closed.hook.menu_gone"] == 1
+
+
+async def test_a_question_closed_twice_counts_once(session):
+    """A second close frame for the same question (a race at turn end) is not a second close."""
+    broker, _, _ = session
+    await broker._handle_cli_event(
+        _transport_close("tty-9", trigger="operator", reason="dismissed_by_operator")
+    )
+    await broker._handle_cli_event(
+        _transport_close("tty-9", trigger="turn_ended", reason="turn_ended")
+    )
+    await broker._handle_cli_event(
+        _transport_close("tty-9", trigger="operator", reason="dismissed_by_operator")
+    )
+
+    counts = broker.question_reconcile_counts
+    assert counts["closed.operator.dismissed_by_operator"] == 1
+    assert counts["closed.turn_ended.turn_ended"] == 0
