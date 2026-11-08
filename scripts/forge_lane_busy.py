@@ -19,7 +19,8 @@ that carries the session's id (a detached worker Forge's stop would also kill). 
 whose pane, task directory or transcript cannot be found is busy, because its background
 work cannot be seen.
 
-A Codex lane (LEX-1967) has no pane: its broker runs ``codex app-server``. It is busy when
+A Codex lane (LEX-1967, Linux only: it reads /proc; elsewhere a Codex lane has no pane and
+is judged busy) has no pane: its broker runs ``codex app-server``. It is busy when
 any thread the app-server has open is mid-turn (its rollout file, the app-server's own
 record, ends in ``task_started``), when a process under the app-server is not one of its
 helpers (an ``exec`` tool command, or a worker one detached), or when a process elsewhere
@@ -296,15 +297,22 @@ def _environ(pid: str, proc: Path) -> list[bytes] | None:
         return None
 
 
-def codex_app_server(sid: str, procs: dict[str, tuple[str, str, str]], proc: Path) -> str | None:
-    """The pid of the session's ``codex app-server``, or None."""
+def codex_app_servers(sid: str, procs: dict[str, tuple[str, str, str]], proc: Path) -> list[str]:
+    """The pids of every ``codex app-server`` carrying the session (one, normally)."""
     marker = f"SKULD__SESSION__ID={sid}".encode()
+    found = []
     for pid, (_, _, command) in procs.items():
         if " app-server" in f" {command}" and "codex" in command.split()[0]:
             env = _environ(pid, proc)
             if env is not None and marker in env:
-                return pid
-    return None
+                found.append(pid)
+    return sorted(found, key=int)
+
+
+def codex_app_server(sid: str, procs: dict[str, tuple[str, str, str]], proc: Path) -> str | None:
+    """The pid of the session's ``codex app-server``, or None (also when there are two)."""
+    found = codex_app_servers(sid, procs, proc)
+    return found[0] if len(found) == 1 else None
 
 
 def codex_home(app_pid: str, proc: Path = Path("/proc")) -> Path:
@@ -362,6 +370,15 @@ def last_turn_marker(path: Path, chunk: int = 1 << 20) -> tuple[str, str, str] |
     return None
 
 
+def _ends_complete(path: Path) -> bool:
+    """The file ends with a whole record (a newline), so no write is half done."""
+    with open(path, "rb") as stream:
+        if stream.seek(0, 2) == 0:
+            return True
+        stream.seek(-1, 2)
+        return stream.read(1) == b"\n"
+
+
 def _descendants(root: str, procs: dict[str, tuple[str, str, str]]) -> list[str]:
     kids: dict[str, list[str]] = {}
     for pid, (ppid, _, _) in procs.items():
@@ -374,29 +391,65 @@ def _descendants(root: str, procs: dict[str, tuple[str, str, str]]) -> list[str]
     return out
 
 
-def mcp_commands(app_command: str, home: Path) -> set[str]:
-    """Executables the app-server starts as MCP servers: its ``-c mcp_servers.<name>.command``
-    overrides and the ``command =`` of each ``[mcp_servers.<name>]`` in its config.toml."""
-    found = set(re.findall(r'mcp_servers\.[\w-]+\.command="?([^\s"]+)', app_command))
+def _toml_list(text: str) -> list[str] | None:
+    """A TOML array of plain strings (``["-y", "pkg"]``), or None for anything else."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, list) and all(isinstance(v, str) for v in value) else None
+
+
+def mcp_commands(app_command: str, home: Path) -> list[list[str]]:
+    """The full argv of each MCP server the app-server starts (command plus args), from its
+    ``-c mcp_servers.<name>.command/args`` overrides and its config.toml sections."""
+    servers: dict[str, dict] = {}
+    for name, key, value in re.findall(
+        r'mcp_servers\.([\w-]+)\.(command|args)=("[^"]*"|\[[^\]]*\])', app_command
+    ):
+        servers.setdefault(name, {})[key] = value
     try:
         text = (home / "config.toml").read_text(errors="replace")
     except OSError:
-        return found
-    section = ""
+        text = ""
+    section, pending = None, None
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("["):
-            section = line
+        if pending is not None:  # a multi-line args array
+            pending[1].append(line)
+            if line.endswith("]"):
+                servers.setdefault(section, {}).setdefault("args", " ".join(pending[1]))
+                pending = None
             continue
-        match = re.match(r'command\s*=\s*"([^"]+)"', line)
-        if match and re.match(r"\[mcp_servers\.[\w-]+\]$", section):
-            found.add(match.group(1))
-    return found
+        header = re.match(r"\[mcp_servers\.([\w-]+)\]$", line)
+        if line.startswith("["):
+            section = header.group(1) if header else None
+            continue
+        if section is None:
+            continue
+        match = re.match(r"(command|args)\s*=\s*(.+)$", line)
+        if not match:
+            continue
+        if match.group(1) == "args" and not match.group(2).rstrip().endswith("]"):
+            pending = (section, [match.group(2)])
+            continue
+        servers.setdefault(section, {}).setdefault(match.group(1), match.group(2))
+    out = []
+    for server in servers.values():
+        command = _toml_list(f"[{server.get('command', '')}]")
+        args = _toml_list(server.get("args", "[]"))
+        if command and len(command) == 1 and args is not None:
+            out.append([command[0], *args])
+    return out
 
 
-def _is_helper(command: str, mcp: set[str]) -> bool:
+def _is_helper(command: str, mcp: list[list[str]]) -> bool:
+    """One of the app-server's own processes: its code-mode host, a Forge MCP server, or a
+    process whose whole argv is a configured MCP server's (an interpreter may run it)."""
+    if _CODEX_HELPER.search(command):
+        return True
     words = command.split()
-    return bool(_CODEX_HELPER.search(command)) or bool(set(words[:2]) & mcp)
+    return any(words == argv or words[1:] == argv for argv in mcp)
 
 
 def codex_reasons(
@@ -406,17 +459,22 @@ def codex_reasons(
     proc: Path = Path("/proc"),
 ) -> tuple[list[str], set[str]] | None:
     """Why a Codex lane is busy, and the pids it owns; None when the lane is not Codex."""
-    app = codex_app_server(sid, procs, proc)
-    if app is None:
+    apps = codex_app_servers(sid, procs, proc)
+    if not apps:
         return None
+    if len(apps) > 1:
+        return [f"{len(apps)} Codex app-servers carry the session: {', '.join(apps)}"], set(apps)
+    app = apps[0]
     reasons = []
     tree = _descendants(app, procs)
     mcp = mcp_commands(procs[app][2], codex_home(app, proc))
     for pid in tree:
         ppid, elapsed, command = procs[pid]
         # One reason per piece of work: a direct child of the app-server that is not one of
-        # its helpers (a tool command, or a worker it detached); what runs under it is its.
-        if ppid == app and not _is_helper(command, mcp):
+        # its helpers (a tool command, or a worker it detached), and anything the code-mode
+        # host runs (code the agent executes). What runs under either is its.
+        parent = procs.get(ppid, ("", "", ""))[2]
+        if (ppid == app and not _is_helper(command, mcp)) or "codex-code-mode-host" in parent:
             reasons.append(f"pid {pid}, {elapsed}, under the Codex app-server: {command[:120]}")
     rollouts = open_rollouts(app, proc)
     if not cli_session_id or not any(r.name.endswith(f"-{cli_session_id}.jsonl") for r in rollouts):
@@ -430,9 +488,13 @@ def codex_reasons(
         except OSError as exc:
             reasons.append(f"cannot read {rollout.name}: {exc}")
             continue
-        if marker is not None and marker[0] == "task_started":
-            thread = rollout.stem[-36:]
+        thread = rollout.stem[-36:]
+        if marker is None:
+            reasons.append(f"thread {thread} has no turn record: its state cannot be seen")
+        elif marker[0] == "task_started":
             reasons.append(f"thread {thread} turn {marker[1]} running since {marker[2]}")
+        elif not _ends_complete(rollout):
+            reasons.append(f"thread {thread}'s rollout is mid-write: a record is being appended")
     return reasons, {app, *tree}
 
 

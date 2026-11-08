@@ -315,7 +315,7 @@ def _rollout_line(ordinal: int, kind: str = "item_completed") -> str:
 def codex(forge, monkeypatch, tmp_path):
     """One Codex session: an app-server per broker start, holding the thread's rollout."""
 
-    def install(state="below", *, reopens=True, replace=False, turns_after=None):
+    def install(state="below", *, reopens=True, replace=False, turns_after=None, twins=False):
         fake = forge(("cx", "agent-service", state))
         thread = fake.rows["cx"]["cli_session_id"]
         home = tmp_path / "codex"
@@ -325,16 +325,23 @@ def codex(forge, monkeypatch, tmp_path):
         fake.app = {"n": 0}
         fake.turns = [7, 7 if turns_after is None else turns_after]
 
-        def app_server(sid, procs, proc):
+        def app_servers(sid, procs, proc):
             if fake.rows[sid]["status"] != "running":
-                return None
+                return []
             if fake.calls.count("POST /sessions/cx/start") and fake.app["n"] == 0:
                 fake.app["n"] = 1
                 if replace:
                     rollout.unlink()
-                    rollout.write_text(_rollout_line(1) + "\n")
-            return f"app-{fake.app['n']}"
+                    rollout.write_text("\n".join(_rollout_line(n) for n in (9, 8, 7)) + "\n")
+            if twins and fake.app["n"]:
+                return ["app-0", "app-1"]  # the old one never exited
+            return [f"app-{fake.app['n']}"]
 
+        def app_server(sid, procs, proc):
+            found = app_servers(sid, procs, proc)
+            return found[0] if len(found) == 1 else None
+
+        monkeypatch.setattr(catchup.forge_lane_busy, "codex_app_servers", app_servers)
         monkeypatch.setattr(catchup.forge_lane_busy, "codex_app_server", app_server)
         monkeypatch.setattr(catchup.forge_lane_busy, "codex_home", lambda app: home)
         monkeypatch.setattr(
@@ -422,3 +429,49 @@ def test_codex_appended_fails_on_a_gap_or_nothing_new(codex, capsys, tmp_path):
         stream.write(_rollout_line(9, "task_complete") + "\n")
     code, verdict = _appended(capsys, evidence)
     assert code == 1 and verdict["problems"] == ["ordinals do not continue from 3: [9]..."]
+
+
+def test_even_if_met_needs_only(codex, capsys):
+    codex(state="met")
+    with pytest.raises(SystemExit, match="--even-if-met restarts only sessions named"):
+        catchup.main(["restart", BASE, "tmux", "--until", UNTIL, "--even-if-met"])
+
+
+def test_a_codex_restart_with_the_old_app_server_still_up_fails(codex, capsys):
+    codex(twins=True)
+    code, outcome = _run(capsys, "--only", "cx", "--start-timeout", "0")
+    assert code == 1 and "no new Codex app-server reopened" in outcome["cx"]["result"]
+
+
+def test_a_thread_id_that_changes_while_settling_fails(codex, capsys, monkeypatch):
+    fake = codex()
+    real_sleep = []
+
+    def settle(seconds):
+        real_sleep.append(seconds)
+        if seconds == 15.0:  # the settle: Forge now reports another thread
+            fake.rows["cx"]["cli_session_id"] = "another"
+
+    monkeypatch.setattr(catchup.time, "sleep", settle)
+    code, outcome = _run(capsys, "--only", "cx")
+    assert code == 1
+    assert outcome["cx"]["result"].startswith("started, then within 15s its thread is another")
+
+
+def test_codex_appended_needs_a_completed_restart(codex, capsys, tmp_path):
+    codex(reopens=False)
+    evidence = tmp_path / "ev.json"
+    _run(capsys, "--only", "cx", "--start-timeout", "0", "--evidence", str(evidence))
+    with pytest.raises(SystemExit, match="no completed Codex restart"):
+        catchup.main(["codex-appended", str(evidence), "cx"])
+
+
+def test_last_ordinal_reads_within_the_recorded_size_and_past_huge_records(tmp_path):
+    path = tmp_path / "rollout-x.jsonl"
+    big = json.dumps({"type": "response_item", "payload": {"output": "x" * 3000}})
+    path.write_text(_rollout_line(5) + "\n" + big + "\n")
+    assert catchup.last_ordinal(path, chunk=512) == 5
+    size = path.stat().st_size
+    with open(path, "a") as stream:
+        stream.write(_rollout_line(6) + "\n")
+    assert catchup.last_ordinal(path, size) == 5 and catchup.last_ordinal(path) == 6

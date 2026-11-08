@@ -416,4 +416,49 @@ def test_mcp_commands_come_from_the_overrides_and_config_sections(tmp_path):
         '[mcp_servers.hgx.oauth]\ncommand = "/bin/no"\n'
     )
     app = 'codex app-server -c mcp_servers.forge.command="/venv/python" -c x=1'
-    assert lane_busy.mcp_commands(app, tmp_path) == {"/venv/python", "/bin/google"}
+    assert sorted(lane_busy.mcp_commands(app, tmp_path)) == [["/bin/google"], ["/venv/python"]]
+
+
+def test_a_rollout_mid_write_or_without_turns_is_busy(tmp_path):
+    procs, proc = _codex_host(tmp_path)
+    main = next((tmp_path / "codex/sessions/2026/11/08").glob(f"*{THREAD}.jsonl"))
+    with open(main, "a") as stream:
+        stream.write('{"ordinal": 9, "payload": {"type": "task_sta')
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == [f"thread {THREAD}'s rollout is mid-write: a record is being appended"]
+    main.write_text(_record(1) + "\n")
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == [f"thread {THREAD} has no turn record: its state cannot be seen"]
+
+
+def test_code_the_code_mode_host_runs_is_work(tmp_path):
+    ps = CODEX_PS + " 900 326336 00:30 /usr/bin/node -e work()\n"
+    procs, proc = _codex_host(tmp_path, ps)
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == ["pid 900, 00:30, under the Codex app-server: /usr/bin/node -e work()"]
+
+
+def test_a_tool_run_of_an_mcp_servers_interpreter_is_work(tmp_path):
+    ps = CODEX_PS + " 901 2926124 00:20 /rel/py worker.py\n"
+    procs, proc = _codex_host(tmp_path, ps)
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == ["pid 901, 00:20, under the Codex app-server: /rel/py worker.py"]
+
+
+def test_two_app_servers_for_one_session_are_busy(tmp_path):
+    ps = CODEX_PS + " 2926999 2925740 00:05 /x/bin/codex app-server --listen unix:///tmp/t.sock\n"
+    procs, proc = _codex_host(tmp_path, ps)
+    (proc / "2926999" / "environ").write_bytes(f"SKULD__SESSION__ID={SID}".encode())
+    reasons, _ = lane_busy.codex_reasons(SID, THREAD, procs, proc)
+    assert reasons == ["2 Codex app-servers carry the session: 2926124, 2926999"]
+
+
+def test_mcp_servers_match_on_their_whole_argv(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.google]\ncommand = "/bin/google"\nargs = [\n  "--port",\n  "1"\n]\n'
+    )
+    app = 'codex app-server -c mcp_servers.forge.command="/venv/python" -c x=1'
+    mcp = lane_busy.mcp_commands(app, tmp_path)
+    assert sorted(mcp) == [["/bin/google", "--port", "1"], ["/venv/python"]]
+    assert lane_busy._is_helper("node /bin/google --port 1", mcp)
+    assert not lane_busy._is_helper("/venv/python worker.py", mcp)

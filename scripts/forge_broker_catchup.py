@@ -39,6 +39,7 @@ work in that pane, so the gate never restarts the session that runs it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -157,20 +158,42 @@ def codex_rollouts(home: Path, thread_id: str) -> list[Path]:
     return sorted((home / "sessions").glob(f"*/*/*/rollout-*-{thread_id}.jsonl"))
 
 
-def last_ordinal(path: Path) -> int | None:
-    """The ``ordinal`` of the rollout's last complete record."""
+def last_ordinal(path: Path, end: int | None = None, chunk: int = 1 << 20) -> int | None:
+    """The ``ordinal`` of the last record that has one in the first ``end`` bytes (the whole
+    file by default), read backwards."""
     with open(path, "rb") as stream:
-        end = stream.seek(0, 2)
-        stream.seek(max(0, end - (1 << 20)))
-        lines = [line for line in stream.read().split(b"\n") if line.strip()]
-    for raw in reversed(lines):
-        try:
-            value = json.loads(raw).get("ordinal")
-        except (ValueError, AttributeError):
-            continue
-        if isinstance(value, int):
-            return value
+        pos = stream.seek(0, 2) if end is None else end
+        carry = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            stream.seek(pos)
+            lines = (stream.read(step) + carry).split(b"\n")
+            carry = lines.pop(0) if pos > 0 else b""
+            for raw in reversed(lines):
+                if b'"ordinal"' not in raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and isinstance(record.get("ordinal"), int):
+                    return record["ordinal"]
     return None
+
+
+def prefix_digest(path: Path, size: int, chunk: int = 1 << 20) -> str:
+    """A digest of the file's first ``size`` bytes: an append keeps it, a rewrite does not."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        left = size
+        while left > 0:
+            block = stream.read(min(chunk, left))
+            if not block:
+                break
+            digest.update(block)
+            left -= len(block)
+    return digest.hexdigest()
 
 
 def turn_count(api: str, sid: str) -> int:
@@ -188,15 +211,19 @@ def codex_baseline(api: str, sid: str, resume_id: str, app: str) -> dict | str:
     if len(files) != 1:
         return f"not restarted: {len(files)} rollout files for Codex thread {resume_id} in {home}"
     stat = files[0].stat()
+    ordinal = last_ordinal(files[0], stat.st_size)
+    if ordinal is None:
+        return f"not restarted: {files[0].name} has no record ordinals to prove an append with"
     return {
         "engine": "codex",
         "thread": resume_id,
         "app_server_pid": app,
         "codex_home": str(home),
-        "rollout": str(files[0]),
+        "rollout": str(files[0].resolve()),
+        "prefix_digest": prefix_digest(files[0], stat.st_size),
         "inode": stat.st_ino,
         "size": stat.st_size,
-        "last_ordinal": last_ordinal(files[0]),
+        "last_ordinal": ordinal,
         "turns": turn_count(api, sid),
     }
 
@@ -304,70 +331,99 @@ def _start_codex_again(
     rollout = Path(before["rollout"])
     deadline = time.monotonic() + args.start_timeout
 
-    def reopened():
-        app = forge_lane_busy.codex_app_server(sid, _procs(), Path("/proc"))
-        if app is None or app == before["app_server_pid"]:
+    def reopened():  # exactly one app-server, a new one, holding the thread's rollout
+        apps = forge_lane_busy.codex_app_servers(sid, _procs(), Path("/proc"))
+        if len(apps) != 1 or apps[0] == before["app_server_pid"]:
             return None
-        return app if rollout in forge_lane_busy.open_rollouts(app) else None
+        held = {p.resolve() for p in forge_lane_busy.open_rollouts(apps[0])}
+        return apps[0] if rollout in held else None
 
     app = _wait(reopened, deadline, args.poll)
     if app is None:
         return f"started, but no new Codex app-server reopened {rollout.name}: context lost?"
-    now = _session(api, sid).get("cli_session_id")
-    if now != resume_id:
-        return f"started, but its thread is {now}, not {resume_id}: context lost?"
-    stat = rollout.stat()
-    if stat.st_ino != before["inode"] or stat.st_size < before["size"]:
-        return (
-            f"started, but {rollout.name} was replaced or shrank (inode {before['inode']} -> "
-            f"{stat.st_ino}, size {before['size']} -> {stat.st_size})"
-        )
-    files = codex_rollouts(Path(before["codex_home"]), resume_id)
-    if files != [rollout]:
-        return f"started, but thread {resume_id} now has rollouts {[f.name for f in files]}"
+    failed = _same_thread(api, sid, resume_id, before, app)
+    if failed:
+        return failed
     time.sleep(args.settle)
-    if forge_lane_busy.codex_app_server(sid, _procs(), Path("/proc")) != app:
-        return f"started, but its resumed app-server (pid {app}) exited within {args.settle:g}s"
+    failed = _same_thread(api, sid, resume_id, before, app)  # still true after settling
+    if failed:
+        return failed.replace("started, but", f"started, then within {args.settle:g}s")
     turns = turn_count(api, sid)
-    PROOF[sid]["after"] = {"app_server_pid": app, "size": stat.st_size, "turns": turns}
+    size = rollout.stat().st_size
+    PROOF[sid]["after"] = {
+        "app_server_pid": app,
+        "size": size,
+        "last_ordinal": last_ordinal(rollout, size),
+        "prefix_digest": prefix_digest(rollout, size),
+        "turns": turns,
+    }
     if turns < before["turns"]:
         return f"started, but its turns dropped {before['turns']} -> {turns}"
     return "restarted"
 
 
+def _same_thread(api: str, sid: str, resume_id: str, before: dict, app: str) -> str | None:
+    """Why the resumed session is not on its own thread and file, or None when it is."""
+    rollout = Path(before["rollout"])
+    if forge_lane_busy.codex_app_servers(sid, _procs(), Path("/proc")) != [app]:
+        return f"started, but its resumed app-server (pid {app}) is not the only one running"
+    now = _session(api, sid).get("cli_session_id")
+    if now != resume_id:
+        return f"started, but its thread is {now}, not {resume_id}: context lost?"
+    stat = rollout.stat()
+    if (
+        stat.st_ino != before["inode"]
+        or stat.st_size < before["size"]
+        or prefix_digest(rollout, before["size"]) != before["prefix_digest"]
+    ):
+        return f"started, but {rollout.name} was replaced or shrank since the stop"
+    files = [f.resolve() for f in codex_rollouts(Path(before["codex_home"]), resume_id)]
+    if files != [rollout]:
+        return f"started, but thread {resume_id} now has rollouts {[f.name for f in files]}"
+    return None
+
+
 def codex_appended(evidence: str, sid: str) -> int:
     """After the restarted session's next turn: the same rollout grew, ordinals continuing."""
-    proof = (json.loads(Path(evidence).read_text()).get(sid) or {}).get("proof") or {}
-    before = proof.get("before")
-    if not before:
-        raise SystemExit(f"{evidence} holds no Codex resume proof for {sid}")
+    record = json.loads(Path(evidence).read_text()).get(sid) or {}
+    proof = record.get("proof") or {}
+    before, after = proof.get("before"), proof.get("after")
+    if not before or not after or record.get("result") != "restarted":
+        raise SystemExit(f"{evidence} holds no completed Codex restart for {sid}")
     rollout = Path(before["rollout"])
     problems = []
     stat = rollout.stat()
-    if stat.st_ino != before["inode"]:
-        problems.append(f"{rollout.name} was replaced (inode {before['inode']} -> {stat.st_ino})")
-    files = codex_rollouts(Path(before["codex_home"]), before["thread"])
+    if (
+        stat.st_ino != before["inode"]
+        or stat.st_size < after["size"]
+        or prefix_digest(rollout, after["size"]) != after["prefix_digest"]
+    ):
+        problems.append(f"{rollout.name} was replaced since the restart")
+    files = [f.resolve() for f in codex_rollouts(Path(before["codex_home"]), before["thread"])]
     if files != [rollout]:
         problems.append(f"the thread has rollouts {[f.name for f in files]}")
     ordinals, turns = [], 0
     with open(rollout, "rb") as stream:
-        stream.seek(before["size"])
+        stream.seek(after["size"])  # only what the resumed app-server wrote
         for raw in stream:
             try:
                 record = json.loads(raw)
             except ValueError:
                 continue
+            if not isinstance(record, dict):
+                continue
             if isinstance(record.get("ordinal"), int):
                 ordinals.append(record["ordinal"])
-            if (record.get("payload") or {}).get("type") == "task_complete":
+            payload = record.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "task_complete":
                 turns += 1
     if not ordinals:
         problems.append(f"nothing was appended to {rollout.name} since the restart")
-    elif before.get("last_ordinal") is not None and ordinals != list(
-        range(before["last_ordinal"] + 1, before["last_ordinal"] + 1 + len(ordinals))
+    elif after.get("last_ordinal") is None or ordinals != list(
+        range(after["last_ordinal"] + 1, after["last_ordinal"] + 1 + len(ordinals))
     ):
         problems.append(
-            f"ordinals do not continue from {before['last_ordinal']}: {ordinals[:3]}..."
+            f"ordinals do not continue from {after.get('last_ordinal')}: {ordinals[:3]}..."
         )
     if not turns:
         problems.append("no turn has completed in it since the restart")
@@ -375,7 +431,7 @@ def codex_appended(evidence: str, sid: str) -> int:
         json.dumps(
             {
                 "rollout": str(rollout),
-                "appended_bytes": stat.st_size - before["size"],
+                "appended_bytes": stat.st_size - after["size"],
                 "records": len(ordinals),
                 "first_ordinal": ordinals[0] if ordinals else None,
                 "completed_turns": turns,
@@ -399,6 +455,8 @@ def _resolve_holds(rows: list[dict], holds: list[str]) -> set[str]:
 
 
 def restart(args: argparse.Namespace) -> int:
+    if args.even_if_met and not args.only:
+        raise SystemExit("--even-if-met restarts only sessions named with --only")
     until = datetime.fromisoformat(args.until.replace("Z", "+00:00"))
     if until.tzinfo is None:
         raise SystemExit("--until needs a timezone (e.g. 2026-11-06T23:00:00Z)")
