@@ -5358,7 +5358,15 @@ class TmuxInteractiveTransport(CLITransport):
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout_b, stderr_b = await process.communicate()
+        try:
+            stdout_b, stderr_b = await process.communicate()
+        except asyncio.CancelledError:
+            # A bounded caller gave up (a hung tmux server): never leave the child behind.
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(Exception):
+                await process.wait()
+            raise
         result = _TmuxResult(
             returncode=process.returncode or 0,
             stdout=stdout_b.decode("utf-8", errors="replace"),

@@ -571,8 +571,6 @@ def apply_tool_result_blocks(
         tool_use_id = block.get("tool_use_id")
         if not tool_use_id:
             continue
-        # A real result replaces a question's closure (LEX-1979).
-        drop_question_closures(acc.parts, {str(tool_use_id)})
         part: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -964,12 +962,6 @@ def reduce_frames(
                 continue
 
         if k in ("user", "user_confirmed"):
-            # A real result replaces a question's closure in a finished turn too (LEX-1979).
-            answered = tool_result_block_ids(p)
-            if answered:
-                for turn in turns:
-                    if isinstance(turn.get("parts"), list):
-                        drop_question_closures(turn["parts"], answered)
             # Tool-result frames belong to the open assistant span. Human user
             # frames flush that span first and carry their own provenance below.
             if is_imported and _user_string_content(p) is None:
@@ -1069,6 +1061,7 @@ def reduce_frames(
 
     _apply_steering_states(turns, steering)
     turns = apply_steering_frames(turns, rows)
+    drop_superseded_closures(turns)
 
     partial = any(
         t.get("metadata", {}).get("status") in ("interrupted", "error")
@@ -1207,6 +1200,34 @@ def drop_question_closures(parts: list, tool_use_ids: set[str]) -> bool:
     return True
 
 
+def drop_superseded_closures(turns: list) -> None:
+    """Drop every closure whose call has a real result in some turn (IN PLACE).
+
+    A real result replaces a question's closure wherever each one sits, including in
+    two different stored turns. Run on finished turns only: removing a part while a
+    turn is being reduced would shift the indexes its later parts are stamped from.
+    """
+
+    def parts_of(turn: object) -> list | None:
+        parts = turn.get("parts") if isinstance(turn, dict) else getattr(turn, "parts", None)
+        return parts if isinstance(parts, list) else None
+
+    real = {
+        str(part.get("tool_use_id"))
+        for turn in turns
+        for part in (parts_of(turn) or [])
+        if isinstance(part, dict)
+        and part.get("type") == "tool_result"
+        and not is_question_closure(part)
+    }
+    if not real:
+        return
+    for turn in turns:
+        parts = parts_of(turn)
+        if parts:
+            drop_question_closures(parts, real)
+
+
 def apply_question_closure(
     open_parts: list, turns: list, payload: dict, ended_at: str | None
 ) -> list | None:
@@ -1293,7 +1314,12 @@ def apply_question_closures(turns: list[dict], frames: list[Frame]) -> list[dict
         and isinstance(row.payload, dict)
         and question_closure(row.payload) is not None
     ]
-    if not rows:
+    has_closure = any(
+        is_question_closure(part)
+        for turn in turns
+        for part in (turn.get("parts") or [] if isinstance(turn.get("parts"), list) else [])
+    )
+    if not rows and not has_closure:
         return turns
     result = [
         {
@@ -1306,6 +1332,7 @@ def apply_question_closures(turns: list[dict], frames: list[Frame]) -> list[dict
     ]
     for row in rows:
         apply_question_closure([], result, row.payload, _stamp_iso(_ts_of(row)))
+    drop_superseded_closures(result)
     return result
 
 

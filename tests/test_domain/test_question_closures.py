@@ -189,3 +189,56 @@ def test_a_rebuild_never_mutates_the_seed_it_was_given():
     turn = _question_turn()
     reduce_frames([_dismissed(2)], sdk_turns=[turn])
     assert _results(turn) == []
+
+
+def test_a_seeded_rebuild_drops_a_closure_whose_real_answer_is_in_another_seed():
+    """Codex re-check: two stored turns, the closure in one and the real answer in the next."""
+    closed = apply_question_closures([_question_turn()], [_dismissed(5)])[0]
+    answer = {
+        "id": "turn-2",
+        "role": "assistant",
+        "content": "",
+        "parts": [{"type": "tool_result", "tool_use_id": PHANTOM, "content": "Yes"}],
+        "created_at": "2026-10-19T07:20:00+00:00",
+        "metadata": {},
+    }
+    rows = [
+        _row(10, "conversation.turn", {"turn": closed}),
+        _row(11, "conversation.turn", {"turn": answer}),
+    ]
+    turns = rebuild_turns(rows).turns
+    assert [p["content"] for t in turns for p in _results(t)] == ["Yes"]
+    assert _results(closed)  # the stored seed itself is untouched
+
+
+def test_a_real_answer_after_a_closure_keeps_its_timeline_stamp():
+    """Codex re-check: dropping mid-reduction shifted the index the result is stamped from."""
+    from niuu.domain.conversation_timeline import TIMELINE_KEY, TIMELINE_SCHEMA
+
+    def stamp(seq: int) -> dict:
+        return {
+            TIMELINE_KEY: {
+                "schema": TIMELINE_SCHEMA,
+                "seq": seq,
+                "observed_at": f"2026-11-08T09:3{seq}:00+00:00",
+            }
+        }
+
+    answer = {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": PHANTOM, "content": "Yes"}]},
+    }
+    rows = [
+        _row(
+            1,
+            "assistant",
+            {"type": "assistant", "message": {"content": [QUESTION_USE]}, **stamp(1)},
+        ),
+        _dismissed(2),
+        _row(3, "user", {**answer, **stamp(3)}),
+        _row(4, "result", {"type": "result", "result": "ok", **stamp(4)}),
+    ]
+    [turn] = reduce_frames(rows).turns
+    [result] = _results(turn)
+    assert result["content"] == "Yes"
+    assert result[TIMELINE_KEY]["seq"] == 3

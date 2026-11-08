@@ -738,3 +738,32 @@ async def test_ordinary_permission_is_not_person_only(tmp_path):
     finally:
         await transport.stop()
     await asyncio.sleep(0)
+
+
+async def test_a_cancelled_tmux_call_kills_and_reaps_its_child(tmp_path, monkeypatch):
+    """Codex re-check: a timed-out capture left the tmux child running."""
+    import skuld.transports.tmux_interactive as module
+
+    class Hung:
+        returncode = None
+        killed = waited = False
+
+        async def communicate(self):
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            self.waited = True
+
+    hung = Hung()
+    monkeypatch.setattr(module.asyncio, "create_subprocess_exec", lambda *a, **k: _resolved(hung))
+    transport = TmuxInteractiveTransport(str(tmp_path))
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(transport._run_tmux("capture-pane", "-p"), timeout=0.05)
+    assert hung.killed and hung.waited
+
+
+async def _resolved(value):
+    return value

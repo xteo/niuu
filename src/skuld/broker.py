@@ -985,6 +985,7 @@ class Broker(
         answered = tool_result_block_ids(data)
         if not answered:
             return
+        drop_question_closures(self._pending_assistant_parts, answered)
         changed = False
         for turn in self._conversation_turns:
             changed = drop_question_closures(turn.parts, answered) or changed
@@ -3908,7 +3909,6 @@ class Broker(
                 )
         elif tool_result_only_user_event:
             await self._finish_assistant_tool_trace_spans_from_user_event(data)
-            self._drop_question_closures(data)
             # Persist tool_result blocks onto the open assistant turn so the saved
             # conversation carries tool OUTPUT (not just the call) for read-back — via the
             # SHARED reducer transition (the same enrichment a later log rebuild applies).
@@ -3923,6 +3923,8 @@ class Broker(
             part_start = len(acc.parts)
             apply_tool_result_blocks(acc, tr_blocks, ts=frame_ts)
             stamp_parts(self._pending_assistant_parts, data, start=part_start)
+            # After stamping: a real result replaces a question's closure (LEX-1979).
+            self._drop_question_closures(data)
             self._pending_assistant_last_seq = self._event_log_seq
             self._pending_assistant_last_ts = frame_ts
         elif event_type == "result":
