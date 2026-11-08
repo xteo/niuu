@@ -9,6 +9,7 @@ closes the span at the same frame, so both give the same turn.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import UTC, datetime
@@ -265,3 +266,61 @@ async def test_a_full_hydration_after_an_interrupt_merges_with_the_cache(tmp_pat
     )
     hydrated = json.loads(after._conversation_history_path().read_text())["turns"]
     assert len(hydrated) == len(before._conversation_turns)
+
+
+async def test_the_save_waits_for_a_frame_logged_but_not_yet_folded(tmp_path):
+    """A frame is logged, then broadcast, then folded: the saved turn must still hold it."""
+    broker = _broker(tmp_path)
+    await _run_open_turn(broker)
+    release = asyncio.Event()
+
+    async def slow_broadcast(frame):
+        if frame.get("type") == "assistant":
+            await release.wait()
+
+    broker._channels.broadcast = slow_broadcast
+    late = asyncio.create_task(
+        broker._handle_cli_event(_assistant({"type": "text", "text": "Still watching"}))
+    )
+    await asyncio.sleep(0)
+    assert broker._event_log_buffer[-1]["payload"]["type"] == "assistant"  # logged, not folded
+    save = asyncio.create_task(broker._interrupt_open_turn("broker_shutdown"))
+    await asyncio.sleep(0)
+    assert not save.done()  # waits for the frame in flight
+    # A frame that arrives while the save waits is held until the boundary is logged.
+    after = asyncio.create_task(
+        broker._handle_cli_event(_assistant({"type": "text", "text": "After the boundary"}))
+    )
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(late, save, after)
+
+    span = turn_record(broker._conversation_turns[-1])
+    assert "Still watching" in span["content"]
+    assert "After the boundary" not in span["content"]
+    kinds = [e["kind"] for e in broker._event_log_buffer]
+    assert kinds.index(TURN_INTERRUPTED_KIND) < len(kinds) - 1
+    assert broker._event_log_buffer[-1]["payload"]["message"]["content"][0]["text"] == (
+        "After the boundary"
+    )
+    await broker._handle_cli_event({"type": "result", "result": "", "stop_reason": "end_turn"})
+    live = [turn_record(t) for t in broker._conversation_turns]
+    assert _shape(reduce_frames(_logged_frames(broker)).turns) == _shape(live)
+
+
+async def test_a_nested_event_inside_a_handler_is_not_held(tmp_path):
+    broker = _broker(tmp_path)
+    seen = []
+    real = broker._handle_cli_event_now
+
+    async def outer(data):
+        if data.get("type") == "outer":
+            await broker._handle_cli_event({"type": "inner"})
+        seen.append(data["type"])
+        await real(data) if data["type"] not in ("outer", "inner") else None
+
+    broker._handle_cli_event_now = outer
+    await asyncio.wait_for(broker._handle_cli_event({"type": "outer"}), timeout=5)
+
+    assert seen == ["inner", "outer"]
+    assert broker._cli_events_in_flight == 0

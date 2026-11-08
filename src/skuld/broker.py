@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import json
 import logging
 import os
@@ -217,6 +218,9 @@ def _configure_logging() -> None:
 _configure_logging()
 
 logger = logging.getLogger("skuld.broker")
+
+# Set while a CLI event is being handled, so a nested one skips the shutdown gate.
+_IN_CLI_EVENT: contextvars.ContextVar[bool] = contextvars.ContextVar("in_cli_event", default=False)
 
 FORGE_SESSIONS_PATH = "/api/v1/forge/sessions"
 FORGE_CHRONICLES_PATH = "/api/v1/forge/chronicles"
@@ -754,6 +758,13 @@ class Broker(
         self._pending_attention: dict[str, str] = {}
         self._activity_heartbeat_task: asyncio.Task[None] | None = None
         self._conversation_turns: list[ConversationTurn] = []
+        # CLI events in flight, and the gate shutdown closes to save the open turn
+        # between two of them (LEX-1982).
+        self._cli_events_open = asyncio.Event()
+        self._cli_events_open.set()
+        self._cli_events_settled = asyncio.Event()
+        self._cli_events_settled.set()
+        self._cli_events_in_flight = 0
         self._pending_assistant_content: str = ""
         self._pending_assistant_parts: list[dict] = []
         # Tool details are available before their live preview is sent, including
@@ -1075,14 +1086,19 @@ class Broker(
         seq and time: a rebuild closes the span at that frame the same way, so both give
         the same turn, whatever frames (terminal repaints) the span held.
         """
-        if build_assistant_turn(self.session_id, self._pending_accumulator()) is None:
-            return
-        frame = {"type": TURN_INTERRUPTED_KIND, "reason": reason}
-        observed_at = datetime.now(UTC)
-        self._enqueue_event_log(frame, ts=observed_at)
-        self._pending_assistant_last_seq = self._event_log_seq
-        self._pending_assistant_last_ts = observed_at
-        self._flush_pending_assistant_turn(metadata={"status": "interrupted"})
+        self._cli_events_open.clear()
+        try:
+            await self._cli_events_settled.wait()
+            if build_assistant_turn(self.session_id, self._pending_accumulator()) is None:
+                return
+            frame = {"type": TURN_INTERRUPTED_KIND, "reason": reason}
+            observed_at = datetime.now(UTC)
+            self._enqueue_event_log(frame, ts=observed_at)
+            self._pending_assistant_last_seq = self._event_log_seq
+            self._pending_assistant_last_ts = observed_at
+            self._flush_pending_assistant_turn(metadata={"status": "interrupted"})
+        finally:
+            self._cli_events_open.set()
         await self._channels.broadcast(frame)
 
     def _discard_pending_assistant_turn(self) -> None:
@@ -3581,6 +3597,29 @@ class Broker(
 
     @history_write
     async def _handle_cli_event(self, data: dict) -> None:
+        """Handle one CLI event, unless shutdown is saving the open turn (LEX-1982).
+
+        An event is logged before it is folded into the open span, with awaits between.
+        Shutdown closes the gate and waits for the events in flight, so the turn it
+        saves holds every frame logged before its ``turn_interrupted`` frame and none
+        after. A nested call (made while handling an event) runs at once.
+        """
+        if _IN_CLI_EVENT.get():
+            await self._handle_cli_event_now(data)
+            return
+        await self._cli_events_open.wait()
+        self._cli_events_in_flight += 1
+        self._cli_events_settled.clear()
+        token = _IN_CLI_EVENT.set(True)
+        try:
+            await self._handle_cli_event_now(data)
+        finally:
+            _IN_CLI_EVENT.reset(token)
+            self._cli_events_in_flight -= 1
+            if self._cli_events_in_flight == 0:
+                self._cli_events_settled.set()
+
+    async def _handle_cli_event_now(self, data: dict) -> None:
         """Forward a CLI event to all connected channels."""
         event_type = data.get("type", "unknown")
         if event_type == "assistant" and is_late_frame(self._closed_turn_id, data):
