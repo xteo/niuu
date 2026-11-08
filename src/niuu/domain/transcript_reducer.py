@@ -571,6 +571,8 @@ def apply_tool_result_blocks(
         tool_use_id = block.get("tool_use_id")
         if not tool_use_id:
             continue
+        # A real result replaces a question's closure (LEX-1979).
+        drop_question_closures(acc.parts, {str(tool_use_id)})
         part: dict[str, Any] = {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
@@ -890,6 +892,8 @@ def reduce_frames(
                 if isinstance(turn.get("metadata"), dict)
                 else {}
             ),
+            # Question closures append to a seed's parts (LEX-1979): copy, never mutate.
+            **({"parts": list(turn["parts"])} if isinstance(turn.get("parts"), list) else {}),
         }
         for turn in sdk_turns or []
     ]
@@ -941,6 +945,10 @@ def reduce_frames(
             imported_prefix_open = False
         if is_imported:
             imported_prefix_open = True
+        if k == "ask_user_resolved":
+            # The live broker closes a dismissed question as this frame arrives (LEX-1979).
+            apply_question_closure(acc.parts, turns, p, _stamp_iso(_ts_of(r)))
+            continue
         if k in NON_BROADCAST_KINDS or k in _IGNORED_KINDS:
             continue
         if r.request_id and r.request_id in folded_request_ids:
@@ -956,6 +964,12 @@ def reduce_frames(
                 continue
 
         if k in ("user", "user_confirmed"):
+            # A real result replaces a question's closure in a finished turn too (LEX-1979).
+            answered = tool_result_block_ids(p)
+            if answered:
+                for turn in turns:
+                    if isinstance(turn.get("parts"), list):
+                        drop_question_closures(turn["parts"], answered)
             # Tool-result frames belong to the open assistant span. Human user
             # frames flush that span first and carry their own provenance below.
             if is_imported and _user_string_content(p) is None:
@@ -1055,7 +1069,6 @@ def reduce_frames(
 
     _apply_steering_states(turns, steering)
     turns = apply_steering_frames(turns, rows)
-    turns = apply_question_closures(turns, rows)
 
     partial = any(
         t.get("metadata", {}).get("status") in ("interrupted", "error")
@@ -1154,23 +1167,105 @@ def question_closure_part(tool_use_id: str, payload: dict, ended_at: str | None)
     return part
 
 
-def close_open_question(
-    parts: list[dict], tool_use_id: str, payload: dict, ended_at: str | None
-) -> bool:
-    """Append the closing tool_result after this tool_use in ``parts`` (IN PLACE).
-
-    Returns False when ``parts`` holds no such tool_use. Callers check first that no
-    turn already has a tool_result for it.
-    """
-    if not any(
-        part.get("type") == "tool_use" and str(part.get("id") or "") == tool_use_id
+def _has_tool_use(parts: list, tool_use_id: str) -> bool:
+    return any(
+        isinstance(part, dict)
+        and part.get("type") == "tool_use"
+        and str(part.get("id") or "") == tool_use_id
         for part in parts
-    ):
+    )
+
+
+def _has_tool_result(parts: list, tool_use_id: str) -> bool:
+    return any(
+        isinstance(part, dict)
+        and part.get("type") == "tool_result"
+        and str(part.get("tool_use_id") or "") == tool_use_id
+        for part in parts
+    )
+
+
+def is_question_closure(part: object) -> bool:
+    return (
+        isinstance(part, dict)
+        and part.get("type") == "tool_result"
+        and isinstance(part.get("metadata"), dict)
+        and part["metadata"].get("source") == QUESTION_CLOSURE_SOURCE
+    )
+
+
+def drop_question_closures(parts: list, tool_use_ids: set[str]) -> bool:
+    """Remove the closures of these calls from ``parts`` IN PLACE: their real result came."""
+    kept = [
+        part
+        for part in parts
+        if not (is_question_closure(part) and str(part.get("tool_use_id")) in tool_use_ids)
+    ]
+    if len(kept) == len(parts):
         return False
-    parts.append(question_closure_part(tool_use_id, payload, ended_at))
-    if ended_at:
-        _close_tool_use(parts, tool_use_id, ended_at)
+    parts[:] = kept
     return True
+
+
+def apply_question_closure(
+    open_parts: list, turns: list, payload: dict, ended_at: str | None
+) -> list | None:
+    """The one closure transition, shared by the live broker and every rebuild.
+
+    ``open_parts`` is the turn in progress, ``turns`` the finished turns (dicts or
+    objects with ``role`` and ``parts``). The closing tool_result goes where the
+    question's tool_use is: appended to the turn in progress, else to the end of the
+    latest finished turn that holds it. Nothing happens when any turn already has a
+    result for the call. Returns the parts list it appended to, or None. The
+    tool_use itself is not stamped, so a stale copy of the turn stays a prefix of
+    the closed one and a restart's history merge keeps the closure.
+    """
+    closure = question_closure(payload)
+    if closure is None:
+        return None
+    tool_use_id = closure[0]
+
+    def parts_of(turn: object) -> list:
+        parts = turn.get("parts") if isinstance(turn, dict) else getattr(turn, "parts", None)
+        return parts if isinstance(parts, list) else []
+
+    def role_of(turn: object) -> object:
+        return turn.get("role") if isinstance(turn, dict) else getattr(turn, "role", None)
+
+    if _has_tool_result(open_parts, tool_use_id) or any(
+        _has_tool_result(parts_of(turn), tool_use_id) for turn in turns
+    ):
+        return None
+    if _has_tool_use(open_parts, tool_use_id):
+        target = open_parts
+    else:
+        target = next(
+            (
+                parts_of(turn)
+                for turn in reversed(turns)
+                if role_of(turn) == "assistant" and _has_tool_use(parts_of(turn), tool_use_id)
+            ),
+            None,
+        )
+        if target is None:
+            return None
+    target.append(question_closure_part(tool_use_id, payload, ended_at))
+    return target
+
+
+def tool_result_block_ids(payload: dict) -> set[str]:
+    """The tool_use_ids a ``user`` frame carries results for."""
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(block.get("tool_use_id"))
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id")
+    }
 
 
 def tool_result_ids(turns: list[dict]) -> set[str]:
@@ -1184,48 +1279,33 @@ def tool_result_ids(turns: list[dict]) -> set[str]:
 
 
 def apply_question_closures(turns: list[dict], frames: list[Frame]) -> list[dict]:
-    """Close every question an ``ask_user_resolved`` frame dismissed, in whatever turn.
+    """Close every question a logged ``ask_user_resolved`` frame dismissed (rebuild side).
 
-    A question can stay open in the record for good: an auto-compaction drops its
-    tool call, or the session restarts with the menu up, so no tool_result ever comes.
-    The live broker applies the same closure to its turns when the frame arrives;
-    this is the rebuild's side of it, so live and rebuilt history agree. Turns are
-    copied, never mutated: seeds may be a repository's stored rows.
+    For the stored turns a rebuild starts from (``conversation.turn`` seeds that
+    predate the close): the same transition the live broker applied, in frame order.
+    Turns are copied, never mutated: seeds may be a repository's stored rows. A
+    question already closed (or answered) is left as it is.
     """
-    closures: dict[str, tuple[dict, str | None]] = {}
-    for row in sorted(frames, key=lambda frame: frame.seq):
-        payload = row.payload
-        if row.kind != "ask_user_resolved" or not isinstance(payload, dict):
-            continue
-        closure = question_closure(payload)
-        if closure is not None:
-            closures.setdefault(closure[0], (closure[1], _stamp_iso(_ts_of(row))))
-    if not closures:
+    rows = [
+        row
+        for row in sorted(frames, key=lambda frame: frame.seq)
+        if row.kind == "ask_user_resolved"
+        and isinstance(row.payload, dict)
+        and question_closure(row.payload) is not None
+    ]
+    if not rows:
         return turns
-    answered = tool_result_ids(turns)
-    result: list[dict] = []
-    for turn in turns:
-        parts = turn.get("parts")
-        if turn.get("role") != "assistant" or not isinstance(parts, list):
-            result.append(turn)
-            continue
-        open_ids = [
-            str(part.get("id"))
-            for part in parts
-            if isinstance(part, dict)
-            and part.get("type") == "tool_use"
-            and str(part.get("id") or "") in closures
-            and str(part.get("id")) not in answered
-        ]
-        if not open_ids:
-            result.append(turn)
-            continue
-        copied = [dict(part) if isinstance(part, dict) else part for part in parts]
-        for tool_use_id in open_ids:
-            payload, ended_at = closures[tool_use_id]
-            close_open_question(copied, tool_use_id, payload, ended_at)
-            answered.add(tool_use_id)
-        result.append({**turn, "parts": copied})
+    result = [
+        {
+            **turn,
+            "parts": [dict(part) if isinstance(part, dict) else part for part in turn["parts"]],
+        }
+        if turn.get("role") == "assistant" and isinstance(turn.get("parts"), list)
+        else turn
+        for turn in turns
+    ]
+    for row in rows:
+        apply_question_closure([], result, row.payload, _stamp_iso(_ts_of(row)))
     return result
 
 

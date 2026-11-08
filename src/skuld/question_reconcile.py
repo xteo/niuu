@@ -62,6 +62,7 @@ class QuestionReconcileMixin:
     """Broker side of LEX-1979; mixed into :class:`skuld.broker.Broker`."""
 
     _question_index: NativeQuestionIndex | None = None
+    _record_answered: frozenset[str] | set[str] = frozenset()
     _question_reconcile_task: asyncio.Task[None] | None = None
 
     @property
@@ -95,11 +96,30 @@ class QuestionReconcileMixin:
                     and str(part.get(TOOL_STARTED_AT) or "") <= settled_before
                 ):
                     open_questions[part["id"]] = f"reconcile:{part['id']}"
+        # The restored and pending lists also hold permission gates (sent as
+        # ask_user_question too): only a question counts, by its card's kind or, for a card
+        # from an older broker without one, by its call being an AskUserQuestion in the
+        # record. A card whose question the record already answered is still listed, so
+        # its replay stops.
+        record_questions = {
+            part["id"]
+            for record in records
+            for part in record.get("parts") or []
+            if isinstance(part, dict)
+            and part.get("type") == "tool_use"
+            and part.get("name") == QUESTION_TOOL
+            and isinstance(part.get("id"), str)
+        }
         for controls in (self._unrestored_questions, self._pending_ask_user_questions):
             for request_id, data in controls.items():
-                tool_use_id = str((data or {}).get("tool_use_id") or "")
-                if tool_use_id and tool_use_id != request_id and tool_use_id not in answered:
+                data = data or {}
+                tool_use_id = str(data.get("tool_use_id") or "")
+                kind = (data.get("metadata") or {}).get("control_kind")
+                if not tool_use_id or tool_use_id == request_id:
+                    continue
+                if kind == "question" or (kind is None and tool_use_id in record_questions):
                     open_questions[tool_use_id] = request_id
+        self._record_answered = answered
         return open_questions
 
     def _turn_records_for_reconcile(self) -> list[dict[str, Any]]:
@@ -121,7 +141,17 @@ class QuestionReconcileMixin:
         return index
 
     async def reconcile_open_questions(self, *, trigger: str) -> dict[str, Any]:
-        """Check every open question against the CLI's session file; close the stale ones."""
+        """Check every open question against the CLI's session file; close the stale ones.
+
+        One reconcile at a time (the sweep and the owner route share the index).
+        """
+        lock = getattr(self, "_question_reconcile_lock", None)
+        if lock is None:
+            lock = self._question_reconcile_lock = asyncio.Lock()
+        async with lock:
+            return await self._reconcile_open_questions_locked(trigger=trigger)
+
+    async def _reconcile_open_questions_locked(self, *, trigger: str) -> dict[str, Any]:
         transport = self._transport
         if transport is None or not transport.capabilities.native_controls:
             raise NativeQuestionsUnsupportedError(
@@ -149,7 +179,7 @@ class QuestionReconcileMixin:
                 )
                 continue
             state = index.state(tool_use_id)
-            if state == ANSWERED:
+            if tool_use_id in self._record_answered or state == ANSWERED:
                 reason = DISMISS_RESOLVED_IN_TERMINAL
             elif state == NEVER_SHOWN:
                 reason = DISMISS_NEVER_SHOWN
@@ -160,7 +190,13 @@ class QuestionReconcileMixin:
                 continue
             else:
                 if menu_state is None:
-                    menu_state = await transport.observe_native_menu_state()
+                    try:
+                        menu_state = await transport.observe_native_menu_state()
+                    except TimeoutError:
+                        # A capture that hangs proves nothing: keep every question.
+                        self.question_reconcile_counts["screen_check_timeouts"] += 1
+                        logger.error("Question reconcile: the pane capture timed out")
+                        menu_state = "timed out"
                 if menu_state != MENU_GONE:
                     kept.append(
                         {"tool_use_id": tool_use_id, "why": f"unanswered, menu {menu_state}"}

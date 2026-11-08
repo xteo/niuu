@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from stat import S_ISREG
@@ -55,13 +56,20 @@ class NativeQuestionIndex:
     _partial: bytes = b""
     _questions: set[str] = field(default_factory=set)
     _results: dict[str, QuestionResult] = field(default_factory=dict)
+    # One refresh at a time: a concurrent one must never read a half-indexed file.
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def refresh(self) -> None:
         """Read what was appended since the last refresh (all of it, the first time).
 
+        Streams line by line, so a first read of a large file holds one line at a time.
         A replaced file (another inode) or a truncated one is read again from the
-        start. Raises :class:`NativeTranscriptUnavailableError` when the file cannot be read.
+        start. Raises :class:`NativeTranscriptUnavailableError` when it cannot be read.
         """
+        with self._lock:
+            self._refresh_locked()
+
+    def _refresh_locked(self) -> None:
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         except OSError as exc:
@@ -81,13 +89,18 @@ class NativeQuestionIndex:
                 self._results.clear()
                 self._device, self._inode = stat.st_dev, stat.st_ino
             stream.seek(self._offset)
-            data = stream.read(stat.st_size - self._offset)
-        self._offset += len(data)
-        lines = (self._partial + data).split(b"\n")
-        # The last piece has no newline yet: a writer may still be appending it.
-        self._partial = lines.pop()
-        for line in lines:
-            self._index_line(line)
+            end = stat.st_size
+            while self._offset < end:
+                line = stream.readline(end - self._offset)
+                if not line:
+                    break
+                self._offset += len(line)
+                if not line.endswith(b"\n"):
+                    # A writer may still be appending this line: finish it next time.
+                    self._partial += line
+                    break
+                self._index_line(self._partial + line)
+                self._partial = b""
 
     def _index_line(self, line: bytes) -> None:
         if b"tool_" not in line:

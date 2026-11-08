@@ -3971,10 +3971,18 @@ class TmuxInteractiveTransport(CLITransport):
         }
 
     async def observe_native_menu_state(self) -> str:
-        """The main pane's menu state over the render window, under the input locks."""
+        """The main pane's menu state over the render window, under the input locks.
+
+        Bounded by the render window plus ``SKULD__TMUX_DELIVER_TIMEOUT_SECONDS``: a
+        hung capture raises :class:`TimeoutError` instead of holding both locks, which
+        would stop every answer and delivery.
+        """
         async with self._answer_lock:
             async with self._send_lock:
-                return await self._observe_native_menu()
+                return await asyncio.wait_for(
+                    self._observe_native_menu(),
+                    timeout=max(self._menu_render_wait_s, 0.0) + self._deliver_timeout_s,
+                )
 
     def _note_superseding_hook(self, event_name: str, payload: dict[str, Any]) -> None:
         """Mark open cards a later main-agent hook shows the CLI has moved past (LEX-1979).

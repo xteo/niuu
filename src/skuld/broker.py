@@ -41,6 +41,7 @@ from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import (
     TurnAccumulator,
     apply_assistant_blocks,
+    apply_question_closure,
     apply_result_content,
     apply_text_delta,
     apply_text_start,
@@ -49,17 +50,16 @@ from niuu.domain.transcript_reducer import (
     apply_tool_result_blocks,
     assistant_turn_id,
     build_assistant_turn,
-    close_open_question,
+    drop_question_closures,
     error_text,
     frame_turn_id,
     is_late_frame,
     note_message_id,
-    question_closure,
     result_metadata,
     result_repeats_error,
     steering_state_from_frame,
     steering_target_id,
-    tool_result_ids,
+    tool_result_block_ids,
 )
 from niuu.domain.workflow_evidence import evaluate_workflow_evidence, validate_evidence_gate_nodes
 from niuu.domain.workflow_kickoff import (
@@ -968,27 +968,28 @@ class Broker(
     def _close_question_in_conversation(self, data: dict, frame_ts: datetime) -> bool:
         """Write a dismissed question's closing tool_result into its turn (LEX-1979).
 
-        The same transition ``apply_question_closures`` applies on a rebuild from the
-        logged ``ask_user_resolved`` frame, so live and rebuilt history agree. A
-        question some turn already has a result for is left alone.
+        ``apply_question_closure`` is the transition every rebuild applies to the same
+        logged ``ask_user_resolved`` frame, so live and rebuilt history agree.
         """
-        closure = question_closure(data)
-        if closure is None:
+        target = apply_question_closure(
+            self._pending_assistant_parts, self._conversation_turns, data, frame_ts.isoformat()
+        )
+        if target is None:
             return False
-        tool_use_id, payload = closure
-        records = [turn_record(turn) for turn in self._conversation_turns]
-        if tool_use_id in tool_result_ids([*records, {"parts": self._pending_assistant_parts}]):
-            return False
-        ended_at = frame_ts.isoformat()
-        if close_open_question(self._pending_assistant_parts, tool_use_id, payload, ended_at):
-            return True
-        for turn in reversed(self._conversation_turns):
-            if turn.role == "assistant" and close_open_question(
-                turn.parts, tool_use_id, payload, ended_at
-            ):
-                self._save_conversation_history()
-                return True
-        return False
+        if target is not self._pending_assistant_parts:
+            self._save_conversation_history()
+        return True
+
+    def _drop_question_closures(self, data: dict) -> None:
+        """A real result replaces a question's closure in a finished turn (LEX-1979)."""
+        answered = tool_result_block_ids(data)
+        if not answered:
+            return
+        changed = False
+        for turn in self._conversation_turns:
+            changed = drop_question_closures(turn.parts, answered) or changed
+        if changed:
+            self._save_conversation_history()
 
     def _serialize_in_progress_turn(self) -> dict | None:
         """Reconstruct the in-flight assistant turn as a turn-shaped dict (or None when idle).
@@ -3907,6 +3908,7 @@ class Broker(
                 )
         elif tool_result_only_user_event:
             await self._finish_assistant_tool_trace_spans_from_user_event(data)
+            self._drop_question_closures(data)
             # Persist tool_result blocks onto the open assistant turn so the saved
             # conversation carries tool OUTPUT (not just the call) for read-back — via the
             # SHARED reducer transition (the same enrichment a later log rebuild applies).

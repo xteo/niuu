@@ -133,3 +133,59 @@ def test_a_restart_never_brings_an_orphan_back():
     stale_cache = _question_turn()
     assert _results(merge_history_turns([closed], [stale_cache])[0])
     assert _results(merge_history_turns([_question_turn()], [closed])[0])
+
+
+def _assistant(seq: int, *blocks: dict) -> SimpleNamespace:
+    return _row(seq, "assistant", {"type": "assistant", "message": {"content": list(blocks)}})
+
+
+QUESTION_USE = {"type": "tool_use", "id": PHANTOM, "name": "AskUserQuestion", "input": {}}
+
+
+def test_the_closure_sits_where_the_live_broker_put_it():
+    """Codex review: live appends the closure when the frame arrives, before later text."""
+    rows = [
+        _assistant(1, QUESTION_USE),
+        _dismissed(2),
+        _assistant(3, {"type": "text", "text": "Moving on."}),
+        _row(4, "result", {"type": "result", "result": "Moving on."}),
+    ]
+    [turn] = reduce_frames(rows).turns
+    assert [p["type"] for p in turn["parts"]][:3] == ["tool_use", "tool_result", "text"]
+
+
+def test_a_real_answer_after_a_close_replaces_the_closure_on_rebuild():
+    rows = [
+        _assistant(1, QUESTION_USE),
+        _dismissed(2),
+        _row(
+            3,
+            "user",
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": PHANTOM, "content": "Yes"}]
+                },
+            },
+        ),
+        _row(4, "result", {"type": "result", "result": "ok"}),
+    ]
+    [turn] = reduce_frames(rows).turns
+    assert [(p["content"], p.get("metadata")) for p in _results(turn)] == [("Yes", None)]
+
+
+def test_a_timestamped_closure_still_merges_over_a_stale_cache():
+    """Codex review: stamping the tool_use broke the prefix and kept the stale cache."""
+    seed = _row(10, "conversation.turn", {"turn": _question_turn()})
+    dismissed = _dismissed(20)
+    dismissed.ts = "2026-11-08T09:30:00+00:00"
+    closed = rebuild_turns([seed, dismissed]).turns[0]
+    assert "ended_at" not in closed["parts"][1]
+    merged = merge_history_turns([closed], [_question_turn()])
+    assert _results(merged[0])[0]["ended_at"] == "2026-11-08T09:30:00+00:00"
+
+
+def test_a_rebuild_never_mutates_the_seed_it_was_given():
+    turn = _question_turn()
+    reduce_frames([_dismissed(2)], sdk_turns=[turn])
+    assert _results(turn) == []

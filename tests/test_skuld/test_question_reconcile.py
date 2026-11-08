@@ -437,3 +437,107 @@ async def test_the_reconcile_route_is_owner_only_and_maps_refusals(monkeypatch):
     with pytest.raises(HTTPException) as denied:
         await reconcile_native_questions(_request("viewer"))
     assert denied.value.status_code == 403
+
+
+# -- Codex review of ba9074354 ------------------------------------------------------------
+
+
+async def test_concurrent_refreshes_never_see_a_half_indexed_file(tmp_path):
+    import asyncio
+
+    file = SessionFile(tmp_path / f"{NATIVE}.jsonl")
+    for n in range(2000):
+        file.write({"type": "user", "message": {"content": [{"type": "text", "text": f"x{n}"}]}})
+    file.question(STRANDED)
+    index = NativeQuestionIndex(file.path, NATIVE)
+    await asyncio.gather(*(asyncio.to_thread(index.refresh) for _ in range(4)))
+    assert index.state(STRANDED) == UNANSWERED
+
+
+async def test_reconciles_run_one_at_a_time(session):
+    import asyncio
+
+    broker, file, frames = session
+    broker._conversation_turns = [_question_turn(PHANTOM)]
+    outcomes = await asyncio.gather(
+        broker.reconcile_open_questions(trigger=RECONCILE_SWEEP),
+        broker.reconcile_open_questions(trigger=RECONCILE_OWNER),
+    )
+    assert sorted(len(o["closed"]) for o in outcomes) == [0, 1]
+    assert len([f for f in frames if f["type"] == "ask_user_resolved"]) == 1
+
+
+@pytest.mark.parametrize("kind", ["permission", None])
+async def test_a_restored_permission_gate_is_never_reconciled(session, kind):
+    """Permission gates are sent as ask_user_question too; their call is no question."""
+    broker, file, frames = session
+    bash = ConversationTurn(
+        id="t",
+        role="assistant",
+        content="",
+        parts=[{"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {}}],
+    )
+    broker._conversation_turns = [bash]
+    broker._unrestored_questions = {
+        "tty-1": {
+            "request_id": "tty-1",
+            "tool_use_id": "toolu_bash",
+            "metadata": {"control_kind": kind} if kind else {},
+        }
+    }
+    assert (await broker.reconcile_open_questions(trigger=RECONCILE_SWEEP))["checked"] == 0
+    assert broker._unrestored_questions and not frames
+
+
+async def test_a_hung_screen_check_keeps_every_question(session):
+    broker, file, frames = session
+    file.question(STRANDED)
+    broker._conversation_turns = [_question_turn(STRANDED)]
+    broker._transport.observe_native_menu_state = AsyncMock(side_effect=TimeoutError)
+    outcome = await broker.reconcile_open_questions(trigger=RECONCILE_SWEEP)
+    assert outcome["closed"] == [] and not frames
+    assert outcome["kept"] == [{"tool_use_id": STRANDED, "why": "unanswered, menu timed out"}]
+    assert broker.question_reconcile_counts["screen_check_timeouts"] == 1
+
+
+async def test_a_restored_card_whose_question_the_record_answered_stops_replaying(session):
+    broker, file, frames = session
+    turn = _question_turn(STRANDED)
+    turn.parts.append({"type": "tool_result", "tool_use_id": STRANDED, "content": "Yes"})
+    broker._conversation_turns = [turn]
+    broker._unrestored_questions = {
+        "tty-1-c0653dcb": {
+            "request_id": "tty-1-c0653dcb",
+            "tool_use_id": STRANDED,
+            "metadata": {"control_kind": "question"},
+        }
+    }
+    outcome = await broker.reconcile_open_questions(trigger=RECONCILE_START)
+    assert outcome["closed"][0]["reason"] == "resolved_in_terminal"
+    assert broker._unrestored_questions == {}
+    # The record's real answer stays the only result.
+    assert [p for p in broker._conversation_turns[0].parts if p["type"] == "tool_result"] == [
+        {"type": "tool_result", "tool_use_id": STRANDED, "content": "Yes"}
+    ]
+
+
+async def test_a_real_answer_after_a_close_replaces_the_closure_live(session):
+    broker, file, frames = session
+    broker._conversation_turns = [_question_turn(PHANTOM)]
+    await broker.reconcile_open_questions(trigger=RECONCILE_START)
+    assert _closures(broker)[PHANTOM]["metadata"]["source"] == QUESTION_CLOSURE_SOURCE
+    await broker._handle_cli_event(
+        {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": PHANTOM, "content": "Yes"}]
+            },
+        }
+    )
+    sources = [
+        (p.get("metadata") or {}).get("source")
+        for t in broker._conversation_turns
+        for p in t.parts
+        if p.get("type") == "tool_result" and p["tool_use_id"] == PHANTOM
+    ]
+    assert QUESTION_CLOSURE_SOURCE not in sources
