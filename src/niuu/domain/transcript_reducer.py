@@ -113,6 +113,12 @@ NON_BROADCAST_KINDS: frozenset[str] = frozenset(
     {"conversation.turn", "conversation.projection", "history_import"}
 )
 
+# A broker that stops while its agent's turn is open logs this frame, then saves the open
+# span as an interrupted turn (LEX-1982). A rebuild closes the span at the same frame, so
+# the turn the broker saved and the one a rebuild gives agree (INV-4). Logged, never
+# broadcast live.
+TURN_INTERRUPTED_KIND = "turn_interrupted"
+
 # Per-connect handshake/preamble frames: addressed to ONE freshly-connecting
 # socket, NOT the canonical shared stream (SRD FR-7 / INV-5). On every browser
 # connect the broker emits a ``system`` "Connected to session …" welcome and a
@@ -943,6 +949,11 @@ def reduce_frames(
             imported_prefix_open = False
         if is_imported:
             imported_prefix_open = True
+        if k == TURN_INTERRUPTED_KIND:
+            # The broker stopped mid-turn and saved the open span as interrupted (LEX-1982).
+            flush(status="interrupted")
+            terminal_span_closed = True
+            continue
         if k == "ask_user_resolved":
             # The live broker closes a dismissed question as this frame arrives (LEX-1979).
             apply_question_closure(acc.parts, turns, p, _stamp_iso(_ts_of(r)))

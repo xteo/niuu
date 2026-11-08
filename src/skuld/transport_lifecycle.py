@@ -437,6 +437,8 @@ class TransportLifecycleMixin:
         if self._chronicle_watcher:
             await self._chronicle_watcher.stop()
 
+        # An open turn is saved as interrupted, then logged by the drain (LEX-1982).
+        self._interrupt_open_turn("broker_shutdown")
         # Drain and stop the durable event-log worker so the last turn persists
         await self._stop_event_log()
 

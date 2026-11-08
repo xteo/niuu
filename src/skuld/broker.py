@@ -39,6 +39,7 @@ from niuu.domain.message_sender import (
 from niuu.domain.outcome import parse_outcome_block
 from niuu.domain.text_projection import projection_revision
 from niuu.domain.transcript_reducer import (
+    TURN_INTERRUPTED_KIND,
     TurnAccumulator,
     apply_assistant_blocks,
     apply_question_closure,
@@ -1064,6 +1065,19 @@ class Broker(
             )
         )
         self._discard_pending_assistant_turn()
+
+    def _interrupt_open_turn(self, reason: str) -> None:
+        """Save the open assistant span as an interrupted turn before the broker stops.
+
+        The span lives only in memory until its turn ends, so a restart would drop it
+        from the record whenever the durable log is too large to read back (LEX-1982).
+        The ``turn_interrupted`` frame goes first: a rebuild closes the span at it,
+        giving the same turn, with the same id, as the one saved here.
+        """
+        if build_assistant_turn(self.session_id, self._pending_accumulator()) is None:
+            return
+        self._enqueue_event_log({"type": TURN_INTERRUPTED_KIND, "reason": reason})
+        self._flush_pending_assistant_turn(metadata={"status": "interrupted"})
 
     def _discard_pending_assistant_turn(self) -> None:
         """Clear the open assistant turn: after a flush, or when it is not to be saved."""
