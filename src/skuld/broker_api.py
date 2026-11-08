@@ -403,6 +403,9 @@ async def health() -> dict:
         **startup,
         **_BUILD_IDENTITY,
         "broker_contract": BROKER_CONTRACT,
+        # Questions closed without an answer, per stage and reason, and the reconcile's
+        # own failures, since this broker started (LEX-1979 f).
+        "question_counts": dict(sorted(broker.question_reconcile_counts.items())),
     }
 
 

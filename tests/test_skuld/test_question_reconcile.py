@@ -541,3 +541,43 @@ async def test_a_real_answer_after_a_close_replaces_the_closure_live(session):
         if p.get("type") == "tool_result" and p["tool_use_id"] == PHANTOM
     ]
     assert QUESTION_CLOSURE_SOURCE not in sources
+
+
+def _transport_close(request_id: str, *, trigger: str, reason: str, kind: str = "question"):
+    """An ask_user_resolved frame as the tmux transport emits it when a card closes."""
+    return {
+        "type": "ask_user_resolved",
+        "request_id": request_id,
+        "tool_use_id": f"toolu_{request_id}",
+        "decision": reason,
+        "accepted": False,
+        "dismissed": True,
+        "dismiss_reason": reason,
+        "dismiss_detail": "the menu is gone",
+        "dismiss_trigger": trigger,
+        "control_kind": kind,
+        "metadata": {"source": "tmux_tty_bridge"},
+    }
+
+
+async def test_every_question_close_is_counted_by_stage_and_reason(session, monkeypatch):
+    """LEX-1979 (f): closes by the transport are counted with the reconcile's, once each."""
+    broker, _, _ = session
+    await broker._handle_cli_event(
+        _transport_close("tty-2", trigger="delivery", reason="superseded")
+    )
+    await broker._handle_cli_event(_transport_close("tty-3", trigger="hook", reason="menu_gone"))
+    await broker._handle_cli_event(
+        _transport_close("perm-1", trigger="delivery", reason="superseded", kind="permission")
+    )
+
+    counts = broker.question_reconcile_counts
+    assert counts["closed.delivery.superseded"] == 1  # the permission card is not a question
+    assert counts["closed.hook.menu_gone"] == 1
+
+    import skuld.broker_api as api
+
+    monkeypatch.setattr(api, "broker", broker)
+    health = await api.health()
+    assert health["question_counts"]["closed.delivery.superseded"] == 1
+    assert health["question_counts"]["closed.hook.menu_gone"] == 1

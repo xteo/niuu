@@ -3790,6 +3790,12 @@ class Broker(
             # A question closed without an answer leaves its tool_use open in the record
             # for good (LEX-1979): close it there too, as the rebuild does from this frame.
             self._close_question_in_conversation(data, frame_ts)
+            if data.get("dismissed") and data.get("control_kind") == "question":
+                # Every close, whichever stage made it: the menu check, a hook, the
+                # reconcile, an operator (LEX-1979 f).
+                stage = data.get("dismiss_trigger") or "unattributed"
+                reason = data.get("dismiss_reason") or "unattributed"
+                self.question_reconcile_counts[f"closed.{stage}.{reason}"] += 1
 
         # Plan + running-agents surfacing: keep the latest plan and the live agent
         # set so reconnects + GET /api/plan|agents can answer. The frames are still

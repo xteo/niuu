@@ -243,8 +243,7 @@ class QuestionReconcileMixin:
             trigger,
             _DETAILS[reason],
         )
-        await self._handle_cli_event(frame)
-        self.question_reconcile_counts[f"closed.{trigger}.{reason}"] += 1
+        await self._handle_cli_event(frame)  # counted there, with every other close
 
     async def dismiss_record_question(self, tool_use_id: str, *, dismissed_by: str) -> dict:
         """An owner closes a question that is open only in the record (audited)."""
@@ -274,8 +273,7 @@ class QuestionReconcileMixin:
                 "control_kind": "question",
                 "metadata": {"source": "skuld_question_reconcile"},
             }
-        )
-        self.question_reconcile_counts["closed.operator.dismissed_by_operator"] += 1
+        )  # counted where the frame is handled, with every other close
         return {"tool_use_id": tool_use_id, "request_id": request_id, "dismiss_detail": detail}
 
     async def _run_question_reconcile_loop(self) -> None:
