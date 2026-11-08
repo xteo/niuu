@@ -120,7 +120,10 @@ class ActivityReportingMixin:
         return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
     def _open_controls(self, state: str) -> list[dict[str, str]] | None:
-        """The open human gates as ``[{request_id, kind, opened_at}]`` (F12d).
+        """The open human gates as ``[{request_id, kind, opened_at, tool_use_id?}]`` (F12d).
+
+        ``tool_use_id`` is the CLI's id for the call the gate asks about, when known
+        (LEX-1979), so a client can tie a transcript question to its card.
 
         Served by Forge on the session so the Code tab runs the same derived-state
         algorithm as the control plane. ``None`` means unknown: awaiting input on a
@@ -136,11 +139,17 @@ class ActivityReportingMixin:
         if state == "awaiting_input" and not pending:
             return None
         now = datetime.now(UTC).isoformat()
+        tool_use_ids = getattr(self, "_control_tool_use_ids", {})
         return [
             {
                 "request_id": request_id,
                 "kind": kind,
                 "opened_at": opened.setdefault(request_id, now),
+                **(
+                    {"tool_use_id": tool_use_ids[request_id]}
+                    if tool_use_ids.get(request_id)
+                    else {}
+                ),
             }
             for request_id, kind in pending.items()
         ]

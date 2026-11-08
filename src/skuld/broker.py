@@ -49,14 +49,17 @@ from niuu.domain.transcript_reducer import (
     apply_tool_result_blocks,
     assistant_turn_id,
     build_assistant_turn,
+    close_open_question,
     error_text,
     frame_turn_id,
     is_late_frame,
     note_message_id,
+    question_closure,
     result_metadata,
     result_repeats_error,
     steering_state_from_frame,
     steering_target_id,
+    tool_result_ids,
 )
 from niuu.domain.workflow_evidence import evaluate_workflow_evidence, validate_evidence_gate_nodes
 from niuu.domain.workflow_kickoff import (
@@ -124,6 +127,7 @@ from skuld.file_routes import (  # noqa: F401
 )
 from skuld.forge_mcp.integration import ForgeSessionMixin
 from skuld.history_hydration import fetch_durable_history, merge_history_turns
+from skuld.question_reconcile import QuestionReconcileMixin
 from skuld.service_manager import (  # noqa: F401
     ServiceCreateRequest,
     ServiceManager,
@@ -604,6 +608,7 @@ class Broker(
     EventLogMixin,
     ActivityReportingMixin,
     ChronicleMixin,
+    QuestionReconcileMixin,
 ):
     """WebSocket broker for Claude Code sessions.
 
@@ -823,6 +828,9 @@ class Broker(
         # (ask_user.resolved), and turn completion (result).
         self._pending_ask_user_questions: dict[str, dict[str, Any]] = {}
         self._unrestored_questions: dict[str, dict[str, Any]] = {}
+        # The CLI's tool_use_id for each open control, served in open_controls so a client
+        # ties a transcript question (toolu_…) to its card (LEX-1979).
+        self._control_tool_use_ids: dict[str, str] = {}
         self._unrestored_permissions: dict[str, dict[str, Any]] = {}
 
         # Msg ids whose transport delivery task is still in flight (mid-retry, not yet
@@ -956,6 +964,31 @@ class Broker(
                 "turn": turn_record(turn),
             }
         )
+
+    def _close_question_in_conversation(self, data: dict, frame_ts: datetime) -> bool:
+        """Write a dismissed question's closing tool_result into its turn (LEX-1979).
+
+        The same transition ``apply_question_closures`` applies on a rebuild from the
+        logged ``ask_user_resolved`` frame, so live and rebuilt history agree. A
+        question some turn already has a result for is left alone.
+        """
+        closure = question_closure(data)
+        if closure is None:
+            return False
+        tool_use_id, payload = closure
+        records = [turn_record(turn) for turn in self._conversation_turns]
+        if tool_use_id in tool_result_ids([*records, {"parts": self._pending_assistant_parts}]):
+            return False
+        ended_at = frame_ts.isoformat()
+        if close_open_question(self._pending_assistant_parts, tool_use_id, payload, ended_at):
+            return True
+        for turn in reversed(self._conversation_turns):
+            if turn.role == "assistant" and close_open_question(
+                turn.parts, tool_use_id, payload, ended_at
+            ):
+                self._save_conversation_history()
+                return True
+        return False
 
     def _serialize_in_progress_turn(self) -> dict | None:
         """Reconstruct the in-flight assistant turn as a turn-shaped dict (or None when idle).
@@ -3634,6 +3667,9 @@ class Broker(
             if ask_request_id:
                 self._pending_ask_user_questions[ask_request_id] = dict(data)
                 self._unrestored_questions.pop(ask_request_id, None)
+                native_tool_use_id = str(data.get("tool_use_id") or "")
+                if native_tool_use_id and native_tool_use_id != ask_request_id:
+                    self._control_tool_use_ids[ask_request_id] = native_tool_use_id
                 # A native adapter may reissue the same question with a fresh
                 # RPC ID. Retire only matching historical text, never another ask.
                 for old_id, old in list(self._unrestored_questions.items()):
@@ -3678,8 +3714,12 @@ class Broker(
             if resolved_request_id:
                 self._pending_ask_user_questions.pop(resolved_request_id, None)
                 self._unrestored_questions.pop(resolved_request_id, None)
+                self._control_tool_use_ids.pop(resolved_request_id, None)
                 self._save_control_state()
                 asyncio.create_task(self._exit_attention(resolved_request_id))
+            # A question closed without an answer leaves its tool_use open in the record
+            # for good (LEX-1979): close it there too, as the rebuild does from this frame.
+            self._close_question_in_conversation(data, frame_ts)
 
         # Plan + running-agents surfacing: keep the latest plan and the live agent
         # set so reconnects + GET /api/plan|agents can answer. The frames are still
@@ -3889,6 +3929,7 @@ class Broker(
             # awaiting_input.
             self._pending_attention.clear()
             self._pending_ask_user_questions.clear()
+            self._control_tool_use_ids.clear()
             for permission_id in list(self._pending_permission_requests):
                 self._clear_pending_permission_request(permission_id)
             self._unrestored_questions.clear()
@@ -4928,16 +4969,37 @@ class Broker(
             raise NativeControlsUnsupportedError(
                 "This session's transport has no native-control cards"
             )
-        return transport.list_native_controls()
+        return {
+            **transport.list_native_controls(),
+            # Questions open only in the record or the restored list, and the closes of
+            # each reconcile stage (LEX-1979).
+            "record_questions": [
+                {"tool_use_id": tool_use_id, "request_id": request_id}
+                for tool_use_id, request_id in self._open_record_questions().items()
+                if tool_use_id not in transport.open_question_tool_use_ids()
+            ],
+            "reconcile_counts": dict(self.question_reconcile_counts),
+        }
 
     async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:
-        """Close one card for an operator (audited by the transport and here)."""
+        """Close one card, or a question open only in the record, for an operator.
+
+        ``request_id`` is a card's id, or for a question with no card its CLI
+        ``tool_use_id`` (``toolu_…``) or its ``reconcile:<tool_use_id>`` id. Audited by
+        the transport and here.
+        """
         transport = self._transport
         if transport is None or not transport.capabilities.native_controls:
             raise NativeControlsUnsupportedError(
                 "This session's transport has no native-control cards"
             )
-        dismissed = await transport.dismiss_native_control(request_id, dismissed_by=dismissed_by)
+        try:
+            dismissed = await transport.dismiss_native_control(
+                request_id, dismissed_by=dismissed_by
+            )
+        except LookupError:
+            tool_use_id = request_id.removeprefix("reconcile:")
+            return await self.dismiss_record_question(tool_use_id, dismissed_by=dismissed_by)
         logger.warning(
             "AUDIT session %s: native control %s dismissed by operator %s",
             self.session_id,

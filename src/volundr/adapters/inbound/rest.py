@@ -1385,8 +1385,9 @@ class SessionResponse(BaseModel):
     open_controls: list[dict] | None = Field(
         default=None,
         description=(
-            "Open human gates as [{request_id, kind, opened_at}] from the broker's control "
-            "state; null means unknown, never 'none open'"
+            "Open human gates as [{request_id, kind, opened_at, tool_use_id?}] from the "
+            "broker's control state; tool_use_id is the CLI's id for the call when known "
+            "(LEX-1979); null means unknown, never 'none open'"
         ),
     )
 
@@ -5904,6 +5905,34 @@ def create_router(
             "dismiss",
             json_body={"dismissed_by": principal.user_id},
         )
+
+    @router.post(
+        "/sessions/{session_id}/native-controls/reconcile",
+        tags=["Sessions"],
+        responses={
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+        },
+    )
+    async def reconcile_native_questions(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> Response:
+        """Check a live session's open questions against its CLI session file now (LEX-1979).
+
+        Owner or admin only. Closes each question the CLI answered, never showed, or no
+        longer shows (audited, and pushed to every client); keeps one whose menu is on
+        screen. Answers ``{checked, closed, kept}``; 409 when the transport keeps no
+        session file or it cannot be read.
+        """
+        principal, base_url = await _native_controls_target(request, session_id)
+        logger.warning(
+            "AUDIT session %s: question reconcile requested by %s",
+            session_id,
+            _sanitize_log(principal.user_id),
+        )
+        return await _native_controls_call(request, session_id, base_url, "POST", "reconcile")
 
     @router.get(
         "/sessions/{session_id}/help/requests",

@@ -411,14 +411,14 @@ QUESTION = {"questions": [{"question": "Which DB?", "options": [{"label": "PG"}]
 QUESTION_MENU = "Which DB?\n❯ 1. PG\n  2. Type something.\n"
 
 
-async def _question_card(s: Session, *, settled: bool = True) -> str:
+async def _question_card(s: Session, *, settled: bool = True, age_s: float = 60.0) -> str:
     await s.hook(
         "PreToolUse", tool_name="AskUserQuestion", tool_input=QUESTION, tool_use_id="toolu_q"
     )
     [card] = _ask_user_questions(s.events)
     rid = card["request_id"]
     if settled:  # the menu has had its render window
-        s.transport._pending_tty_prompts[rid]["opened_monotonic"] -= 60.0
+        s.transport._pending_tty_prompts[rid]["opened_monotonic"] -= age_s
     return rid
 
 
@@ -431,7 +431,8 @@ def _a_sweep_interval_later(s: Session, rid: str) -> None:
 async def test_a_question_card_closes_only_after_the_configured_absent_checks(tmp_path):
     """LEX-1979: the sweep checks question cards too (menu_checked_at was null for 6 h)."""
     async with Session(tmp_path, native_control_absent_checks=3) as s:
-        rid = await _question_card(s)
+        # Younger than a sweep interval: a delivery alone does not close it.
+        rid = await _question_card(s, age_s=5.0)
         assert await s.transport.sweep_native_controls() == []
         [view] = s.transport.list_native_controls()["controls"]
         assert view["menu_state"] == MENU_GONE and view["menu_checked_at"]
@@ -598,6 +599,27 @@ async def test_a_delivery_with_no_card_types_nothing_into_a_live_submit_page(tmp
             await s.transport.send_message("steer")
         assert refused.value.menu_state == MENU_LIVE
         assert s.typed() == [] and _keys(s.transport) == []
+
+
+async def test_a_delivery_closes_a_settled_question_whose_menu_is_gone(tmp_path):
+    """LEX-1979 (b): a message is never refused for a menu that is not on screen."""
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s, age_s=60.0)
+        await s.transport.send_message("Damien: still there?")
+        [dismissal] = s.dismissals()
+        assert dismissal["request_id"] == rid
+        assert dismissal["dismiss_reason"] == DISMISS_MENU_NOT_SHOWN
+        assert dismissal["dismiss_trigger"] == "delivery"
+        assert s.typed() == ["Damien: still there?"]
+
+
+async def test_a_delivery_keeps_a_settled_question_whose_menu_is_live(tmp_path):
+    async with Session(tmp_path) as s:
+        await _question_card(s, age_s=60.0)
+        s.transport.capture_stdout = QUESTION_MENU
+        with pytest.raises(NativeControlPendingError):
+            await s.transport.send_message("steer")
+        assert s.typed() == [] and not s.dismissals()
 
 
 async def test_absent_checks_must_be_positive(tmp_path):

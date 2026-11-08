@@ -38,7 +38,11 @@ from typing import TYPE_CHECKING, Any
 
 from niuu.domain.conversation_timeline import project_timeline, timeline
 from niuu.domain.text_projection import apply_repair_markers, repair_legacy_turns
-from niuu.domain.transcript_reducer import apply_steering_frames, reduce_frames
+from niuu.domain.transcript_reducer import (
+    apply_question_closures,
+    apply_steering_frames,
+    reduce_frames,
+)
 
 if TYPE_CHECKING:
     from volundr.domain.models import SessionLogEntry
@@ -144,6 +148,7 @@ def rebuild_turns(entries: list[SessionLogEntry]) -> RebuildResult:
     # Explicit verified repairs take precedence over automatic reconstruction,
     # including native item IDs/phases recovered from a separately verified log.
     turns = apply_steering_frames(result.turns, rows)
+    turns = apply_question_closures(turns, rows)
     turns = apply_repair_markers(turns, rows)
     turns = repair_legacy_turns(turns, rows)
     return RebuildResult(

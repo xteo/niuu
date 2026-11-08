@@ -256,3 +256,32 @@ async def test_a_non_json_broker_reply_is_wrapped(client, service, body):
         client_cls.return_value.__aenter__.return_value = broker
         response = client.get(f"/api/v1/forge/sessions/{session.id}/native-controls")
     assert response.status_code == 502 and response.json() == {"detail": "not json"}
+
+
+async def test_owner_reconcile_proxies_to_the_broker_and_is_audited(client, service, caplog):
+    """LEX-1979: an owner checks the session's open questions against its CLI session file."""
+    session = await _running(service)
+    caplog.set_level(logging.WARNING)
+    outcome = {"checked": 1, "closed": [{"tool_use_id": "toolu_x", "reason": "never_shown"}]}
+    with (
+        _principal(OWNER),
+        patch("volundr.adapters.inbound.rest.httpx.AsyncClient") as client_cls,
+    ):
+        broker = AsyncMock()
+        broker.request.return_value = _broker_reply(200, {**outcome, "kept": []})
+        client_cls.return_value.__aenter__.return_value = broker
+        response = client.post(f"/api/v1/forge/sessions/{session.id}/native-controls/reconcile")
+    assert response.status_code == 200
+    assert response.json()["closed"] == outcome["closed"]
+    method, url = broker.request.await_args.args
+    assert method == "POST"
+    assert url.endswith(f"/s/{session.id}/api/native-controls/reconcile")
+    assert broker.request.await_args.kwargs["headers"]["x-niuu-room-role"] == "owner"
+    assert "question reconcile requested by dfagnou" in caplog.text
+
+
+async def test_a_session_credential_may_not_reconcile(client, service):
+    session = await _running(service)
+    with _principal(SESSION_TOKEN):
+        response = client.post(f"/api/v1/forge/sessions/{session.id}/native-controls/reconcile")
+    assert response.status_code == 403

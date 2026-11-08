@@ -119,3 +119,18 @@ def test_any_other_message_refusal_stays_a_plain_error() -> None:
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Session is not running"}
+
+
+@respx.mock
+def test_a_reconcile_goes_to_the_owning_host() -> None:
+    """LEX-1979: the Guild facade forwards an owner's question reconcile."""
+    client = _owned_by_beta()
+    reconciled = respx.post(f"{SESSIONS}/s2/native-controls/reconcile").mock(
+        return_value=Response(200, json={"checked": 0, "closed": [], "kept": []})
+    )
+    response = client.post(
+        "/api/v1/forge/sessions/s2/native-controls/reconcile", headers=_headers()
+    )
+    assert response.status_code == 200
+    assert response.json() == {"checked": 0, "closed": [], "kept": []}
+    assert reconciled.called

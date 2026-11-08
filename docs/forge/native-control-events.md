@@ -174,6 +174,45 @@ card (a background subagent's menu can wait while the main agent works). Neither
 the card's own tool call, one within the render window after the card opened (parallel tool
 calls), a subagent's or teammate's hook, or one that arrives after the broker stopped.
 
+## Questions the CLI is not asking: reconcile (LEX-1979)
+
+A question can be open in three places: the card above, the broker's pending and restored
+`ask_user_question` lists (replayed to every client that connects), and the conversation
+record (an AskUserQuestion `tool_use` with no `tool_result`). The CLI's session file
+(`~/.claude/projects/<workspace>/<native id>.jsonl`) is the truth. Skuld checks every question
+still open in the record or the restored list, and not an open card (the checks above cover
+those), against it at broker start, every sweep, and on
+`POST /sessions/{id}/native-controls/reconcile` (owner or admin, audited):
+
+| Session file says | Close | `dismiss_reason` |
+|---|---|---|
+| its `tool_result` is there | with that answer (`is_error: false`) | `resolved_in_terminal` |
+| its `tool_use` is not there at all | `Dismissed: the CLI never showed it …` | `never_shown` |
+| its `tool_use`, no result | kept while the pane shows a live menu or at broker start; otherwise `Dismissed: the CLI is no longer showing it.` | `menu_not_shown` |
+
+A question asked less than one sweep interval ago is not checked yet: its card may not be open,
+nor its call written to the file. An unreadable session file closes nothing (409 from the route,
+counted as `transcript_unavailable`).
+
+Every close, by a check, a reconcile or an operator, is an `ask_user_resolved` frame with
+`dismissed: true`, `control_kind: "question"` and the CLI `tool_use_id`. It clears the card and
+the broker's lists, and writes the closing `tool_result` into the question's turn, in whatever
+turn it is: live in the broker, and on every rebuild from the logged frame
+(`niuu.domain.transcript_reducer.apply_question_closures`), so a restart that replays the
+stored turns never brings the question back. The part carries
+`metadata: {source: "skuld_dismissal", dismissed: true, dismiss_reason, request_id}`; a real
+`tool_result` anywhere wins over a closure.
+
+The dismiss route also takes a question with no card: pass its `tool_use_id` (or
+`reconcile:<tool_use_id>`) as the request id. `GET …/native-controls` lists those as
+`record_questions`, and `reconcile_counts` counts each close as
+`closed.<trigger>.<reason>`, where the trigger is `reconcile_start`, `reconcile_sweep`,
+`reconcile_owner` or `operator`.
+
+`open_controls` on the session (REST and `session_updated`) carries each control's CLI
+`tool_use_id` when known: `[{request_id, kind, opened_at, tool_use_id?}]`. A client shows a
+question as waiting only while `open_controls` lists it.
+
 ## A message while a card is open: 409 `native_control_pending`
 
 Skuld does **not** type a message into a live menu. In Claude's permission menu a digit

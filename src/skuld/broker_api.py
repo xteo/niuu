@@ -44,6 +44,7 @@ from skuld.conversation_snapshot import ConversationSnapshotTooLargeError, prepa
 from skuld.event_log import FORGE_SESSIONS_PATH
 from skuld.file_routes import register_file_routes
 from skuld.forge_mcp.routes import register_forge_mcp_routes
+from skuld.native_question_index import NativeTranscriptUnavailableError
 from skuld.path_security import (
     UnsafePathError,
     resolve_contained_path,
@@ -58,6 +59,7 @@ from skuld.presented_durable import (
     upload_presented_file,
     write_pending_record,
 )
+from skuld.question_reconcile import RECONCILE_OWNER, NativeQuestionsUnsupportedError
 from skuld.room_role_port import RoomRoleResolutionError
 from skuld.service_manager import ServiceCreateRequest, ServiceStatus
 from volundr.log_aggregate import aggregate_workspace_logs
@@ -1735,6 +1737,21 @@ async def dismiss_native_control(
     except NativeControlsUnsupportedError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"status": "dismissed", "control": control}
+
+
+@app.post("/api/native-controls/reconcile")
+async def reconcile_native_questions(request: Request) -> dict:
+    """Check every open question against the CLI's session file now (owner only, LEX-1979).
+
+    Closes each question the CLI has answered, never showed, or no longer shows, and
+    keeps one whose menu is on screen. Each close is audited and reaches every client.
+    """
+    if await _room_role_from_state(request) != "owner":
+        raise HTTPException(403, "Only the session owner may reconcile native questions")
+    try:
+        return await broker.reconcile_open_questions(trigger=RECONCILE_OWNER)
+    except (NativeQuestionsUnsupportedError, NativeTranscriptUnavailableError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/communication/routes")

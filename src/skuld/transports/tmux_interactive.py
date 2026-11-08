@@ -126,6 +126,7 @@ DISMISS_MENU_NOT_SHOWN = "menu_not_shown"
 DISMISS_BY_OPERATOR = "dismissed_by_operator"
 DISMISS_TURN_ENDED = "turn_ended"
 DISMISS_SUPERSEDED = "superseded"
+DISMISS_NEVER_SHOWN = "never_shown"
 _DISMISS_DETAILS = {
     DISMISS_RESOLVED_IN_TERMINAL: "resolved in terminal",
     DISMISS_MENU_NOT_SHOWN: "menu no longer shown",
@@ -1609,6 +1610,7 @@ class TmuxInteractiveTransport(CLITransport):
         if event_name != "UserPromptSubmit":
             self._schedule_native_usage(payload)
         self._note_superseding_hook(event_name, payload)
+        self._note_main_transcript_path(payload)
 
         if event_name == "UserPromptSubmit":
             if not self._is_child_hook(payload):
@@ -3940,6 +3942,40 @@ class TmuxInteractiveTransport(CLITransport):
         await self._emit_question_result_once(pending["native_tool_use_id"], frame)
         return True
 
+    def _note_main_transcript_path(self, payload: dict[str, Any]) -> None:
+        """Remember where the main conversation's session file is, as the CLI reports it."""
+        native_id = self._claude_native_session_id
+        path = self._coerce_str(payload.get("transcript_path"))
+        if (
+            native_id
+            and path
+            and not self._is_child_hook(payload)
+            and Path(path).name == f"{native_id}.jsonl"
+        ):
+            self._main_transcript_path = path
+
+    def native_transcript_path(self) -> str | None:
+        """The main conversation's session file, once a hook has reported it (LEX-1979)."""
+        path = getattr(self, "_main_transcript_path", None)
+        native_id = self._claude_native_session_id
+        if path and native_id and Path(path).name == f"{native_id}.jsonl":
+            return path
+        return None
+
+    def open_question_tool_use_ids(self) -> set[str]:
+        """The CLI tool calls the open cards ask about; their own checks apply to them."""
+        return {
+            str(pending["native_tool_use_id"])
+            for pending in self._pending_tty_prompts.values()
+            if pending.get("native_tool_use_id")
+        }
+
+    async def observe_native_menu_state(self) -> str:
+        """The main pane's menu state over the render window, under the input locks."""
+        async with self._answer_lock:
+            async with self._send_lock:
+                return await self._observe_native_menu()
+
     def _note_superseding_hook(self, event_name: str, payload: dict[str, Any]) -> None:
         """Mark open cards a later main-agent hook shows the CLI has moved past (LEX-1979).
 
@@ -4071,10 +4107,19 @@ class TmuxInteractiveTransport(CLITransport):
                 )
                 retired.append(rid)
                 continue
-            needed = (
-                1 if pending.get("kind") == "permission" else self._native_control_absent_checks
+            opened = pending.get("opened_monotonic")
+            settled = isinstance(opened, float) and (
+                time.monotonic() - opened >= self._native_control_sweep_interval_s
             )
-            if pending["absent_checks"] >= needed:
+            # A message is never refused for a menu that is not there (LEX-1979): at a
+            # delivery, a question open for a sweep interval closes on one gone check.
+            # A younger one needs the count, so a menu still drawing is not typed into.
+            needed = (
+                1
+                if pending.get("kind") == "permission" or (trigger == "delivery" and settled)
+                else self._native_control_absent_checks
+            )
+            if pending.get("absent_checks", 0) >= needed:
                 await self._dismiss_tty_prompt(rid, DISMISS_MENU_NOT_SHOWN, trigger=trigger)
                 retired.append(rid)
         return retired

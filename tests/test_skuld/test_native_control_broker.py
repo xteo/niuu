@@ -157,7 +157,12 @@ async def test_broker_dismiss_is_audited_and_unsupported_transports_refuse(tmp_p
     }
     b._transport.dismiss_native_control.assert_awaited_once_with("tty-1", dismissed_by="dfagnou")
     assert "dismissed by operator dfagnou" in caplog.text
-    assert b.list_native_controls() == {"controls": []}
+    b._transport.open_question_tool_use_ids = MagicMock(return_value=set())
+    assert b.list_native_controls() == {
+        "controls": [],
+        "record_questions": [],
+        "reconcile_counts": {},
+    }
 
     plain = _broker(tmp_path, native_controls=False)
     with pytest.raises(NativeControlsUnsupportedError):

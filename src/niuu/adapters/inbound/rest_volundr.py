@@ -3838,6 +3838,15 @@ def create_volundr_router(
         """The native-control cards a session's broker holds, from its owning host."""
         return await _forward_native_controls(request, principal, session_id, "GET")
 
+    @router.post("/sessions/{session_id}/native-controls/reconcile")
+    async def reconcile_session_native_questions(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> JSONResponse:
+        """Reconcile a session's open questions with its CLI session file (LEX-1979)."""
+        return await _forward_native_controls(request, principal, session_id, "POST", "/reconcile")
+
     @router.post("/sessions/{session_id}/native-controls/{request_id}/dismiss")
     async def dismiss_session_native_control(
         request: Request,

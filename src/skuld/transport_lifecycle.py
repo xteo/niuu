@@ -288,6 +288,11 @@ class TransportLifecycleMixin:
         # Initialize transport
         self._transport = self._create_transport()
         self._transport.on_event(self._handle_cli_event)
+        if self._transport.capabilities.native_controls:
+            # LEX-1979: close the questions the CLI is not asking, now and every sweep.
+            self._question_reconcile_task = asyncio.create_task(
+                self._run_question_reconcile_loop(), name=f"question-reconcile-{self.session_id}"
+            )
 
         # Initialize service manager
         self.service_manager = ServiceManager(self.workspace_dir)
@@ -438,6 +443,9 @@ class TransportLifecycleMixin:
         if self._activity_heartbeat_task is not None:
             self._activity_heartbeat_task.cancel()
             await asyncio.gather(self._activity_heartbeat_task, return_exceptions=True)
+        if self._question_reconcile_task is not None:
+            self._question_reconcile_task.cancel()
+            await asyncio.gather(self._question_reconcile_task, return_exceptions=True)
             self._activity_heartbeat_task = None
 
         if self._peer_watchdog_task is not None:
