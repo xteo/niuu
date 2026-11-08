@@ -558,12 +558,21 @@ async def test_a_hook_supersedes_nothing_until_the_main_conversation_is_known(tm
         assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
 
 
-async def test_a_main_hook_never_supersedes_a_background_subagents_card(tmp_path):
+async def test_a_main_hook_never_supersedes_a_background_subagents_question(tmp_path):
     async with Session(tmp_path) as s:
-        rid = await _question_card(s)
-        s.transport._pending_tty_prompts[rid]["child"] = True
+        await s.hook(
+            "PreToolUse",
+            tool_name="AskUserQuestion",
+            tool_input=QUESTION,
+            tool_use_id="toolu_sub_q",
+            agent_id="sub-1",
+        )
+        [card] = _ask_user_questions(s.events)
+        pending = s.transport._pending_tty_prompts[card["request_id"]]
+        assert pending["child"] is True
+        pending["opened_monotonic"] -= 60.0
         await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_x")
-        assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+        assert "superseded_by" not in pending
 
 
 async def test_a_hook_after_stop_starts_no_check(tmp_path):
@@ -672,6 +681,9 @@ async def test_turn_end_still_clears_cards_with_a_reason(tmp_path):
         ("", MENU_UNKNOWN),
         ("⏺ thinking…", MENU_UNKNOWN),
         (QUESTION_SUBMIT_PAGE, MENU_LIVE),
+        # The footer quoted in output: the composer follows it, so it is no menu.
+        ("Enter to select · ↑/↓ to navigate · Esc to cancel\n❯ ", MENU_GONE),
+        ("Enter to select · ↑/↓ to navigate · Esc to cancel\n❯ continue", MENU_UNKNOWN),
     ],
 )
 def test_native_menu_state(screen, state):

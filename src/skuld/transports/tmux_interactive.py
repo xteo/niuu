@@ -192,12 +192,11 @@ _SLASH_COMMAND_ROW_RE = re.compile(r"^(/\S+)\s{2,}(.+?)\s*$")
 _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
 # The highlighted row of a live Claude selection menu, e.g. "❯ 1. Yes".
 _SELECTED_MENU_ROW_RE = re.compile(r"^\s*❯\s*[1-9][.)]\s+\S")
-#: Rows only a Claude question menu draws: its key-help footer and its tab bar. A
-#: multi-select question with its unnumbered Submit row selected has no numbered
-#: selected row, so without these it would read as ``unknown`` (LEX-1979 review).
-_QUESTION_MENU_ROW_RE = re.compile(
-    r"^\s*(?:Enter to select\b.*\bEsc to cancel|←\s.*\bSubmit\s*→)\s*$"
-)
+#: The key-help footer a Claude question menu draws as its last row. A multi-select
+#: question with its unnumbered Submit row selected has no numbered selected row, so
+#: without it that menu would read as ``unknown`` (LEX-1979 review). It counts only as
+#: the screen's last row above menu rows: quoted in output, the composer follows it.
+_QUESTION_MENU_FOOTER_RE = re.compile(r"^\s*Enter to select\b.*\bEsc to cancel\s*$")
 # The generic permission answers Skuld accepts for any permission card (Telegram's
 # buttons, cards sent before the live menu rendered). Each maps onto the live menu's
 # equivalent row, in `_menu_label_key` form.
@@ -2866,6 +2865,8 @@ class TmuxInteractiveTransport(CLITransport):
         self._pending_tty_prompts[request_id] = {
             "kind": "question",
             "questions": questions,
+            # A subagent's question waits while the main agent works: never superseded.
+            "child": self._is_child_hook(payload or {}),
             **native,
             **self._card_opened(),
         }
@@ -3875,14 +3876,11 @@ class TmuxInteractiveTransport(CLITransport):
         if not rows:
             return MENU_UNKNOWN
         menu = cls._menu_rows("\n".join(rows))
-        shaped = (
-            bool(menu)
-            and (
-                cls._permission_menu_digit("allow", menu) is not None
-                or cls._custom_confirmation(menu)
-                or any(_SELECTED_MENU_ROW_RE.match(row) for row in rows)
-            )
-            or any(_QUESTION_MENU_ROW_RE.match(row) for row in rows)
+        shaped = bool(menu) and (
+            cls._permission_menu_digit("allow", menu) is not None
+            or cls._custom_confirmation(menu)
+            or any(_SELECTED_MENU_ROW_RE.match(row) for row in rows)
+            or bool(_QUESTION_MENU_FOOTER_RE.match(rows[-1]))
         )
         composer = any(cls._is_empty_prompt_row(row) for row in rows)
         if shaped and not composer:
