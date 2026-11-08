@@ -132,9 +132,11 @@ _DISMISS_DETAILS = {
     DISMISS_TURN_ENDED: "turn ended",
     DISMISS_SUPERSEDED: "the CLI moved on past it",
 }
-#: Main-agent hooks that prove the CLI is no longer waiting on a menu opened before
-#: them: Claude cannot submit a prompt or start another tool while a menu waits (LEX-1979).
-_SUPERSEDING_HOOKS = frozenset({"UserPromptSubmit", "PreToolUse", "PostToolUse"})
+#: Main-agent hooks that show the CLI is no longer waiting on a main-agent menu opened
+#: before them (LEX-1979): Claude takes no prompt and starts no new tool while one of its
+#: own menus waits. A PostToolUse is not evidence: a slow tool started in parallel with
+#: the waiting one finishes while its menu is still up.
+_SUPERSEDING_HOOKS = frozenset({"UserPromptSubmit", "PreToolUse"})
 #: What the pane shows for an open native control: its menu (``live``), the empty chat
 #: composer and no menu (``gone``), or neither / both (``unknown``, never cleared).
 MENU_LIVE = "live"
@@ -190,6 +192,12 @@ _SLASH_COMMAND_ROW_RE = re.compile(r"^(/\S+)\s{2,}(.+?)\s*$")
 _MENU_ROW_RE = re.compile(r"^\s*[❯>\s]*([1-9])[.)]\s+(.+?)\s*$")
 # The highlighted row of a live Claude selection menu, e.g. "❯ 1. Yes".
 _SELECTED_MENU_ROW_RE = re.compile(r"^\s*❯\s*[1-9][.)]\s+\S")
+#: Rows only a Claude question menu draws: its key-help footer and its tab bar. A
+#: multi-select question with its unnumbered Submit row selected has no numbered
+#: selected row, so without these it would read as ``unknown`` (LEX-1979 review).
+_QUESTION_MENU_ROW_RE = re.compile(
+    r"^\s*(?:Enter to select\b.*\bEsc to cancel|←\s.*\bSubmit\s*→)\s*$"
+)
 # The generic permission answers Skuld accepts for any permission card (Telegram's
 # buttons, cards sent before the live menu rendered). Each maps onto the live menu's
 # equivalent row, in `_menu_label_key` form.
@@ -3116,6 +3124,7 @@ class TmuxInteractiveTransport(CLITransport):
             # concurrent turn-end signal must not clear this entry while we're waiting
             # on it — `_clear_pending_tty_prompts` skips any entry with `answer_in_flight`.
             pending["answer_in_flight"] = True
+            pending.pop("superseded_by", None)
             try:
                 rows = await self._capture_menu_rows_wait(pane_id=pane_id)
                 if self._pending_tty_prompts.get(request_id) is not pending:
@@ -3163,6 +3172,7 @@ class TmuxInteractiveTransport(CLITransport):
         # live, which is the actual bug: the client's answer would be refused for a
         # question that vanished attribution-free instead of failing loudly and visibly.
         pending["answer_in_flight"] = True
+        pending.pop("superseded_by", None)
         try:
             result = await self._native_question_result(pending)
             if result is not None:
@@ -3865,10 +3875,14 @@ class TmuxInteractiveTransport(CLITransport):
         if not rows:
             return MENU_UNKNOWN
         menu = cls._menu_rows("\n".join(rows))
-        shaped = bool(menu) and (
-            cls._permission_menu_digit("allow", menu) is not None
-            or cls._custom_confirmation(menu)
-            or any(_SELECTED_MENU_ROW_RE.match(row) for row in rows)
+        shaped = (
+            bool(menu)
+            and (
+                cls._permission_menu_digit("allow", menu) is not None
+                or cls._custom_confirmation(menu)
+                or any(_SELECTED_MENU_ROW_RE.match(row) for row in rows)
+            )
+            or any(_QUESTION_MENU_ROW_RE.match(row) for row in rows)
         )
         composer = any(cls._is_empty_prompt_row(row) for row in rows)
         if shaped and not composer:
@@ -3931,13 +3945,21 @@ class TmuxInteractiveTransport(CLITransport):
     def _note_superseding_hook(self, event_name: str, payload: dict[str, Any]) -> None:
         """Mark open cards a later main-agent hook shows the CLI has moved past (LEX-1979).
 
-        Claude cannot take a prompt or start another tool while a menu waits, so such a
-        hook for another tool call, arriving after the card's menu had time to draw, is
-        evidence the card's menu is gone (an auto-compaction can drop the tool it asked
-        about). The card still closes only when the screen does not show a live menu;
-        the check runs at once instead of waiting for the next sweep.
+        Claude takes no prompt and starts no new tool while one of its own menus waits,
+        so such a hook, arriving after the card's menu had time to draw, is evidence the
+        card's menu is gone (an auto-compaction can drop the tool it asked about). Only
+        a hook from the known main conversation counts (a teammate is another session),
+        and only a main-agent card: a background subagent's menu can wait while the main
+        agent works. The card still closes only when the screen shows no menu and the
+        empty composer; the check runs at once instead of waiting for the next sweep.
         """
-        if event_name not in _SUPERSEDING_HOOKS or self._is_child_hook(payload):
+        if (
+            event_name not in _SUPERSEDING_HOOKS
+            or not self._alive
+            or self._is_child_hook(payload)
+            or not self._claude_native_session_id
+            or self._coerce_str(payload.get("session_id")) != self._claude_native_session_id
+        ):
             return
         tool_id = self._coerce_str(payload.get("tool_use_id"))
         settled_before = time.monotonic() - max(self._menu_render_wait_s, 0.0)
@@ -3946,6 +3968,7 @@ class TmuxInteractiveTransport(CLITransport):
             opened = pending.get("opened_monotonic")
             if (
                 pending.get("superseded_by")
+                or pending.get("child")
                 or pending.get("answer_in_flight")
                 or pending.get("answer_uncertain")
                 or not isinstance(opened, float)
@@ -3984,8 +4007,10 @@ class TmuxInteractiveTransport(CLITransport):
         watched for the whole render window. A permission card closes on one check with
         no menu and the empty composer; a question card needs
         ``tmux_native_control_absent_checks`` such checks in a row (LEX-1979). A card a
-        later main-agent hook superseded closes on any check that does not show a live
-        menu. A card being answered, or whose answer is uncertain, is left alone.
+        later main-agent hook superseded closes on its first such check. ``unknown``
+        never closes a card: a multi-select question with its unnumbered Submit row
+        selected reads as ``unknown``. A card being answered, or whose answer is
+        uncertain, is left alone.
         """
         candidates = [
             (rid, pending)
@@ -4014,16 +4039,23 @@ class TmuxInteractiveTransport(CLITransport):
             changed = pending.get("menu_state") != state
             pending["menu_state"] = state
             pending["menu_checked_at"] = checked_at
-            if state == MENU_GONE:
-                pending["absent_checks"] = pending.get("absent_checks", 0) + 1
-            elif state == MENU_LIVE:
+            if state != MENU_GONE:
                 pending["absent_checks"] = 0
+                pending.pop("absent_counted_monotonic", None)
+                if state == MENU_LIVE:
+                    # The menu is up after all: whatever superseded it was not proof.
+                    pending.pop("superseded_by", None)
+            elif self._absent_check_counts(pending):
+                pending["absent_checks"] = pending.get("absent_checks", 0) + 1
+                pending["absent_counted_monotonic"] = time.monotonic()
             if changed and state != MENU_GONE:
                 await self._emit_native_control_state(rid, pending)
+        if state != MENU_GONE:
+            return retired
         for rid, pending in remaining:
             if self._pending_tty_prompts.get(rid) is not pending:
                 continue
-            if pending.get("superseded_by") and state != MENU_LIVE:
+            if pending.get("superseded_by"):
                 superseded = pending["superseded_by"]
                 await self._dismiss_tty_prompt(
                     rid,
@@ -4041,8 +4073,6 @@ class TmuxInteractiveTransport(CLITransport):
                 )
                 retired.append(rid)
                 continue
-            if state != MENU_GONE:
-                continue
             needed = (
                 1 if pending.get("kind") == "permission" else self._native_control_absent_checks
             )
@@ -4050,6 +4080,17 @@ class TmuxInteractiveTransport(CLITransport):
                 await self._dismiss_tty_prompt(rid, DISMISS_MENU_NOT_SHOWN, trigger=trigger)
                 retired.append(rid)
         return retired
+
+    def _absent_check_counts(self, pending: dict[str, Any]) -> bool:
+        """A ``gone`` check counts once per sweep interval, so the count measures time.
+
+        Refused deliveries also check the screen; without this, a burst of messages
+        while a question's menu is still drawing (slow PreToolUse hooks) would close it.
+        """
+        last = pending.get("absent_counted_monotonic")
+        return not isinstance(last, float) or (
+            time.monotonic() - last >= self._native_control_sweep_interval_s
+        )
 
     async def _emit_native_control_state(self, request_id: str, pending: dict[str, Any]) -> None:
         await self._emit(

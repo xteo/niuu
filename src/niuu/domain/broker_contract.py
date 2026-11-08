@@ -11,7 +11,7 @@ list, and restart, every session still below.
 A broker that reports no level predates this module and is below level 1.
 """
 
-BROKER_CONTRACT = 1
+BROKER_CONTRACT = 2
 
 # Why each level exists: what a broker below it gets wrong.
 BROKER_CONTRACT_LEVELS = {
@@ -20,6 +20,11 @@ BROKER_CONTRACT_LEVELS = {
         "refuses input while a native control is open (LEX-1936) and offers a permission "
         "card the live menu's rows (LEX-1950); a broker below it stores no sender, so "
         "the apps show 'Unknown sender'"
+    ),
+    2: (
+        "closes a native-control card the CLI has moved past: question cards are swept, "
+        "and a later main-agent hook for another tool call supersedes a card (LEX-1979); "
+        "a broker below it can refuse every message for hours behind a stale card"
     ),
 }
 

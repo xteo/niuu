@@ -142,7 +142,7 @@ client now carries the dismissal fields:
 |---|---|---|---|
 | `resolved_in_terminal` | `resolved in terminal` | The card's tool call finished: a `PostToolUse` / `PostToolUseFailure` or `PermissionDenied` hook for it, or its `tool_result` in the native transcript (a timed-out prompt fires no hook). | `completed_elsewhere` |
 | `menu_not_shown` | `menu no longer shown` | The menu stayed `gone` for the whole render window, at a delivery or a sweep: once for a permission card, `tmux_native_control_absent_checks` checks in a row for a question card. | `menu_not_shown` |
-| `superseded` | `the CLI moved on past it (<hook> for <tool_use_id> at <time>)` | A later main-agent `UserPromptSubmit`, `PreToolUse` or `PostToolUse` for another tool call arrived after the card's menu had time to draw, and the next check did not show a live menu. That check runs at once. | `superseded` |
+| `superseded` | `the CLI moved on past it (<hook> for <tool_use_id> at <time>)` | A later `UserPromptSubmit` or `PreToolUse` (for another tool call) from the main conversation arrived after a main-agent card's menu had time to draw, and the next check found the menu `gone`. That check runs at once. | `superseded` |
 | `dismissed_by_operator` | `dismissed by operator <principal>` | The dismiss endpoint below. | `dismissed_by_operator` |
 | `turn_ended` | `turn ended` | The agent's turn ended with the card still open (unchanged behaviour). | `turn_ended` |
 
@@ -156,17 +156,23 @@ Clients drop the card on any `ask_user_resolved` for its `request_id`, as before
 
 Permission and question cards are both cleared by these checks (LEX-1979). A question answered
 in the terminal closes on its transcript result, as a permission does. A question whose menu is
-gone needs `tmux_native_control_absent_checks` checks in a row, because its tool can be dropped
+gone needs `tmux_native_control_absent_checks` `gone` checks in a row, at most one counted per
+sweep interval (so a burst of refused messages while a menu is still drawing cannot close it);
+any check that is not `gone` starts the count again. It needs them because its tool can be dropped
 without any result: on 8 Nov 2026 an auto-compaction left ios-coordinator's question card open
 for six hours with no tool run, `menu_checked_at` never set (the sweep skipped questions) and
 every message refused. A card whose answer is in flight or uncertain is never cleared
 automatically.
 
-A superseding hook is evidence, not proof: Claude cannot take a prompt or start another tool
-while a menu waits, but a menu could still be on screen for another reason. So a superseded card
-closes only when the check does not show a live menu, and a hook for the card's own tool call,
-or one within the render window after the card opened (parallel tool calls), never counts.
-Subagent and teammate hooks never count.
+A superseding hook is evidence, not proof: Claude takes no prompt and starts no new tool while one
+of its own menus waits, but a menu could still be on screen for another reason. So a superseded
+card closes only on a `gone` check (one is enough), never on `unknown`, and a check that sees the
+menu `live` withdraws the evidence. A `PostToolUse` never counts (a slow tool started in parallel
+finishes while the menu waits), nor does a hook before Skuld knows the main conversation's
+session id (a teammate's hook would look like the main agent's), nor any hook for a subagent's
+card (a background subagent's menu can wait while the main agent works). Neither does a hook for
+the card's own tool call, one within the render window after the card opened (parallel tool
+calls), a subagent's or teammate's hook, or one that arrives after the broker stopped.
 
 ## A message while a card is open: 409 `native_control_pending`
 
@@ -277,7 +283,7 @@ terminal.
 | Setting | Default | Purpose |
 |---|---|---|
 | `tmux_native_control_sweep_interval_s` | 30 | How often open permission and question cards are re-checked. |
-| `tmux_native_control_absent_checks` | 3 | Checks in a row with no menu before a question card is dismissed (a permission card needs one). |
+| `tmux_native_control_absent_checks` | 3 | `gone` checks in a row, at most one per sweep interval, before a question card is dismissed (a permission card needs one). |
 | `tmux_person_only_prompt_timeout_s` | 120 | Claude Code's auto-deny timeout, stated in the notification. |
 | `tmux_question_transcript_max_bytes` | 1 MiB | The transcript read bound, shared with question answers. |
 

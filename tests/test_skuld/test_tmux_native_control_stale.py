@@ -300,15 +300,13 @@ async def test_13oct_unbound_card_the_cli_let_through_is_dismissed_once_its_menu
         )
         assert rid in s.transport._pending_tty_prompts  # not this card's exact call
 
-        # That result is for another tool call after the menu had time to draw, so the
-        # check it starts closes the card (LEX-1979); the screen shows no menu.
-        await _wait_until(lambda: bool(s.dismissals()), timeout=5.0)
+        # A result is no evidence (a parallel tool can finish while a menu waits).
+        assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+
+        assert await s.transport.sweep_native_controls() == [rid]
         [dismissal] = s.dismissals()
-        assert dismissal["dismiss_reason"] == DISMISS_SUPERSEDED
-        assert dismissal["dismiss_detail"].startswith(
-            "the CLI moved on past it (PostToolUse for toolu_other at "
-        )
-        assert dismissal["dismiss_trigger"] == "hook"
+        assert dismissal["dismiss_reason"] == DISMISS_MENU_NOT_SHOWN
+        assert dismissal["dismiss_detail"] == "menu no longer shown"
         assert dismissal["menu_state"] == MENU_GONE
         await s.transport.send_message("carry on")
         assert s.typed() == ["carry on"]
@@ -424,6 +422,12 @@ async def _question_card(s: Session, *, settled: bool = True) -> str:
     return rid
 
 
+def _a_sweep_interval_later(s: Session, rid: str) -> None:
+    s.transport._pending_tty_prompts[rid]["absent_counted_monotonic"] -= (
+        s.transport._native_control_sweep_interval_s
+    )
+
+
 async def test_a_question_card_closes_only_after_the_configured_absent_checks(tmp_path):
     """LEX-1979: the sweep checks question cards too (menu_checked_at was null for 6 h)."""
     async with Session(tmp_path, native_control_absent_checks=3) as s:
@@ -432,10 +436,18 @@ async def test_a_question_card_closes_only_after_the_configured_absent_checks(tm
         [view] = s.transport.list_native_controls()["controls"]
         assert view["menu_state"] == MENU_GONE and view["menu_checked_at"]
         assert view["absent_checks"] == 1
-        with pytest.raises(NativeControlPendingError) as refused:
-            await s.transport.send_message("steer")  # a refused delivery is check 2
+        # Refused deliveries within the same sweep interval do not add to the count:
+        # a burst of messages while the menu is still drawing must not close it.
+        for _ in range(3):
+            with pytest.raises(NativeControlPendingError) as refused:
+                await s.transport.send_message("steer")
         assert refused.value.control_kind == "question"
+        assert s.transport._pending_tty_prompts[rid]["absent_checks"] == 1
+        _a_sweep_interval_later(s, rid)
+        with pytest.raises(NativeControlPendingError):
+            await s.transport.send_message("steer")  # a delivery an interval later counts
         assert s.transport._pending_tty_prompts[rid]["absent_checks"] == 2
+        _a_sweep_interval_later(s, rid)
         assert await s.transport.sweep_native_controls() == [rid]
         [dismissal] = s.dismissals()
         assert dismissal["dismiss_reason"] == DISMISS_MENU_NOT_SHOWN
@@ -444,11 +456,12 @@ async def test_a_question_card_closes_only_after_the_configured_absent_checks(tm
         assert s.typed() == ["steer"]
 
 
-async def test_a_live_question_menu_resets_the_absent_count_and_keeps_the_card(tmp_path):
+@pytest.mark.parametrize("screen", ["", "QUESTION_MENU"])
+async def test_any_check_that_is_not_gone_resets_the_absent_count(tmp_path, screen):
     async with Session(tmp_path, native_control_absent_checks=2) as s:
         rid = await _question_card(s)
         await s.transport.sweep_native_controls()
-        s.transport.capture_stdout = QUESTION_MENU
+        s.transport.capture_stdout = QUESTION_MENU if screen == "QUESTION_MENU" else screen
         for _ in range(3):
             assert await s.transport.sweep_native_controls() == []
         assert s.transport._pending_tty_prompts[rid]["absent_checks"] == 0
@@ -490,31 +503,76 @@ async def test_7nov_a_prompt_typed_into_the_pane_supersedes_a_stranded_card(tmp_
         assert s.dismissals()[0]["dismiss_reason"] == DISMISS_SUPERSEDED
 
 
-async def test_a_superseded_card_whose_menu_is_live_is_kept(tmp_path):
+# A multi-select question with its unnumbered Submit row selected (Codex review of
+# LEX-1979): no numbered selected row, but its footer and tab bar make it live.
+QUESTION_SUBMIT_PAGE = (
+    Path(__file__).resolve().parents[1]
+    / "support/forge/screens/claude-question-mixed-07-down-submit.txt"
+).read_text()
+
+
+@pytest.mark.parametrize("screen", [QUESTION_MENU, QUESTION_SUBMIT_PAGE, ""])
+async def test_a_superseded_card_is_kept_unless_its_menu_is_gone(tmp_path, screen):
     async with Session(tmp_path) as s:
         rid = await _question_card(s)
-        s.transport.capture_stdout = QUESTION_MENU
+        s.transport.capture_stdout = screen
         await s.hook("UserPromptSubmit", prompt="typed")
         await asyncio.sleep(0.2)
         assert await s.transport.sweep_native_controls() == []
-        assert s.transport._pending_tty_prompts[rid]["superseded_by"]["hook"] == "UserPromptSubmit"
         assert not s.dismissals()
+        superseded = s.transport._pending_tty_prompts[rid].get("superseded_by")
+        if screen in (QUESTION_MENU, QUESTION_SUBMIT_PAGE):
+            # A live menu proves the hook was not evidence; a later unknown check
+            # (a failed capture) must not close it.
+            assert superseded is None
+            s.transport.capture_stdout = ""
+            assert await s.transport.sweep_native_controls() == []
+            assert rid in s.transport._pending_tty_prompts
+        else:
+            assert superseded["hook"] == "UserPromptSubmit"
 
 
 @pytest.mark.parametrize(
-    ("payload", "why"),
+    ("event", "payload", "why"),
     [
-        ({"tool_use_id": "toolu_q"}, "the card's own tool call"),
-        ({"tool_use_id": "toolu_sub", "agent_id": "sub-1"}, "a subagent"),
-        ({"tool_use_id": "toolu_mate", "session_id": "teammate-native"}, "a teammate"),
+        ("PreToolUse", {"tool_use_id": "toolu_q"}, "the card's own tool call"),
+        ("PreToolUse", {"tool_use_id": "toolu_sub", "agent_id": "sub-1"}, "a subagent"),
+        ("PreToolUse", {"tool_use_id": "t", "session_id": "teammate-native"}, "a teammate"),
+        ("PostToolUse", {"tool_use_id": "toolu_slow", "tool_response": {}}, "a parallel result"),
     ],
 )
-async def test_hooks_that_never_supersede_a_card(tmp_path, payload, why):
+async def test_hooks_that_never_supersede_a_card(tmp_path, event, payload, why):
     async with Session(tmp_path) as s:
         rid = await _question_card(s)
-        await s.hook("PostToolUse", tool_name="Read", tool_input={}, tool_response={}, **payload)
+        await s.hook(event, tool_name="WebFetch", tool_input={}, **payload)
         await asyncio.sleep(0.2)
         assert "superseded_by" not in s.transport._pending_tty_prompts.get(rid, {}), why
+
+
+async def test_a_hook_supersedes_nothing_until_the_main_conversation_is_known(tmp_path):
+    """Before Skuld knows its main session id, a teammate's hook looks like the main one."""
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        s.transport._claude_native_session_id = ""
+        await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_x")
+        assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+
+
+async def test_a_main_hook_never_supersedes_a_background_subagents_card(tmp_path):
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        s.transport._pending_tty_prompts[rid]["child"] = True
+        await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_x")
+        assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+
+
+async def test_a_hook_after_stop_starts_no_check(tmp_path):
+    async with Session(tmp_path) as s:
+        rid = await _question_card(s)
+        await s.transport.stop()
+        await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_x")
+        assert "superseded_by" not in s.transport._pending_tty_prompts.get(rid, {})
+        assert not s.transport._native_control_followups
 
 
 async def test_a_parallel_tool_hook_within_the_render_window_does_not_supersede(tmp_path):
@@ -522,6 +580,15 @@ async def test_a_parallel_tool_hook_within_the_render_window_does_not_supersede(
         rid = await _question_card(s, settled=False)
         await s.hook("PreToolUse", tool_name="Read", tool_input={}, tool_use_id="toolu_par")
         assert "superseded_by" not in s.transport._pending_tty_prompts[rid]
+
+
+async def test_a_delivery_with_no_card_types_nothing_into_a_live_submit_page(tmp_path):
+    async with Session(tmp_path) as s:
+        s.transport.capture_stdout = QUESTION_SUBMIT_PAGE
+        with pytest.raises(NativeControlPendingError) as refused:
+            await s.transport.send_message("steer")
+        assert refused.value.menu_state == MENU_LIVE
+        assert s.typed() == [] and _keys(s.transport) == []
 
 
 async def test_absent_checks_must_be_positive(tmp_path):
@@ -604,6 +671,7 @@ async def test_turn_end_still_clears_cards_with_a_reason(tmp_path):
         ("1. first step\n2. second step\n❯ ", MENU_GONE),
         ("", MENU_UNKNOWN),
         ("⏺ thinking…", MENU_UNKNOWN),
+        (QUESTION_SUBMIT_PAGE, MENU_LIVE),
     ],
 )
 def test_native_menu_state(screen, state):

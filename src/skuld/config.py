@@ -1197,10 +1197,11 @@ class SkuldSettings(BaseSettings):
         description=(
             "How many native-control checks in a row must see no menu and the empty chat "
             "composer before a question card the CLI no longer shows is dismissed (LEX-1979). "
-            "A permission card closes on one such check. Each check is a sweep "
-            "(tmux_native_control_sweep_interval_s) or a refused delivery, so with the "
-            "defaults a stranded question blocks messages for about a minute and a half; "
-            "a later hook from the main agent closes it at once."
+            "At most one check counts per tmux_native_control_sweep_interval_s, and any "
+            "other result starts the count again, so with the defaults a stranded question "
+            "blocks messages for one to one and a half minutes. A permission card closes on "
+            "one such check; a later prompt or tool start in the main conversation closes "
+            "either at the first such check."
         ),
     )
     tmux_person_only_prompt_timeout_s: float = Field(
