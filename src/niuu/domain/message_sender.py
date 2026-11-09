@@ -11,7 +11,8 @@ path the message took, never parsed from its text:
   names the call;
 * ``{"kind": "agent", "sub_kind": "automation", "name": <driver>}`` — a script,
   driver, crash reporter or scheduled summary;
-* ``{"kind": "agent", "sub_kind": "unknown"}`` — a REST post that named no sender;
+* ``{"kind": "agent", "sub_kind": "unknown"}`` — a message that named no sender and
+  carries neither a client request id nor a ``voice-call-`` one;
 * ``assistant`` — the session's own model; its turns carry no sender, the role
   says it, and no message may claim it.
 
@@ -56,7 +57,7 @@ _CLIENT_REQUEST_ID = re.compile(
 )
 # The request id the Lexi voice agent mints for each message it relays from a call
 # (``voice-call-<uuid>``, one per message, so it is not the call id) (LEX-2013).
-_VOICE_CALL_REQUEST_ID = re.compile(r"^voice-call-.+$")
+_VOICE_CALL_REQUEST_ID = re.compile(r"^voice-call-[A-Za-z0-9._:-]+$")
 
 
 # A one-line slash command (``/clear``, ``/effort high``), not prose that starts with

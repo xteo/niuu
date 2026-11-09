@@ -952,8 +952,8 @@ nor `assistant`. For every sender except the user, the text the model receives
 starts with one header line, for example
 `[Message from automation lexi-errturn-m6, not typed by the user]`, then a blank
 line and the message. A voice call is the owner, so its header says so:
-`[From the user by voice: Lexi voice call <id>, relayed by the voice agent]`; a slash command (`/clear`) is delivered unheaded so it
-still runs. The stored turn keeps the message as sent. `POST /sessions` takes
+`[From the user by voice: Lexi voice call <id>, relayed by the voice agent]`.
+A slash command (`/clear`) is delivered unheaded so it still runs. The stored turn keeps the message as sent. `POST /sessions` takes
 `initial_prompt_sender` the same way for the first prompt; without one, the first
 prompt carries no sender.
 

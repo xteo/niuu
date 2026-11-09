@@ -38,6 +38,7 @@ def test_the_lexi_clients_request_ids_are_the_user(request_id):
         "fmcp-1a2d3a0b3d664760ac677a79e033669d",
         "lexi-crash:abc",
         "voice-call-",
+        "voice-call- x",
         "a-voice-call-1",
     ],
 )
