@@ -15,6 +15,7 @@ from skuld.transports.grok import GrokACPTransport
 from skuld.transports.muse import MuseMSPTransport
 from skuld.transports.pi import PiProtocolError, PiRpcTransport
 from skuld.transports.tmux_interactive import TmuxInteractiveTransport
+from tests.support.claude_pickers import effort_ack, effort_slider
 
 
 @pytest.fixture
@@ -176,8 +177,10 @@ async def test_muse_and_claude_launch_and_change(tmp_path, claude_model):
     assert args[args.index("--effort") + 1] == "xhigh"
     claude._wait_for_repl_ready = AsyncMock()
     claude._send_slash_command = AsyncMock()
+    claude._send_key = AsyncMock()
+    claude._pane_poll_interval_s = 0
     claude._capture_pane_text = AsyncMock(
-        return_value="Set effort level to high\nSet effort level to low"
+        side_effect=["", effort_slider("xhigh"), effort_slider("low"), effort_ack("low")]
     )
     await claude._set_effort("low")
     assert (await claude.get_effort())["current"] == "low"

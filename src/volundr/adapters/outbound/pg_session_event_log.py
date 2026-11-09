@@ -39,7 +39,13 @@ from volundr.domain.history_import import (
 )
 from volundr.domain.models import SessionLogEntry
 from volundr.domain.ports import SessionEventLogRepository, _log_entries_conflict
-from volundr.domain.session_usage import fold_usage, observation, parse_json, projection_key
+from volundr.domain.session_usage import (
+    fold_usage,
+    observation,
+    parse_json,
+    projection_key,
+    runtime_choice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +247,11 @@ class PostgresSessionEventLog(SessionEventLogRepository):
         # The COUNT guard preserves orphan-log writes (there is deliberately no FK).
         entries = sorted(entries, key=lambda e: (str(e.session_id), e.seq))
         args = [self._entry_to_args(e) for e in entries]
-        has_usage = any(observation(e.payload, seq=e.seq, at=e.ts) is not None for e in entries)
+        has_usage = any(
+            observation(e.payload, seq=e.seq, at=e.ts) is not None
+            or runtime_choice(e.payload) is not None
+            for e in entries
+        )
         try:
             await self._append_batch(args, entries, has_usage=has_usage)
         except asyncpg.exceptions.UntranslatableCharacterError:
@@ -271,6 +281,28 @@ class PostgresSessionEventLog(SessionEventLogRepository):
                     by_session.setdefault(entry.session_id, []).append(entry.seq)
                 for sid, seqs in by_session.items():
                     await self._project_usage(conn, sid, seqs)
+                for entry in entries:
+                    await self._record_runtime_choice(conn, entry)
+
+    async def _record_runtime_choice(
+        self, conn: asyncpg.Connection, entry: SessionLogEntry
+    ) -> None:
+        """An applied model/effort switch becomes the session's launch choice (LEX-2022)."""
+        choice = runtime_choice(entry.payload)
+        if choice is None:
+            return
+        model, effort = choice
+        await conn.execute(
+            """UPDATE sessions SET
+                 model = COALESCE($2, model),
+                 workload_config = CASE WHEN $3::text IS NULL THEN workload_config
+                   ELSE jsonb_set(COALESCE(workload_config, '{}'::jsonb),
+                                  '{reasoningEffort}', to_jsonb($3::text)) END
+               WHERE id = $1""",
+            entry.session_id,
+            model,
+            effort,
+        )
 
     async def _project_usage(self, conn: asyncpg.Connection, sid: UUID, seqs: list[int]) -> None:
         row = await conn.fetchrow("SELECT session_usage FROM sessions WHERE id=$1 FOR UPDATE", sid)

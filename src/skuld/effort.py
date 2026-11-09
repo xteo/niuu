@@ -101,7 +101,13 @@ class EffortControlMixin:
                 if state.get("current") != value:
                     raise RuntimeError("The harness did not confirm the requested effort")
                 self._save_effort(value)
-            frame = {"type": "effort_status", "request_id": request_id, **state}
+            # ``applied`` marks a confirmed change, as opposed to a read (LEX-2022).
+            frame = {
+                "type": "effort_status",
+                "request_id": request_id,
+                "applied": bool(argument),
+                **state,
+            }
             await self._emit_broker_frame(frame)
             return frame
 

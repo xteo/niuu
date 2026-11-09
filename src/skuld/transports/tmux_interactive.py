@@ -288,6 +288,20 @@ class _TmuxResult:
 # Claude Code's acknowledgement of /model ("Set model to …", or "Kept model as …").
 _MODEL_ACK = re.compile(r"^.*(?:Set model to|Kept model as) .*$", re.MULTILINE)
 
+# LEX-2022: a typed `/model X` or `/effort X` saves X as the default for every new
+# Claude Code session on the host (~/.claude/settings.json). Only the pickers' "s"
+# (this session only) changes the running session alone, and the /model picker lists
+# just its aliases' current models. These are the ones a running session can switch to,
+# keyed to the picker row that names them (Sonnet and Haiku are not offered: Damien).
+SESSION_SWITCH_MODELS: dict[str, str] = {
+    "claude-opus-5-5": "Opus 5.5",
+    "claude-fable-5-2": "Fable 5.2",
+}
+_PICKER_SESSION_ONLY = "s to use this session only"
+_SLIDER_SESSION_ONLY = "s for this session only"
+_PICKER_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+\S.*?\s{2,}(\S.*?)\s*$")
+_SLIDER_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 
 @dataclass
 class _NativeUsageTail:
@@ -1365,32 +1379,39 @@ class TmuxInteractiveTransport(CLITransport):
             raise ValueError("Claude is working. Change /effort after this turn finishes.")
         async with self._send_lock:
             await self._wait_for_repl_ready()
-            await self._send_slash_command("effort", arguments=effort)
-            async with asyncio.timeout(self._effort_control_timeout):
-                while True:
-                    text = await self._capture_pane_text()
-                    # Native CLI acknowledgement, never merely the echoed command.
-                    confirmations = re.findall(
-                        r"Set effort level to (low|medium|high|xhigh|max)\b", text
-                    )
-                    if confirmations and confirmations[-1] == effort:
-                        self._reasoning_effort = effort
-                        return
-                    await asyncio.sleep(self._pane_poll_interval_s)
+            before = await self._capture_pane_text()
+            # The slider's "s" applies the level to this session only; a typed
+            # `/effort X` would save X as the host default (LEX-2022).
+            await self._send_slash_command("effort")
+            screen = await self._await_screen(_SLIDER_SESSION_ONLY, "/effort")
+            current = _slider_level(screen)
+            if current is None:
+                await self._send_key("Escape")
+                raise RuntimeError("Could not read the /effort slider's position")
+            step = _SLIDER_LEVELS.index(effort) - _SLIDER_LEVELS.index(current)
+            for _ in range(abs(step)):
+                await self._send_key("Right" if step > 0 else "Left")
+            if _slider_level(await self._capture_pane_text()) != effort:
+                await self._send_key("Escape")
+                raise RuntimeError(f"The /effort slider did not move to {effort}")
+            await self._send_key("s")
+            ack = f"Set effort level to {effort} (this session only)"
+            await self._await_new_line(ack, before, "/effort")
+            self._reasoning_effort = effort
 
     async def get_runtime_options(self, *, refresh: bool = False) -> dict:
         """The Claude models the effort vocabulary knows, and the model in effect.
 
-        Claude Code publishes no model catalog, so the choices are the product's
-        Claude entries in ``MODEL_EFFORTS``; ``current.model`` follows the native
+        Claude Code publishes no model catalog, and a running session can switch only
+        to its /model picker's models without changing the host default (LEX-2022), so
+        the choices are ``SESSION_SWITCH_MODELS``; ``current.model`` follows the native
         transcript, so a ``/model`` typed in the terminal shows here too.
         """
         if self._model_gateway_url:
             raise RuntimeError("Runtime options are not offered behind a model gateway")
         models = []
-        for model, levels in MODEL_EFFORTS.items():
-            if not model.startswith("claude-"):
-                continue
+        for model in SESSION_SWITCH_MODELS:
+            levels = MODEL_EFFORTS[model]
             models.append(
                 {
                     "id": model,
@@ -1427,10 +1448,13 @@ class TmuxInteractiveTransport(CLITransport):
         if options.get("service_tier") is not None:
             raise ValueError("Claude Code offers no service tiers")
         model = options.get("model") or self._model
-        if "model" in options:
-            state = await self.get_runtime_options()
-            if not any(entry["model"] == model for entry in state["models"]):
-                raise ValueError("The requested model is not in the Claude model catalog")
+        if "model" in options and model != self._model and model not in SESSION_SWITCH_MODELS:
+            offered = ", ".join(SESSION_SWITCH_MODELS)
+            raise ValueError(
+                f"A running Claude Code session can switch only to {offered} for this "
+                f"session alone; {model} needs the session's model set "
+                "(PUT /sessions/{id}) and a relaunch"
+            )
         effort = options.get("effort")
         if effort is not None:
             if not isinstance(effort, str):
@@ -1445,25 +1469,73 @@ class TmuxInteractiveTransport(CLITransport):
     async def _set_model(self, model: str) -> None:
         if self._turn_active:
             raise ValueError("Claude is working. Change /model after this turn finishes.")
+        display = SESSION_SWITCH_MODELS.get(model)
+        if display is None:
+            raise ValueError(f"{model} is not offered by the Claude Code /model picker")
         async with self._send_lock:
             await self._wait_for_repl_ready()
-            before = _MODEL_ACK.findall(await self._capture_pane_text())
-            await self._send_slash_command("model", arguments=model)
-            try:
-                async with asyncio.timeout(self._effort_control_timeout):
-                    while True:
-                        # The CLI names the model by display name, so the proof is
-                        # a new acknowledgement line, never the echoed command.
-                        after = _MODEL_ACK.findall(await self._capture_pane_text())
-                        if after and after != before:
-                            self._model = model
-                            return
-                        await asyncio.sleep(self._pane_poll_interval_s)
-            except TimeoutError as exc:
+            before = await self._capture_pane_text()
+            # The picker's "s" selects the model for this session only; a typed
+            # `/model X` would save X as the host default (LEX-2022).
+            await self._send_slash_command("model")
+            screen = await self._await_screen(_PICKER_SESSION_ONLY, "/model")
+            rows = _picker_rows(screen)
+            target = next((r for r in rows if r[2].startswith(f"{display} ·")), None)
+            cursor = next((r for r in rows if r[0]), None)
+            if target is None or cursor is None:
+                await self._send_key("Escape")
                 raise RuntimeError(
-                    "Claude did not acknowledge /model within effort_control_timeout_s; "
-                    "raise it if the CLI is slow to answer"
-                ) from exc
+                    f"The /model picker offers no {display} row; this Claude Code "
+                    "version cannot switch to it for this session"
+                )
+            step = target[1] - cursor[1]
+            for _ in range(abs(step)):
+                await self._send_key("Down" if step > 0 else "Up")
+            now = next((r for r in _picker_rows(await self._capture_pane_text()) if r[0]), None)
+            if now is None or now[1] != target[1]:
+                await self._send_key("Escape")
+                raise RuntimeError(f"The /model picker cursor did not reach {display}")
+            await self._send_key("s")
+            await self._await_new_line(
+                f"Set model to {display} for this session only", before, "/model"
+            )
+            self._model = model
+
+    async def _await_screen(self, marker: str, command: str) -> str:
+        """The pane once ``marker`` shows; a timeout names the knob and closes nothing."""
+        try:
+            async with asyncio.timeout(self._effort_control_timeout):
+                while True:
+                    text = await self._capture_pane_text()
+                    if marker in text:
+                        return text
+                    await asyncio.sleep(self._pane_poll_interval_s)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Claude did not open the {command} picker within effort_control_timeout_s; "
+                "raise it if the CLI is slow to answer"
+            ) from exc
+
+    async def _await_new_line(self, ack: str, before: str, command: str) -> None:
+        """Wait for a new native acknowledgement; a saved default is a hard error."""
+        seen = before.count(ack)
+        try:
+            async with asyncio.timeout(self._effort_control_timeout):
+                while True:
+                    text = await self._capture_pane_text()
+                    if text.count(ack) > seen:
+                        return
+                    if text.count("saved as your default") > before.count("saved as your default"):
+                        raise RuntimeError(
+                            f"Claude saved the {command} change as the host default; "
+                            "check ~/.claude/settings.json"
+                        )
+                    await asyncio.sleep(self._pane_poll_interval_s)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Claude did not acknowledge {command} within effort_control_timeout_s; "
+                "raise it if the CLI is slow to answer"
+            ) from exc
 
     async def send_control(self, subtype: str, **kwargs: object) -> None:
         if not self.is_alive:
@@ -5953,3 +6025,29 @@ class TmuxInteractiveTransport(CLITransport):
             return float(raw)
         except ValueError:
             return default
+
+
+def _picker_rows(screen: str) -> list[tuple[bool, int, str]]:
+    """(cursor, number, description) for each numbered row of the /model picker."""
+    rows = []
+    for line in screen.splitlines():
+        match = _PICKER_ROW.match(line)
+        if match:
+            rows.append((bool(match.group(1)), int(match.group(2)), match.group(3)))
+    return rows
+
+
+def _slider_level(screen: str) -> str | None:
+    """The /effort slider level under its ▲ marker, or None when the slider is not shown."""
+    lines = screen.splitlines()
+    for index, line in enumerate(lines):
+        labels = [(m.start(), m.group(0)) for m in re.finditer(r"[a-z]+", line)]
+        names = [name for _, name in labels]
+        if names[: len(_SLIDER_LEVELS)] != list(_SLIDER_LEVELS) or index == 0:
+            continue
+        marker = lines[index - 1].find("▲")
+        if marker < 0:
+            return None
+        centres = [(abs(start + len(name) / 2 - marker), name) for start, name in labels[:5]]
+        return min(centres)[1]
+    return None
