@@ -779,6 +779,12 @@ The turn blocks until a client answers:
 A controller that cannot meaningfully answer should surface the question to a
 human rather than auto-answering.
 
+In a Claude tmux session (LEX-2016) an answer may cover only some of the questions: name
+each question it answers, and list the rest in `"skipped": ["..."]`. A user message sent
+while a question is open closes the question the way Claude's own menu does ("Chat about
+this") and is then delivered; only a permission prompt refuses a message. See
+`docs/forge/native-control-events.md`.
+
 ### What to send
 
 The simplest valid user frame is:

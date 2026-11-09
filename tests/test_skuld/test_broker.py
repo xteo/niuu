@@ -3485,6 +3485,56 @@ class TestDispatchBrowserMessage:
         )
 
     @pytest.mark.asyncio
+    async def test_a_question_closed_to_deliver_the_message_is_not_reported_blocking(
+        self, test_broker
+    ):
+        # LEX-2016: the tmux bridge closes a live question to deliver a message; its
+        # resolved frame clears the question, so the ack says delivered.
+        test_broker._channels.broadcast = AsyncMock()
+        test_broker._apply_retrieval_reflex = AsyncMock(side_effect=lambda m: m)
+        test_broker._pending_ask_user_questions = {"q1": {"type": "ask_user_question"}}
+
+        async def close_question_then_type(*args, **kwargs):
+            test_broker._pending_ask_user_questions.pop("q1")
+
+        test_broker._transport.send_message = AsyncMock(side_effect=close_question_then_type)
+
+        await test_broker._dispatch_browser_message(
+            {"content": "use postgres", "request_id": "req-8"}
+        )
+        await _settle_delivery()
+
+        test_broker._channels.broadcast.assert_any_await(
+            {
+                "type": "user_delivered",
+                "status": "delivered",
+                "id": ANY,
+                "request_id": "req-8",
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_partial_answer_passes_its_skipped_questions_to_the_transport(
+        self, test_broker
+    ):
+        # LEX-2016: the app sends the questions left unanswered as `skipped`.
+        test_broker._transport.send_control = AsyncMock()
+        answers = [{"question": "Pick a colour?", "answer": "Red"}]
+
+        await test_broker._dispatch_browser_message(
+            {
+                "type": "ask_user_answer",
+                "request_id": "q1",
+                "answers": answers,
+                "skipped": ["Pick a size?"],
+            }
+        )
+
+        test_broker._transport.send_control.assert_awaited_once_with(
+            "ask_user_answer", request_id="q1", answers=answers, skipped=["Pick a size?"]
+        )
+
+    @pytest.mark.asyncio
     async def test_dispatch_user_message_steers_when_turn_active(self, test_broker):
         test_broker._transport.capabilities = TransportCapabilities(steer=True)
         test_broker._transport.is_turn_active = True

@@ -145,6 +145,7 @@ client now carries the dismissal fields:
 | `superseded` | `the CLI moved on past it (<hook> for <tool_use_id> at <time>)` | A later `UserPromptSubmit` or `PreToolUse` (for another tool call) from the main conversation arrived after a main-agent card's menu had time to draw, and the next check found the menu `gone`. That check runs at once. | `superseded` |
 | `dismissed_by_operator` | `dismissed by operator <principal>` | The dismiss endpoint below. | `dismissed_by_operator` |
 | `turn_ended` | `turn ended` | The agent's turn ended with the card still open (unchanged behaviour). | `turn_ended` |
+| `closed_for_message` | `closed so a message could be delivered (Chat about this)` or `(Esc)` | A message arrived while a question was live; Skuld closed it the CLI's own way and Claude's result confirmed the close (LEX-2016, below). | `closed_for_message` |
 
 `dismiss_trigger` says which check closed it: `tool_result`, `PermissionDenied`, `delivery`,
 `sweep`, `hook` (the check a superseding hook started), `operator` or `turn_ended`. When the transcript proves the result and no hook
@@ -213,14 +214,40 @@ The dismiss route also takes a question with no card: pass its `tool_use_id` (or
 `tool_use_id` when known: `[{request_id, kind, opened_at, tool_use_id?}]`. A client shows a
 question as waiting only while `open_controls` lists it.
 
-## A message while a card is open: 409 `native_control_pending`
+## A question never holds a session (LEX-2016)
+
+Claude Code's own question menu never traps a person, and the bridge does not either:
+
+- **A partial answer submits.** `ask_user_answer` may answer some of the questions: each
+  answer names its question (`question` text or `question_id`), and the optional `skipped`
+  list, when sent, must name exactly the questions left out. Skuld moves past each skipped
+  page with Right, as a person does, and presses Submit on the review page, which then warns
+  "You have not answered all questions". Claude's result names only the answered questions,
+  and that is the proof checked. An answer must cover at least one question; to answer none,
+  send a message. Cards carry `metadata.requires_all_answers: false`.
+- **A message closes a live question.** When a message arrives while a question card is open,
+  Skuld picks "Chat about this" on the question page (Esc on the review page, which has no
+  such row), waits for Claude's result for that tool call (hook or session file), closes the
+  card with `dismiss_reason: closed_for_message`, and then types the message. After "Chat
+  about this" Claude carries on in the same turn, so the message steers it; after Esc
+  Claude ends its turn, Skuld closes that turn from the session file's `turn_duration`, and
+  the message starts the next one. The delivery ACK is `delivered`.
+  - The closing key is pressed once. If Claude has not confirmed the close in
+    `question_result_wait_s`, delivery fails with `question_close_unconfirmed`, with nothing
+    typed. A retry presses nothing and waits for the same proof, and the sweep closes the card
+    once the proof lands. Meanwhile the card cannot be answered.
+  - A permission prompt still refuses the message (below). So does a question card being
+    answered, one with no CLI identity, or a screen that is not that question's menu.
+
+## A message while a permission card is open: 409 `native_control_pending`
 
 Skuld does **not** type a message into a live menu. In Claude's permission menu a digit
 selects a row and Enter confirms the highlighted row, which is "Yes" (Allow), so pasting a
 steer and pressing Enter would approve the pending command. The message is refused instead,
 and nothing is typed. This happens when:
 
-- a card is open after its delivery-time check (its menu is `live` or `unknown`), or
+- a permission card is open after its delivery-time check (its menu is `live` or `unknown`),
+  or a question card that cannot be closed as described above, or
 - no card is open but a recognizable menu is `live` on screen (for example after an operator
   dismissed a card whose menu is still there). `control_request_id` is then empty.
 

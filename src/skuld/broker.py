@@ -4472,6 +4472,9 @@ class Broker(
                     "ask_user_answer",
                     request_id=data.get("request_id", ""),
                     answers=data.get("answers", []),
+                    # The questions the person left unanswered (LEX-2016); None from
+                    # clients that predate it.
+                    skipped=data.get("skipped"),
                 )
                 # The human answered — the session is no longer blocked. Drop the
                 # replay entry too so a later reconnect doesn't re-surface an
@@ -5183,9 +5186,9 @@ class Broker(
         pending_q = len(self._pending_ask_user_questions)
         if pending_q:
             logger.warning(
-                "user message delivered while %d ask_user_question(s) pending "
-                "(request_id=%s) — a free-text steer may not start a turn until the "
-                "question is answered",
+                "user message arrived while %d ask_user_question(s) pending "
+                "(request_id=%s); a tmux session closes the question to deliver it "
+                "(LEX-2016), other transports deliver it as a steer",
                 pending_q,
                 _sanitize_log(request_id),
             )
@@ -5247,6 +5250,9 @@ class Broker(
         finally:
             self._delivering_msg_ids.discard(msg_id)
 
+        # A question open when the message arrived may have been closed to deliver it
+        # (LEX-2016): the ack reports the questions still open now.
+        pending_q = len(self._pending_ask_user_questions)
         await self._emit_delivery_ack(
             request_id,
             msg_id,

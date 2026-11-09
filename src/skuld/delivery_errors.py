@@ -48,3 +48,13 @@ class NativeControlPendingError(DeliveryNotAcceptedError):
             "control_opened_at": self.opened_at,
             "menu_state": self.menu_state,
         }
+
+
+class QuestionCloseUnconfirmedError(DeliveryNotAcceptedError):
+    """A message closed a live question, and Claude has not yet confirmed it closed.
+
+    The message itself was not typed, so a retry cannot duplicate it, and the retry
+    never presses the closing key again: it waits for the same native proof (LEX-2016).
+    """
+
+    code = "question_close_unconfirmed"
