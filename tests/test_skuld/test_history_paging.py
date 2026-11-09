@@ -374,3 +374,73 @@ def test_valid_base64_with_invalid_cursor_schema_is_rejected():
     ).decode()
     with pytest.raises(ValueError, match="Malformed"):
         page(rows(), cursor)
+
+
+def _kinds(turn):
+    return [(p.get("type"), p.get("id") or p.get("tool_use_id")) for p in turn["parts"]]
+
+
+def test_an_oversize_turn_is_elided_deeper_and_fits_without_part_paging():
+    """LEX-2017: one turn of 300 calls with ~600 B results (each under the shallow
+    1 KB line) was served whole over budget, and the apps reject such a page, so
+    "Show earlier" stopped there. Every part and call stays; only bodies go lazy."""
+    source = [*rows(4), tool_turn(300, result_bytes=600)]
+    original = copy.deepcopy(source)
+    shallow_only = snapshot_byte_size(page(source, budget=10**9, limit=1))
+    budget = 128 * 1024
+    assert shallow_only > budget  # the old page would not fit
+
+    result = page(source, budget=budget, limit=15)
+
+    assert snapshot_byte_size(result) <= budget
+    [turn] = result["turns"]
+    assert turn["id"] == "long" and "part_window" not in turn
+    assert _kinds(turn) == _kinds(source[-1])  # every part, every call, in order
+    assert turn["content"] == "final answer"
+    lazy = [p for p in turn["parts"] if p["type"] == "tool_result"]
+    assert all(p["truncated"] and p["byte_size"] == 600 and "content" not in p for p in lazy)
+    assert result["has_more_before"] and result["older_cursor"]
+    assert source == original
+
+
+def test_part_paging_clients_still_page_within_the_turn_unelided():
+    source = [*rows(4), tool_turn(300, result_bytes=600)]
+    result = page(source, budget=128 * 1024, limit=15, part_paging=True)
+    [turn] = result["turns"]
+    assert turn["part_window"]["end"] == len(source[-1]["parts"])
+    assert turn["part_window"]["offset"] > 0
+    results = [p for p in turn["parts"] if p["type"] == "tool_result"]
+    assert results and all(p["content"] == "r" * 600 for p in results)
+
+
+def test_a_turn_too_big_even_deep_elided_is_served_whole_as_before():
+    source = [*rows(2), tool_turn(300, result_bytes=600, content="y" * 200_000)]
+    result = page(source, budget=128 * 1024, limit=15)
+    [turn] = result["turns"]
+    # Deep elision cannot fit 200 KB of prose: the shallow turn is served whole.
+    assert snapshot_byte_size(result) > 128 * 1024
+    results = [p for p in turn["parts"] if p["type"] == "tool_result"]
+    assert all(p["content"] == "r" * 600 for p in results)
+
+
+def test_deep_elision_never_grows_a_part_and_keeps_questions_whole():
+    from skuld.conversation_shallow import elide_part_deep
+
+    tiny = {"type": "tool_result", "tool_use_id": "t", "content": "ok"}
+    assert elide_part_deep(tiny) is tiny
+    ask = {
+        "type": "tool_use",
+        "id": "q",
+        "name": "AskUserQuestion",
+        "input": {"questions": [{"question": "x" * 900, "options": []}]},
+    }
+    assert elide_part_deep(ask) is ask
+    edit = {
+        "type": "tool_use",
+        "id": "e",
+        "name": "Edit",
+        "input": {"file_path": "a.py", "old_string": "o" * 400, "new_string": "n" * 400},
+    }
+    deep = elide_part_deep(edit)
+    assert deep["input"]["_elided_input"] is True and deep["input"]["preview"] == "a.py"
+    assert snapshot_byte_size(deep) < snapshot_byte_size(edit)

@@ -1061,8 +1061,13 @@ rule for the byte budget is:
   `content`, `reasoning`, metadata and every part and tool call. Only the usual
   shallow elision applies (heavy `tool_result` content and `tool_use` input become
   lazy placeholders, loaded through `/tool-result/{tool_use_id}`).
-- **A single turn larger than the budget is returned whole** (the page is then
-  larger than `max_bytes`). A WebSocket replay whose frame would exceed
+- **A single turn larger than the budget is elided deeper, then returned whole**
+  (LEX-2017). Without `part_paging`, every `tool_result` body and `tool_use` input
+  whose placeholder is smaller than it becomes one (the same placeholder shapes,
+  loaded through the same `/tool-result/{tool_use_id}`), whatever its size; every
+  part and tool call stays. `AskUserQuestion` inputs stay whole. If even that does
+  not fit, the shallow turn is returned whole as before (the page is then larger
+  than `max_bytes`). A WebSocket replay whose frame would exceed
   `conversation_snapshot_max_bytes` is not sent; protocol 2 sends a `history_gap`
   (`snapshot_too_large`) and older clients get `conversation_history_too_large`,
   and both read the page over REST.
@@ -1093,7 +1098,8 @@ rule for the byte budget is:
   with `detail=shallow` it now keeps heavy tool results lazy.
 
 Without `part_paging`, a client never receives a `part_window`, so clients that
-predate it (web-next, earlier iOS/Mac builds) keep working: they get the whole turn.
+predate it (web-next, earlier iOS/Mac builds) keep working: they get the whole turn,
+deep-elided when that is what fits.
 
 ### Image tool-result previews
 

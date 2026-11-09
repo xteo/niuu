@@ -3,9 +3,11 @@
 A byte budget only ever drops OLDER WHOLE turns. A returned turn is complete:
 its content, reasoning and every part (under the shallow tool_result/input
 elision, whose full bodies stay lazily loadable). Nothing here cuts text or
-trims parts (LEX-1937). A single turn larger than the budget is either served
-whole, or — when the client negotiated ``part_paging`` — paged WITHIN by part
-ranges, each page carrying complete parts. Wire contract: "Bounded history
+trims parts (LEX-1937). A single turn larger than the budget is paged WITHIN by
+part ranges, each page carrying complete parts, when the client negotiated
+``part_paging``. Otherwise it is elided deeper — every tool body whose placeholder
+is smaller becomes one, every part and tool call kept (LEX-2017) — and served
+whole as it is only if even that does not fit. Wire contract: "Bounded history
 pages" in ``docs/forge/openclaw-session-orchestrator-guide.md``.
 """
 
@@ -15,7 +17,7 @@ import logging
 from niuu.domain.history_paging import history_page_metadata, select_history_window
 from niuu.domain.json_text import json_text_safe
 from niuu.domain.text_projection import projection_revision
-from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turns
+from skuld.conversation_shallow import SHALLOW_DETAIL, elide_turn_deep, elide_turns
 
 logger = logging.getLogger(__name__)
 
@@ -189,11 +191,14 @@ def prepare_history_page(
     require several bounded responses after growth: continuation_cursor names
     its remaining prefix, never a moving end-relative count.
 
-    The budget drops older whole turns. When one turn alone exceeds it, the turn
-    is served whole unless ``part_paging`` was negotiated (or the cursor already
-    names a part range): then the page holds the largest suffix of its complete
-    parts that fits — always at least one — with ``part_window`` on the turn and
-    an ``older_cursor`` to its preceding parts.
+    The budget drops older whole turns. When one turn alone exceeds it and
+    ``part_paging`` was negotiated (or the cursor already names a part range), the
+    page holds the largest suffix of its complete parts that fits — always at least
+    one — with ``part_window`` on the turn and an ``older_cursor`` to its preceding
+    parts. Without part paging the turn is elided deeper (``elide_turn_deep``: all
+    its parts and tool calls kept, each body lazily loadable) when that fits, and
+    served whole as it is otherwise (LEX-2017: clients reject an oversize page, so
+    "Show earlier" stopped at such a turn).
     """
     source = frame["turns"]
     revision = frame.get("projection_revision") or projection_revision(source)
@@ -238,6 +243,17 @@ def prepare_history_page(
     start = window.end - kept
     turns = selected[len(selected) - kept :]
     parts = window.parts
+    if kept == 1 and not part_paging and envelope + snapshot_byte_size(turns[0]) > budget:
+        deep = json_text_safe(elide_turn_deep(source[window.end - 1]))
+        if envelope + snapshot_byte_size(deep) <= budget:
+            logger.info(
+                "History page: turn %s is over its %d-byte budget at the shallow detail; "
+                "served with every tool body elided (%d bytes)",
+                deep.get("id"),
+                budget,
+                snapshot_byte_size(deep),
+            )
+            turns = [deep]
     if kept == 1 and part_paging and envelope + snapshot_byte_size(turns[0]) > budget:
         part_start, part_end = parts or (0, len(last.get("parts") or []))
         if part_end - part_start > 1:
