@@ -180,7 +180,7 @@ async def test_muse_and_claude_launch_and_change(tmp_path, claude_model):
     claude._send_key = AsyncMock()
     claude._pane_poll_interval_s = 0
     claude._capture_pane_text = AsyncMock(
-        side_effect=["", effort_slider("xhigh"), effort_slider("low"), effort_ack("low")]
+        side_effect=[effort_slider("xhigh"), effort_slider("low"), effort_ack("low")]
     )
     await claude._set_effort("low")
     assert (await claude.get_effort())["current"] == "low"

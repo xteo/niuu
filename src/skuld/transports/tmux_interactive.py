@@ -301,6 +301,7 @@ _PICKER_SESSION_ONLY = "s to use this session only"
 _SLIDER_SESSION_ONLY = "s for this session only"
 _PICKER_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+\S.*?\s{2,}(\S.*?)\s*$")
 _SLIDER_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_FOOTER_EFFORT = re.compile(r"[◉●○◐◑◒◓]\s+(low|medium|high|xhigh|max)\s+·\s+/effort")
 
 
 @dataclass
@@ -1379,24 +1380,23 @@ class TmuxInteractiveTransport(CLITransport):
             raise ValueError("Claude is working. Change /effort after this turn finishes.")
         async with self._send_lock:
             await self._wait_for_repl_ready()
-            before = await self._capture_pane_text()
             # The slider's "s" applies the level to this session only; a typed
             # `/effort X` would save X as the host default (LEX-2022).
             await self._send_slash_command("effort")
             screen = await self._await_screen(_SLIDER_SESSION_ONLY, "/effort")
             current = _slider_level(screen)
             if current is None:
-                await self._send_key("Escape")
+                await self._close_picker()
                 raise RuntimeError("Could not read the /effort slider's position")
             step = _SLIDER_LEVELS.index(effort) - _SLIDER_LEVELS.index(current)
             for _ in range(abs(step)):
                 await self._send_key("Right" if step > 0 else "Left")
-            if _slider_level(await self._capture_pane_text()) != effort:
-                await self._send_key("Escape")
-                raise RuntimeError(f"The /effort slider did not move to {effort}")
+            await self._await_picker_state(
+                lambda text: _slider_level(text) == effort,
+                f"the /effort slider did not move to {effort}",
+            )
             await self._send_key("s")
-            ack = f"Set effort level to {effort} (this session only)"
-            await self._await_new_line(ack, before, "/effort")
+            await self._await_ack(f"Set effort level to {effort} (this session only)", "effort")
             self._reasoning_effort = effort
 
     async def get_runtime_options(self, *, refresh: bool = False) -> dict:
@@ -1474,7 +1474,6 @@ class TmuxInteractiveTransport(CLITransport):
             raise ValueError(f"{model} is not offered by the Claude Code /model picker")
         async with self._send_lock:
             await self._wait_for_repl_ready()
-            before = await self._capture_pane_text()
             # The picker's "s" selects the model for this session only; a typed
             # `/model X` would save X as the host default (LEX-2022).
             await self._send_slash_command("model")
@@ -1483,7 +1482,7 @@ class TmuxInteractiveTransport(CLITransport):
             target = next((r for r in rows if r[2].startswith(f"{display} ·")), None)
             cursor = next((r for r in rows if r[0]), None)
             if target is None or cursor is None:
-                await self._send_key("Escape")
+                await self._close_picker()
                 raise RuntimeError(
                     f"The /model picker offers no {display} row; this Claude Code "
                     "version cannot switch to it for this session"
@@ -1491,49 +1490,66 @@ class TmuxInteractiveTransport(CLITransport):
             step = target[1] - cursor[1]
             for _ in range(abs(step)):
                 await self._send_key("Down" if step > 0 else "Up")
-            now = next((r for r in _picker_rows(await self._capture_pane_text()) if r[0]), None)
-            if now is None or now[1] != target[1]:
-                await self._send_key("Escape")
-                raise RuntimeError(f"The /model picker cursor did not reach {display}")
-            await self._send_key("s")
-            await self._await_new_line(
-                f"Set model to {display} for this session only", before, "/model"
+            await self._await_picker_state(
+                lambda text: any(r[0] and r[1] == target[1] for r in _picker_rows(text)),
+                f"the /model picker cursor did not reach {display}",
             )
+            await self._send_key("s")
+            after = await self._await_ack(f"Set model to {display} for this session only", "model")
             self._model = model
+            # The new model may bring its own effort (Fable 5.2: high); record what the
+            # CLI now shows, so the applied frame never carries a stale effort.
+            shown = _FOOTER_EFFORT.findall(after)
+            if shown:
+                self._reasoning_effort = shown[-1]
+
+    async def _close_picker(self) -> None:
+        """Leave the pane as it was: close an open picker, drop a stray "s"."""
+        await self._send_key("Escape")
+        text = await self._capture_pane_text()
+        if any(line.strip() == "❯ s" for line in text.splitlines()[-8:]):
+            await self._send_key("BSpace")
 
     async def _await_screen(self, marker: str, command: str) -> str:
-        """The pane once ``marker`` shows; a timeout names the knob and closes nothing."""
+        """The pane once ``marker`` shows; a timeout closes the picker and names the knob."""
+        return await self._await_picker_state(
+            lambda text: marker in text, f"Claude did not open the {command} picker"
+        )
+
+    async def _await_picker_state(self, ready, what: str) -> str:
         try:
             async with asyncio.timeout(self._effort_control_timeout):
                 while True:
                     text = await self._capture_pane_text()
-                    if marker in text:
+                    if ready(text):
                         return text
                     await asyncio.sleep(self._pane_poll_interval_s)
         except TimeoutError as exc:
+            await self._close_picker()
             raise RuntimeError(
-                f"Claude did not open the {command} picker within effort_control_timeout_s; "
-                "raise it if the CLI is slow to answer"
+                f"{what} within effort_control_timeout_s; raise it if the CLI is slow to answer"
             ) from exc
 
-    async def _await_new_line(self, ack: str, before: str, command: str) -> None:
-        """Wait for a new native acknowledgement; a saved default is a hard error."""
-        seen = before.count(ack)
+    async def _await_ack(self, ack: str, command: str) -> str:
+        """The native acknowledgement under the latest `/command` echo; a saved default
+        is a hard error. Older identical lines above an earlier echo never count."""
         try:
             async with asyncio.timeout(self._effort_control_timeout):
                 while True:
                     text = await self._capture_pane_text()
-                    if text.count(ack) > seen:
-                        return
-                    if text.count("saved as your default") > before.count("saved as your default"):
+                    tail = _after_last_echo(text, command)
+                    if tail is not None and ack in tail:
+                        return text
+                    if tail is not None and "saved as your default" in tail:
                         raise RuntimeError(
-                            f"Claude saved the {command} change as the host default; "
-                            "check ~/.claude/settings.json"
+                            f"Claude saved the /{command} change as the host default; "
+                            "check ~/.claude/settings.json and restore it"
                         )
                     await asyncio.sleep(self._pane_poll_interval_s)
         except TimeoutError as exc:
+            await self._close_picker()
             raise RuntimeError(
-                f"Claude did not acknowledge {command} within effort_control_timeout_s; "
+                f"Claude did not acknowledge /{command} within effort_control_timeout_s; "
                 "raise it if the CLI is slow to answer"
             ) from exc
 
@@ -6027,10 +6043,24 @@ class TmuxInteractiveTransport(CLITransport):
             return default
 
 
+def _region(screen: str, header: str) -> list[str]:
+    """The lines from the last ``header`` down: the open picker, never older text."""
+    lines = screen.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == header]
+    return lines[starts[-1] :] if starts else []
+
+
+def _after_last_echo(screen: str, command: str) -> str | None:
+    """Text below the latest echoed `/command` prompt line, or None if none shows."""
+    lines = screen.splitlines()
+    echoes = [i for i, line in enumerate(lines) if line.strip() == f"❯ /{command}"]
+    return "\n".join(lines[echoes[-1] + 1 :]) if echoes else None
+
+
 def _picker_rows(screen: str) -> list[tuple[bool, int, str]]:
-    """(cursor, number, description) for each numbered row of the /model picker."""
+    """(cursor, number, description) for each numbered row of the open /model picker."""
     rows = []
-    for line in screen.splitlines():
+    for line in _region(screen, "Select model"):
         match = _PICKER_ROW.match(line)
         if match:
             rows.append((bool(match.group(1)), int(match.group(2)), match.group(3)))
@@ -6038,8 +6068,8 @@ def _picker_rows(screen: str) -> list[tuple[bool, int, str]]:
 
 
 def _slider_level(screen: str) -> str | None:
-    """The /effort slider level under its ▲ marker, or None when the slider is not shown."""
-    lines = screen.splitlines()
+    """The open /effort slider's level under its ▲ marker, or None when not shown."""
+    lines = _region(screen, "Effort")
     for index, line in enumerate(lines):
         labels = [(m.start(), m.group(0)) for m in re.finditer(r"[a-z]+", line)]
         names = [name for _, name in labels]

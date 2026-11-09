@@ -161,7 +161,7 @@ def _keys(transport: TmuxInteractiveTransport) -> list[str]:
 async def test_set_model_picks_this_session_only_and_waits_for_the_cli(tmp_path):
     transport = _driven(
         tmp_path,
-        ["", model_picker(3), model_picker(2), model_ack("Opus 5.5")],
+        [model_picker(3), model_picker(2), model_ack("Opus 5.5")],
     )
     await transport.send_control("set_model", model="claude-opus-5-5")
     # Never `/model <id>`: that saves the model as the host default (LEX-2022).
@@ -174,8 +174,8 @@ async def test_set_runtime_options_changes_model_then_effort(tmp_path):
     transport = _driven(
         tmp_path,
         [
-            *("", model_picker(3), model_picker(2), model_ack("Opus 5.5")),
-            *("", effort_slider("xhigh"), effort_slider("max"), effort_ack("max")),
+            *(model_picker(3), model_picker(2), model_ack("Opus 5.5")),
+            *(effort_slider("xhigh"), effort_slider("max"), effort_ack("max")),
         ],
     )
     await transport.send_control(
@@ -189,9 +189,7 @@ async def test_set_runtime_options_changes_model_then_effort(tmp_path):
 
 
 async def test_effort_alone_needs_no_catalog_model(tmp_path):
-    transport = _driven(
-        tmp_path, ["", effort_slider("xhigh"), effort_slider("low"), effort_ack("low")]
-    )
+    transport = _driven(tmp_path, [effort_slider("xhigh"), effort_slider("low"), effort_ack("low")])
     transport._model = "opus"  # a launch alias the catalog does not list
     with pytest.raises(ValueError, match="Unsupported effort"):
         await transport.send_control("set_runtime_options", options={"effort": "low"})
@@ -239,10 +237,12 @@ async def test_an_unacknowledged_change_raises_naming_the_knob(tmp_path):
     transport._alive = True
     transport._wait_for_repl_ready = AsyncMock()
     transport._send_slash_command = AsyncMock()
+    transport._send_key = AsyncMock()
     transport._capture_pane_text = AsyncMock(return_value="Set model to Fable 5.1")
     with pytest.raises(RuntimeError, match="effort_control_timeout_s"):
         await transport.send_control("set_model", model="claude-opus-5-5")
     assert transport._model == "claude-fable-5-1"
+    assert _keys(transport) == ["Escape"]  # a picker that opened late is closed
 
 
 async def test_broker_set_model_publishes_an_applied_frame_volundr_observes(tmp_path):
@@ -256,9 +256,7 @@ async def test_broker_set_model_publishes_an_applied_frame_volundr_observes(tmp_
         )
     )
     broker._conversation_history_path = lambda: tmp_path / "conversation.json"
-    broker._transport = _driven(
-        tmp_path, ["", model_picker(3), model_picker(2), model_ack("Opus 5.5")]
-    )
+    broker._transport = _driven(tmp_path, [model_picker(3), model_picker(2), model_ack("Opus 5.5")])
     broker._emit_broker_frame = AsyncMock()
     await broker._dispatch_browser_message(
         {"type": "set_model", "model": "claude-opus-5-5", "request_id": "app"}
@@ -277,3 +275,32 @@ async def test_broker_set_model_publishes_an_applied_frame_volundr_observes(tmp_
     read = broker._emit_broker_frame.await_args.args[0]
     assert read["applied"] is False
     assert observation(read, seq=2, at=AT) is None
+
+
+async def test_a_model_switch_that_succeeded_before_its_effort_failed_is_reported(tmp_path):
+    """LEX-2022: the session did switch model, so the row must learn it; then raise."""
+    broker = Broker(
+        SkuldSettings(
+            session={
+                "id": "partial-test",
+                "model": "claude-fable-5-1",
+                "workspace_dir": str(tmp_path),
+            }
+        )
+    )
+    broker._conversation_history_path = lambda: tmp_path / "conversation.json"
+    screens = [model_picker(3), model_picker(2), model_ack("Opus 5.5")]
+    broker._transport = _driven(tmp_path, [])
+    # The slider then never moves: every later capture shows it at xhigh.
+    broker._transport._capture_pane_text = AsyncMock(
+        side_effect=lambda *_a, **_k: screens.pop(0) if screens else effort_slider("xhigh")
+    )
+    broker._transport._effort_control_timeout = 0.05
+    broker._emit_broker_frame = AsyncMock()
+    with pytest.raises(RuntimeError, match="slider did not move to max"):
+        await broker.handle_runtime_options({"model": "claude-opus-5-5", "effort": "max"})
+    frame = broker._emit_broker_frame.await_args.args[0]
+    assert frame["applied"] is True
+    assert frame["current"]["model"] == "claude-opus-5-5"
+    assert frame["current"]["effort"] == "xhigh"
+    assert broker.model == "claude-opus-5-5"

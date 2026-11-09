@@ -19,7 +19,7 @@ _INDENT = 25
 
 def model_picker(cursor: int, *, fable: str = "Fable 5.2") -> str:
     """The open /model picker with its cursor (❯) on row ``cursor``."""
-    lines = ["  Select model", "  Switch between Claude models."]
+    lines = ["❯ /model", "────", "  Select model", "  Switch between Claude models."]
     for number, label, text in _ROWS:
         mark = "❯" if number == cursor else " "
         lines.append(f"  {mark} {number}. {label:<22} {text.format(fable=fable)}")
@@ -37,6 +37,8 @@ def effort_slider(level: str) -> str:
     bar = "─" * (centre - _INDENT) + "▲" + "─" * (_INDENT + len(_LABELS) - centre - 1)
     return "\n".join(
         [
+            "❯ /effort",
+            "────",
             "  Effort",
             " " * _INDENT + "Faster                             Smarter",
             " " * _INDENT + bar + "      Ultracode  off",
@@ -46,9 +48,21 @@ def effort_slider(level: str) -> str:
     )
 
 
-def model_ack(display: str) -> str:
-    return f"  ⎿  Set model to {display} for this session only"
+def model_ack(display: str, *, effort: str = "xhigh") -> str:
+    """The pane after the picker closed: the echo, the acknowledgement and the footer."""
+    return "\n".join(
+        [
+            "❯ /model",
+            f"  ⎿  Set model to {display} for this session only",
+            "────",
+            "❯ ",
+            "────",
+            f"  ⏵⏵ bypass permissions on                       ◉ {effort} · /effort",
+        ]
+    )
 
 
 def effort_ack(level: str) -> str:
-    return f"  ⎿  Set effort level to {level} (this session only): Effort"
+    return "\n".join(
+        ["❯ /effort", f"  ⎿  Set effort level to {level} (this session only): Effort", "❯ "]
+    )

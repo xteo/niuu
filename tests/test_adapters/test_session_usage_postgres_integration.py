@@ -333,3 +333,9 @@ async def test_an_applied_switch_is_the_next_launch_choice(isolated_pool):
     effort = {"type": "effort_status", "applied": True, "current": "xhigh", "levels": []}
     await log.append([entry(session, 4, effort)])
     assert tuple(await row()) == ("claude-fable-5-2", "xhigh")
+    # A newer choice (PUT), then the broker resends an already stored batch: no rollback.
+    await isolated_pool.execute(
+        "UPDATE sessions SET model='claude-opus-5-5' WHERE id=$1", session.id
+    )
+    await log.append([entry(session, 3, picked)])
+    assert tuple(await row()) == ("claude-opus-5-5", "xhigh")

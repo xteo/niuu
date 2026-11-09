@@ -275,14 +275,32 @@ class PostgresSessionEventLog(SessionEventLogRepository):
         # apply it twice. Ordinary frames retain the existing executemany path.
         async with self._pool.acquire() as conn:
             async with conn.transaction():
+                # A resent batch must not apply an old switch again over a newer
+                # choice (a PUT): only frames this insert stores are recorded.
+                choices = [e for e in entries if runtime_choice(e.payload) is not None]
+                stored = (
+                    {
+                        (row["session_id"], row["seq"])
+                        for row in await conn.fetch(
+                            """SELECT session_id, seq FROM session_event_log
+                           WHERE (session_id, seq) IN (
+                             SELECT * FROM unnest($1::uuid[], $2::bigint[]))""",
+                            [e.session_id for e in choices],
+                            [e.seq for e in choices],
+                        )
+                    }
+                    if choices
+                    else set()
+                )
                 await conn.executemany(_INSERT_SQL, args)
                 by_session: dict[UUID, list[int]] = {}
                 for entry in entries:
                     by_session.setdefault(entry.session_id, []).append(entry.seq)
                 for sid, seqs in by_session.items():
                     await self._project_usage(conn, sid, seqs)
-                for entry in entries:
-                    await self._record_runtime_choice(conn, entry)
+                for entry in choices:
+                    if (entry.session_id, entry.seq) not in stored:
+                        await self._record_runtime_choice(conn, entry)
 
     async def _record_runtime_choice(
         self, conn: asyncpg.Connection, entry: SessionLogEntry
