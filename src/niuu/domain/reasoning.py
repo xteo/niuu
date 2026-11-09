@@ -10,6 +10,7 @@ CODEX_EFFORTS = (*CLAUDE_EFFORTS, "ultra")
 MUSE_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra")
 
 MODEL_EFFORTS: dict[str, tuple[str, ...]] = {
+    "claude-fable-5-2": CLAUDE_EFFORTS,
     "claude-fable-5-1": CLAUDE_EFFORTS,
     "claude-fable-5": CLAUDE_EFFORTS,
     "claude-opus-5-5": CLAUDE_EFFORTS,

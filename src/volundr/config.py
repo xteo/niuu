@@ -3153,6 +3153,7 @@ class SessionUsageConfig(BaseModel):
     model_windows: dict[str, Annotated[int, Field(strict=True, gt=0, le=2**53 - 1)]] = Field(
         default_factory=lambda: {
             "claude-opus-5-5": 1_000_000,
+            "claude-fable-5-2": 1_000_000,
             "claude-fable-5-1": 1_000_000,
             "claude-sonnet-5-5": 1_000_000,
         },

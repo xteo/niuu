@@ -202,6 +202,28 @@ def _default_models() -> list[ManagedModelConfig]:
             session_definition="skuldPi",
         ),
         ManagedModelConfig(
+            # Claude Fable 5.2 (released 2026-11-09) is the newest Fable. Opus 5.5 stays the
+            # Forge default, and Fable 5.1 stays listed for the sessions already on it (Damien,
+            # LEX-2021). Fable 5.2 defaults to high effort, so the catalogue launches it there.
+            id="claude-fable-5-2",
+            name="Claude Fable 5.2",
+            vendor="anthropic",
+            provider=ManagedModelProvider.CLOUD,
+            tier=ManagedModelTier.FRONTIER,
+            color="#6D28D9",
+            description=(
+                "Anthropic's most capable model for demanding reasoning and "
+                "long-horizon agentic work; 1M-token context. Needs Claude Code 2.1.321 "
+                "or newer."
+            ),
+            # Claude Fable 5.2 is $8 in / $40 out per 1M tokens (blended shown).
+            cost_per_million_tokens=24.0,
+            session_definition="skuldClaude",
+            supports_tools=True,
+            supports_thinking=True,
+            default_effort="high",
+        ),
+        ManagedModelConfig(
             # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
             # (Damien, 2026-09-02). `claude-fable-5` is still served, so a client on an old
             # build that keeps sending it is not broken — it just no longer appears here.
