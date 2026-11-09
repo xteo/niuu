@@ -299,8 +299,9 @@ SESSION_SWITCH_MODELS: dict[str, str] = {
 }
 _PICKER_SESSION_ONLY = "s to use this session only"
 _SLIDER_SESSION_ONLY = "s for this session only"
-_PICKER_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+\S.*?\s{2,}(\S.*?)\s*$")
+_PICKER_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(\S.*?)\s{2,}(\S.*?)\s*$")
 _SLIDER_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_CONFIRM_TITLES = ("Switch model?", "Change effort level?")
 _FOOTER_EFFORT = re.compile(r"[◉●○◐◑◒◓]\s+(low|medium|high|xhigh|max)\s+·\s+/effort")
 
 
@@ -1386,8 +1387,8 @@ class TmuxInteractiveTransport(CLITransport):
             screen = await self._await_screen(_SLIDER_SESSION_ONLY, "/effort")
             current = _slider_level(screen)
             if current is None:
-                await self._close_picker()
-                raise RuntimeError("Could not read the /effort slider's position")
+                note = await self._close_picker()
+                raise RuntimeError(f"Could not read the /effort slider's position{note}")
             step = _SLIDER_LEVELS.index(effort) - _SLIDER_LEVELS.index(current)
             for _ in range(abs(step)):
                 await self._send_key("Right" if step > 0 else "Left")
@@ -1396,7 +1397,9 @@ class TmuxInteractiveTransport(CLITransport):
                 f"the /effort slider did not move to {effort}",
             )
             await self._send_key("s")
-            await self._await_ack(f"Set effort level to {effort} (this session only)", "effort")
+            await self._await_ack(
+                f"Set effort level to {effort} (this session only)", "effort", effort
+            )
             self._reasoning_effort = effort
 
     async def get_runtime_options(self, *, refresh: bool = False) -> dict:
@@ -1479,13 +1482,13 @@ class TmuxInteractiveTransport(CLITransport):
             await self._send_slash_command("model")
             screen = await self._await_screen(_PICKER_SESSION_ONLY, "/model")
             rows = _picker_rows(screen)
-            target = next((r for r in rows if r[2].startswith(f"{display} ·")), None)
+            target = _picker_row_for(rows, display)
             cursor = next((r for r in rows if r[0]), None)
             if target is None or cursor is None:
-                await self._close_picker()
+                note = await self._close_picker()
                 raise RuntimeError(
                     f"The /model picker offers no {display} row; this Claude Code "
-                    "version cannot switch to it for this session"
+                    f"version cannot switch to it for this session{note}"
                 )
             step = target[1] - cursor[1]
             for _ in range(abs(step)):
@@ -1495,7 +1498,9 @@ class TmuxInteractiveTransport(CLITransport):
                 f"the /model picker cursor did not reach {display}",
             )
             await self._send_key("s")
-            after = await self._await_ack(f"Set model to {display} for this session only", "model")
+            after = await self._await_ack(
+                f"Set model to {display} for this session only", "model", display
+            )
             self._model = model
             # The new model may bring its own effort (Fable 5.2: high); record what the
             # CLI now shows, so the applied frame never carries a stale effort.
@@ -1503,12 +1508,28 @@ class TmuxInteractiveTransport(CLITransport):
             if shown:
                 self._reasoning_effort = shown[-1]
 
-    async def _close_picker(self) -> None:
-        """Leave the pane as it was: close an open picker, drop a stray "s"."""
-        await self._send_key("Escape")
-        text = await self._capture_pane_text()
+    async def _close_picker(self) -> str:
+        """Leave the pane as it was: close an open picker or dialog, drop a stray "s".
+
+        Esc goes back one level (a confirm dialog returns to its picker), so it is
+        pressed while one is visible, each time only after the screen redrew: a spare
+        Esc at the prompt could open Claude's rewind menu. The close is confirmed;
+        returns "" at the prompt, else a note for the caller's error (LEX-2022).
+        """
+        try:
+            async with asyncio.timeout(self._effort_control_timeout):
+                text = await self._capture_pane_text()
+                while _picker_open(text):
+                    await self._send_key("Escape")
+                    shown = text
+                    while text == shown:
+                        await asyncio.sleep(self._pane_poll_interval_s)
+                        text = await self._capture_pane_text()
+        except TimeoutError:
+            return "; the picker is still open after Esc, close it in the terminal"
         if any(line.strip() == "❯ s" for line in text.splitlines()[-8:]):
             await self._send_key("BSpace")
+        return ""
 
     async def _await_screen(self, marker: str, command: str) -> str:
         """The pane once ``marker`` shows; a timeout closes the picker and names the knob."""
@@ -1525,14 +1546,23 @@ class TmuxInteractiveTransport(CLITransport):
                         return text
                     await asyncio.sleep(self._pane_poll_interval_s)
         except TimeoutError as exc:
-            await self._close_picker()
+            note = await self._close_picker()
             raise RuntimeError(
-                f"{what} within effort_control_timeout_s; raise it if the CLI is slow to answer"
+                f"{what} within effort_control_timeout_s; raise it if the CLI is slow "
+                f"to answer{note}"
             ) from exc
 
-    async def _await_ack(self, ack: str, command: str) -> str:
+    async def _await_ack(self, ack: str, command: str, choice: str) -> str:
         """The native acknowledgement under the latest `/command` echo; a saved default
-        is a hard error. Older identical lines above an earlier echo never count."""
+        is a hard error. Older identical lines above an earlier echo never count.
+
+        With history, Claude first asks "Switch model?" / "Change effort level?" (the
+        cache is re-read). The request is the user's choice, so the dialog is confirmed
+        only when its selected option is "Yes, switch to <choice>"; any other dialog (a
+        hook's, or one focused on "No") is closed and reported (LEX-2022).
+        """
+        confirm = f"❯ 1. Yes, switch to {choice}"
+        confirmed = False
         try:
             async with asyncio.timeout(self._effort_control_timeout):
                 while True:
@@ -1545,12 +1575,23 @@ class TmuxInteractiveTransport(CLITransport):
                             f"Claude saved the /{command} change as the host default; "
                             "check ~/.claude/settings.json and restore it"
                         )
+                    lines = [" ".join(line.split()) for line in (tail or "").splitlines()]
+                    asks = any(line in _CONFIRM_TITLES for line in lines)
+                    if asks and not confirmed and confirm in lines:
+                        await self._send_key("Enter")
+                        confirmed = True
+                    elif asks and not confirmed:
+                        note = await self._close_picker()
+                        raise RuntimeError(
+                            f"Claude asked to confirm the /{command} change in a way the "
+                            f"broker does not answer; confirm it in the terminal{note}"
+                        )
                     await asyncio.sleep(self._pane_poll_interval_s)
         except TimeoutError as exc:
-            await self._close_picker()
+            note = await self._close_picker()
             raise RuntimeError(
                 f"Claude did not acknowledge /{command} within effort_control_timeout_s; "
-                "raise it if the CLI is slow to answer"
+                f"raise it if the CLI is slow to answer{note}"
             ) from exc
 
     async def send_control(self, subtype: str, **kwargs: object) -> None:
@@ -6043,6 +6084,13 @@ class TmuxInteractiveTransport(CLITransport):
             return default
 
 
+def _picker_open(screen: str) -> bool:
+    """A /model picker, /effort slider or their confirm dialog is on screen."""
+    if _PICKER_SESSION_ONLY in screen or _SLIDER_SESSION_ONLY in screen:
+        return True
+    return any(" ".join(line.split()) in _CONFIRM_TITLES for line in screen.splitlines())
+
+
 def _region(screen: str, header: str) -> list[str]:
     """The lines from the last ``header`` down: the open picker, never older text."""
     lines = screen.splitlines()
@@ -6057,14 +6105,31 @@ def _after_last_echo(screen: str, command: str) -> str | None:
     return "\n".join(lines[echoes[-1] + 1 :]) if echoes else None
 
 
-def _picker_rows(screen: str) -> list[tuple[bool, int, str]]:
-    """(cursor, number, description) for each numbered row of the open /model picker."""
+def _picker_rows(screen: str) -> list[tuple[bool, int, str, str]]:
+    """(cursor, number, label, description) for each numbered row of the open picker."""
     rows = []
     for line in _region(screen, "Select model"):
         match = _PICKER_ROW.match(line)
         if match:
-            rows.append((bool(match.group(1)), int(match.group(2)), match.group(3)))
+            label = match.group(3).replace("✔", "").strip()
+            rows.append((bool(match.group(1)), int(match.group(2)), label, match.group(4)))
     return rows
+
+
+def _picker_row_for(rows: list[tuple[bool, int, str, str]], display: str):
+    """The row that selects ``display`` itself, never the Default row that follows it.
+
+    API-key logins label rows by alias ("Fable", description "Fable 5.2 · ..."); a
+    claude.ai login labels them by model ("Fable 5.2", a prose description). The
+    Default row describes the default model in either layout, so it never matches.
+    """
+    for row in rows:
+        _, _, label, description = row
+        if label.startswith("Default"):
+            continue
+        if label == display or description.startswith(f"{display} ·"):
+            return row
+    return None
 
 
 def _slider_level(screen: str) -> str | None:

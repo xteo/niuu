@@ -7,6 +7,7 @@ drives the pickers. Screens are Claude Code 2.1.321 captures.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -120,7 +121,7 @@ async def test_a_saved_default_is_a_hard_error(tmp_path):
 
 async def test_a_picker_without_the_model_is_closed_and_refused(tmp_path):
     old = _picker(2).replace("Fable 5.2", "Fable 5.1")
-    pane = _Pane([old])
+    pane = _Pane([old, old, "❯ /model\n  ⎿  Kept model as Opus 5.5"])
     claude = _claude(tmp_path, pane)
 
     with pytest.raises(RuntimeError, match="offers no Fable 5.2 row"):
@@ -156,7 +157,7 @@ def test_parsing_ignores_text_above_the_open_picker():
 async def test_an_older_identical_ack_never_counts(tmp_path):
     """Only an acknowledgement under the latest /model echo proves this switch."""
     old = "❯ /model\n  ⎿  Set model to Fable 5.2 for this session only\n"
-    pane = _Pane([old + _picker(2), old + _picker(3), old + "❯ /model\n  ⎿  (picker open)"])
+    pane = _Pane([old + _picker(2), old + _picker(3)])  # "s" taken, no new ack
     claude = _claude(tmp_path, pane)
     claude._effort_control_timeout = 0.05
 
@@ -175,3 +176,87 @@ async def test_a_slow_redraw_is_waited_for(tmp_path):
     await claude._set_model("claude-fable-5-2")
 
     assert pane.keys == ["Down", "s"]
+
+
+_SUBSCRIPTION = (
+    Path(__file__).resolve().parents[1]
+    / "support/forge/screens/claude-model-picker-subscription.txt"
+).read_text()
+
+
+async def test_a_claude_ai_login_picker_is_read_by_its_model_labels(tmp_path):
+    """Live LEX-2022 QA: a claude.ai login labels rows "Opus 5.5" with prose descriptions,
+    and its Default row's description starts "Opus 5.5 ·". The switch must take row 2,
+    never Default (where "s" does nothing)."""
+    rows = _picker_rows(_SUBSCRIPTION)
+    assert [(r[1], r[2]) for r in rows][:3] == [
+        (1, "Default (recommended)"),
+        (2, "Opus 5.5"),
+        (3, "Fable 5.2"),
+    ]
+    moved = _SUBSCRIPTION.replace("  ❯ 3.  Fable", "    3.  Fable").replace(
+        "    2.  Opus 5.5 ", "  ❯ 2.  Opus 5.5 "
+    )
+    ack = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only"
+    pane = _Pane([_SUBSCRIPTION, moved, ack])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+
+    await claude._set_model("claude-opus-5-5")
+
+    assert pane.keys == ["Up", "s"]
+    assert claude._model == "claude-opus-5-5"
+
+
+async def test_a_picker_that_will_not_close_is_an_error(tmp_path):
+    old = _picker(2).replace("Fable 5.2", "Fable 5.1")
+    pane = _Pane([old])
+    claude = _claude(tmp_path, pane)
+    claude._effort_control_timeout = 0.05
+
+    with pytest.raises(RuntimeError, match="offers no Fable 5.2 row.*still open after Esc"):
+        await claude._set_model("claude-fable-5-2")
+
+
+_CONFIRM = """\
+❯ /model
+────
+  Switch model?
+  Your next response will be slower and use more tokens
+  This conversation is cached for the current model. Switching to Opus 5.5 means…
+  ❯ 1. Yes, switch to {choice}
+    2. No, go back
+"""
+
+
+async def test_the_cache_confirm_dialog_is_answered_only_for_the_requested_choice(tmp_path):
+    """With history, Claude asks "Switch model?" after "s" (live QA, claude.ai login)."""
+    moved = _SUBSCRIPTION.replace("  ❯ 3.  Fable", "    3.  Fable").replace(
+        "    2.  Opus 5.5 ", "  ❯ 2.  Opus 5.5 "
+    )
+    ack = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only"
+    pane = _Pane([_SUBSCRIPTION, moved, _CONFIRM.format(choice="Opus 5.5"), ack])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+
+    await claude._set_model("claude-opus-5-5")
+
+    assert pane.keys == ["Up", "s", "Enter"]
+    assert claude._model == "claude-opus-5-5"
+
+
+async def test_a_confirm_dialog_for_another_choice_is_closed_not_answered(tmp_path):
+    moved = _SUBSCRIPTION.replace("  ❯ 3.  Fable", "    3.  Fable").replace(
+        "    2.  Opus 5.5 ", "  ❯ 2.  Opus 5.5 "
+    )
+    hook = (
+        _CONFIRM.format(choice="Opus 5.5")
+        .replace("❯ 1. Yes", "  1. Yes")
+        .replace("    2. No", "  ❯ 2. No")
+    )
+    pane = _Pane([_SUBSCRIPTION, moved, hook, hook, _SUBSCRIPTION, "❯ /model\n  ⎿  Cancelled"])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+
+    with pytest.raises(RuntimeError, match="asked to confirm the /model change"):
+        await claude._set_model("claude-opus-5-5")
+
+    assert pane.keys == ["Up", "s", "Escape", "Escape"]  # dialog -> picker -> prompt
+    assert claude._model == "claude-fable-5-2"

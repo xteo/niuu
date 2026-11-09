@@ -242,7 +242,8 @@ async def test_an_unacknowledged_change_raises_naming_the_knob(tmp_path):
     with pytest.raises(RuntimeError, match="effort_control_timeout_s"):
         await transport.send_control("set_model", model="claude-opus-5-5")
     assert transport._model == "claude-fable-5-1"
-    assert _keys(transport) == ["Escape"]  # a picker that opened late is closed
+    # No picker ever showed, so no Esc: a spare Esc at the prompt can open Claude's rewind.
+    assert _keys(transport) == []
 
 
 async def test_broker_set_model_publishes_an_applied_frame_volundr_observes(tmp_path):
