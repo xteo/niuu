@@ -167,6 +167,11 @@ def sender_header(sender: dict[str, Any]) -> str | None:
     return "[Message from an unidentified sender through the Forge API, not typed by the user]"
 
 
+def is_owner_by_voice(sender: dict[str, Any]) -> bool:
+    """A voice call: the owner speaking, relayed by the platform's voice agent (LEX-2013)."""
+    return sender["kind"] == KIND_AGENT and sender["sub_kind"] == SUB_KIND_VOICE_CALL
+
+
 def text_for_model(sender: dict[str, Any], content: str) -> str:
     """What the receiving model gets: the header line, a blank line, the message.
 

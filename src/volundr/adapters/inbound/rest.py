@@ -27,6 +27,7 @@ from niuu.domain.json_text import json_text_safe
 from niuu.domain.message_sender import (
     SENDER_NODE_HEADER,
     SenderError,
+    is_owner_by_voice,
     parse_claimed_sender,
     sender_for_request_id,
     session_sender,
@@ -953,7 +954,15 @@ def _sender_frame(content: str, request_id: str, sender: dict[str, Any]) -> dict
     sender is not the user. ``display_content`` is the message as sent, which a broker
     that reads ``sender`` records on the turn; a broker that predates it ignores both
     keys and still hands the model the header.
+
+    A voice call is the owner speaking (LEX-2013), so it needs no warning from a broker
+    that predates ``sender``: its message goes unheaded and the broker writes the
+    header in its own words. A broker checks a written header against its own
+    wording and refuses a mismatch, so writing the voice header here would refuse
+    every voice message at a broker launched before that wording changed.
     """
+    if is_owner_by_voice(sender):
+        return {"type": "user", "content": content, "request_id": request_id, "sender": sender}
     frame: dict[str, Any] = {
         "type": "user",
         "content": text_for_model(sender, content),

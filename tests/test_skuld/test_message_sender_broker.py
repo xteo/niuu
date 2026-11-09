@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from niuu.domain.message_sender import text_for_model
 from niuu.domain.transcript_reducer import reduce_frames
 from skuld.broker import Broker
 from skuld.config import SkuldSettings
@@ -22,6 +23,7 @@ from tests.test_skuld.test_delivery_failed_steering_state import (
     _settle_delivery,
     delivery_claim_api,  # noqa: F401 - autouse fixture
 )
+from volundr.adapters.inbound.rest import _sender_frame
 
 UNKNOWN = {"kind": "agent", "sub_kind": "unknown"}
 UNKNOWN_HEADER = (
@@ -306,3 +308,38 @@ async def test_stored_and_logged_turns_omit_an_absent_sender(broker):
     assert "sender" not in turn_record(ConversationTurn(id="a", role="assistant", content="yo"))
     labelled = ConversationTurn(id="u", role="user", content="hi", sender={"kind": "user"})
     assert turn_record(labelled)["sender"] == {"kind": "user"}
+
+
+def _old_text_for_model(sender: dict, content: str) -> str:
+    """The voice wording of every broker launched before LEX-2013, as it shipped."""
+    if sender.get("sub_kind") != "voice_call":
+        return text_for_model(sender, content)
+    call = f" {sender['id']}" if sender.get("id") else ""
+    return f"[Message from voice call{call}, not typed by the user]\n\n{content}"
+
+
+@pytest.mark.parametrize(
+    "sender",
+    [
+        {"kind": "agent", "sub_kind": "voice_call", "id": "call-7"},
+        {"kind": "agent", "sub_kind": "voice_call"},
+    ],
+)
+@pytest.mark.parametrize("old_broker", [True, False])
+async def test_forges_voice_frame_is_accepted_by_old_and_new_brokers(
+    broker, monkeypatch, sender, old_broker
+):
+    """LEX-2013: a broker checks a written header against its own wording, so Forge
+    sends a voice message unheaded and each broker heads it in its own words."""
+    if old_broker:
+        monkeypatch.setattr("skuld.broker.text_for_model", _old_text_for_model)
+    frame = _sender_frame("add milk", "voice-call-1b729d02-aa11", sender)
+
+    await _dispatch(broker, frame)
+
+    turn = broker._conversation_turns[-1]
+    assert turn.sender == sender
+    assert turn.content == "add milk"
+    expected = _old_text_for_model if old_broker else text_for_model
+    assert _delivered(broker) == expected(sender, "add milk")
+    assert _rebuilt_user_turn(broker)["sender"] == sender
