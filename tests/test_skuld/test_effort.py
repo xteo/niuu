@@ -221,3 +221,11 @@ def test_catalog_metadata_and_host_only_additions():
     assert validate_effort("extra-high", ["xhigh"]) == "xhigh"
     with pytest.raises(ValueError):
         ManagedModelConfig(id="invalid", name="invalid", effort_levels=[], default_effort="high")
+
+
+def test_a_model_with_its_own_default_effort_launches_there():
+    # Claude Fable 5.2 defaults to high (LEX-2021); other Claude models keep extra high.
+    levels = ["low", "medium", "high", "xhigh", "max"]
+    assert preferred_effort(levels, "claude-fable-5-2") == "high"
+    assert preferred_effort(levels, "claude-fable-5-1") == "xhigh"
+    assert preferred_effort(levels) == "xhigh"

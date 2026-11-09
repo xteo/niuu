@@ -1400,7 +1400,7 @@ class TmuxInteractiveTransport(CLITransport):
                     "default": model == self._launch_model,
                     "hidden": False,
                     "effort_levels": list(levels),
-                    "default_effort": preferred_effort(levels),
+                    "default_effort": preferred_effort(levels, model),
                     "service_tiers": [],
                     "default_service_tier": None,
                     "input_modalities": [],

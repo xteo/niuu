@@ -171,7 +171,7 @@ class ManagedModelConfig(BaseModel):
         if self.effort_levels is None:
             self.effort_levels = list(MODEL_EFFORTS.get(self.id, ()))
         if not self.default_effort:
-            self.default_effort = preferred_effort(self.effort_levels)
+            self.default_effort = preferred_effort(self.effort_levels, self.id)
         if self.default_effort and self.default_effort not in self.effort_levels:
             raise ValueError("default_effort must be one of effort_levels")
         return self
@@ -204,7 +204,7 @@ def _default_models() -> list[ManagedModelConfig]:
         ManagedModelConfig(
             # Claude Fable 5.2 (released 2026-11-09) is the newest Fable. Opus 5.5 stays the
             # Forge default, and Fable 5.1 stays listed for the sessions already on it (Damien,
-            # LEX-2021). Fable 5.2 defaults to high effort, so the catalogue launches it there.
+            # LEX-2021). It launches at high, its own default (MODEL_DEFAULT_EFFORTS).
             id="claude-fable-5-2",
             name="Claude Fable 5.2",
             vendor="anthropic",
@@ -221,7 +221,6 @@ def _default_models() -> list[ManagedModelConfig]:
             session_definition="skuldClaude",
             supports_tools=True,
             supports_thinking=True,
-            default_effort="high",
         ),
         ManagedModelConfig(
             # Claude Fable 5.1 succeeds Claude Fable 5 in the same tier at the same price
