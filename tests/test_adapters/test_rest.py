@@ -2332,14 +2332,29 @@ class TestMessageSenders:
 
         assert frame["sender"] == sender
         assert frame["content"] == (
-            "[Message from voice call voice-call-ios-42, not typed by the user]\n\nadd milk"
+            "[From the user by voice: Lexi voice call voice-call-ios-42, relayed by the voice "
+            "agent]\n\nadd milk"
         )
 
     def test_a_voice_call_word_is_accepted(self, client, repository):
         _, frame = self._post(client, repository, {"content": "x", "sender": "voice_call"})
 
         assert frame["sender"] == {"kind": "agent", "sub_kind": "voice_call"}
-        assert frame["content"].startswith("[Message from voice call, not typed by the user]")
+        assert frame["content"].startswith(
+            "[From the user by voice: Lexi voice call, relayed by the voice agent]"
+        )
+
+    def test_a_voice_call_request_id_without_a_sender_is_a_voice_call(self, client, repository):
+        """LEX-2013: call A8849ECB's steer of lexi was stored as an unknown sender."""
+        body = {"content": "add milk", "request_id": "voice-call-1b729d02-aa11-4b22-8c33-d44e"}
+        response, frame = self._post(client, repository, body)
+
+        assert response.json()["sender"] == {"kind": "agent", "sub_kind": "voice_call"}
+        assert frame["sender"] == {"kind": "agent", "sub_kind": "voice_call"}
+        assert frame["content"] == (
+            "[From the user by voice: Lexi voice call, relayed by the voice agent]\n\nadd milk"
+        )
+        assert frame["display_content"] == "add milk"
 
     def test_automation_is_headed_with_its_name(self, client, repository):
         sender = {"kind": "agent", "sub_kind": "automation", "name": "guild-daily"}

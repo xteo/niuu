@@ -943,15 +943,16 @@ object; clients read it before anything else:
 |---|---|
 | `{"kind": "user"}` | the owner's Lexi client sends `"sender": "user"`, or (until every client sends it) uses a client request id: iOS UPPERCASE UUID, web/Mac `<epoch ms>-<base36>`, `forge-ios-`/`forge-web-`/`forge-mac-` |
 | `{"kind": "agent", "sub_kind": "session", "id", "name", "host"}` | a session calls Forge MCP `send_message` (its credential says which session; `"via": "guild"` when relayed from another node) |
-| `{"kind": "agent", "sub_kind": "voice_call", "id": <call id>}` | the caller sends `"voice_call"` or that object |
+| `{"kind": "agent", "sub_kind": "voice_call", "id": <call id>}` | the owner speaking in a Lexi voice call, relayed by the voice agent: the caller sends `"voice_call"` or that object, or (until the voice agent sends it) uses a `voice-call-` request id, which names no call (LEX-2013) |
 | `{"kind": "agent", "sub_kind": "automation", "name": <driver>}` | a script or driver sends `"automation"` or that object |
-| `{"kind": "agent", "sub_kind": "unknown"}` | no `sender` and no client request id. Never the user |
+| `{"kind": "agent", "sub_kind": "unknown"}` | no `sender`, no client request id and no `voice-call-` request id. Never the user |
 
 A REST body cannot claim a session sender (400: only `send_message` sets it),
 nor `assistant`. For every sender except the user, the text the model receives
 starts with one header line, for example
 `[Message from automation lexi-errturn-m6, not typed by the user]`, then a blank
-line and the message; a slash command (`/clear`) is delivered unheaded so it
+line and the message. A voice call is the owner, so its header says so:
+`[From the user by voice: Lexi voice call <id>, relayed by the voice agent]`; a slash command (`/clear`) is delivered unheaded so it
 still runs. The stored turn keeps the message as sent. `POST /sessions` takes
 `initial_prompt_sender` the same way for the first prompt; without one, the first
 prompt carries no sender.

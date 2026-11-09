@@ -36,12 +36,22 @@ def test_the_lexi_clients_request_ids_are_the_user(request_id):
         "agent-service-lex1904-ready-94c7b941",
         "rollout-m6-cutover-1",
         "fmcp-1a2d3a0b3d664760ac677a79e033669d",
-        "voice-call-ios-1",
         "lexi-crash:abc",
+        "voice-call-",
+        "a-voice-call-1",
     ],
 )
 def test_any_other_request_id_is_an_unknown_sender_never_the_user(request_id):
     assert sender_for_request_id(request_id) == {"kind": "agent", "sub_kind": "unknown"}
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    ["voice-call-1b729d02-5f0e-4c1a-9a7e-0d6b2c3e4f51", "voice-call-ios-1"],
+)
+def test_a_voice_call_request_id_is_a_voice_call_without_a_call_id(request_id):
+    """LEX-2013: the voice agent mints one per message, so it names no call."""
+    assert sender_for_request_id(request_id) == {"kind": "agent", "sub_kind": "voice_call"}
 
 
 @pytest.mark.parametrize(
@@ -129,7 +139,11 @@ def test_a_session_sender_carries_its_identity():
         (session_sender(session_id="s-1", name="", host=""), "[Message from session s-1]"),
         (
             {"kind": "agent", "sub_kind": "voice_call", "id": "c-1"},
-            "[Message from voice call c-1, not typed by the user]",
+            "[From the user by voice: Lexi voice call c-1, relayed by the voice agent]",
+        ),
+        (
+            {"kind": "agent", "sub_kind": "voice_call"},
+            "[From the user by voice: Lexi voice call, relayed by the voice agent]",
         ),
         (
             {"kind": "agent", "sub_kind": "automation"},

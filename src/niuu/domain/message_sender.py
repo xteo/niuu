@@ -6,7 +6,9 @@ path the message took, never parsed from its text:
 * ``{"kind": "user"}`` — the session owner typing or dictating in a Lexi client;
 * ``{"kind": "agent", "sub_kind": "session", "name", "id", "host"}`` — another
   session, through Forge MCP ``send_message`` or a Guild relay (``via: "guild"``);
-* ``{"kind": "agent", "sub_kind": "voice_call", "id": <call id>}`` — a voice call;
+* ``{"kind": "agent", "sub_kind": "voice_call", "id": <call id>}`` — the owner speaking
+  in a Lexi voice call, relayed by the voice agent (LEX-2013); ``id`` when the caller
+  names the call;
 * ``{"kind": "agent", "sub_kind": "automation", "name": <driver>}`` — a script,
   driver, crash reporter or scheduled summary;
 * ``{"kind": "agent", "sub_kind": "unknown"}`` — a REST post that named no sender;
@@ -52,6 +54,9 @@ _CLIENT_REQUEST_ID = re.compile(
     r"|\d{13}-[0-9a-z]+"
     r"|forge-(?:ios|web|mac)-.+)$"
 )
+# The request id the Lexi voice agent mints for each message it relays from a call
+# (``voice-call-<uuid>``, one per message, so it is not the call id) (LEX-2013).
+_VOICE_CALL_REQUEST_ID = re.compile(r"^voice-call-.+$")
 
 
 # A one-line slash command (``/clear``, ``/effort high``), not prose that starts with
@@ -119,15 +124,23 @@ def parse_recorded_sender(value: Any) -> dict[str, Any] | None:
     return _parse(value)
 
 
-def sender_for_request_id(request_id: str | None) -> dict[str, Any]:
-    """The sender of a message that named none: the owner's client, or unknown.
+def voice_call_sender() -> dict[str, Any]:
+    return {"kind": KIND_AGENT, "sub_kind": SUB_KIND_VOICE_CALL}
 
-    Transition rule until every Lexi client sends ``sender``: the request id shapes
-    those clients mint are the owner's; anything else is an unknown sender, never
-    the user.
+
+def sender_for_request_id(request_id: str | None) -> dict[str, Any]:
+    """The sender of a message that named none: the owner's client, a voice call, or unknown.
+
+    Transition rule until every Lexi client and the voice agent send ``sender``: the
+    request id shapes the clients mint are the owner's, a ``voice-call-`` id is a voice
+    call (LEX-2013), and anything else is an unknown sender, never the user.
     """
-    if request_id and _CLIENT_REQUEST_ID.match(request_id):
+    if not request_id:
+        return unknown_sender()
+    if _CLIENT_REQUEST_ID.match(request_id):
         return user_sender()
+    if _VOICE_CALL_REQUEST_ID.match(request_id):
+        return voice_call_sender()
     return unknown_sender()
 
 
@@ -143,8 +156,10 @@ def sender_header(sender: dict[str, Any]) -> str | None:
         relayed = ", relayed through the Guild" if sender.get("via") == VIA_GUILD else ""
         return f"[Message from session {who}{where}{relayed}]"
     if sub_kind == SUB_KIND_VOICE_CALL:
+        # The owner, speaking: a voice call reaches a session only through the
+        # platform's voice agent (LEX-2013), so this is the user, not a third party.
         call = f" {sender['id']}" if sender.get("id") else ""
-        return f"[Message from voice call{call}, not typed by the user]"
+        return f"[From the user by voice: Lexi voice call{call}, relayed by the voice agent]"
     if sub_kind == SUB_KIND_AUTOMATION:
         name = f" {sender['name']}" if sender.get("name") else ""
         return f"[Message from automation{name}, not typed by the user]"

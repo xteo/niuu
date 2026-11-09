@@ -121,8 +121,21 @@ async def test_a_client_that_names_a_voice_call_is_headed(broker):
     assert turn.sender == {"kind": "agent", "sub_kind": "voice_call", "id": "call-7"}
     assert turn.content == "Damien's instruction: add milk"
     assert _delivered(broker) == (
-        "[Message from voice call call-7, not typed by the user]\n\nDamien's instruction: add milk"
+        "[From the user by voice: Lexi voice call call-7, relayed by the voice agent]\n\n"
+        "Damien's instruction: add milk"
     )
+
+
+async def test_a_voice_call_request_id_alone_is_a_voice_call(broker):
+    """LEX-2013: the voice agent's steer names no sender, only its request id."""
+    voice = {"kind": "agent", "sub_kind": "voice_call"}
+    await _dispatch(broker, {"content": "add milk", "request_id": "voice-call-1b729d02-aa11"})
+
+    assert broker._conversation_turns[-1].sender == voice
+    assert _delivered(broker) == (
+        "[From the user by voice: Lexi voice call, relayed by the voice agent]\n\nadd milk"
+    )
+    assert _rebuilt_user_turn(broker)["sender"] == voice
 
 
 async def test_an_unnamed_socket_message_is_an_unknown_sender_never_the_user(broker):
