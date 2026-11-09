@@ -783,6 +783,29 @@ class TestSessionEndpoints:
         # Verify event was published
         assert len(mock_broadcaster.session_updated_events) == 1
 
+    def test_update_session_launch_effort(self, client):
+        """LEX-2022: PUT records a launch effort; one the model lacks is a 400."""
+        session_id = client.post(
+            "/api/v1/forge/sessions",
+            json={
+                "name": "effort-session",
+                "model": "claude-opus-5-5",
+                "repo": "https://github.com/test/repo",
+                "branch": "main",
+            },
+        ).json()["id"]
+
+        ok = client.put(
+            f"/api/v1/forge/sessions/{session_id}",
+            json={"model": "claude-fable-5-2", "reasoning_effort": "high"},
+        )
+        bad = client.put(f"/api/v1/forge/sessions/{session_id}", json={"reasoning_effort": "ultra"})
+
+        assert ok.status_code == 200
+        assert ok.json()["model"] == "claude-fable-5-2"
+        assert bad.status_code == 400
+        assert "Unsupported effort" in bad.json()["detail"]
+
     def test_delete_session(self, client, mock_broadcaster):
         """Deleting a session via API publishes event."""
         # Create session first

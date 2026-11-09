@@ -17,6 +17,7 @@ except ImportError:
     _catalog_failed = None  # type: ignore[assignment]
 
 from niuu.domain.models import is_push_device
+from niuu.domain.reasoning import MODEL_EFFORTS, validate_effort
 from niuu.domain.services.forge_session_token import (
     ForgeSessionTokenService,
     IssuedForgeSessionToken,
@@ -973,8 +974,13 @@ class SessionService:
         branch: str | None = None,
         tracker_issue_id: str | None = None,
         principal: Principal | None = None,
+        reasoning_effort: str | None = None,
     ) -> Session:
-        """Update a session's name, model, branch, and/or tracker issue."""
+        """Update a session's name, model, launch effort, branch, and/or tracker issue.
+
+        The effort is checked against the (new) model's levels and stored as
+        ``workload_config.reasoningEffort``, which the next launch uses (LEX-2022).
+        """
         session = await self._repository.get(session_id)
         if session is None:
             raise SessionNotFoundError(session_id)
@@ -986,6 +992,13 @@ class SessionService:
             updates["name"] = name
         if model is not None:
             updates["model"] = model
+        if reasoning_effort is not None:
+            levels = MODEL_EFFORTS.get(model or session.model, ())
+            effort = validate_effort(reasoning_effort, levels)
+            updates["workload_config"] = {
+                **(session.workload_config or {}),
+                "reasoningEffort": effort,
+            }
         if branch is not None and isinstance(session.source, GitSource):
             updates["source"] = session.source.model_copy(update={"branch": branch})
         if tracker_issue_id is not None:

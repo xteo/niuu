@@ -53,6 +53,26 @@ class TestSessionServiceBroadcaster:
         assert broadcaster.session_updated_events[0].name == "Updated Name"
 
     @pytest.mark.asyncio
+    async def test_update_session_stores_a_launch_effort_for_the_model(self, service):
+        """LEX-2022: a model and effort switch is recorded on the row for the next launch."""
+        session = await service.create_session(
+            name="Test",
+            model="claude-opus-5-5",
+            source=GitSource(repo="https://github.com/test/repo", branch="main"),
+        )
+
+        updated = await service.update_session(
+            session.id, model="claude-fable-5-2", reasoning_effort="high"
+        )
+
+        assert updated.model == "claude-fable-5-2"
+        assert updated.workload_config["reasoningEffort"] == "high"
+        with pytest.raises(ValueError, match="Unsupported effort"):
+            await service.update_session(session.id, reasoning_effort="ultra")
+        unchanged = await service.update_session(session.id, name="renamed")
+        assert unchanged.workload_config["reasoningEffort"] == "high"
+
+    @pytest.mark.asyncio
     async def test_delete_session_publishes_event(self, service, broadcaster):
         """Deleting a session publishes a session_deleted event."""
         session = await service.create_session(

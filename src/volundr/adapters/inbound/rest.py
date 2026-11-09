@@ -863,6 +863,15 @@ class SessionUpdate(BaseModel):
         max_length=100,
         description="New LLM model identifier",
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        description=(
+            "Native effort the session launches at from now on (workload_config.reasoningEffort); "
+            "it must be one of the model's effort levels. It does not change a running CLI."
+        ),
+    )
     branch: str | None = Field(
         default=None,
         min_length=1,
@@ -3096,11 +3105,14 @@ def create_router(
                 session_id=session_id,
                 name=data.name,
                 model=data.model,
+                reasoning_effort=data.reasoning_effort,
                 branch=data.branch,
                 tracker_issue_id=data.tracker_issue_id,
                 principal=principal,
             )
             return _session_response(session)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except SessionAccessDeniedError:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
