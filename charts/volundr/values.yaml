@@ -1239,6 +1239,16 @@ ravnFlockImage: ""
 #         base_url: https://vllm.example.internal
 ravnFlockLlmConfig: {}
 
+# Environment variables a session may set for its CLI (workload_config.launch_env,
+# PUT /sessions/{id} launch_env), each with its rule: a whole-value `pattern`, or an
+# integer `min_int`/`max_int`. Empty keeps Volundr's defaults
+# (CLAUDE_CODE_SUBAGENT_MODEL, CLAUDE_CODE_AUTO_COMPACT_WINDOW 100000-1000000; LEX-2045).
+# Setting it replaces the whole list.
+#   sessionLaunchEnv:
+#     CLAUDE_CODE_SUBAGENT_MODEL: {pattern: "[A-Za-z0-9][A-Za-z0-9._\\[\\]-]{0,99}"}
+#     CLAUDE_CODE_AUTO_COMPACT_WINDOW: {min_int: 100000, max_int: 1000000}
+sessionLaunchEnv: {}
+
 sessionContributors:
   - adapter: "volundr.adapters.outbound.contributors.core.CoreSessionContributor"
     kwargs:

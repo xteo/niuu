@@ -29,6 +29,7 @@ from niuu.forge_mcp.credentials import grants_from_scopes, normalize_grants
 from niuu.forge_mcp.models import ForgeMcpGrant
 from sleipnir.domain.catalog import volundr_session_forge_mcp_grants_changed
 from volundr.domain.execution_catalog import ExecutionCatalogError, ExecutionSelectionError
+from volundr.domain.launch_env import LAUNCH_ENV_KEY, LaunchEnvRule, validate_launch_env
 from volundr.domain.models import (
     CleanupTarget,
     CommunicationRoute,
@@ -191,8 +192,10 @@ class SessionService:
         audit_repository: AuditRepository | None = None,
         user_integration: UserIntegrationPort | None = None,
         presented_file_store: PresentedFileStore | None = None,
+        launch_env_rules: Mapping[str, LaunchEnvRule] | None = None,
     ):
         self._repository = repository
+        self._launch_env_rules: dict[str, LaunchEnvRule] = dict(launch_env_rules or {})
         self._reported_orphan_slots: set[str] = set()
         self._presented_file_store = presented_file_store
         self._pod_manager = pod_manager
@@ -975,11 +978,15 @@ class SessionService:
         tracker_issue_id: str | None = None,
         principal: Principal | None = None,
         reasoning_effort: str | None = None,
+        launch_env: Mapping[str, object] | None = None,
     ) -> Session:
-        """Update a session's name, model, launch effort, branch, and/or tracker issue.
+        """Update a session's name, model, launch effort, launch env, branch, and/or tracker issue.
 
         The effort is checked against the (new) model's levels and stored as
         ``workload_config.reasoningEffort``, which the next launch uses (LEX-2022).
+        ``launch_env`` replaces ``workload_config.launch_env`` whole (an empty map clears it);
+        every name must be allowlisted and every value meet its rule (LEX-2045). Like the
+        effort, it takes effect at the next start or restart, not in a running CLI.
         """
         session = await self._repository.get(session_id)
         if session is None:
@@ -999,6 +1006,13 @@ class SessionService:
                 **(session.workload_config or {}),
                 "reasoningEffort": effort,
             }
+        if launch_env is not None:
+            checked = validate_launch_env(launch_env, self._launch_env_rules)
+            config = dict(updates.get("workload_config", session.workload_config or {}))
+            config.pop(LAUNCH_ENV_KEY, None)
+            if checked:
+                config[LAUNCH_ENV_KEY] = checked
+            updates["workload_config"] = config
         if branch is not None and isinstance(session.source, GitSource):
             updates["source"] = session.source.model_copy(update={"branch": branch})
         if tracker_issue_id is not None:
@@ -1308,6 +1322,13 @@ class SessionService:
             workload_type = session.workload_type
         if not workload_config and session.workload_config:
             workload_config = dict(session.workload_config)
+        if workload_config and LAUNCH_ENV_KEY in workload_config:
+            workload_config = {
+                **workload_config,
+                LAUNCH_ENV_KEY: validate_launch_env(
+                    workload_config[LAUNCH_ENV_KEY], self._launch_env_rules
+                ),
+            }
         if self._execution_resolver is not None:
             workload_config = await self._resolve_execution_config(
                 session, workload_config or {}, launch_spec

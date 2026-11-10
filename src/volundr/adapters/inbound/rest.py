@@ -96,6 +96,7 @@ from volundr.domain.history_import import (
     HistoryImportSessionNotFoundError,
     HistoryImportValidationError,
 )
+from volundr.domain.launch_env import LAUNCH_ENV_KEY
 from volundr.domain.models import (
     Chronicle,
     ChronicleStatus,
@@ -872,6 +873,14 @@ class SessionUpdate(BaseModel):
             "it must be one of the model's effort levels. It does not change a running CLI."
         ),
     )
+    launch_env: dict[str, str | int] | None = Field(
+        default=None,
+        description=(
+            "Environment the session's CLI starts with from now on (workload_config.launch_env), "
+            "replacing the stored map; {} clears it. Names must be allowlisted in "
+            "session_launch_env and values meet their rule. It does not change a running CLI."
+        ),
+    )
     branch: str | None = Field(
         default=None,
         min_length=1,
@@ -1233,6 +1242,13 @@ class DeviceResponse(BaseModel):
         )
 
 
+def _launch_env(session: Session) -> dict[str, str]:
+    stored = (session.workload_config or {}).get(LAUNCH_ENV_KEY)
+    if not isinstance(stored, dict):
+        return {}
+    return {str(name): str(value) for name, value in stored.items()}
+
+
 def _launch_effort(session: Session) -> str | None:
     """The stored launch effort, or None when the session launches at the model default."""
     effort = str((session.workload_config or {}).get("reasoningEffort") or "").strip()
@@ -1266,6 +1282,13 @@ class SessionResponse(BaseModel):
             "Native effort the next start or restart launches at "
             "(workload_config.reasoningEffort, set by PUT /sessions/{id} reasoning_effort); "
             "null when the model's default is used"
+        ),
+    )
+    launch_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Environment the next start or restart gives the session's CLI "
+            "(workload_config.launch_env, set by PUT /sessions/{id} launch_env)"
         ),
     )
     persona_name: str = Field(default="", description="Persona attached at launch")
@@ -1475,6 +1498,7 @@ class SessionResponse(BaseModel):
             model=session.effective_model,
             launch_model=session.model,
             launch_effort=_launch_effort(session),
+            launch_env=_launch_env(session),
             persona_name=str(session.workload_config.get("persona") or ""),
             source=session.source,
             status=session.status,
@@ -3133,6 +3157,7 @@ def create_router(
                 name=data.name,
                 model=data.model,
                 reasoning_effort=data.reasoning_effort,
+                launch_env=data.launch_env,
                 branch=data.branch,
                 tracker_issue_id=data.tracker_issue_id,
                 principal=principal,

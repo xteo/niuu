@@ -1292,6 +1292,7 @@ def create_app(
                 forge_mcp_role_grants=settings.forge_mcp.role_grants,
                 audit_repository=PostgresAuditRepository(pool),
                 presented_file_store=presented_file_store,
+                launch_env_rules=settings.session_launch_env,
             )
             # Local-process brokers notify the session service when they exit so
             # the DB row is reconciled promptly (pod-status authoritative) rather

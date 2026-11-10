@@ -98,6 +98,17 @@ Check `GET /s/{id}/api/capabilities`: `runtime_options: true` gates the new surf
   switch; restart launches with it. Sessions show it as `launch_model`, with
   `launch_effort` (`workload_config.reasoningEffort`, null at the model's default),
   so a `PUT` is visible before the CLI reports anything new.
+- Per-session launch environment (LEX-2045): `PUT /api/v1/forge/sessions/{id}` takes
+  `launch_env`, a `{name: value}` map stored whole as `workload_config.launch_env`
+  (`{}` clears it), and session create accepts the same key in `workload_config`.
+  Every start and restart gives it to the broker, whose environment the CLI inherits,
+  so a lane can launch with, for example, `CLAUDE_CODE_SUBAGENT_MODEL=opus` and
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000`. Only names in Volundr's
+  `session_launch_env` are accepted, each with a rule: a whole-value `pattern`, or an
+  integer `min_int`/`max_int` (defaults: those two variables; the window is 100000 to
+  1000000). Anything else is a 400 naming the allowlist, and a stored map the
+  allowlist no longer admits stops the start with the same error. Sessions show it as
+  `launch_env`. Like `launch_effort`, it does not change a running CLI.
 - With history, Claude asks "Switch model?" / "Change effort level?" after `s`.
   The broker reads the dialog from the live screen (border or not) and presses
   Enter only on "Yes, switch to <choice>", once the dialog has stayed unchanged

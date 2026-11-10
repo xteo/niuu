@@ -16,6 +16,7 @@ from volundr.adapters.inbound.rest import (
     create_router,
 )
 from volundr.adapters.outbound.broadcaster import InMemoryEventBroadcaster
+from volundr.config import Settings
 from volundr.domain.models import EventType, RealtimeEvent
 from volundr.domain.push import (
     PushEnvironment,
@@ -694,6 +695,7 @@ class TestSessionEndpoints:
             repository=repository,
             pod_manager=pod_manager,
             broadcaster=mock_broadcaster,
+            launch_env_rules=Settings.model_fields["session_launch_env"].default_factory(),
         )
         stats_service = StatsService(stats_repository, session_service)
 
@@ -805,6 +807,40 @@ class TestSessionEndpoints:
         assert ok.json()["model"] == "claude-fable-5-2"
         assert bad.status_code == 400
         assert "Unsupported effort" in bad.json()["detail"]
+
+    def test_update_session_launch_env(self, client):
+        """LEX-2045: PUT stores an allowlisted launch env and the response shows it."""
+        session_id = client.post(
+            "/api/v1/forge/sessions",
+            json={
+                "name": "env-session",
+                "model": "claude-opus-5-5",
+                "repo": "https://github.com/test/repo",
+                "branch": "main",
+            },
+        ).json()["id"]
+        url = f"/api/v1/forge/sessions/{session_id}"
+
+        ok = client.put(
+            url,
+            json={
+                "launch_env": {
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "opus",
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 150000,
+                }
+            },
+        )
+        bad = client.put(url, json={"launch_env": {"HOME": "/tmp"}})
+
+        assert ok.status_code == 200
+        assert ok.json()["launch_env"] == {
+            "CLAUDE_CODE_SUBAGENT_MODEL": "opus",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "150000",
+        }
+        assert bad.status_code == 400
+        assert "not allowed" in bad.json()["detail"]
+        assert client.get(url).json()["launch_env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
+        assert client.put(url, json={"launch_env": {}}).json()["launch_env"] == {}
 
     def test_delete_session(self, client, mock_broadcaster):
         """Deleting a session via API publishes event."""

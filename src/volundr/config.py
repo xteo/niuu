@@ -59,6 +59,7 @@ from niuu.forge_mcp.models import ForgeMcpGrant
 from ravn.config import LLMConfig, PersonaSourceConfig
 from skuld.tool_result_preview import PREVIEW_EDGE_LIMIT, PREVIEW_MAX_EDGE, PREVIEW_MIN_EDGE
 from volundr.compute.config import ComputeConfig
+from volundr.domain.launch_env import LaunchEnvRule
 from volundr.domain.mcp_hosts import normalize_internal_host_pattern
 from volundr.domain.model_gateway import MODEL_GATEWAY_TOKEN_ENV
 from volundr.domain.models import (
@@ -3547,6 +3548,21 @@ class Settings(BaseSettings):
     external_sessions: ExternalSessionsConfig = Field(default_factory=ExternalSessionsConfig)
     telegram_ingress: TelegramIngressConfig = Field(default_factory=TelegramIngressConfig)
     session_contributors: list[SessionContributorConfig] = Field(default_factory=list)
+    session_launch_env: dict[str, LaunchEnvRule] = Field(
+        default_factory=lambda: {
+            # Model the CLI's helpers (subagents) use unless the caller names one.
+            "CLAUDE_CODE_SUBAGENT_MODEL": LaunchEnvRule(
+                pattern=r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}"
+            ),
+            # Context size at which the CLI auto-compacts; Claude Code accepts 100k-1M.
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": LaunchEnvRule(min_int=100_000, max_int=1_000_000),
+        },
+        description=(
+            "Environment variables a session may set for its CLI (workload_config.launch_env, "
+            "set at create or by PUT /sessions/{id} launch_env), each with the rule its value "
+            "must meet. Any other name is refused. Applied at every start and restart (LEX-2045)."
+        ),
+    )
     ravn_flock_image: str = Field(
         default="",
         description=(

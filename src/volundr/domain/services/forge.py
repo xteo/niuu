@@ -261,12 +261,14 @@ class ForgeService:
         branch: str | None = None,
         tracker_issue_id: str | None = None,
         principal: Principal | None = None,
+        launch_env: dict[str, str | int] | None = None,
     ) -> Session:
         return await self._session_service.update_session(
             session_id=session_id,
             name=name,
             model=model,
             reasoning_effort=reasoning_effort,
+            launch_env=launch_env,
             branch=branch,
             tracker_issue_id=tracker_issue_id,
             principal=principal,
