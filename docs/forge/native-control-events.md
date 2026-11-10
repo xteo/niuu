@@ -181,8 +181,8 @@ A question can be open in three places: the card above, the broker's pending and
 `ask_user_question` lists (replayed to every client that connects), and the conversation
 record (an AskUserQuestion `tool_use` with no `tool_result`). The CLI's session file
 (`~/.claude/projects/<workspace>/<native id>.jsonl`) is the truth. Skuld checks every question
-still open in the record or the restored list, and not an open card (the checks above cover
-those), against it at broker start, every sweep, and on
+still open in the record or the restored list against it (an open card is otherwise left to
+the checks above) at broker start, every sweep, and on
 `POST /sessions/{id}/native-controls/reconcile` (owner or admin, audited):
 
 | Session file says | Close | `dismiss_reason` |
@@ -190,6 +190,18 @@ those), against it at broker start, every sweep, and on
 | its `tool_result` is there | with that answer (`is_error: false`) | `resolved_in_terminal` |
 | its `tool_use` is not there at all | `Dismissed: the CLI never showed it …` | `never_shown` |
 | its `tool_use`, no result | kept while the pane shows a live menu or at broker start; otherwise `Dismissed: the CLI is no longer showing it.` | `menu_not_shown` |
+
+An open card is checked too when its call is not in the file at all (LEX-2025): Claude writes
+a main-agent question's call before its PreToolUse hook fires, so a card open for a sweep
+interval whose call is still missing was never the session's question. It closes as
+`never_shown` everywhere, even while the menu reads `unknown` (a dim prompt suggestion in the
+composer reads as typed text). A card being answered, and a registered subagent's question
+(its call is in the subagent's own file), are left to the card's checks.
+
+Hooks from Claude Code's own side queries (prompt suggestions, speculation) never open a card,
+a tool call or a turn: they carry an `agent_id` but no `agent_type`, send no SubagentStart and
+write no transcript. Skuld logs each one (`claude_hook`) and counts it as
+`side_query_hooks_ignored`. A real subagent names its type and is registered when it starts.
 
 A question asked less than one sweep interval ago is not checked yet: its card may not be open,
 nor its call written to the file. An unreadable session file closes nothing (409 from the route,

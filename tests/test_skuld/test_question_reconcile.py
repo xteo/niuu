@@ -309,8 +309,39 @@ async def test_an_unanswered_question_whose_menu_is_live_is_kept(session):
 
 async def test_a_question_with_an_open_card_is_left_to_the_cards_checks(session):
     broker, file, frames = session
+    file.question(STRANDED)  # in the session file: the card's own checks apply
+    broker._conversation_turns = [_question_turn(STRANDED)]
+    broker._transport.open_question_tool_use_ids = MagicMock(return_value={STRANDED})
+    broker._transport.dismiss_never_shown_question = AsyncMock()
+    outcome = await broker.reconcile_open_questions(trigger=RECONCILE_SWEEP)
+    assert outcome["closed"] == [] and not frames
+    broker._transport.dismiss_never_shown_question.assert_not_awaited()
+
+
+async def test_10nov_an_open_card_whose_call_is_not_in_the_file_closes_everywhere(session):
+    """LEX-2025: a side query's question held ios-release 2 h with its menu "unknown"."""
+    broker, file, frames = session
     broker._conversation_turns = [_question_turn(PHANTOM)]
     broker._transport.open_question_tool_use_ids = MagicMock(return_value={PHANTOM})
+    broker._transport.dismiss_never_shown_question = AsyncMock(return_value="tty-1-9c8e24a8")
+
+    outcome = await broker.reconcile_open_questions(trigger=RECONCILE_SWEEP)
+
+    broker._transport.dismiss_never_shown_question.assert_awaited_once_with(
+        PHANTOM, trigger=RECONCILE_SWEEP
+    )
+    assert outcome["closed"] == [
+        {"tool_use_id": PHANTOM, "request_id": "tty-1-9c8e24a8", "reason": "never_shown"}
+    ]
+    assert _closures(broker)[PHANTOM]  # the record holds the closure too
+
+
+async def test_an_open_never_shown_card_the_transport_keeps_stays_kept(session):
+    """The transport's guards (young, being answered, a subagent's) win."""
+    broker, file, frames = session
+    broker._conversation_turns = [_question_turn(PHANTOM)]
+    broker._transport.open_question_tool_use_ids = MagicMock(return_value={PHANTOM})
+    broker._transport.dismiss_never_shown_question = AsyncMock(return_value=None)
     outcome = await broker.reconcile_open_questions(trigger=RECONCILE_SWEEP)
     assert outcome["closed"] == [] and not frames
 

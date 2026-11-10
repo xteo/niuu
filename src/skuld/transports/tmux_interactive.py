@@ -140,6 +140,7 @@ _DISMISS_DETAILS = {
     DISMISS_TURN_ENDED: "turn ended",
     DISMISS_SUPERSEDED: "the CLI moved on past it",
     DISMISS_CLOSED_FOR_MESSAGE: "closed so a message could be delivered",
+    DISMISS_NEVER_SHOWN: "the CLI never showed it (its call is not in the session file)",
 }
 #: The row a Claude question menu offers to set the questions aside and talk instead.
 _QUESTION_CHAT_ROW = "Chat about this"
@@ -1751,6 +1752,11 @@ class TmuxInteractiveTransport(CLITransport):
                 "metadata": {"source": "claude_hook"},
             }
         )
+        if self._is_side_query_hook(payload, event_name):
+            # Logged above for audit; never a tool call, turn or question of the
+            # session (LEX-2025: a side query's AskUserQuestion held ios-release 2 h).
+            self._native_control_counts["side_query_hooks_ignored"] += 1
+            return True
         if event_name != "UserPromptSubmit":
             self._schedule_native_usage(payload)
         self._note_superseding_hook(event_name, payload)
@@ -2100,6 +2106,21 @@ class TmuxInteractiveTransport(CLITransport):
             or "unknown"
         )
         return str(event_name)
+
+    def _is_side_query_hook(self, payload: dict[str, Any], event_name: str) -> bool:
+        """A hook from Claude Code's own side queries (prompt suggestions, speculation).
+
+        They report an ``agent_id`` but no ``agent_type``, never send SubagentStart and
+        write no transcript; a real subagent (Task, fork) names its type and is
+        registered when it starts. Measured on mini-m6 (LEX-2025): 400 such agents,
+        none with a SubagentStart; main-agent hooks never carry an ``agent_id``.
+        """
+        agent_id = self._coerce_str(payload.get("agent_id") or payload.get("agentId"))
+        if not agent_id or event_name == "SubagentStart":
+            return False
+        if self._coerce_str(payload.get("agent_type")):
+            return False
+        return agent_id not in self._hook_agents
 
     def _is_child_hook(self, payload: dict[str, Any]) -> bool:
         if payload.get("is_sidechain") or payload.get("isSidechain"):
@@ -3018,6 +3039,7 @@ class TmuxInteractiveTransport(CLITransport):
             "questions": questions,
             # A subagent's question waits while the main agent works: never superseded.
             "child": self._is_child_hook(payload or {}),
+            "subagent_id": self._coerce_str((payload or {}).get("agent_id")) or None,
             **native,
             **self._card_opened(),
         }
@@ -4468,6 +4490,38 @@ class TmuxInteractiveTransport(CLITransport):
             "sweep_interval_seconds": self._native_control_sweep_interval_s,
             "absent_checks_to_close_question": self._native_control_absent_checks,
         }
+
+    async def dismiss_never_shown_question(self, tool_use_id: str, *, trigger: str) -> str | None:
+        """Close a question card whose call the main session file does not hold (LEX-2025).
+
+        Claude writes a main-agent question's call to its session file before the
+        PreToolUse hook fires, so a card open for a sweep interval whose call is still
+        not in the file never was the session's question; "menu unknown" (a dim prompt
+        suggestion in the composer) must not keep it. A registered subagent's question
+        lives in its own file and is left alone, as is a card being answered.
+        Returns the closed card's request id, or None when no such card qualifies.
+        """
+        async with self._answer_lock:
+            async with self._send_lock:
+                for request_id, pending in list(self._pending_tty_prompts.items()):
+                    if pending.get("native_tool_use_id") != tool_use_id:
+                        continue
+                    opened = pending.get("opened_monotonic")
+                    settled = isinstance(opened, float) and (
+                        time.monotonic() - opened >= self._native_control_sweep_interval_s
+                    )
+                    if (
+                        pending.get("kind") != "question"
+                        or not settled
+                        or pending.get("answer_in_flight")
+                        or pending.get("answer_uncertain")
+                        or pending.get("closing_for_message")
+                        or pending.get("subagent_id") in self._hook_agents
+                    ):
+                        return None
+                    await self._dismiss_tty_prompt(request_id, DISMISS_NEVER_SHOWN, trigger=trigger)
+                    return request_id
+        return None
 
     async def dismiss_native_control(self, request_id: str, *, dismissed_by: str) -> dict:
         """An operator closes a card the automatic checks did not (audited).

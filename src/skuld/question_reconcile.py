@@ -174,9 +174,30 @@ class QuestionReconcileMixin:
         menu_state: str | None = None
         for tool_use_id, request_id in candidates.items():
             if tool_use_id in cards:
-                kept.append(
-                    {"tool_use_id": tool_use_id, "why": "an open card; its own checks apply"}
+                # A card whose call the session file never got is no question of this
+                # session (LEX-2025); the transport closes it under its own guards.
+                closed_card = None
+                if index.state(tool_use_id) == NEVER_SHOWN:
+                    closed_card = await transport.dismiss_never_shown_question(
+                        tool_use_id, trigger=trigger
+                    )
+                if closed_card is None:
+                    kept.append(
+                        {"tool_use_id": tool_use_id, "why": "an open card; its own checks apply"}
+                    )
+                    continue
+                closed.append(
+                    {
+                        "tool_use_id": tool_use_id,
+                        "request_id": closed_card,
+                        "reason": DISMISS_NEVER_SHOWN,
+                    }
                 )
+                still_open = self._open_record_questions().get(tool_use_id)
+                if still_open is not None and still_open != closed_card:
+                    await self._close_record_question(
+                        tool_use_id, still_open, DISMISS_NEVER_SHOWN, trigger=trigger, index=index
+                    )
                 continue
             state = index.state(tool_use_id)
             if tool_use_id in self._record_answered or state == ANSWERED:

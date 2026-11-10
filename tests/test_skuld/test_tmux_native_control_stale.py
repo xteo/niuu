@@ -567,6 +567,7 @@ async def test_a_main_hook_never_supersedes_a_background_subagents_question(tmp_
             tool_input=QUESTION,
             tool_use_id="toolu_sub_q",
             agent_id="sub-1",
+            agent_type="general-purpose",  # a real subagent names its type (LEX-2025)
         )
         [card] = _ask_user_questions(s.events)
         pending = s.transport._pending_tty_prompts[card["request_id"]]
