@@ -364,6 +364,7 @@ terminal.
 | `tmux_native_control_absent_checks` | 3 | `gone` checks in a row, at most one per sweep interval, before a question card is dismissed (a permission card needs one). |
 | `tmux_person_only_prompt_timeout_s` | 120 | Claude Code's auto-deny timeout, stated in the notification. |
 | `tmux_question_transcript_max_bytes` | 1 MiB | The transcript read bound, shared with question answers. |
+| `tmux_prompt_suggestions` | false | Claude's prompt suggestions in Forge-launched CLIs. Off sets `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0` for that CLI only (LEX-2026); `~/.claude/settings.json` is untouched. |
 
 The menu render window is the existing `SKULD__TMUX_MENU_RENDER_WAIT_SECONDS` (1.5 s).
 
