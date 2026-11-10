@@ -303,6 +303,7 @@ _SLIDER_SESSION_ONLY = "s for this session only"
 _PICKER_ROW = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(\S.*?)\s{2,}(\S.*?)\s*$")
 _SLIDER_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _CONFIRM_TITLES = ("Switch model?", "Change effort level?")
+_DIALOG_OPTION = re.compile(r"^(?:❯ )?\d+\. ")
 _FOOTER_EFFORT = re.compile(r"[◉●○◐◑◒◓]\s+(low|medium|high|xhigh|max)\s+·\s+/effort")
 
 
@@ -380,6 +381,7 @@ class TmuxInteractiveTransport(CLITransport):
         person_only_prompt_timeout_s: float = 120.0,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
+        effort_confirm_settle_s: float = 1.0,
         session_tools: SessionTools | None = None,
         workspace_trust_stable_s: float = 0.5,
         workspace_trust_settle_s: float = 1.0,
@@ -398,6 +400,7 @@ class TmuxInteractiveTransport(CLITransport):
             else ""
         )
         self._effort_control_timeout = effort_control_timeout_s
+        self._effort_confirm_settle = effort_confirm_settle_s
         self._forge_session_id = session_id or "skuld-interactive"
         self._skip_permissions = skip_permissions
         self._claude_permission_mode = resolve_claude_permission_mode(claude_permission_mode)
@@ -1560,12 +1563,18 @@ class TmuxInteractiveTransport(CLITransport):
         is a hard error. Older identical lines above an earlier echo never count.
 
         With history, Claude first asks "Switch model?" / "Change effort level?" (the
-        cache is re-read). The request is the user's choice, so the dialog is confirmed
+        cache is re-read). The request is the user's choice, so the dialog is answered
         only when its selected option is "Yes, switch to <choice>"; any other dialog (a
-        hook's, or one focused on "No") is closed and reported (LEX-2022).
+        hook's, or one focused on "No") is closed and reported (LEX-2022). The dialog
+        is read from the live screen, not below the echo, which it may replace. Enter
+        goes only to a dialog that stayed unchanged for ``effort_confirm_settle_s``: a
+        key sent as it first draws can be lost, and the switch then times out and is
+        cancelled ("Kept model as …", mini 2026-11-10). A dialog that is still there,
+        unchanged, a settle period after Enter did not take it and gets Enter again.
         """
-        confirm = f"❯ 1. Yes, switch to {choice}"
-        confirmed = False
+        confirm = f"Yes, switch to {choice}"
+        seen: str | None = None
+        seen_at = 0.0
         try:
             async with asyncio.timeout(self._effort_control_timeout):
                 while True:
@@ -1578,17 +1587,20 @@ class TmuxInteractiveTransport(CLITransport):
                             f"Claude saved the /{command} change as the host default; "
                             "check ~/.claude/settings.json and restore it"
                         )
-                    lines = [" ".join(line.split()) for line in (tail or "").splitlines()]
-                    asks = any(line in _CONFIRM_TITLES for line in lines)
-                    if asks and not confirmed and confirm in lines:
-                        await self._send_key("Enter")
-                        confirmed = True
-                    elif asks and not confirmed:
+                    dialog = _confirm_dialog(text)
+                    if dialog is None:
+                        seen = None
+                    elif not any(line.startswith("❯") and confirm in line for line in dialog):
                         note = await self._close_picker()
                         raise RuntimeError(
                             f"Claude asked to confirm the /{command} change in a way the "
                             f"broker does not answer; confirm it in the terminal{note}"
                         )
+                    elif dialog != seen:
+                        seen, seen_at = dialog, time.monotonic()
+                    elif time.monotonic() - seen_at >= self._effort_confirm_settle:
+                        await self._send_key("Enter")
+                        seen_at = time.monotonic()
                     await asyncio.sleep(self._pane_poll_interval_s)
         except TimeoutError as exc:
             note = await self._close_picker()
@@ -6153,7 +6165,28 @@ def _picker_open(screen: str) -> bool:
     """A /model picker, /effort slider or their confirm dialog is on screen."""
     if _PICKER_SESSION_ONLY in screen or _SLIDER_SESSION_ONLY in screen:
         return True
-    return any(" ".join(line.split()) in _CONFIRM_TITLES for line in screen.splitlines())
+    return _confirm_dialog(screen) is not None
+
+
+def _unboxed(line: str) -> str:
+    """A screen line without the box border Claude may draw around a dialog, one-spaced."""
+    return " ".join(line.strip().strip("│┃║").split())
+
+
+def _confirm_dialog(screen: str) -> list[str] | None:
+    """The open "Switch model?" / "Change effort level?" dialog's lines, else None.
+
+    The title must stand alone on its line (border aside), so prose that quotes it is
+    never taken for the dialog.
+    """
+    lines = [_unboxed(line) for line in screen.splitlines()]
+    starts = [i for i, line in enumerate(lines) if line in _CONFIRM_TITLES]
+    if not starts:
+        return None
+    dialog = lines[starts[-1] :]
+    # Up to its last numbered option: anything drawn below may change on its own.
+    options = [i for i, line in enumerate(dialog) if _DIALOG_OPTION.match(line)]
+    return dialog[: options[-1] + 1] if options else dialog
 
 
 def _region(screen: str, header: str) -> list[str]:

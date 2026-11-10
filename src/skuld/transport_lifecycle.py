@@ -86,6 +86,7 @@ class TransportLifecycleMixin:
             "reasoning_effort": self._restored_effort(),
             "service_tier": getattr(self, "_runtime_service_tier", None),
             "effort_control_timeout_s": self._settings.effort_control_timeout_s,
+            "effort_confirm_settle_s": self._settings.effort_confirm_settle_s,
             "sdk_port": self._settings.port,
             "session_id": self.session_id,
             "skip_permissions": self._settings.skip_permissions,

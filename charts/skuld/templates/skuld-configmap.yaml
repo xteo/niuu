@@ -111,6 +111,7 @@ data:
     history_hydration_max_frames: {{ .Values.broker.historyHydrationMaxFrames | toJson }}
     history_hydration_max_bytes: {{ .Values.broker.historyHydrationMaxBytes | toJson }}
     effort_control_timeout_s: {{ .Values.broker.effortControlTimeoutSeconds | toJson }}
+    effort_confirm_settle_s: {{ .Values.broker.effortConfirmSettleSeconds | toJson }}
     pi: {{ .Values.broker.pi | toJson }}
     codex_auth:
       adapter: {{ dig "codexAuth" "adapter" "skuld.codex_auth.HostCodexAuthProvider" .Values.broker | quote }}

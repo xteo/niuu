@@ -15,6 +15,7 @@ import pytest
 from skuld.transports.tmux_interactive import (
     SESSION_SWITCH_MODELS,
     TmuxInteractiveTransport,
+    _confirm_dialog,
     _picker_rows,
     _slider_level,
 )
@@ -70,6 +71,7 @@ def _claude(tmp_path, pane: _Pane, model="claude-opus-5-5") -> TmuxInteractiveTr
     claude._capture_pane_text = pane.capture
     claude._send_key = pane.key
     claude._pane_poll_interval_s = 0
+    claude._effort_confirm_settle = 0
     return claude
 
 
@@ -234,7 +236,8 @@ async def test_the_cache_confirm_dialog_is_answered_only_for_the_requested_choic
         "    2.  Opus 5.5 ", "  ❯ 2.  Opus 5.5 "
     )
     ack = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only"
-    pane = _Pane([_SUBSCRIPTION, moved, _CONFIRM.format(choice="Opus 5.5"), ack])
+    dialog = _CONFIRM.format(choice="Opus 5.5")
+    pane = _Pane([_SUBSCRIPTION, moved, dialog, dialog, ack])
     claude = _claude(tmp_path, pane, model="claude-fable-5-2")
 
     await claude._set_model("claude-opus-5-5")
@@ -260,3 +263,66 @@ async def test_a_confirm_dialog_for_another_choice_is_closed_not_answered(tmp_pa
 
     assert pane.keys == ["Up", "s", "Escape", "Escape"]  # dialog -> picker -> prompt
     assert claude._model == "claude-fable-5-2"
+
+
+def _moved_to_opus() -> str:
+    return _SUBSCRIPTION.replace("  ❯ 3.  Fable", "    3.  Fable").replace(
+        "    2.  Opus 5.5 ", "  ❯ 2.  Opus 5.5 "
+    )
+
+
+_ACK_OPUS = "❯ /model\n  ⎿  Set model to Opus 5.5 for this session only"
+
+
+async def test_a_boxed_dialog_that_replaced_the_echo_is_still_answered(tmp_path):
+    """The dialog is read from the live screen, border or not, echo or not."""
+    boxed = "\n".join(
+        f"│ {line.strip():<70} │"
+        for line in _CONFIRM.format(choice="Opus 5.5").splitlines()
+        if line.strip() not in ("❯ /model", "────")
+    )
+    pane = _Pane([_SUBSCRIPTION, _moved_to_opus(), boxed, boxed, _ACK_OPUS])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+
+    await claude._set_model("claude-opus-5-5")
+
+    assert pane.keys == ["Up", "s", "Enter"]
+    assert claude._model == "claude-opus-5-5"
+
+
+async def test_an_enter_the_dialog_did_not_take_is_sent_again(tmp_path):
+    """Mini 2026-11-10: the first Enter was lost and the switch was cancelled on timeout."""
+    dialog = _CONFIRM.format(choice="Opus 5.5")
+    pane = _Pane([_SUBSCRIPTION, _moved_to_opus(), dialog, dialog, dialog, _ACK_OPUS])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+
+    await claude._set_model("claude-opus-5-5")
+
+    assert pane.keys == ["Up", "s", "Enter", "Enter"]
+    assert claude._model == "claude-opus-5-5"
+
+
+async def test_a_dialog_is_not_answered_before_it_settles(tmp_path):
+    dialog = _CONFIRM.format(choice="Opus 5.5")
+    pane = _Pane([_SUBSCRIPTION, _moved_to_opus(), dialog])
+    claude = _claude(tmp_path, pane, model="claude-fable-5-2")
+    claude._effort_confirm_settle = 60
+    claude._effort_control_timeout = 0.05
+
+    with pytest.raises(RuntimeError, match="did not acknowledge /model"):
+        await claude._set_model("claude-opus-5-5")
+
+    assert "Enter" not in pane.keys
+    assert pane.keys[:3] == ["Up", "s", "Escape"]
+    assert claude._model == "claude-fable-5-2"
+
+
+def test_prose_that_quotes_the_title_is_not_a_dialog():
+    assert _confirm_dialog("● It asked Switch model? and I said yes\n❯ ") is None
+    assert _confirm_dialog(
+        "  Switch model?\n  ❯ 1. Yes, switch to Fable 5.2\n    2. No\n ⏵⏵ 3s"
+    ) == [
+        "Switch model?",
+        "❯ 1. Yes, switch to Fable 5.2",
+        "2. No",
+    ]

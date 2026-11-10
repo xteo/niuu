@@ -95,7 +95,16 @@ Check `GET /s/{id}/api/capabilities`: `runtime_options: true` gates the new surf
   `session_updated` event is the model **in effect**: the last one the runtime
   reported (a reply's `message.model`, or an acknowledged change between turns),
   else the launch model. The launch model stays stored, updated by an applied
-  switch; restart launches with it.
+  switch; restart launches with it. Sessions show it as `launch_model`, with
+  `launch_effort` (`workload_config.reasoningEffort`, null at the model's default),
+  so a `PUT` is visible before the CLI reports anything new.
+- With history, Claude asks "Switch model?" / "Change effort level?" after `s`.
+  The broker reads the dialog from the live screen (border or not) and presses
+  Enter only on "Yes, switch to <choice>", once the dialog has stayed unchanged
+  for `effort_confirm_settle_s` (1 s; chart `broker.effortConfirmSettleSeconds`).
+  An Enter sent as the dialog first draws can be lost, and the switch then timed
+  out and was cancelled ("Kept model as …"). A dialog still there, unchanged, a
+  settle period later gets Enter again.
 
 ## Approvals, questions and notices
 

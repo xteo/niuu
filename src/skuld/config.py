@@ -1258,6 +1258,16 @@ class SkuldSettings(BaseSettings):
         gt=0,
         description="Time allowed for a native effort or model change to be acknowledged.",
     )
+    effort_confirm_settle_s: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            'How long Claude\'s "Switch model?" / "Change effort level?" dialog must stay '
+            "unchanged before the broker answers it, and again before it re-sends a key the "
+            "dialog did not take. A key sent as the dialog first draws can be lost; the "
+            "switch then times out (effort_control_timeout_s) and is cancelled."
+        ),
+    )
     acp_prompt_timeout_s: float = Field(default=300.0)  # ACP/MSP (Grok Build, Muse) turn timeout
     mcp_servers: list[dict[str, Any]] = Field(default_factory=list)
     forge_mcp: ForgeMcpConfig = Field(default_factory=ForgeMcpConfig)

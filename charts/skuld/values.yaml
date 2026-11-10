@@ -261,6 +261,9 @@ broker:
   historyHydrationMaxFrames: 100000
   historyHydrationMaxBytes: 67108864
   effortControlTimeoutSeconds: 15
+  # Seconds Claude's model/effort confirm dialog must stay unchanged before the broker
+  # answers it (a key sent as it first draws can be lost).
+  effortConfirmSettleSeconds: 1
   # PI paths refer to the session container, not the API host.
   pi:
     binary: pi

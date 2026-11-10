@@ -1879,6 +1879,7 @@ class LocalProcessPodManager(PodManager):
                 "tmuxNativeTextWaitSeconds": "tmux_native_text_wait_s",
                 "tmuxNativeTextPollSeconds": "tmux_native_text_poll_s",
                 "effortControlTimeoutSeconds": "effort_control_timeout_s",
+                "effortConfirmSettleSeconds": "effort_confirm_settle_s",
                 "museBin": "muse_bin",
                 "pi": "pi",
             }.items():
