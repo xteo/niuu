@@ -195,7 +195,7 @@ An open card is checked too when its call is not in the file at all (LEX-2025): 
 a main-agent question's call before its PreToolUse hook fires, so a card open for a sweep
 interval whose call is still missing was never the session's question. It closes as
 `never_shown` everywhere, even while the menu reads `unknown` (a dim prompt suggestion in the
-composer reads as typed text). A card being answered, and a registered subagent's question
+composer reads as typed text). A card being answered, and any subagent's question
 (its call is in the subagent's own file), are left to the card's checks.
 
 Hooks from Claude Code's own side queries (prompt suggestions, speculation) never open a card,

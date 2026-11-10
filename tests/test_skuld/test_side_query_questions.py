@@ -162,3 +162,21 @@ def test_fixture_is_the_incidents_shape():
     """The replayed hook is the one recorded at 04:47:17Z (agent_id, no agent_type)."""
     hook = {"agent_id": SIDE, "tool_name": "AskUserQuestion"}
     assert "agent_type" not in json.loads(json.dumps(hook))
+
+
+async def test_a_subagents_question_is_never_closed_as_never_shown(tmp_path):
+    """Review finding: after a broker restart its agent is unregistered, its call is in its
+    own file (never the main one), and its menu may be live: the card must stay."""
+    async with Session(tmp_path) as s:
+        s.transport._native_control_sweep_interval_s = 0.0
+        await s.hook(
+            "PreToolUse",
+            agent_id="agent-after-restart",
+            agent_type="general-purpose",
+            tool_name="AskUserQuestion",
+            tool_input=QUESTIONS,
+            tool_use_id="toolu_sub_q",
+        )
+        [card] = _ask_user_questions(s.events)
+        assert await s.transport.dismiss_never_shown_question("toolu_sub_q", trigger="t") is None
+        assert card["request_id"] in s.transport._pending_tty_prompts

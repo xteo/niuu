@@ -3039,7 +3039,10 @@ class TmuxInteractiveTransport(CLITransport):
             "questions": questions,
             # A subagent's question waits while the main agent works: never superseded.
             "child": self._is_child_hook(payload or {}),
-            "subagent_id": self._coerce_str((payload or {}).get("agent_id")) or None,
+            "subagent_id": self._coerce_str(
+                (payload or {}).get("agent_id") or (payload or {}).get("agentId")
+            )
+            or None,
             **native,
             **self._card_opened(),
         }
@@ -4497,7 +4500,7 @@ class TmuxInteractiveTransport(CLITransport):
         Claude writes a main-agent question's call to its session file before the
         PreToolUse hook fires, so a card open for a sweep interval whose call is still
         not in the file never was the session's question; "menu unknown" (a dim prompt
-        suggestion in the composer) must not keep it. A registered subagent's question
+        suggestion in the composer) must not keep it. A subagent's question
         lives in its own file and is left alone, as is a card being answered.
         Returns the closed card's request id, or None when no such card qualifies.
         """
@@ -4516,7 +4519,10 @@ class TmuxInteractiveTransport(CLITransport):
                         or pending.get("answer_in_flight")
                         or pending.get("answer_uncertain")
                         or pending.get("closing_for_message")
-                        or pending.get("subagent_id") in self._hook_agents
+                        # A subagent's question is in its own file, never the main one,
+                        # registered or not (a broker restart forgets its agents).
+                        or pending.get("child")
+                        or pending.get("subagent_id")
                     ):
                         return None
                     await self._dismiss_tty_prompt(request_id, DISMISS_NEVER_SHOWN, trigger=trigger)
