@@ -1233,6 +1233,12 @@ class DeviceResponse(BaseModel):
         )
 
 
+def _launch_effort(session: Session) -> str | None:
+    """The stored launch effort, or None when the session launches at the model default."""
+    effort = str((session.workload_config or {}).get("reasoningEffort") or "").strip()
+    return effort or None
+
+
 class SessionResponse(BaseModel):
     """Response model for a session."""
 
@@ -1242,7 +1248,26 @@ class SessionResponse(BaseModel):
 
     id: UUID = Field(description="Unique session identifier")
     name: str = Field(description="Human-readable session name")
-    model: str = Field(description="LLM model identifier")
+    model: str = Field(
+        description=(
+            "LLM model in effect: the one the runtime last reported, else the launch model"
+        )
+    )
+    launch_model: str = Field(
+        default="",
+        description=(
+            "Model the session launches with on its next start or restart (the stored "
+            "launch record that PUT /sessions/{id} sets); `model` is the one in effect now"
+        ),
+    )
+    launch_effort: str | None = Field(
+        default=None,
+        description=(
+            "Native effort the next start or restart launches at "
+            "(workload_config.reasoningEffort, set by PUT /sessions/{id} reasoning_effort); "
+            "null when the model's default is used"
+        ),
+    )
     persona_name: str = Field(default="", description="Persona attached at launch")
     source: SessionSource = Field(description="Workspace source config")
     status: SessionStatus = Field(description="Current lifecycle status")
@@ -1448,6 +1473,8 @@ class SessionResponse(BaseModel):
             coordination=session.coordination,
             name=session.name,
             model=session.effective_model,
+            launch_model=session.model,
+            launch_effort=_launch_effort(session),
             persona_name=str(session.workload_config.get("persona") or ""),
             source=session.source,
             status=session.status,

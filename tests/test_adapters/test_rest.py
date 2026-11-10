@@ -509,6 +509,50 @@ class TestUpdateSession:
         data = response.json()
         assert data["model"] == "claude-opus-4"
 
+    async def test_update_shows_the_launch_choice_apart_from_the_model_in_effect(
+        self,
+        client: TestClient,
+        service: SessionService,
+        repository: InMemorySessionRepository,
+    ):
+        """A running CLI keeps reporting its model; the response still shows what was set."""
+        session = await service.create_session(
+            "Test",
+            "claude-opus-5-5",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+        # The runtime's reported usage is projection-owned; seed it as the projector would.
+        repository._sessions[session.id] = session.model_copy(
+            update={"session_usage": {"model": "claude-opus-5-5"}}
+        )
+
+        response = client.put(
+            f"/api/v1/forge/sessions/{session.id}",
+            json={"model": "claude-fable-5-2", "reasoning_effort": "high"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["model"] == "claude-opus-5-5"
+        assert data["launch_model"] == "claude-fable-5-2"
+        assert data["launch_effort"] == "high"
+        fetched = client.get(f"/api/v1/forge/sessions/{session.id}").json()
+        assert (fetched["launch_model"], fetched["launch_effort"]) == ("claude-fable-5-2", "high")
+
+    async def test_launch_effort_is_null_at_the_model_default(
+        self, client: TestClient, service: SessionService
+    ):
+        session = await service.create_session(
+            "Test",
+            "claude-opus-5-5",
+            source=GitSource(repo="https://github.com/org/repo", branch="main"),
+        )
+
+        data = client.get(f"/api/v1/forge/sessions/{session.id}").json()
+
+        assert data["launch_model"] == "claude-opus-5-5"
+        assert data["launch_effort"] is None
+
     async def test_update_session_branch(self, client: TestClient, service: SessionService):
         """Updates session branch."""
         session = await service.create_session(
