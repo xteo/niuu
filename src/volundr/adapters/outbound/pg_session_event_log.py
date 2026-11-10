@@ -24,6 +24,7 @@ from niuu.domain.text_projection import (
 )
 from niuu.domain.work_facts import (
     HOOK_KIND,
+    SUBAGENT_START_HOOK,
     TOOL_CLOSE_HOOKS,
     TOOL_OPEN_HOOK,
     TURN_END_HOOK,
@@ -72,6 +73,12 @@ _FINAL_OUTPUT_SQL = """i.kind = 'conversation.turn' AND i.payload->>'type' = 'co
            AND LENGTH(BTRIM(COALESCE(i.payload->'turn'->>'content', ''))) > 0
            AND LENGTH(COALESCE(i.payload->'turn'->>'id', '')) > 0"""
 
+# niuu.domain.work_facts.is_side_query_hook, in SQL: a Claude Code side query's hook
+# (an agent_id with no agent_type, not a SubagentStart) is never work (LEX-2026).
+_SIDE_QUERY_HOOK_SQL = f"""COALESCE(i.payload->'payload'->>'agent_id', '') <> ''
+                    AND COALESCE(i.payload->'payload'->>'agent_type', '') = ''
+                    AND h.hook <> '{SUBAGENT_START_HOOK}'"""
+
 _INSERT_SQL = f"""WITH locked_session AS MATERIALIZED (
            SELECT id FROM sessions WHERE id = $1 FOR UPDATE
        ), inserted AS (
@@ -84,7 +91,8 @@ _INSERT_SQL = f"""WITH locked_session AS MATERIALIZED (
        ), facts AS (
            SELECT i.*, ({_FINAL_OUTPUT_SQL}) AS is_final,
                (i.kind IN ({_sql_list(WORK_KINDS)})
-                OR (i.kind = '{HOOK_KIND}' AND h.hook IN ({_sql_list(WORK_HOOKS)}))) AS is_work,
+                OR (i.kind = '{HOOK_KIND}' AND h.hook IN ({_sql_list(WORK_HOOKS)})
+                    AND NOT ({_SIDE_QUERY_HOOK_SQL}))) AS is_work,
                h.hook
            FROM inserted i
            CROSS JOIN LATERAL (

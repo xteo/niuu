@@ -284,6 +284,9 @@ broker:
   # -- Checks in a row (at most one per sweep interval) that must see no menu before a
   # question card is dismissed; a permission card closes on one
   tmuxNativeControlAbsentChecks: 3
+  # -- Claude prompt suggestions in Forge-launched CLIs (each one is a forked model query
+  # per turn); false sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 for the CLI only (LEX-2026)
+  tmuxPromptSuggestions: false
   # -- Claude Code's own auto-deny timeout for a person-only safety prompt (stated in the
   # attention notification; not enforced by Skuld)
   tmuxPersonOnlyPromptTimeoutSeconds: 120.0

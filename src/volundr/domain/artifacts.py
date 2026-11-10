@@ -33,6 +33,7 @@ from uuid import UUID
 
 from niuu.domain.artifact_reports import REPORT_ARTIFACT_TOOL_NAME, report_from_turn
 from niuu.domain.notifications import NOTIFICATION_TURN_KIND
+from niuu.domain.work_facts import is_side_query_hook
 from volundr.domain.models import SessionLogEntry
 from volundr.domain.presented_files import validate_public_base_url
 
@@ -503,6 +504,8 @@ def _from_hook(
 ) -> PublicationCandidate | None:
     if payload.get("hook_event_name") != "PostToolUse":
         return None
+    if is_side_query_hook(payload):
+        return None  # a Claude Code side query publishes nothing (LEX-2026)
     inner = payload.get("payload")
     if not isinstance(inner, dict) or inner.get("tool_name") != ARTIFACT_TOOL_NAME:
         return None

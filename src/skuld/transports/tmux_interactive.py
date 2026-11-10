@@ -376,6 +376,7 @@ class TmuxInteractiveTransport(CLITransport):
         native_text_poll_s: float = 0.005,
         native_control_sweep_interval_s: float = 30.0,
         native_control_absent_checks: int = 3,
+        prompt_suggestions: bool = False,
         person_only_prompt_timeout_s: float = 120.0,
         reasoning_effort: str = "",
         effort_control_timeout_s: float = 15.0,
@@ -401,6 +402,7 @@ class TmuxInteractiveTransport(CLITransport):
         self._skip_permissions = skip_permissions
         self._claude_permission_mode = resolve_claude_permission_mode(claude_permission_mode)
         self._agent_teams = agent_teams
+        self._prompt_suggestions = prompt_suggestions
         self._system_prompt = system_prompt
         self._initial_prompt = initial_prompt
         self._raw_mcp_servers = list(mcp_servers or [])
@@ -4961,6 +4963,9 @@ class TmuxInteractiveTransport(CLITransport):
         env["TERM"] = env.get("TERM") or "xterm-256color"
         if self._agent_teams:
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        if not self._prompt_suggestions:
+            # tmux_prompt_suggestions (LEX-2026): this CLI only, never the shared settings.
+            env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "0"
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._raw_mcp_servers,

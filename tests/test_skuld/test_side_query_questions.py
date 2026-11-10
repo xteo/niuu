@@ -180,3 +180,17 @@ async def test_a_subagents_question_is_never_closed_as_never_shown(tmp_path):
         [card] = _ask_user_questions(s.events)
         assert await s.transport.dismiss_never_shown_question("toolu_sub_q", trigger="t") is None
         assert card["request_id"] in s.transport._pending_tty_prompts
+
+
+def test_forge_launched_clis_make_no_prompt_suggestions_by_default(tmp_path):
+    """LEX-2026: the env var for this CLI only; ~/.claude/settings.json is never touched."""
+    from skuld.config import SkuldSettings
+    from skuld.transports.tmux_interactive import TmuxInteractiveTransport
+
+    assert SkuldSettings().tmux_prompt_suggestions is False
+    off = TmuxInteractiveTransport(str(tmp_path))._spawn_env()
+    assert off["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] == "0"
+    on = TmuxInteractiveTransport(str(tmp_path), prompt_suggestions=True)._spawn_env()
+    assert "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION" not in on or on[
+        "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"
+    ] == __import__("os").environ.get("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION")

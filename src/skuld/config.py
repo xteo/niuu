@@ -1191,6 +1191,16 @@ class SkuldSettings(BaseSettings):
             "CLI resolved by itself (a timed-out safety prompt) can block steering."
         ),
     )
+    tmux_prompt_suggestions: bool = Field(
+        default=False,
+        description=(
+            "Whether a Forge-launched Claude CLI makes prompt suggestions (the dim next-prompt "
+            "text). Off by default: each suggestion is a forked model query after every turn, "
+            "nobody types in these composers, and its tool calls (always denied) reach the "
+            "hooks (LEX-2025/2026). Off sets CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 for the "
+            "CLI only; ~/.claude/settings.json is untouched, so interactive use keeps them."
+        ),
+    )
     tmux_native_control_absent_checks: int = Field(
         default=3,
         ge=1,
