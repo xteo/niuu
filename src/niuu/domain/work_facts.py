@@ -87,9 +87,11 @@ def is_side_query_hook(payload: Mapping[str, Any] | None) -> bool:
     inner = payload.get("payload")
     if not isinstance(inner, Mapping):
         return False
-    if not str(inner.get("agent_id") or ""):
+    agent_id, agent_type = inner.get("agent_id"), inner.get("agent_type")
+    if not (isinstance(agent_id, str) and agent_id):
         return False
-    return not str(inner.get("agent_type") or "") and hook_name(payload) != SUBAGENT_START_HOOK
+    typed = isinstance(agent_type, str) and bool(agent_type)
+    return not typed and hook_name(payload) != SUBAGENT_START_HOOK
 
 
 def is_work_row(kind: str, payload: Mapping[str, Any] | None) -> bool:

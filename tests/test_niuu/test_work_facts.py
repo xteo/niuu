@@ -140,3 +140,29 @@ def test_side_query_hooks_are_never_work():
     at = datetime(2026, 11, 10, 4, 47, 17, tzinfo=UTC)
     facts = fold_rows([("claude_hook", side, at), ("claude_hook", stop, at)])
     assert facts.last_work_at is None and not facts.tool_open
+
+
+# Row-for-row with Forge's _SIDE_QUERY_HOOK_SQL (checked against PostgreSQL on Thor,
+# LEX-2026 review): only non-empty JSON strings count as an agent id or type.
+_PARITY = [
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": "a0a9"}}, True),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": "a1", "agent_type": "Plan"}}, False),
+    ({"hook_event_name": "PreToolUse", "payload": {"tool_name": "Bash"}}, False),
+    ({"hook_event_name": "SubagentStart", "payload": {"agent_id": "a2"}}, False),
+    ({"hook_event_name": "SubagentStop", "payload": {"agent_id": "a3", "agent_type": ""}}, True),
+    ({"payload": {"hook_event_name": "PreToolUse", "agent_id": "a4"}}, True),
+    ({"hook_event_name": "PreToolUse", "payload": "a string"}, False),
+    ({"hook_event_name": "PreToolUse", "payload": ["x"]}, False),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": 0}}, False),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": ""}}, False),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": "a5", "agent_type": 0}}, True),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": "a6", "agent_type": False}}, True),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": "a7", "agent_type": None}}, True),
+    ({"hook_event_name": "PreToolUse", "payload": {"agent_id": ["x"]}}, False),
+    ({"hook_event_name": "PreToolUse"}, False),
+]
+
+
+@pytest.mark.parametrize(("frame", "side"), _PARITY)
+def test_side_query_rule_matches_the_ingest_sql(frame, side):
+    assert is_side_query_hook({"type": "claude_hook", **frame}) is side

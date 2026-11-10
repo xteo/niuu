@@ -75,8 +75,12 @@ _FINAL_OUTPUT_SQL = """i.kind = 'conversation.turn' AND i.payload->>'type' = 'co
 
 # niuu.domain.work_facts.is_side_query_hook, in SQL: a Claude Code side query's hook
 # (an agent_id with no agent_type, not a SubagentStart) is never work (LEX-2026).
-_SIDE_QUERY_HOOK_SQL = f"""COALESCE(i.payload->'payload'->>'agent_id', '') <> ''
-                    AND COALESCE(i.payload->'payload'->>'agent_type', '') = ''
+# Only non-empty JSON strings count as an id or a type, exactly as in Python; never NULL.
+_SIDE_QUERY_HOOK_SQL = f"""COALESCE(jsonb_typeof(i.payload->'payload'->'agent_id'), '') = 'string'
+                    AND COALESCE(i.payload->'payload'->>'agent_id', '') <> ''
+                    AND NOT (
+                        COALESCE(jsonb_typeof(i.payload->'payload'->'agent_type'), '') = 'string'
+                        AND COALESCE(i.payload->'payload'->>'agent_type', '') <> '')
                     AND h.hook <> '{SUBAGENT_START_HOOK}'"""
 
 _INSERT_SQL = f"""WITH locked_session AS MATERIALIZED (
