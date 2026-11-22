@@ -2,7 +2,57 @@
 
 Status: phase 1 research, 22 Nov 2026. Branch `skuld-antigravity-gemini`, cut from `5ccf9ea3c`.
 
-## Recommendation
+## Update, 22 Nov: tmux direction
+
+Damien chose to run the real `agy` TUI in tmux, reusing the Claude tmux workflow. This replaces ACP as
+the planned transport. Sections 2 and 5 below remain as the research record.
+
+**Tmux does not change the terms position.** Google's line depends on who drives the session. Its
+staff say another agent, loop or task queue may not generate prompts for `agy` on a personal login
+([#1493](https://github.com/google-antigravity/antigravity-cli/issues/1493)), and that this includes
+[GUI or computer-use automation](https://discuss.ai.google.dev/t/supported-automation-into-an-existing-antigravity-conversation-on-a-consumer-plan/188220).
+Two setups remain defensible:
+
+- **API key:** humans and agents can both drive the session.
+- **Personal login, human turns only:** Forge must refuse agent, coordinator, Ting and scheduled input
+  to the session. Google staff have
+  [allowed a private single-user interactive client](https://discuss.ai.google.dev/t/personal-app-using-the-official-agy-acp-binary-with-google-ai-pro-permitted/198889),
+  but [another reply](https://discuss.ai.google.dev/t/can-a-third-party-desktop-app-run-the-official-antigravity-cli-with-the-user-s-own-google-ai-pro-ultra-subscription/190447/1)
+  rejects wrapping `agy` in an app, so some suspension risk remains.
+
+### What carries over from the Claude tmux transport
+
+`agy` has [hooks](https://antigravity.google/docs/hooks/) close to Claude's, so the workflow maps well.
+These mappings come from documentation and have not been run:
+
+| Forge need | Claude tmux today | `agy` in tmux |
+|---|---|---|
+| Launch, adopt, send keys, interrupt | tmux lifecycle | Reuse |
+| Tool start | `PreToolUse` | `PreToolUse` |
+| Tool end | `PostToolUse` | `PostToolUse`, output probably from the transcript |
+| Turn start | `UserPromptSubmit` | `PreInvocation` with `invocationNum == 0` |
+| Turn end | `Stop` | `Stop` with `fullyIdle: true` |
+| Live assistant text | `MessageDisplay` hook | **No hook**, tail `transcript.jsonl` |
+| Permission cards | `PermissionRequest` hook | **No hook**, `PreToolUse` plus reading the menu |
+| Questions | Native question tool and menus | `ask_question`, new menu parsing |
+| Usage | Native transcript | **Unknown**, inspect `transcript.jsonl` |
+| Hook delivery | HTTP to the broker | Command hooks only, needs a small bridge to the broker |
+
+**Build a separate `TmuxAgyTransport`; do not parameterize the Claude class.**
+`tmux_interactive.py` is 6,249 lines with 267 Claude references, and its screen parsing is specific to
+Claude's TUI. Extract only engine-neutral tmux helpers, under the existing Claude test suites, so live
+Claude sessions keep their behaviour. Each session gets an isolated home, so its `hooks.json` and login
+never touch the host's `~/.gemini` or the repo.
+
+### Revised slices
+
+1. Install `agy` in an isolated home and record TUI screens, hook payloads and `transcript.jsonl`.
+2. Hook bridge and `TmuxAgyTransport`: launch, send, stream, tool, turn end, usage.
+3. Permissions and questions, visible and answerable in Forge.
+4. Resume, interrupt, model and effort.
+5. The login guard for the chosen auth mode, then catalog, chart and docs.
+
+## Original recommendation (ACP)
 
 Add a `skuldGemini` session that runs Google's `agy acp` over ACP, reusing the shape of the Grok
 transport, and **authenticate it only with a Gemini API key or a Google Cloud project**.
@@ -170,15 +220,13 @@ Phase 2 of the brief is slices 0 and 1. Nothing touches the live Forge, and roll
 
 ## Decision
 
-**Which credential should Forge use for Gemini?**
+**Which login should the tmux `agy` session use?**
 
-- **A. New dedicated Gemini API key with a spend cap (recommended).** Fastest, with clear cost limits.
-- **B. Google Cloud project.** Better if Damien has Cloud credits or wants Cloud terms. More setup.
-- **C. Stop here.** Keep using the subscription only in Google's own apps.
+- **API key (recommended).** Humans and agents can both drive it. Billed per token.
+- **Personal login, human turns only.** Uses the subscription. Forge blocks all agent-originated input,
+  and some suspension risk remains.
 
-Choosing A or B also approves installing `agy` on Thor under the matching terms.
-
-For A, create a key in a new AI Studio project, set a low monthly cap, turn off logging, then store it
+For the API key, create a key in a new AI Studio project, set a low monthly cap, turn off logging, then store it
 without echoing it:
 
 ```bash
