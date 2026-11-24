@@ -114,6 +114,8 @@ class TransportLifecycleMixin:
             "pi_command_timeout_s": self._settings.pi.command_timeout_s,
             "pi_turn_timeout_s": self._settings.pi.turn_timeout_s,
             "pi_shutdown_timeout_s": self._settings.pi.shutdown_timeout_s,
+            "agy": self._settings.agy.model_dump(),
+            "initial_prompt_sender": self._settings.session.initial_prompt_sender,
             "question_transcript_max_bytes": self._settings.tmux_question_transcript_max_bytes,
             "workspace_trust_stable_s": self._settings.tmux_workspace_trust_stable_s,
             "workspace_trust_settle_s": self._settings.tmux_workspace_trust_settle_s,

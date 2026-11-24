@@ -43,6 +43,7 @@ _ENGINE_BY_MODULE = {
     "skuld.transports.codex": "codex",
     "skuld.transports.codex_ws": "codex",
     "skuld.transports.grok": "grok",
+    "skuld.transports.tmux_agy": "agy",
     "skuld.transports.opencode": "opencode",
     "skuld.transports.muse": "muse",
     "skuld.transports.pi": "pi",

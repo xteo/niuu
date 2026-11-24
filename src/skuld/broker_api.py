@@ -942,6 +942,23 @@ async def send_slash_command(body: _SlashCommandRequest) -> dict[str, str]:
     return {"status": "sent", "command": name}
 
 
+@app.post("/api/agy/hooks", dependencies=_LOOPBACK_GUARD)
+async def receive_agy_hook(body: dict[str, Any]) -> dict[str, Any]:
+    """Answer one Antigravity CLI command hook (posted by the agy hook bridge).
+
+    The returned JSON is what agy reads from the hook's stdout, e.g. a PreToolUse
+    decision, so it is the transport's answer and nothing else.
+    """
+    event = body.get("event")
+    payload = body.get("payload")
+    if not isinstance(event, str) or not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="expected {event: str, payload: object}")
+    try:
+        return await broker.handle_agy_hook(event, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/claude/hooks", dependencies=_LOOPBACK_GUARD)
 async def receive_claude_hook(payload: dict[str, Any]) -> dict[str, bool]:
     """Receive Claude Code HTTP hook callbacks for interactive tmux sessions."""

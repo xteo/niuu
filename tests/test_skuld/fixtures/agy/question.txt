@@ -1,0 +1,23 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.16
+     ▀▀▀▀▀▀       person@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 4 Neon (Low)
+   ▄▀▀    ▀▀▄     /work/project
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use the ask_question tool to ask me: tea or coffee? Then tell me what I chose.
+
+? Tea or coffee?
+
+Question
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/1: Tea or coffee?
+
+> 1. Tea
+  2. Coffee
+  3. Write-in...
+
+  ↑/↓ Navigate · enter Select · esc Skip
+esc to cancel                                                                                                                                                         accept-edits · Gemini 4 Neon · low

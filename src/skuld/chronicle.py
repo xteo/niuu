@@ -37,6 +37,16 @@ class ChronicleMixin:
                 "unfinished_work": None,
             }
 
+        if getattr(self._transport, "human_input_only", False) is True:
+            # The summary prompt is Skuld's, not a person's: a human-input-only login
+            # (agy.human_input_only) must not receive it. Chronicle keeps the artifacts.
+            logger.info("Human-input-only session: no AI summary prompt is sent")
+            return {
+                "summary": None,
+                "key_changes": self._artifacts.files_changed,
+                "unfinished_work": None,
+            }
+
         try:
             await self._transport.send_message(CHRONICLE_SUMMARY_PROMPT)
 

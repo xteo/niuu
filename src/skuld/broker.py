@@ -32,6 +32,7 @@ from niuu.domain.logging import LoggingConfig
 from niuu.domain.message_sender import (
     SENDER_KEY,
     SenderError,
+    is_human,
     parse_recorded_sender,
     sender_for_request_id,
     text_for_model,
@@ -90,6 +91,7 @@ from skuld.chronicle_watcher import ChronicleWatcher
 from skuld.config import SkuldSettings
 from skuld.control_errors import (
     ControlRecoveryError,
+    HumanInputOnlyError,
     NativeControlsUnsupportedError,
     control_error_frame,
 )
@@ -4504,6 +4506,9 @@ class Broker(
             # Phase 3: steer the current turn with additional user guidance
             case "steer_active_turn":
                 content = str(data.get("content") or "").strip()
+                if content and self._human_input_only:
+                    # A bare steer carries no sender; send it as a message so it is checked.
+                    raise HumanInputOnlyError(self._human_input_refusal(None))
                 if content:
                     await self._transport.send_control("steer", content=content)
 
@@ -4813,6 +4818,15 @@ class Broker(
                     if sender_ws:
                         await self._send_broker_frame_to(
                             sender_ws, control_error_frame(str(exc), data, code="invalid_sender")
+                        )
+                    return
+                if self._human_input_only and not is_human(sender):
+                    refusal = self._human_input_refusal(sender)
+                    logger.warning("_dispatch_browser_message: %s", refusal)
+                    if sender_ws:
+                        await self._send_broker_frame_to(
+                            sender_ws,
+                            control_error_frame(refusal, data, code=HumanInputOnlyError.code),
                         )
                     return
                 if request_id and self.volundr_api_url:
@@ -5476,6 +5490,27 @@ class Broker(
         for msg_id in flipped:
             await self._broadcast_user_active(msg_id)
 
+    @property
+    def _human_input_only(self) -> bool:
+        """The transport's login lets only people drive it (agy.human_input_only)."""
+        return getattr(self._transport, "human_input_only", False) is True
+
+    @staticmethod
+    def _human_input_refusal(sender: dict[str, Any] | None) -> str:
+        who = "a sender Skuld cannot identify" if sender is None else f"sender {sender}"
+        return (
+            f"Refused a message from {who}: this session's Google login accepts messages "
+            "typed by a person only (agy.human_input_only). Send it from the Forge app or "
+            "the terminal yourself."
+        )
+
+    async def handle_agy_hook(self, event: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Answer one Antigravity CLI hook; the answer goes back to agy unchanged."""
+        handler = getattr(self._transport, "handle_agy_hook", None)
+        if not callable(handler):
+            raise RuntimeError("an agy hook reached a broker whose transport is not agy")
+        return await handler(event, payload)
+
     async def handle_claude_hook(self, payload: dict[str, Any]) -> None:
         """Ingest a Claude Code hook payload into the normal event pipeline.
 
@@ -5883,6 +5918,9 @@ class Broker(
         if self._transport is None:
             logger.warning("No transport available for explicit human room message")
             return
+        if self._human_input_only:
+            # Room text is relayed by the room, which cannot prove a person typed it.
+            raise HumanInputOnlyError(self._human_input_refusal(None))
         outbound = self._format_room_message_for_skuld(content)
         self._pending_explicit_human_messages.append((content, outbound))
         self._pending_explicit_human_response_count += 1

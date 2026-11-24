@@ -815,6 +815,90 @@ class PiRuntimeConfig(BaseModel):
     shutdown_timeout_s: float = Field(default=5, gt=0)
 
 
+class AgyRuntimeConfig(BaseModel):
+    """Antigravity CLI (``agy``) in tmux, for TmuxAgyTransport.
+
+    ``agy`` keeps its login, settings, hooks and conversations under ``$HOME/.gemini``
+    and honours no other location, so it runs with ``HOME`` set to ``home``: sign in
+    once there (``HOME=<home> agy``). Tools the agent runs see the same ``HOME``.
+    """
+
+    binary: str = Field(default="agy", description="Path to the agy executable.")
+    home: str = Field(
+        default="",
+        description=(
+            "HOME for agy: the directory whose .gemini holds the signed-in login. "
+            "Required; agy sessions refuse to start without it."
+        ),
+    )
+    expected_version: str = Field(
+        default="",
+        description=(
+            "The `agy --version` this Skuld was built and tested against. agy updates "
+            "itself, and a new build can redraw the menus Skuld reads, so any other "
+            "version refuses to start. Required."
+        ),
+    )
+    mode: str = Field(
+        default="auto",
+        description="agy execution mode passed as --mode: auto, accept-edits or plan.",
+    )
+    human_input_only: bool = Field(
+        default=True,
+        description=(
+            "Refuse every message whose sender is not a person (agents, coordinators, "
+            "Ting, automations, room relays, chronicle prompts). Required by Google's "
+            "terms for a personal Google login; set false only for an API-key login."
+        ),
+    )
+    tmux_bin: str = Field(default="tmux", description="tmux executable.")
+    socket_dir: str = Field(
+        default="",
+        description="Directory for the per-session tmux sockets; empty uses <tmp>/skuld-agy-<uid>.",
+    )
+    pane_cols: int = Field(default=200, gt=0, description="Width of the agy terminal.")
+    pane_rows: int = Field(default=50, gt=0, description="Height of the agy terminal.")
+    poll_interval_s: float = Field(
+        default=0.25,
+        gt=0,
+        description="How often the screen is read for frames, menus and the turn's state.",
+    )
+    ready_timeout_s: float = Field(
+        default=60,
+        gt=0,
+        description="How long a starting agy may take to show its composer before start fails.",
+    )
+    version_check_timeout_s: float = Field(
+        default=30, gt=0, description="Bound on `agy --version` at start."
+    )
+    hook_timeout_s: float = Field(
+        default=30,
+        gt=0,
+        description=(
+            "Seconds agy waits for each hook (its own default). A hook that takes longer "
+            "is abandoned by agy and fails loudly in the bridge."
+        ),
+    )
+    menu_render_wait_s: float = Field(
+        default=5,
+        gt=0,
+        description="How long an answer waits for its menu to be drawn before it is refused.",
+    )
+    interrupt_confirm_timeout_s: float = Field(
+        default=10,
+        gt=0,
+        description="How long an interrupt waits for agy to show that it stopped.",
+    )
+    turn_max_seconds: float = Field(
+        default=3600,
+        gt=0,
+        description=(
+            "Longest a turn may run without agy's Stop hook. Reaching it ends the turn with "
+            "an error naming this knob; raise it for longer unattended work."
+        ),
+    )
+
+
 class DshRuntimeConfig(BaseModel):
     """DeepSeek Harness (dsh) SDK runtime settings for DshJsonRpcTransport."""
 
@@ -1059,6 +1143,7 @@ class SkuldSettings(BaseSettings):
     model_gateway: ModelGatewayConfig = Field(default_factory=ModelGatewayConfig)
 
     pi: PiRuntimeConfig = Field(default_factory=PiRuntimeConfig)
+    agy: AgyRuntimeConfig = Field(default_factory=AgyRuntimeConfig)
     service_user_id: str = Field(default="skuld-broker")
     service_tenant_id: str = Field(default="default")
     persistence_mount_path: str = Field(default="/volundr/sessions")
@@ -1311,6 +1396,9 @@ class SkuldSettings(BaseSettings):
             return self
         if self.cli_type == "muse":
             self.transport_adapter = "skuld.transports.muse.MuseMSPTransport"
+            return self
+        if self.cli_type == "agy":
+            self.transport_adapter = "skuld.transports.tmux_agy.TmuxAgyTransport"
             return self
 
         if self.transport == "subprocess":

@@ -392,6 +392,47 @@ def _default_models() -> list[ManagedModelConfig]:
             supports_tools=True,
             supports_thinking=True,
         ),
+        # Google Gemini through the Antigravity CLI (`agy`, skuldGemini). agy names a model
+        # with its thinking level (`gemini-4-neon-high`); the catalog id is the model alone
+        # and the session's effort supplies the level. Billed to the Google login, not per
+        # token, so no cost is listed.
+        *(
+            ManagedModelConfig(
+                id=model_id,
+                name=name,
+                vendor="google",
+                provider=ManagedModelProvider.CLOUD,
+                tier=ManagedModelTier.FRONTIER,
+                color="#4285F4",
+                description=description,
+                cost_per_million_tokens=None,
+                session_definition="skuldGemini",
+                supports_tools=True,
+                supports_thinking=True,
+            )
+            for model_id, name, description in (
+                (
+                    "gemini-4-neon",
+                    "Gemini 4 Neon (Antigravity)",
+                    "Google's fast agentic coding model, 1M-token context.",
+                ),
+                (
+                    "gemini-4-hydrogen",
+                    "Gemini 4 Hydrogen (Antigravity)",
+                    "Google's lower-cost Gemini 4 model.",
+                ),
+                (
+                    "gemini-4-argon",
+                    "Gemini 4 Argon (Antigravity)",
+                    "Google's Gemini 4 Argon model.",
+                ),
+                (
+                    "gemini-3.8-flash",
+                    "Gemini 3.8 Flash (Antigravity)",
+                    "Google's Gemini 3.8 Flash model.",
+                ),
+            )
+        ),
         # Meta Muse Spark — served by Muse Code (`muse serve`, MSP over stdio) and the Meta
         # Model API. Ids are exactly what the API accepts; the -contributor variants are
         # the discounted tier whose traffic Meta uses to improve its products.

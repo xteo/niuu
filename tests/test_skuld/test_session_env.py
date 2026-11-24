@@ -206,7 +206,8 @@ def test_every_engine_module_builds_env_through_the_scrubber() -> None:
     offenders = [
         path.name
         for path in root.glob("*.py")
-        if path.name not in {"session_env.py", "owned_codex_process.py"}
+        # agy_mcp_launcher runs inside agy, whose env the broker already scrubbed.
+        if path.name not in {"session_env.py", "owned_codex_process.py", "agy_mcp_launcher.py"}
         and ("dict(os.environ)" in path.read_text() or "**os.environ" in path.read_text())
     ]
     assert offenders == []

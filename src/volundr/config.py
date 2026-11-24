@@ -2482,6 +2482,20 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             file_mounts={"/home/skuld/.grok/auth.json": "auth.json"},
         ),
         IntegrationDefinitionConfig(
+            slug="antigravity",
+            name="Google Antigravity (host sign-in)",
+            description=(
+                "Your Google account, signed in to the Antigravity CLI on the host that runs "
+                "the session (skuld agy.home). Forge stores no credential; a personal login "
+                "takes messages typed by a person only."
+            ),
+            integration_type="ai_provider",
+            model_vendor="google",
+            icon="google",
+            auth_type="none",
+            credential_schema={},
+        ),
+        IntegrationDefinitionConfig(
             slug="deepseek",
             name="DeepSeek",
             description="DeepSeek API key for DeepSeek models and the DeepSeek Harness runtime",

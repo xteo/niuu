@@ -7,6 +7,12 @@ class ControlRecoveryError(ValueError):
     code = "question_recovery_required"
 
 
+class HumanInputOnlyError(ValueError):
+    """A message a person did not write, refused by a human-input-only session."""
+
+    code = "human_input_only"
+
+
 def control_error_frame(error: object, message: Any = None, *, code: str | None = None) -> dict:
     """Keep control rejection separate from completion of an assistant turn."""
     message = message if isinstance(message, dict) else {}

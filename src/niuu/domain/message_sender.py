@@ -172,6 +172,17 @@ def is_owner_by_voice(sender: dict[str, Any]) -> bool:
     return sender["kind"] == KIND_AGENT and sender["sub_kind"] == SUB_KIND_VOICE_CALL
 
 
+def is_human(sender: dict[str, Any] | None) -> bool:
+    """A person wrote it: the user, or the owner speaking on a voice call.
+
+    Sessions with a human-input-only login (``agy.human_input_only``) accept nothing
+    else: another session, an automation, and an unidentified sender are refused.
+    """
+    if sender is None:
+        return False
+    return sender["kind"] == KIND_USER or is_owner_by_voice(sender)
+
+
 def text_for_model(sender: dict[str, Any], content: str) -> str:
     """What the receiving model gets: the header line, a blank line, the message.
 

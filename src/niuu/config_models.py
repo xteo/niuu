@@ -161,6 +161,25 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 },
             },
         ),
+        "skuldGemini": SessionDefinitionConfig(
+            enabled=True,
+            display_name="Google Antigravity (Gemini)",
+            description=(
+                "Google's Antigravity CLI in a terminal Forge drives, signed in with your "
+                "Google account. On a personal login only people may send it messages."
+            ),
+            labels=["session", "gemini", "interactive"],
+            default_model="gemini-4-neon",
+            compatible_providers=["google"],
+            defaults={
+                "broker": {
+                    "cliType": "agy",
+                    "transportAdapter": "skuld.transports.tmux_agy.TmuxAgyTransport",
+                    "skipPermissions": False,
+                    "agentTeams": False,
+                },
+            },
+        ),
         "skuldMuse": SessionDefinitionConfig(
             enabled=True,
             display_name="Meta Muse Code",
