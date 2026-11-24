@@ -2486,14 +2486,18 @@ def _default_integration_definitions() -> list[IntegrationDefinitionConfig]:
             name="Google Antigravity (host sign-in)",
             description=(
                 "Your Google account, signed in to the Antigravity CLI on the host that runs "
-                "the session (skuld agy.home). Forge stores no credential; a personal login "
-                "takes messages typed by a person only."
+                "the session. Give the agy home that holds the login (sign in once with "
+                "HOME=<that folder> agy); no token is stored in Forge. A personal login takes "
+                "messages typed by a person only."
             ),
             integration_type="ai_provider",
             model_vendor="google",
             icon="google",
-            auth_type="none",
-            credential_schema={},
+            credential_schema={
+                "required": ["agy_home"],
+                "properties": {"agy_home": {"label": "agy home on the host", "type": "string"}},
+            },
+            env_from_credentials={"SKULD__AGY__HOME": "agy_home"},
         ),
         IntegrationDefinitionConfig(
             slug="deepseek",

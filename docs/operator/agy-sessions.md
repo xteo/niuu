@@ -40,6 +40,10 @@ Transport: `skuld.transports.tmux_agy.TmuxAgyTransport`. Design and recorded beh
    | `agy.turn_max_seconds` | Longest turn without a Stop hook; reaching it ends the turn with an error. |
    | Others | Polling, timeouts and pane size; see `AgyRuntimeConfig` in `src/skuld/config.py`. |
 
+4. In Forge, connect **Google Antigravity (host sign-in)** under AI providers and give the
+   `agy` home from step 1. It stores only that path (no token) and hands it to the
+   person's sessions as `SKULD__AGY__HOME`; the launcher offers Gemini once it is connected.
+
    Skuld launches `agy` with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (agy ignores `1`). Updates
    started by hand still happen; after one, re-test and raise `agy.expected_version`.
 
