@@ -285,6 +285,8 @@ class InMemoryEventBroadcaster(EventBroadcaster):
                 "description": session.description,
                 "short_description_updated_at": _iso(session.short_description_updated_at),
                 "description_updated_at": _iso(session.description_updated_at),
+                # The registered icon's ETag (null when none): refetch the icon on change.
+                "icon_etag": session.icon_etag,
                 # G10 (F12d): the inputs every reader needs to derive "working" alike.
                 "last_work_at": _iso(session.last_work_at),
                 "tool_open": session.tool_open,

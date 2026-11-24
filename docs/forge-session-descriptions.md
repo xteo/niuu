@@ -4,6 +4,7 @@ Epic LEX-1262 "Session metadata", server ticket LEX-1264. A long-running session
 do many things, and the session list alone does not say which. Every Forge session
 carries two text fields that its agent keeps current and that every client shows.
 Feature flag: `session_descriptions: true` on `GET /api/v1/forge/feature-flags`.
+The session icon (LEX-2629) is built the same way: see [forge-session-icons.md](forge-session-icons.md).
 
 ## Fields
 

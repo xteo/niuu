@@ -42,6 +42,7 @@ class FakeForge:
     def __init__(self) -> None:
         self.logged: list[dict[str, Any]] = []
         self.described: list[tuple[str | None, dict[str, Any]]] = []
+        self.icons: list[tuple[str | None, bytes | None]] = []
         self.lock = threading.Lock()
         forge = self
 
@@ -84,9 +85,24 @@ class FakeForge:
                     return
                 self._send(200, {})
 
+            def do_DELETE(self) -> None:  # noqa: N802
+                if self.path != f"/api/v1/forge/sessions/{SESSION_ID}/icon":
+                    self._send(404, {"detail": "not found"})
+                    return
+                with forge.lock:
+                    forge.icons.append((self.headers.get("authorization"), None))
+                self.send_response(204)
+                self.end_headers()
+
             def do_PUT(self) -> None:  # noqa: N802
                 length = int(self.headers.get("content-length") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}")
+                raw = self.rfile.read(length)
+                if self.path == f"/api/v1/forge/sessions/{SESSION_ID}/icon":
+                    with forge.lock:
+                        forge.icons.append((self.headers.get("authorization"), raw))
+                    self._send(200, {"icon_etag": "e" * 64, "size": 512})
+                    return
+                body = json.loads(raw or b"{}")
                 if self.path != f"/api/v1/forge/sessions/{SESSION_ID}/description":
                     self._send(404, {"detail": "not found"})
                     return
@@ -398,3 +414,75 @@ def test_forge_describe_shim_and_tool_reach_forge_through_the_real_broker(
         timeout=30,
     )
     assert unavailable.returncode == 3 and "not available" in unavailable.stderr
+
+
+def test_forge_icon_shim_reaches_forge_through_the_real_broker(broker, forge, tmp_path) -> None:
+    from skuld.forge_mcp.routes import ICON_TOOL_PATH
+    from skuld.transports.session_tools import BROKER_TOKEN_FILE_ENV, FORGE_ICON_URL_ENV
+    from skuld.transports.tool_shims import ensure_codex_tool_shims
+
+    bin_dir, env = ensure_codex_tool_shims(
+        str(tmp_path / "agent-ws"),
+        session_env={
+            FORGE_ICON_URL_ENV: f"http://127.0.0.1:{broker['port']}{ICON_TOOL_PATH}",
+            BROKER_TOKEN_FILE_ENV: str(broker["token_file"]),
+        },
+    )
+    icon = tmp_path / "workspace" / "icon.png"
+    icon.write_bytes(b"\x89PNG-icon-bytes")
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(bin_dir / "forge-icon"), *args],
+            env={"PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=tmp_path / "workspace",
+        )
+
+    stored = run("icon.png")
+    assert stored.returncode == 0, stored.stderr
+    assert json.loads(stored.stdout) == {
+        "session_id": SESSION_ID,
+        "icon_etag": "e" * 64,
+        "size": 512,
+    }
+    authorization, body = forge.icons[0]
+    assert body == b"\x89PNG-icon-bytes"
+    # The broker's own credential authorizes the write, never the loopback secret.
+    assert authorization and broker["token_file"].read_text().strip() not in authorization
+
+    cleared = run("--clear")
+    assert cleared.returncode == 0, cleared.stderr
+    assert json.loads(cleared.stdout)["cleared"] is True
+    assert forge.icons[1][1] is None
+
+    # A file shown with present-file is read from the broker's staging copy by file_id.
+    import urllib.request
+
+    secret = broker["token_file"].read_text().strip()
+
+    def post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{broker['port']}{path}",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "authorization": f"Bearer {secret}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
+
+    presented = post("/api/present-file", {"path": str(icon)})
+    via_file_id = post(ICON_TOOL_PATH, {"file_id": presented["file_id"]})
+    assert via_file_id["isError"] is False, via_file_id
+    assert forge.icons[2][1] == b"\x89PNG-icon-bytes"
+    unknown = post(ICON_TOOL_PATH, {"file_id": "pf_" + "0" * 32})
+    assert unknown["isError"] is True and "no presented file" in unknown["content"][0]["text"]
+
+    outside = run("/etc/hostname")
+    assert outside.returncode == 1
+    assert "outside the session roots" in outside.stderr
+    missing = run(str(tmp_path / "workspace" / "absent.png"))
+    assert missing.returncode == 1 and "no such file" in missing.stderr
+    assert len(forge.icons) == 3

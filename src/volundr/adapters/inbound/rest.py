@@ -54,6 +54,15 @@ from niuu.domain.session_description import (
     SessionDescriptionPatch,
 )
 from niuu.domain.session_endpoint import BROKER_UNAVAILABLE_HEADER, public_session_endpoint
+from niuu.domain.session_icon import (
+    ICON_CACHE_CONTROL,
+    ICON_MAX_INPUT_BYTES,
+    ICON_MEDIA_TYPE,
+    ICON_SIZE,
+    ICON_SIZES,
+    icon_etag_header,
+    if_none_match_hits,
+)
 from niuu.domain.text_projection import projection_revision
 from niuu.forge_mcp.models import ForgeMcpGrant
 from niuu.room_access import ROOM_ROLE_HEADER
@@ -189,6 +198,7 @@ from volundr.domain.session_broker import (
     server_side_http_proxy_target,
     session_proxy_url,
 )
+from volundr.domain.session_icons import SessionIconError, SessionIconProcessor
 from volundr.domain.session_participants import SessionParticipant
 from volundr.domain.session_read_state import (
     SessionReadState,
@@ -240,6 +250,7 @@ def _session_summary(item: Any, node: str | None) -> dict[str, Any]:
         "status": item.status.value if hasattr(item.status, "value") else item.status,
         "activity_state": getattr(item, "activity_state", None),
         "short_description": getattr(item, "short_description", None),
+        "icon_etag": getattr(item, "icon_etag", None),
         "project": (
             {"id": str(coordination.project_id), "role": coordination.role}
             if coordination is not None
@@ -904,6 +915,13 @@ class SessionUpdate(BaseModel):
     }
 
 
+class SessionIconResponse(BaseModel):
+    """What ``PUT /sessions/{id}/icon`` answers: the stored icon's ETag and side."""
+
+    icon_etag: str = Field(description="Content hash of the stored 512x512 PNG")
+    size: int = Field(description="Side of the stored icon, in pixels")
+
+
 class SessionDescriptionUpdate(SessionDescriptionPatch):
     """Request body for ``PUT /sessions/{id}/description``.
 
@@ -1436,6 +1454,13 @@ class SessionResponse(BaseModel):
         default=None,
         description="ISO 8601 time description last changed; null if never set",
     )
+    icon_etag: str | None = Field(
+        default=None,
+        description=(
+            "ETag of the session's registered icon (GET /sessions/{id}/icon); null when it "
+            "has none. Refetch the icon only when this changes."
+        ),
+    )
     last_work_at: str | None = Field(
         default=None,
         description=(
@@ -1578,6 +1603,7 @@ class SessionResponse(BaseModel):
                 if session.description_updated_at
                 else None
             ),
+            icon_etag=session.icon_etag,
             last_work_at=(session.last_work_at.isoformat() if session.last_work_at else None),
             tool_open=session.tool_open,
             open_controls=session.open_controls,
@@ -2225,9 +2251,14 @@ def create_router(
     history_max_bytes: int = 256 * 1024,
     session_participant_service: SessionParticipantService,
     presented_file_store: PresentedFileStore | None = None,
+    session_icon_processor: SessionIconProcessor | None = None,
 ) -> APIRouter:
     """Create FastAPI router with session, stats, token, repo, and SSE endpoints."""
     router = APIRouter(prefix=prefix)
+    if session_icon_processor is None:
+        from volundr.adapters.outbound.pillow_session_icons import PillowSessionIconProcessor
+
+        session_icon_processor = PillowSessionIconProcessor()
     if preview_cache is None:
         preview_cache = PreviewCache(preview_cache_dir, max_edge=preview_default_edge)
     if not preview_min_edge <= preview_cache.max_edge <= preview_edge_limit:
@@ -2410,6 +2441,8 @@ def create_router(
             "attachments_index": True,
             # PUT /sessions/{id}/description + short_description/description on records.
             "session_descriptions": True,
+            # PUT/DELETE/GET /sessions/{id}/icon + icon_etag on session records.
+            "session_icons": True,
         }
 
     @router.get("/repos/branches", response_model=list[str], tags=["Repositories"])
@@ -2525,7 +2558,7 @@ def create_router(
         fields: Literal["full", "summary"] = Query(
             default="full",
             description="'summary' returns {id, name, status, activity_state, "
-            "short_description, project, last_activity_at, unread, node} per session, "
+            "short_description, icon_etag, project, last_activity_at, unread, node} per session, "
             "newest activity first.",
         ),
     ) -> list[SessionResponse | SessionRoomSummary] | list[dict]:
@@ -3209,6 +3242,162 @@ def create_router(
                 detail=f"Session not found: {session_id}",
             )
         return _session_response(session)
+
+    async def _read_icon_body(request: Request) -> bytes:
+        """The request body, refused with 413 as soon as it passes the icon limit."""
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > ICON_MAX_INPUT_BYTES:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                f"icon exceeds {ICON_MAX_INPUT_BYTES} bytes (2 MiB); send a smaller image",
+            )
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > ICON_MAX_INPUT_BYTES:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE,
+                    f"icon exceeds {ICON_MAX_INPUT_BYTES} bytes (2 MiB); send a smaller image",
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def _authorized_for_icon(request: Request, session_id: UUID):
+        """Check the write before the body is read and decoded (same rule as descriptions)."""
+        principal = await _optional_principal(request)
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        try:
+            await forge.ensure_access(session, principal, "update")
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+        return principal
+
+    async def _store_icon(session_id: UUID, icon, principal) -> Session:
+        try:
+            return await forge.set_icon(session_id, icon, principal=principal)
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+        except SessionNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+
+    @router.put(
+        "/sessions/{session_id}/icon",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
+        response_model=SessionIconResponse,
+        responses={
+            403: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+        tags=["Sessions"],
+    )
+    async def set_session_icon(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> SessionIconResponse:
+        """Set or replace the session's icon (body: a square PNG, JPEG or HEIC image).
+
+        64 to 2048 px on a side and at most 2 MiB; Forge re-encodes it to a 512x512 PNG
+        with no metadata. Open to operators and to the session's own token. A change
+        reaches clients as ``session_updated`` (``icon_etag``) on the fleet stream.
+        """
+        _require_bound_workload_session(request, session_id)
+        principal = await _authorized_for_icon(request, session_id)
+        data = await _read_icon_body(request)
+        try:
+            icon = await asyncio.to_thread(session_icon_processor.process, data)
+        except SessionIconError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from None
+        session = await _store_icon(session_id, icon, principal)
+        logger.info("session icon set: session=%s etag=%s", session_id, session.icon_etag)
+        return SessionIconResponse(icon_etag=icon.etag, size=ICON_SIZE)
+
+    @router.delete(
+        "/sessions/{session_id}/icon",
+        dependencies=[Depends(require_scope(FORGE_NOTIFY_SCOPE))],
+        status_code=status.HTTP_204_NO_CONTENT,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+        tags=["Sessions"],
+    )
+    async def clear_session_icon(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> Response:
+        """Remove the session's icon. Clearing a session that has none is a no-op."""
+        _require_bound_workload_session(request, session_id)
+        principal = await _authorized_for_icon(request, session_id)
+        await _store_icon(session_id, None, principal)
+        logger.info("session icon cleared: session=%s", session_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.get(
+        "/sessions/{session_id}/icon",
+        dependencies=[Depends(require_scope(FORGE_SESSION_READ_SCOPE))],
+        response_class=Response,
+        responses={
+            200: {"content": {ICON_MEDIA_TYPE: {}}},
+            304: {"description": "The If-None-Match ETag is current"},
+            404: {"model": ErrorResponse},
+        },
+        tags=["Sessions"],
+    )
+    async def get_session_icon(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+        size: int = Query(
+            default=ICON_SIZE,
+            description="Side in pixels: " + ", ".join(str(side) for side in ICON_SIZES),
+        ),
+    ) -> Response:
+        """The session's icon as a square PNG; 404 when it has none."""
+        if size not in ICON_SIZES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="size must be one of " + ", ".join(str(side) for side in ICON_SIZES),
+            )
+        principal = await _optional_principal(request)
+        try:
+            stored = await forge.get_icon(session_id, size, principal=principal)
+        except SessionAccessDeniedError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied to session {session_id}",
+            )
+        except SessionNotFoundError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session not found: {session_id}",
+            )
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} has no icon",
+            )
+        etag, png = stored
+        headers = {
+            "ETag": icon_etag_header(etag),
+            "Cache-Control": ICON_CACHE_CONTROL,
+            "X-Content-Type-Options": "nosniff",
+        }
+        if if_none_match_hits(request.headers.get("if-none-match"), etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+        return Response(content=png, media_type=ICON_MEDIA_TYPE, headers=headers)
 
     def _forge_mcp_grants_response(session_id: UUID, view) -> ForgeMcpGrantsResponse:
         return ForgeMcpGrantsResponse(

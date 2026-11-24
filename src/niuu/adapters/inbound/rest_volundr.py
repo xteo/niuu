@@ -84,6 +84,7 @@ from niuu.domain.presented_files import (
 from niuu.domain.services.forge_session_policy import policy_refusal
 from niuu.domain.services.instances import InstanceService
 from niuu.domain.services.token_scope import FORGE_SESSION_TOKEN_USE
+from niuu.domain.session_icon import ICON_MAX_INPUT_BYTES, ICON_MEDIA_TYPE
 from niuu.domain.session_owners import SessionOwners
 from niuu.forge_mcp.credentials import token_scopes
 from niuu.ports.instances import InvalidInstanceIdError
@@ -3764,6 +3765,118 @@ def create_volundr_router(
         _ensure_remote_success(response)
         payload = response.json()
         return _with_instance(payload, instance) if isinstance(payload, dict) else {}
+
+    icon_not_supported = "Update this session's Forge host to enable session icons"
+
+    @router.put("/sessions/{session_id}/icon")
+    async def set_session_icon(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Set the session's icon on its owning host; the image passes through unchanged.
+
+        Bounded before it is buffered (the contract's 2 MiB); the owner validates,
+        re-encodes and answers, and its answer (422 and 413 included) comes back as is.
+        """
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > ICON_MAX_INPUT_BYTES:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                f"icon exceeds {ICON_MAX_INPUT_BYTES} bytes (2 MiB); send a smaller image",
+            )
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > ICON_MAX_INPUT_BYTES:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE,
+                    f"icon exceeds {ICON_MAX_INPUT_BYTES} bytes (2 MiB); send a smaller image",
+                )
+            chunks.append(chunk)
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        content_type = request.headers.get("content-type")
+        response = await _request_remote(
+            instance,
+            request,
+            method="PUT",
+            path=f"/sessions/{session_id}/icon",
+            content_body=b"".join(chunks),
+            extra_headers={"content-type": content_type} if content_type else None,
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, icon_not_supported)
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type"),
+        )
+
+    @router.delete("/sessions/{session_id}/icon", status_code=status.HTTP_204_NO_CONTENT)
+    async def clear_session_icon(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """Remove the session's icon on its owning host."""
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        response = await _request_remote(
+            instance,
+            request,
+            method="DELETE",
+            path=f"/sessions/{session_id}/icon",
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, icon_not_supported)
+        _ensure_remote_success(response)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.get("/sessions/{session_id}/icon")
+    async def get_session_icon(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> Response:
+        """The session's icon PNG from its owning host (``?size=512|256|128``).
+
+        ``If-None-Match`` is forwarded, so a current ETag is answered 304 by the owner;
+        ``ETag`` and ``Cache-Control`` come back with the image.
+        """
+        instance, _ = await _find_session_owner(
+            service, principal, request, session_id, embedded_app=embedded_forge_app
+        )
+        if_none_match = request.headers.get("if-none-match")
+        response = await _request_remote(
+            instance,
+            request,
+            method="GET",
+            path=f"/sessions/{session_id}/icon",
+            params=_query_params(request),
+            extra_headers={"if-none-match": if_none_match} if if_none_match else None,
+            embedded_app=embedded_forge_app,
+        )
+        if _route_missing(response):
+            raise HTTPException(501, icon_not_supported)
+        headers = {
+            name: value
+            for name in ("etag", "cache-control")
+            if (value := response.headers.get(name)) is not None
+        }
+        if response.status_code == status.HTTP_304_NOT_MODIFIED:
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+        _ensure_remote_success(response)
+        return Response(
+            content=response.content,
+            media_type=ICON_MEDIA_TYPE,
+            headers={**headers, "x-content-type-options": "nosniff"},
+        )
 
     async def _forward_forge_mcp(
         request: Request, principal: Principal, session_id: str, method: str, body=None

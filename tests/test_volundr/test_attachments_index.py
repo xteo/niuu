@@ -457,6 +457,7 @@ async def test_feature_flag_advertises_the_index():
     flags = client.get("/api/v1/forge/feature-flags").json()
     assert flags["attachments_index"] is True
     assert flags["session_descriptions"] is True
+    assert flags["session_icons"] is True
 
 
 def test_builder_handles_content_arrays_and_orphan_results():

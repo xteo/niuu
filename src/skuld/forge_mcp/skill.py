@@ -79,6 +79,14 @@ every session list without interrupting anyone. Set `short_description` — one 
 current step and the goal — when you start, whenever the phase changes, when blocked
 ("Blocked on …") and when done ("Done: …"). Put the fuller status someone opening the session
 would want in `description` (markdown). Send only what changed; `null` clears a field.
+
+## Session icon (once, not every turn)
+
+`set_session_icon` (or `forge-icon <path>`) registers the icon every device shows for this
+session. Set once when the session starts, if it has a clear identity (a project, a person, a
+product). Never generate a new icon every turn. Pass `path` (a square PNG, JPEG or HEIC,
+64-2048 px, at most 2 MiB, in the workspace or home) or `file_id` (an image shown with
+present-file); `clear: true` (`forge-icon --clear`) removes it.
 """
 
 

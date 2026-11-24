@@ -169,6 +169,7 @@ class InMemorySessionRepository(SessionRepository):
 
     def __init__(self):
         self._sessions: dict[UUID, Session] = {}
+        self._icons: dict[UUID, tuple[str, dict[int, bytes]]] = {}
 
     async def create(self, session: Session) -> Session:
         self._sessions[session.id] = session
@@ -210,6 +211,7 @@ class InMemorySessionRepository(SessionRepository):
                 "short_description_updated_at": current.short_description_updated_at,
                 "description_updated_at": current.description_updated_at,
                 "session_usage": current.session_usage,
+                "icon_etag": current.icon_etag,
             }
         )
         self._sessions[session.id] = updated
@@ -229,6 +231,27 @@ class InMemorySessionRepository(SessionRepository):
         updated = current.model_copy(update=updates)
         self._sessions[session_id] = updated
         return updated
+
+    async def set_icon(self, session_id, icon, now):
+        current = self._sessions.get(session_id)
+        if current is None:
+            return None
+        etag = icon.etag if icon is not None else None
+        if icon is None:
+            self._icons.pop(session_id, None)
+        else:
+            self._icons[session_id] = (icon.etag, dict(icon.renditions))
+        if current.icon_etag == etag:
+            return current
+        updated = current.model_copy(update={"icon_etag": etag, "updated_at": now})
+        self._sessions[session_id] = updated
+        return updated
+
+    async def get_icon(self, session_id, size):
+        stored = self._icons.get(session_id)
+        if stored is None or size not in stored[1]:
+            return None
+        return stored[0], stored[1][size]
 
     async def update_forge_mcp_grants(self, session_id, grants, now):
         current = self._sessions.get(session_id)
@@ -299,6 +322,7 @@ class InMemorySessionRepository(SessionRepository):
     async def delete(self, session_id: UUID) -> bool:
         if session_id in self._sessions:
             del self._sessions[session_id]
+            self._icons.pop(session_id, None)
             return True
         return False
 

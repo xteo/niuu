@@ -98,6 +98,7 @@ from volundr.domain.models import (  # noqa: F401
 )
 from volundr.domain.projects import SessionCoordination
 from volundr.domain.push import PushTokenKind
+from volundr.domain.session_icons import SessionIconImages
 from volundr.domain.session_participants import ParticipantRole, SessionParticipant
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
@@ -173,6 +174,21 @@ class SessionRepository(ABC):
         when its stored value actually changes. Returns the stored session, or
         ``None`` when it no longer exists. Ordinary updates never write these columns.
         """
+
+    @abstractmethod
+    async def set_icon(
+        self, session_id: UUID, icon: SessionIconImages | None, now: datetime
+    ) -> Session | None:
+        """Store (or, with ``None``, remove) the session's icon renditions.
+
+        ``icon_etag`` follows in the same transaction; ``updated_at`` moves to ``now``
+        only when the stored etag changes. Returns the stored session, or ``None`` when
+        it no longer exists. Ordinary updates never write ``icon_etag``.
+        """
+
+    @abstractmethod
+    async def get_icon(self, session_id: UUID, size: int) -> tuple[str, bytes] | None:
+        """The stored ``(etag, png)`` of one rendition, or ``None`` when there is no icon."""
 
     @abstractmethod
     async def update_forge_mcp_grants(

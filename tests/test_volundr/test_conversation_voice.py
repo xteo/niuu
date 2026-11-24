@@ -260,6 +260,7 @@ async def test_summary_fields() -> None:
         "status",
         "activity_state",
         "short_description",
+        "icon_etag",
         "project",
         "last_activity_at",
         "worked_seconds_24h",

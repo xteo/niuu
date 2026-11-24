@@ -187,3 +187,28 @@ def test_forge_describe_shim_is_installed_and_validates_its_arguments(tmp_path: 
     assert missing.returncode == 2 and "cannot read" in missing.stderr
     unavailable = run("--short=Fixing CI")
     assert unavailable.returncode == 3 and "not available" in unavailable.stderr
+
+
+def test_forge_icon_shim_is_installed_and_validates_its_arguments(tmp_path: Path) -> None:
+    bin_dir, _ = ensure_codex_tool_shims(str(tmp_path / "ws"))
+    shim = bin_dir / "forge-icon"
+    assert shim.stat().st_mode & 0o111
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(shim), *args],
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    assert run().returncode == 2
+    assert run("a.png", "b.png").returncode == 2
+    helped = run("--help")
+    assert helped.returncode == 0 and "--clear" in helped.stdout
+    bad = run("--bogus")
+    assert bad.returncode == 2 and "unexpected option" in bad.stderr
+    unavailable = run("icon.png")
+    assert unavailable.returncode == 3 and "not available" in unavailable.stderr
+    assert run("--clear").returncode == 3

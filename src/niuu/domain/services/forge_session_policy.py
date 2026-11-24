@@ -120,6 +120,11 @@ ROUTE_POLICIES: tuple[RoutePolicy, ...] = (
     RoutePolicy("PUT", f"{_S}/description", FORGE_NOTIFY_SCOPE, Binding.OWN),
     # The broker's durable copy of a file its own session presented (F2).
     RoutePolicy("PUT", f"{_S}/files/presented/{{file_id}}", FORGE_NOTIFY_SCOPE, Binding.OWN),
+    # Session icons (LEX-2629): the agent sets its own icon (set_session_icon, forge-icon);
+    # any of the owner's icons can be read.
+    RoutePolicy("PUT", f"{_S}/icon", FORGE_NOTIFY_SCOPE, Binding.OWN),
+    RoutePolicy("DELETE", f"{_S}/icon", FORGE_NOTIFY_SCOPE, Binding.OWN),
+    RoutePolicy("GET", f"{_S}/icon", _READ, Binding.OWNED),
     # The Forge-hosted MCP. Each tool re-enters this allow-list as a REST call.
     RoutePolicy("POST", f"{FORGE_PREFIX}/mcp", None, Binding.NONE),
 )

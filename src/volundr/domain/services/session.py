@@ -79,6 +79,7 @@ from volundr.domain.services.forge_session_launch import (
     with_forge_mcp,
     without_forge_mcp,
 )
+from volundr.domain.session_icons import SessionIconImages
 from volundr.domain.session_read_state import SessionReadState, SessionReadStateChange
 
 if TYPE_CHECKING:
@@ -1047,6 +1048,34 @@ class SessionService:
         if changed and self._broadcaster is not None:
             await self._broadcaster.publish_session_updated(result)
         return result
+
+    async def set_icon(
+        self,
+        session_id: UUID,
+        icon: SessionIconImages | None,
+        principal: Principal | None = None,
+    ) -> Session:
+        """Store or clear the session's icon; publish only when its etag changed."""
+        session = await self._repository.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+        await self._check_access(session, principal, "update")
+        result = await self._repository.set_icon(session_id, icon, datetime.now(UTC))
+        if result is None:
+            raise SessionNotFoundError(session_id)
+        if result.icon_etag != session.icon_etag and self._broadcaster is not None:
+            await self._broadcaster.publish_session_updated(result)
+        return result
+
+    async def get_icon(
+        self, session_id: UUID, size: int, principal: Principal | None = None
+    ) -> tuple[str, bytes] | None:
+        """One rendition of the session's icon, or ``None`` when it has none."""
+        session = await self._repository.get(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+        await self._check_access(session, principal, "read")
+        return await self._repository.get_icon(session_id, size)
 
     async def update_coordination(
         self,

@@ -78,6 +78,14 @@ class ForgeClient(ABC):
     ) -> dict[str, Any]:
         """``PUT /sessions/{id}/description``: sent keys replace, ``None`` clears."""
 
+    @abstractmethod
+    async def set_icon(self, session_id: str, data: bytes) -> dict[str, Any]:
+        """``PUT /sessions/{id}/icon`` with the image bytes; returns ``{icon_etag, size}``."""
+
+    @abstractmethod
+    async def clear_icon(self, session_id: str) -> None:
+        """``DELETE /sessions/{id}/icon``."""
+
 
 class ForgeMcpHost(ABC):
     """The caller's own context: who is asking, and how its notifications are recorded."""
@@ -94,6 +102,26 @@ class ForgeMcpHost(ABC):
     @abstractmethod
     async def notify(self, draft: NotificationDraft) -> dict[str, Any]:
         """Record a notification; return ``{notification_id, turn_id, session_seq, state}``."""
+
+    async def read_icon_file(self, path: str) -> bytes:
+        """Read an image file from the caller's own workspace or home.
+
+        Only a session's own broker can see those files; other hosts refuse."""
+        raise ForgeApiError(
+            "set_session_icon with a path needs the session's own Forge MCP (it reads that "
+            "session's files); call it from the session, or use `forge-icon <path>` there",
+            status=501,
+        )
+
+    async def read_presented_file(self, file_id: str) -> bytes:
+        """Read a file the caller's own session staged with present-file.
+
+        Only a session's own broker holds those copies; other hosts refuse."""
+        raise ForgeApiError(
+            "set_session_icon with a file_id needs the session's own Forge MCP (it reads "
+            "that session's presented files); call it from the session",
+            status=501,
+        )
 
     async def report_artifact(self, report: ArtifactReport) -> dict[str, Any]:
         """Record an explicit artifact report in the caller's durable log.

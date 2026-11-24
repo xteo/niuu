@@ -14,7 +14,14 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from niuu.domain.artifact_reports import ARTIFACT_REPORT_TYPES, ArtifactReport
 from niuu.domain.notifications import (
@@ -53,6 +60,12 @@ from niuu.domain.session_description import (
     DESCRIPTION_FIELDS,
     DESCRIPTION_MAX_CHARS,
     SHORT_DESCRIPTION_MAX_CHARS,
+)
+from niuu.domain.session_icon import (
+    ICON_INPUT_TYPES_TEXT,
+    ICON_MAX_INPUT_PX,
+    ICON_MIN_INPUT_PX,
+    ICON_SIZE,
 )
 from niuu.forge_mcp.guidance import (
     COMPACT_NOTIFICATION_GUIDANCE,
@@ -222,6 +235,24 @@ class _DescribeSessionArgs(_Args):
             for name in DESCRIPTION_FIELDS
             if name in self.model_fields_set
         }
+
+
+class _SetSessionIconArgs(_Args):
+    path: str | None = None
+    file_id: str | None = Field(default=None, pattern=PRESENTED_FILE_ID_PATTERN)
+    clear: bool = False
+
+    @model_validator(mode="after")
+    def _one_source(self) -> _SetSessionIconArgs:
+        chosen = [self.path is not None, self.file_id is not None, self.clear]
+        if sum(chosen) != 1:
+            raise ValueError(
+                "pass exactly one of path (an image file), file_id (a presented image) "
+                "or clear: true"
+            )
+        if self.path is not None and not self.path.strip():
+            raise ValueError("path must not be blank")
+        return self
 
 
 # --------------------------------------------------------------------------- schemas
@@ -640,6 +671,37 @@ _DESCRIBE_SESSION_SCHEMA = _object(
 )
 
 
+_SET_SESSION_ICON_DESCRIPTION = (
+    "Register your own Forge session's icon, shown for the session on every device (the "
+    "phone shows pinned sessions as an icon grid). Set once when the session starts, if "
+    "it has a clear identity (a project, a person, a product). Never generate a new icon "
+    "every turn. Pass `path` (an image file in your workspace or home), or `file_id` (an "
+    f"image you already showed with present-file), or `clear: true` to remove it. The "
+    f"image must be a {ICON_INPUT_TYPES_TEXT}, square (1:1), {ICON_MIN_INPUT_PX} to "
+    f"{ICON_MAX_INPUT_PX} px on a side and at most 2 MiB; Forge stores it as a "
+    f"{ICON_SIZE}x{ICON_SIZE} PNG. Setting the same image again changes nothing. This is "
+    "not a notification and interrupts no one."
+)
+
+_SET_SESSION_ICON_SCHEMA = _object(
+    {
+        "path": {
+            "type": "string",
+            "description": "Absolute (or ~) path of a square image in your workspace or home.",
+        },
+        "file_id": {
+            "type": "string",
+            "pattern": PRESENTED_FILE_ID_PATTERN,
+            "description": "The file_id present-file returned for a square image.",
+        },
+        "clear": {
+            "type": "boolean",
+            "description": "true removes the session's icon.",
+        },
+    }
+)
+
+
 class _ReportArtifactArgs(_Args):
     url: str
     title: str
@@ -711,6 +773,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=_DESCRIBE_SESSION_DESCRIPTION,
         input_schema=_DESCRIBE_SESSION_SCHEMA,
         args_model=_DescribeSessionArgs,
+    ),
+    ToolSpec(
+        name="set_session_icon",
+        description=_SET_SESSION_ICON_DESCRIPTION,
+        input_schema=_SET_SESSION_ICON_SCHEMA,
+        args_model=_SetSessionIconArgs,
     ),
     ToolSpec(
         name="list_notifications",
@@ -1076,6 +1144,7 @@ class ForgeMcpToolbox:
             "environment": self._environment,
             "notify": notify,
             "describe_session": self._describe_session,
+            "set_session_icon": self._set_session_icon,
             "report_artifact": self._report_artifact,
             "list_notifications": self._list_notifications,
             "list_sessions": self._list_sessions,
@@ -1203,6 +1272,29 @@ class ForgeMcpToolbox:
                         "description_updated_at",
                     )
                 },
+            }
+        )
+
+    async def _set_session_icon(self, args: _SetSessionIconArgs) -> ToolResult:
+        session_id = self._host.session_id
+        if not session_id:
+            return ToolResult.error(
+                "set_session_icon sets your own Forge session's icon, and this agent is "
+                "not running in one."
+            )
+        if args.clear:
+            await self._client.clear_icon(session_id)
+            return self._ok({"session_id": session_id, "icon_etag": None, "cleared": True})
+        if args.path is not None:
+            data = await self._host.read_icon_file(args.path)
+        else:
+            data = await self._host.read_presented_file(str(args.file_id))
+        stored = await self._client.set_icon(session_id, data)
+        return self._ok(
+            {
+                "session_id": session_id,
+                "icon_etag": stored.get("icon_etag"),
+                "size": stored.get("size"),
             }
         )
 

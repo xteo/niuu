@@ -2,23 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import re
 import socket
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from niuu.build_identity import build_identity
 from niuu.domain.artifact_reports import ArtifactReport, build_report_turn
 from niuu.domain.notifications import NotificationDraft, build_notification_turn
+from niuu.domain.presented_files import PRESENTED_FILE_ID_PATTERN
 from niuu.domain.services.forge_session_token import SESSION_ID_CLAIM
+from niuu.domain.session_icon import ICON_MAX_INPUT_BYTES
 from niuu.forge_mcp.credentials import is_forge_session_claims, token_scopes, unverified_claims
 from niuu.forge_mcp.models import ForgeApiError
 from niuu.forge_mcp.ports import ForgeClient, ForgeMcpHost
 from skuld.conversation_models import ConversationTurn, turn_record
+from skuld.path_security import UnsafePathError, resolve_contained_path
 
 if TYPE_CHECKING:
     from skuld.broker import Broker
 
+_PRESENTED_FILE_ID = re.compile(PRESENTED_FILE_ID_PATTERN)
 NOTIFICATION_TURN_PREFIX = "nt_"
 REPORT_TURN_PREFIX = "ar_"
 STATE_COMMITTED = "committed"
@@ -165,6 +173,60 @@ class BrokerForgeMcpHost(ForgeMcpHost):
             "session_seq": entry["seq"],
             "state": STATE_COMMITTED if stored else STATE_PENDING,
         }
+
+    async def read_icon_file(self, path: str) -> bytes:
+        """Read an icon image from this session's workspace or home (like present-file)."""
+        broker = self._broker
+        roots = {
+            "workspace": os.path.realpath(os.path.abspath(broker.workspace_dir)),
+            "home": os.path.realpath(os.path.abspath(broker._settings.home_path)),
+        }
+        candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        if not any(
+            candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
+            for root in roots.values()
+        ):
+            raise ForgeApiError(
+                "path is outside the session roots: set_session_icon reads files under the "
+                f"session workspace ({roots['workspace']}) or home ({roots['home']}). Copy "
+                "the image there first, e.g. mkdir -p ~/tmp && cp /tmp/icon.png ~/tmp/",
+                status=400,
+            )
+        source = Path(candidate)
+        if not source.is_file():
+            raise ForgeApiError(f"no such file: {path}", status=404)
+        size = source.stat().st_size
+        if size > ICON_MAX_INPUT_BYTES:
+            raise ForgeApiError(
+                f"icon is {size} bytes; the limit is {ICON_MAX_INPUT_BYTES} bytes (2 MiB). "
+                "Send a smaller image.",
+                status=413,
+            )
+        return await asyncio.to_thread(source.read_bytes)
+
+    async def read_presented_file(self, file_id: str) -> bytes:
+        """Read the copy present-file staged for ``file_id`` in this session."""
+        if not _PRESENTED_FILE_ID.fullmatch(file_id):
+            raise ForgeApiError("file_id is not a present-file id (pf_ + 32 hex)", status=400)
+        root = Path(self._broker._settings.presented_files_path).expanduser()
+        try:
+            staged = resolve_contained_path(root, f"{file_id}/content", strict=True)
+        except (OSError, UnsafePathError):
+            raise ForgeApiError(
+                f"no presented file {file_id} in this session; present the image with "
+                "present-file first, or pass its path",
+                status=404,
+            ) from None
+        if not staged.is_file():
+            raise ForgeApiError(f"presented file {file_id} is no longer available", status=410)
+        size = staged.stat().st_size
+        if size > ICON_MAX_INPUT_BYTES:
+            raise ForgeApiError(
+                f"icon is {size} bytes; the limit is {ICON_MAX_INPUT_BYTES} bytes (2 MiB). "
+                "Send a smaller image.",
+                status=413,
+            )
+        return await asyncio.to_thread(staged.read_bytes)
 
     async def report_artifact(self, report: ArtifactReport) -> dict[str, Any]:
         """Append the report's durable turn; Forge's artifact projector records it (F1)."""

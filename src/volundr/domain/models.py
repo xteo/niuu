@@ -618,6 +618,13 @@ class Session(BaseModel):
         default=None,
         description="When description last changed value.",
     )
+    icon_etag: str | None = Field(
+        default=None,
+        description=(
+            "Content hash of the session's registered icon (its ETag), or None when it has "
+            "none. Written only by the targeted icon update."
+        ),
+    )
 
     last_work_at: datetime | None = Field(
         default=None,

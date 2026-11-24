@@ -24,6 +24,7 @@ from skuld.config import SkuldSettings
 from skuld.transports.session_tools import (
     BROKER_TOKEN_FILE_ENV,
     FORGE_DESCRIBE_URL_ENV,
+    FORGE_ICON_URL_ENV,
     PRESENT_FILE_URL_ENV,
     claude_cli_args,
 )
@@ -91,11 +92,16 @@ class TestBrokerComposition:
             PRESENT_FILE_URL_ENV: "http://127.0.0.1:18765/api/present-file",
             BROKER_TOKEN_FILE_ENV: str(token_file),
             FORGE_DESCRIBE_URL_ENV: "http://127.0.0.1:18765/api/forge-mcp/tools/describe_session",
+            FORGE_ICON_URL_ENV: "http://127.0.0.1:18765/api/forge-mcp/tools/set_session_icon",
         }
         assert "notify" in tools.instructions and "present-file" in tools.instructions
         # Agents are told to keep their session description current, both ways.
         assert "forge-describe --short" in tools.instructions
         assert "`describe_session`" in tools.instructions
+        # ...and to register an icon once, never every turn.
+        assert "forge-icon <path>" in tools.instructions
+        assert "`set_session_icon`" in tools.instructions
+        assert "Never generate a new icon every turn" in tools.instructions
         # The agent owns the "done" signal now that Forge no longer notifies on turn end.
         assert "Forge sends nothing when a turn ends" in tools.instructions
         assert "reply ready" not in tools.instructions
@@ -135,6 +141,7 @@ class TestBrokerComposition:
         assert "notify" not in kwargs["session_tools"].instructions
         # forge-describe rides the Forge MCP route, so it is neither exported nor advertised.
         assert FORGE_DESCRIBE_URL_ENV not in kwargs["session_tools"].env
+        assert FORGE_ICON_URL_ENV not in kwargs["session_tools"].env
         assert "forge-describe" not in kwargs["session_tools"].instructions
         assert broker._effective_mcp_server_names() == []
 

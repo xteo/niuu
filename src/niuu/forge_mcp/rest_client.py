@@ -99,6 +99,29 @@ class RestForgeClient(ForgeClient):
                 f"non-JSON response from {path}", status=response.status_code
             ) from exc
 
+    async def _raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> httpx.Response:
+        client = await self._http_client()
+        try:
+            response = await client.request(
+                method,
+                f"{FORGE_API_PREFIX}{path}",
+                content=content,
+                headers={**self._headers, **(headers or {})} or None,
+                timeout=self._timeout_s,
+            )
+        except httpx.RequestError as exc:
+            raise ForgeApiError(f"{type(exc).__name__}: {exc}") from exc
+        if response.status_code >= 400:
+            raise ForgeApiError(_detail(response), status=response.status_code)
+        return response
+
     async def _object(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         body = await self._request(method, path, **kwargs)
         if not isinstance(body, dict):
@@ -185,3 +208,21 @@ class RestForgeClient(ForgeClient):
         return await self._object(
             "PUT", f"/sessions/{quote(session_id)}/description", json=dict(changes)
         )
+
+    async def set_icon(self, session_id: str, data: bytes) -> dict[str, Any]:
+        response = await self._raw(
+            "PUT",
+            f"/sessions/{quote(session_id)}/icon",
+            content=data,
+            headers={"content-type": "application/octet-stream"},
+        )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ForgeApiError("non-JSON response from the icon route") from exc
+        if not isinstance(body, dict):
+            raise ForgeApiError("unexpected response shape from the icon route")
+        return body
+
+    async def clear_icon(self, session_id: str) -> None:
+        await self._raw("DELETE", f"/sessions/{quote(session_id)}/icon")

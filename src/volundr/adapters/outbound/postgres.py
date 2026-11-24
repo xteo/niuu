@@ -17,6 +17,7 @@ from volundr.domain.models import (
 )
 from volundr.domain.ports import SessionRepository
 from volundr.domain.projects import SessionCoordination
+from volundr.domain.session_icons import SessionIconImages
 from volundr.domain.session_read_state import (
     SessionReadState,
     SessionReadStateChange,
@@ -179,7 +180,7 @@ class PostgresSessionRepository(SessionRepository):
                       turn_started_at, last_active,
                       short_description, description,
                       short_description_updated_at, description_updated_at,
-                      last_work_at, open_tool_count, session_usage
+                      last_work_at, open_tool_count, session_usage, icon_etag
             """,
             session.id,
             session.name,
@@ -227,6 +228,8 @@ class PostgresSessionRepository(SessionRepository):
                 "last_active": row["last_active"],
                 # Never written here: the stored description wins over a stale copy.
                 **self._description_fields(row),
+                # Never written here either: only set_icon moves the icon's etag.
+                "icon_etag": row.get("icon_etag"),
                 # Folded at log ingest (F12d), never by this update: the stored facts win.
                 **self._work_fact_fields(row),
                 # Projection-owned: an unrelated stale update must preserve newer usage.
@@ -284,6 +287,48 @@ class PostgresSessionRepository(SessionRepository):
             now,
         )
         return self._row_to_session(row) if row is not None else None
+
+    async def set_icon(
+        self, session_id: UUID, icon: SessionIconImages | None, now: datetime
+    ) -> Session | None:
+        etag = icon.etag if icon is not None else None
+        async with self._pool.acquire() as conn, conn.transaction():
+            # The session row first: it locks the row, and a missing session ends here
+            # before any rendition could be written for it.
+            row = await conn.fetchrow(
+                """UPDATE sessions SET
+                       updated_at = CASE WHEN icon_etag IS DISTINCT FROM $2::text
+                                         THEN $3 ELSE updated_at END,
+                       icon_etag = $2
+                   WHERE id = $1
+                   RETURNING *""",
+                session_id,
+                etag,
+                now,
+            )
+            if row is None:
+                return None
+            await conn.execute("DELETE FROM session_icons WHERE session_id = $1", session_id)
+            if icon is not None:
+                await conn.executemany(
+                    """INSERT INTO session_icons (session_id, size, etag, png, updated_at)
+                       VALUES ($1, $2, $3, $4, $5)""",
+                    [
+                        (session_id, size, icon.etag, png, now)
+                        for size, png in sorted(icon.renditions.items())
+                    ],
+                )
+        return self._row_to_session(row)
+
+    async def get_icon(self, session_id: UUID, size: int) -> tuple[str, bytes] | None:
+        row = await self._pool.fetchrow(
+            "SELECT etag, png FROM session_icons WHERE session_id = $1 AND size = $2",
+            session_id,
+            size,
+        )
+        if row is None:
+            return None
+        return row["etag"], bytes(row["png"])
 
     async def update_forge_mcp_grants(
         self, session_id: UUID, grants: list[str], now: datetime
@@ -465,6 +510,7 @@ class PostgresSessionRepository(SessionRepository):
             session_usage=self._parse_json_dict(row.get("session_usage")) or None,
             **self._description_fields(row),
             **self._work_fact_fields(row),
+            icon_etag=row.get("icon_etag"),
         )
 
     @staticmethod

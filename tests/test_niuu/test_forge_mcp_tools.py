@@ -124,6 +124,13 @@ class FakeClient(ForgeClient):
             description_updated_at=stamp if "description" in changes else None,
         )
 
+    async def set_icon(self, session_id, data):
+        self._record("set_icon", (session_id, data))
+        return {"icon_etag": "e" * 64, "size": 512}
+
+    async def clear_icon(self, session_id):
+        self._record("clear_icon", session_id)
+
 
 class FakeHost(ForgeMcpHost):
     def __init__(self) -> None:
@@ -156,6 +163,7 @@ class TestToolList:
             "notify",
             "report_artifact",
             "describe_session",
+            "set_session_icon",
             "list_notifications",
             "list_sessions",
             "get_session",
@@ -654,3 +662,87 @@ class TestDescribeSession:
         assert session["short_description"] == "Reviewing PR"
         assert session["short_description_updated_at"] == "2026-10-16T12:00:00+00:00"
         assert "description" not in session  # unset fields are omitted from summaries
+
+
+class _IconHost(FakeHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read: list[str] = []
+
+    async def read_icon_file(self, path: str) -> bytes:
+        self.read.append(path)
+        return b"file-bytes"
+
+    async def read_presented_file(self, file_id: str) -> bytes:
+        self.read.append(file_id)
+        return b"presented-bytes"
+
+
+class TestSetSessionIcon:
+    async def test_path_is_read_by_the_host_and_sent_to_forge(self) -> None:
+        client, host = FakeClient(), _IconHost()
+        toolbox = ForgeMcpToolbox(client=client, host=host, grants=(), limits=LIMITS)
+        result = await toolbox.call("set_session_icon", {"path": "~/icon.png"})
+        assert not result.is_error, result.text
+        assert host.read == ["~/icon.png"]
+        assert client.calls == [("set_icon", (SELF, b"file-bytes"))]
+        assert result.structured == {"session_id": SELF, "icon_etag": "e" * 64, "size": 512}
+
+    async def test_file_id_comes_from_the_presented_file(self) -> None:
+        client, host = FakeClient(), _IconHost()
+        toolbox = ForgeMcpToolbox(client=client, host=host, grants=(), limits=LIMITS)
+        file_id = "pf_" + "b" * 32
+        result = await toolbox.call("set_session_icon", {"file_id": file_id})
+        assert not result.is_error, result.text
+        assert host.read == [file_id]
+        assert client.calls == [("set_icon", (SELF, b"presented-bytes"))]
+
+    async def test_clear(self) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call("set_session_icon", {"clear": True})
+        assert client.calls == [("clear_icon", SELF)]
+        assert result.structured == {"session_id": SELF, "icon_etag": None, "cleared": True}
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {},
+            {"clear": False},
+            {"path": "/a.png", "file_id": "pf_" + "c" * 32},
+            {"path": "/a.png", "clear": True},
+            {"file_id": "not-an-id"},
+            {"path": " "},
+            {"url": "https://x"},
+        ],
+    )
+    async def test_needs_exactly_one_source(self, arguments) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call("set_session_icon", arguments)
+        assert result.is_error and "Invalid arguments" in result.text
+        assert client.calls == []
+
+    @pytest.mark.parametrize("arguments", [{"path": "/a.png"}, {"file_id": "pf_" + "e" * 32}])
+    async def test_the_default_host_cannot_read_session_files(self, arguments) -> None:
+        toolbox, client, _ = _toolbox()
+        result = await toolbox.call("set_session_icon", arguments)
+        assert result.is_error and "session's own Forge MCP" in result.text
+        assert client.calls == []
+
+    async def test_forge_refusal_is_a_tool_error(self) -> None:
+        toolbox, client, _ = _toolbox()
+        client.fail = ForgeApiError("icon must be 1:1 (square); this image is 20x10", status=422)
+        result = await toolbox.call("set_session_icon", {"clear": True})
+        assert result.is_error and "icon must be 1:1" in result.text
+
+    async def test_outside_a_session_the_call_explains(self) -> None:
+        toolbox, client = _feed_toolbox(_SessionlessHost())
+        result = await toolbox.call("set_session_icon", {"clear": True})
+        assert result.is_error and "own Forge session" in result.text
+        assert client.calls == []
+
+    def test_description_says_once_not_every_turn(self) -> None:
+        toolbox, _, _ = _toolbox()
+        spec = next(t for t in toolbox.list_tools() if t["name"] == "set_session_icon")
+        assert "Set once when the session starts" in spec["description"]
+        assert "Never generate a new icon every turn" in spec["description"]
+        assert spec["inputSchema"]["additionalProperties"] is False

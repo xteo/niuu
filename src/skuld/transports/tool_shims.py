@@ -209,6 +209,69 @@ main()
 '''
 
 
+# The `forge-icon` command — engine-agnostic like forge-describe. It registers the session's
+# icon through the broker's loopback Forge MCP route (URL from FORGE_ICON_URL, exported only
+# when the broker serves the Forge MCP), so the broker's session token authorizes the write.
+_FORGE_ICON_SHIM = '''#!/usr/bin/env python3
+"""forge-icon <path> | forge-icon --clear — register (or remove) this session's icon."""
+import json, os, sys, urllib.request, urllib.error
+
+USAGE = "usage: forge-icon <path to a square PNG/JPEG/HEIC image> | forge-icon --clear"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args in (["-h"], ["--help"]):
+        print(USAGE + "\\n64-2048 px, 1:1, at most 2 MiB; Forge stores a 512x512 PNG.")
+        return
+    if len(args) != 1:
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
+    if args[0] == "--clear":
+        payload = {"clear": True}
+    elif args[0].startswith("-"):
+        print("forge-icon: unexpected option " + repr(args[0]) + "\\n" + USAGE, file=sys.stderr)
+        sys.exit(2)
+    else:
+        payload = {"path": os.path.abspath(os.path.expanduser(args[0]))}
+    url = os.environ.get("FORGE_ICON_URL")
+    if not url:
+        print("forge-icon: not available in this session", file=sys.stderr)
+        sys.exit(3)
+    headers = {"content-type": "application/json"}
+    token_file = os.environ.get("FORGE_BROKER_TOKEN_FILE")
+    if token_file:
+        # The broker's per-start loopback secret; read from the 0600 file, never from argv/env.
+        try:
+            with open(token_file, encoding="utf-8") as handle:
+                headers["authorization"] = "Bearer " + handle.read().strip()
+        except OSError as e:
+            print("forge-icon: cannot read the broker token:", e, file=sys.stderr)
+            sys.exit(3)
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(e.read().decode()); sys.stderr.write("\\n"); sys.exit(1)
+    except Exception as e:  # noqa: BLE001 - surface any transport error to the agent
+        print("forge-icon:", e, file=sys.stderr); sys.exit(1)
+    text = "".join(
+        part.get("text", "") for part in result.get("content") or [] if isinstance(part, dict)
+    )
+    if result.get("isError"):
+        print("forge-icon:", text, file=sys.stderr); sys.exit(1)
+    stored = result.get("structuredContent")
+    sys.stdout.write(json.dumps(stored, indent=2) if stored is not None else text)
+    sys.stdout.write("\\n")
+
+
+main()
+'''
+
+
 def _install_executable(bin_dir: Path, name: str, script: str) -> None:
     target = bin_dir / name
     target.write_text(script, encoding="utf-8")
@@ -218,6 +281,11 @@ def _install_executable(bin_dir: Path, name: str, script: str) -> None:
 def _install_forge_describe_shim(bin_dir: Path) -> None:
     """Write the engine-agnostic ``forge-describe`` PATH shim into ``bin_dir``."""
     _install_executable(bin_dir, "forge-describe", _FORGE_DESCRIBE_SHIM)
+
+
+def _install_forge_icon_shim(bin_dir: Path) -> None:
+    """Write the engine-agnostic ``forge-icon`` PATH shim into ``bin_dir``."""
+    _install_executable(bin_dir, "forge-icon", _FORGE_ICON_SHIM)
 
 
 def ensure_codex_tool_shims(
@@ -242,9 +310,10 @@ def ensure_codex_tool_shims(
     source_root = Path(__file__).resolve().parents[2]
     ravn_config = os.environ.get("RAVN_CONFIG", "").strip()
     mimir_configured = mount is not None or _ravn_config_has_mimir(ravn_config)
-    # Engine-agnostic present-file / forge-describe commands (claude AND codex sessions).
+    # Engine-agnostic present-file / forge-describe / forge-icon commands (claude AND codex).
     _install_present_file_shim(bin_dir)
     _install_forge_describe_shim(bin_dir)
+    _install_forge_icon_shim(bin_dir)
 
     commands: dict[str, tuple[str, str, str]] = {
         "tracker_issue": ("ravn.cli.tracker_bridge", "", "Search, read and update tracker issues."),

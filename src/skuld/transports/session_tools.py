@@ -28,6 +28,7 @@ from skuld.transports.mcp_config import build_claude_mcp_payload
 
 PRESENT_FILE_URL_ENV = "FORGE_PRESENT_FILE_URL"
 FORGE_DESCRIBE_URL_ENV = "FORGE_DESCRIBE_URL"
+FORGE_ICON_URL_ENV = "FORGE_ICON_URL"
 BROKER_TOKEN_FILE_ENV = "FORGE_BROKER_TOKEN_FILE"
 CLAUDE_MCP_CONFIG_FILE = "claude-mcp.json"
 
@@ -63,12 +64,20 @@ opening the session would want. The `{server}` MCP server's `describe_session` t
 same."""
 
 
+SESSION_ICON_INSTRUCTION = """\
+SESSION ICON: if this session has a clear identity (a project, a person, a product), register its \
+icon once when it starts with `forge-icon <path>` (a square PNG, JPEG or HEIC, 64-2048 px, at most \
+2 MiB; `forge-icon --clear` removes it). The `{server}` MCP server's `set_session_icon` tool does \
+the same. Never generate a new icon every turn."""
+
+
 def capability_instructions(*, forge_mcp_server: str | None) -> str:
-    """Capability text: present-file always; notify and descriptions when the MCP is on."""
+    """Capability text: present-file always; notify, descriptions and icon when the MCP is on."""
     parts = [PRESENT_FILE_INSTRUCTION]
     if forge_mcp_server:
         parts.append(FORGE_NOTIFY_INSTRUCTION.format(server=forge_mcp_server))
         parts.append(SESSION_DESCRIPTION_INSTRUCTION.format(server=forge_mcp_server))
+        parts.append(SESSION_ICON_INSTRUCTION.format(server=forge_mcp_server))
     return "\n\n".join(parts)
 
 

@@ -8,6 +8,7 @@ from niuu.domain.session_description import DESCRIPTION_FIELDS, SessionDescripti
 from niuu.forge_mcp.credentials import normalize_grants
 from volundr.domain.services.forge_session_launch import FORGE_MCP_KEY, GRANTS_KEY
 from volundr.domain.session_broker import broker_base_url
+from volundr.domain.session_icons import SessionIconImages
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -282,6 +283,20 @@ class ForgeService:
         principal: Principal | None = None,
     ) -> Session:
         return await self._session_service.update_description(session_id, patch, principal)
+
+    async def set_icon(
+        self,
+        session_id: UUID,
+        icon: SessionIconImages | None,
+        *,
+        principal: Principal | None = None,
+    ) -> Session:
+        return await self._session_service.set_icon(session_id, icon, principal)
+
+    async def get_icon(
+        self, session_id: UUID, size: int, *, principal: Principal | None = None
+    ) -> tuple[str, bytes] | None:
+        return await self._session_service.get_icon(session_id, size, principal)
 
     async def worked_seconds_24h(self, session_ids: list[UUID]) -> dict[UUID, int] | None:
         return await self._session_service.worked_seconds_24h(session_ids)
