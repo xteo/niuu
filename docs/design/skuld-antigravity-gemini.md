@@ -2,6 +2,34 @@
 
 Status: phase 1 research, 22 Nov 2026. Branch `skuld-antigravity-gemini`, cut from `5ccf9ea3c`.
 
+## Update, 24 Nov: recorded behaviour of agy 1.5.15
+
+Damien chose the personal login (Google AI Pro) and signed in on Thor. `agy` lives in a private home,
+`~/.local/share/niuu-skuld-agy-dev/home`; its keyring was unavailable, so the token is in a file there.
+Damien asked the agent to drive the test turns. A recorder hook logged every event and a poller logged
+every distinct tmux screen. The recordings stay on Thor, not in the repo. What they showed:
+
+- **Usage is real.** Each `PLANNER_RESPONSE` row in `transcript.jsonl` has `model`, `input_tokens`,
+  `cache_read_tokens` and `output_tokens`. Caching works across turns (7,534 of 9,698 tokens cached on
+  the second turn).
+- **The transcript has finished steps only.** Rows appear when a step is `DONE`, with `thinking` and
+  `tool_calls`; tool results are `GENERIC` rows. Live text exists only on the screen.
+- **Tool names differ from the docs:** the CLI sends `write_file` and `read_file`, not `write_to_file`
+  and `view_file`, with arguments `Path` and `Content`. Matchers must come from recordings.
+- **Turn boundaries hold:** `PreInvocation` with `invocationNum: 0` starts a turn; `Stop` with
+  `terminationReason: NO_TOOL_CALL` and `fullyIdle: true` ends it. `SessionStart` fired once.
+- **An interrupt fires no hook.** `Esc` printed `Interrupted · What should Antigravity CLI do instead?`;
+  there was no `PostInvocation` or `Stop`, and no model row reached the transcript. Skuld must close the
+  turn itself when it sends the interrupt, and confirm it from the screen.
+- **Permission menu:** a `PreToolUse` answer of `force_ask` showed `Requesting permission for:` and
+  `Run this command?`, with options *Yes, run command*; *Yes, and always allow in this conversation…*;
+  *Yes, and always allow… (Persist to settings.json)*; *No, cancel*. `Enter` picks the highlighted one.
+- **Question menu:** `ask_question` showed `Question 1/1: <text>`, numbered options plus `Write-in...`,
+  and `esc Skip`. The arguments are also in `PreToolUse`, so Forge can show the card from the hook and
+  only use the screen to answer.
+- **It updates itself:** 1.5.14 became 1.5.15 overnight without a prompt. Skuld must check the version
+  it was built against and fail loudly on a mismatch.
+
 ## Update, 22 Nov: tmux direction
 
 Damien chose to run the real `agy` TUI in tmux, reusing the Claude tmux workflow. This replaces ACP as
