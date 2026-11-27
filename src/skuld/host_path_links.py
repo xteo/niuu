@@ -70,11 +70,23 @@ _HOME_VAR_RE = re.compile(r"^(?:\$HOME|\$\{HOME\})(?=/|$)")
 
 # --- The secret rules (compared after NFKC normalisation and casefolding) ------------
 
-#: Trees under the session home that hold application state, tokens, cookies and keys:
-#: refused as a whole. ``ALLOWED_HOME_TREES`` lists the exceptions (none are needed yet).
-DENIED_HOME_TREES = (".config", ".local/share", "Library")
-ALLOWED_HOME_TREES: tuple[str, ...] = ()
-#: Directory names whose contents are refused at any depth.
+#: Directly under the session home (outside an exempt workspace), every dot-entry, file
+#: or directory, is refused: that is where tools keep keys, tokens, cookies and history
+#: (``~/.github-pat``, ``~/.codex-x/auth.json``, ``~/.gstack/chromium-profile``). Only
+#: these are open. A pattern ending in ``/`` opens a tree, any other names one file; ``*``
+#: matches one path component. Every other rule below still applies inside them.
+ALLOWED_HOME_DOT_ENTRIES = (
+    ".lexi/flow/",
+    ".lexi/config/",
+    ".lexi/notes/",
+    ".claude/CLAUDE.md",
+    ".claude/skills/",
+    ".claude/projects/*/memory/",
+)
+#: Non-dot trees under the session home refused as a whole (macOS application state,
+#: cookies and keychains). The dot-entry rule already covers ``~/.config``.
+DENIED_HOME_TREES = ("Library",)
+#: Directory names whose contents are refused at any depth below the matched root.
 SECRET_DIRECTORIES = frozenset(
     {
         ".ssh",
@@ -90,9 +102,37 @@ SECRET_DIRECTORIES = frozenset(
         "keyrings",  # ~/.local/share/keyrings (GNOME)
     }
 )
-#: Any path component containing one of these is refused (``~/.lexi/secrets``,
-#: ``fleet-secrets``, ``github-token``, ``credentials.json``).
+#: A path component below the matched root containing one of these is refused
+#: (``~/.lexi/secrets``, ``fleet-secrets``, ``github-token``, ``credentials.json``),
+#: except as :data:`CODE_EXTENSIONS` and :data:`DOC_EXTENSIONS` say.
 SECRET_SUBSTRINGS = ("secret", "token", "credential")
+#: A final name with one of these skips the substring rule (``token_scope.py``); inside
+#: the workspace, so do the non-dot directories above it. Dot names never skip it.
+CODE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".pyi",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".swift",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".c",
+        ".h",
+        ".cpp",
+        ".m",
+        ".mm",
+        ".rb",
+        ".cs",
+    }
+)
+#: A final name with one of these skips the substring rule only inside the workspace.
+DOC_EXTENSIONS = frozenset({".md", ".rst"})
 #: Exact basenames that are refused.
 SECRET_NAMES = frozenset({".netrc", ".pgpass", ".npmrc", ".pypirc", ".claude.json"})
 #: Basename prefixes that are refused.
@@ -102,6 +142,7 @@ SECRET_NAME_SUFFIXES = (
     ".env",
     ".pem",
     ".key",
+    ".p8",
     ".p12",
     ".pfx",
     ".keychain",
@@ -145,14 +186,31 @@ class LinkRoots:
         return tuple(dict.fromkeys((os.path.abspath(self.home), os.path.realpath(self.home))))
 
     def workspaces(self) -> tuple[str, ...]:
-        """Workspace spellings strictly inside home: their files are exempt from the
-        home-tree rule (a workspace may live under ``~/.local/share``). A workspace that
-        is home, or holds it, exempts nothing."""
-        out: list[str] = []
-        for spelling in (os.path.abspath(self.workspace), os.path.realpath(self.workspace)):
-            if _home_relative(spelling, self.homes()) and spelling not in out:
-                out.append(spelling)
-        return tuple(out)
+        """The workspace as written and canonical."""
+        return tuple(
+            dict.fromkeys((os.path.abspath(self.workspace), os.path.realpath(self.workspace)))
+        )
+
+    def workspace_exempt(self) -> bool:
+        """Whether files in the workspace skip the home-area rules (dot-entries, Library).
+
+        Only when every spelling of the workspace sits strictly below the area it is in:
+        ``~/.niuu/workspaces/x`` is exempt; ``~/.config`` itself (or a symlink to it) is
+        not, and neither is home, or a workspace that holds home."""
+        for spelling in self.workspaces():
+            relative = _relative_parts(spelling, self.homes())
+            if relative is None:
+                if _relative_parts(self.home, (spelling,)) is not None or _same(
+                    spelling, self.home
+                ):
+                    return False
+                continue
+            if not relative:
+                return False
+            depth = _denied_home_depth(relative)
+            if depth is not None and len(relative) <= depth:
+                return False
+        return True
 
 
 def _fold(text: str) -> str:
@@ -231,48 +289,106 @@ def decode_link_path(raw: str, *, home: str, workspace: str) -> list[str]:
     return candidates
 
 
-def _home_relative(path: str, homes: tuple[str, ...]) -> PurePosixPath | None:
-    folded = _fold(path)
-    for home in homes:
-        prefix = _fold(home).rstrip("/") + "/"
-        if folded.startswith(prefix):
-            return PurePosixPath(folded[len(prefix) :])
+def _same(left: str, right: str) -> bool:
+    return _fold(left).rstrip("/") == _fold(right).rstrip("/")
+
+
+def _relative_parts(path: str, roots: tuple[str, ...]) -> tuple[str, ...] | None:
+    """The folded components of *path* strictly below the deepest of *roots*, or None.
+
+    ``()`` when *path* is the root itself."""
+    folded = _fold(path).rstrip("/")
+    best: tuple[str, ...] | None = None
+    for root in roots:
+        prefix = _fold(root).rstrip("/")
+        if folded == prefix:
+            relative: tuple[str, ...] = ()
+        elif folded.startswith(prefix + "/"):
+            relative = PurePosixPath(folded[len(prefix) + 1 :]).parts
+        else:
+            continue
+        if best is None or len(relative) < len(best):
+            best = relative
+    return best
+
+
+def _pattern_matches(pattern: str, relative: tuple[str, ...]) -> bool:
+    is_tree = pattern.endswith("/")
+    parts = PurePosixPath(_fold(pattern.rstrip("/"))).parts
+    if is_tree and len(relative) <= len(parts):
+        return False
+    if not is_tree and len(relative) != len(parts):
+        return False
+    return all(p == "*" or p == r for p, r in zip(parts, relative, strict=False))
+
+
+def _denied_home_depth(relative: tuple[str, ...]) -> int | None:
+    """How deep the denied home area *relative* falls in is, or None when it is open."""
+    if not relative:
+        return None
+    for tree in DENIED_HOME_TREES:
+        parts = PurePosixPath(_fold(tree)).parts
+        if relative[: len(parts)] == parts:
+            return len(parts)
+    if relative[0].startswith(".") and not any(
+        _pattern_matches(pattern, relative) for pattern in ALLOWED_HOME_DOT_ENTRIES
+    ):
+        return 1
     return None
 
 
+def _substring_hit(part: str) -> str | None:
+    return next((word for word in SECRET_SUBSTRINGS if word in part), None)
+
+
 def secret_reason(
-    path: str | Path, homes: tuple[str, ...] = (), workspaces: tuple[str, ...] = ()
+    path: str | Path,
+    homes: tuple[str, ...] = (),
+    workspaces: tuple[str, ...] = (),
+    *,
+    workspace_exempt: bool = True,
 ) -> str | None:
     """Name the rule that makes *path* secret-shaped, or ``None``.
 
-    *homes* are the spellings of the session home, for the home-tree rule; a path in
-    one of *workspaces* is exempt from that rule (never from the others).
+    *homes* and *workspaces* are the spellings of the session roots. Only the
+    components below the matched root are judged (a worktree called
+    ``…-token-fix`` or a home ``/Users/secretary`` is not itself refused). The
+    home-area rule (dot-entries, ``~/Library``) applies outside the workspace, and
+    inside it unless *workspace_exempt* is false.
     """
     text = os.fspath(path)
-    in_workspace = any(_home_relative(text, (w,)) is not None for w in workspaces)
-    relative = None if in_workspace else _home_relative(text, homes)
-    if relative is not None and relative.parts:
-        for tree in DENIED_HOME_TREES:
-            tree_parts = PurePosixPath(_fold(tree)).parts
-            if relative.parts[: len(tree_parts)] != tree_parts:
-                continue
-            allowed = any(
-                relative.parts[: len(PurePosixPath(_fold(a)).parts)]
-                == PurePosixPath(_fold(a)).parts
-                for a in ALLOWED_HOME_TREES
-            )
-            if not allowed:
-                return f"under ~/{tree}"
-    parts = [_fold(part) for part in PurePosixPath(text).parts if part != "/"]
+    in_workspace = _relative_parts(text, workspaces)
+    below_home = _relative_parts(text, homes)
+    if below_home is not None and not (in_workspace is not None and workspace_exempt):
+        depth = _denied_home_depth(below_home)
+        if depth is not None:
+            return f"under ~/{'/'.join(below_home[:depth])}"
+    if in_workspace is not None:
+        parts = in_workspace
+    elif below_home is not None:
+        parts = below_home
+    else:
+        parts = tuple(_fold(p) for p in PurePosixPath(text).parts if p != "/")
     if not parts:
         return None
     for part in parts:
         if part in SECRET_DIRECTORIES:
             return f"in a {part} directory"
-        for word in SECRET_SUBSTRINGS:
-            if word in part:
-                return f"named like a {word} ({part})"
     name = parts[-1]
+    extension = PurePosixPath(name).suffix
+    is_code = extension in CODE_EXTENSIONS and not name.startswith(".")
+    is_doc = extension in DOC_EXTENSIONS and not name.startswith(".")
+    name_skips = is_code or (is_doc and in_workspace is not None)
+    directories_skip = is_code and in_workspace is not None
+    for part in parts[:-1]:
+        if directories_skip and not part.startswith("."):
+            continue
+        word = _substring_hit(part)
+        if word is not None:
+            return f"named like a {word} ({part})"
+    word = None if name_skips else _substring_hit(name)
+    if word is not None:
+        return f"named like a {word} ({name})"
     if name in SECRET_NAMES or name.startswith(SECRET_NAME_PREFIXES):
         return f"a {name} file"
     if name.endswith(SECRET_NAME_SUFFIXES):
@@ -304,7 +420,12 @@ def _judge_path(spelling: str, roots: LinkRoots, *, label: str) -> Path:
     except UnsafePathError:
         raise LinkPathError(403, f"{spelling} is outside the session roots") from None
     for which, candidate in ((label, spelling), ("target", str(resolved))):
-        reason = secret_reason(candidate, roots.homes(), roots.workspaces())
+        reason = secret_reason(
+            candidate,
+            roots.homes(),
+            roots.workspaces(),
+            workspace_exempt=roots.workspace_exempt(),
+        )
         if reason is not None:
             raise LinkPathError(403, f"{candidate} is refused: {which} is {reason}")
     return resolved

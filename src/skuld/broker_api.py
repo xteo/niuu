@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import anyio
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1330,13 +1331,43 @@ async def resolve_file_link(body: _ResolveLinkRequest) -> dict:
     }
 
 
-def _read_descriptor(fd: int):
-    """Stream an open file's bytes, closing it at the end or on disconnect."""
-    try:
-        while chunk := os.read(fd, shutil.COPY_BUFSIZE):
-            yield chunk
-    finally:
+class LinkedFileShrankError(RuntimeError):
+    """The linked file got shorter while it was being sent (content-length was promised)."""
+
+
+async def _read_descriptor(fd: int, size: int):
+    """Yield at most *size* bytes of an open file. The read runs in a worker thread that a
+    cancellation waits for, so the descriptor is never closed under a running read."""
+    remaining = size
+    while remaining > 0:
+        chunk = await anyio.to_thread.run_sync(os.read, fd, min(shutil.COPY_BUFSIZE, remaining))
+        if not chunk:
+            raise LinkedFileShrankError(
+                f"linked file shrank while being served: {remaining} of {size} bytes missing"
+            )
+        remaining -= len(chunk)
+        yield chunk
+
+
+class _DescriptorResponse(StreamingResponse):
+    """Stream an open file and close it when the response ends, however it ends: sent,
+    failed, or the client gone before the first chunk (the body generator may never run)."""
+
+    def __init__(self, fd: int, size: int, **kwargs: Any) -> None:
+        self._fd: int | None = fd
+        super().__init__(_read_descriptor(fd, size), **kwargs)
+
+    def close_descriptor(self) -> None:
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
         os.close(fd)
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.close_descriptor()
 
 
 async def _serve_linked_file(request: Request, file_id: str, link: ResolvedLink) -> Response:
@@ -1355,8 +1386,9 @@ async def _serve_linked_file(request: Request, file_id: str, link: ResolvedLink)
         raise HTTPException(exc.status, exc.detail) from None
     name = link.path.name
     media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    return StreamingResponse(
-        _read_descriptor(fd),
+    return _DescriptorResponse(
+        fd,
+        link.size,
         media_type=media_type,
         headers={
             "content-length": str(link.size),

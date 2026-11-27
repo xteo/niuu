@@ -651,3 +651,198 @@ def test_the_route_serves_a_canonical_path_under_a_symlinked_workspace(
 
 def test_a_malformed_file_url_is_422_at_the_route(client):
     assert client.post("/api/files/resolve", json={"path": "file://[bad"}).status_code == 422
+
+
+# --- review round 2 (LEX-2110 r2) -------------------------------------------
+
+R2_HOME = "/home/agent"
+R2_WS = "/home/agent/.niuu/workspaces/s1"
+
+
+def _r2(path, home=R2_HOME, workspace=R2_WS):
+    roots = LinkRoots(home=home, workspace=workspace, host="h", max_bytes=1)
+    return secret_reason(
+        path, roots.homes(), roots.workspaces(), workspace_exempt=roots.workspace_exempt()
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # r2 item 2: every dot-entry directly under ~ outside the allow-list.
+        "/home/agent/.elevenlabs_key",
+        "/home/agent/.github-pat",
+        "/home/agent/.linear-api-key",
+        "/home/agent/.codex-work/auth.json",
+        "/home/agent/.codex-work/history.jsonl",
+        "/home/agent/.gbrain-owner-1.json",
+        "/home/agent/.gstack/chromium-profile/Default/Cookies",
+        "/home/agent/.openclaw/agents/x.json",
+        "/home/agent/keys/AuthKey_ABC.p8",
+        "/home/agent/.claude/settings.json",
+        "/home/agent/.claude/projects/-home-agent-x/abc.jsonl",
+        "/home/agent/.lexi/state.json",
+        # Every rule still applies inside the allow-list.
+        "/home/agent/.lexi/flow/secrets/x",
+        "/home/agent/.lexi/secrets/x",
+        "/home/agent/.lexi/flow/.env",
+        "/home/agent/.lexi/config/api.key",
+        "/home/agent/Library/Cookies/x",
+    ],
+)
+def test_r2_home_dot_entries_are_refused(path):
+    assert _r2(path) is not None, path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/agent/.lexi/flow/reviews/r2.md",
+        "/home/agent/.lexi/config/markdown-autolinks.json",
+        "/home/agent/.lexi/notes/a.md",
+        "/home/agent/.claude/CLAUDE.md",
+        "/home/agent/.claude/skills/present-file/SKILL.md",
+        "/home/agent/.claude/projects/-home-agent-repos-x/memory/MEMORY.md",
+        "/home/agent/agents/lexi-flow/brief.md",
+        "/home/agent/repos/niuu/README.md",
+        "/home/agent/tmp/report.pdf",
+        # Files in an exempt workspace (below ~/.niuu) skip the home-area rule.
+        "/home/agent/.niuu/workspaces/s1/notes.txt",
+    ],
+)
+def test_r2_allow_listed_and_working_trees_stay_open(path):
+    assert _r2(path) is None, path
+
+
+def test_r2_only_components_below_the_matched_root_are_judged():
+    """r2 item 3: a root path holding a keyword does not refuse everything under it."""
+    assert _r2("/Users/secretary/notes/a.txt", home="/Users/secretary") is None
+    ws = "/home/agent/repos/worktrees/niuu-session-token-fix"
+    assert _r2(f"{ws}/README.txt", workspace=ws) is None
+    assert _r2(f"{ws}/tokens.txt", workspace=ws) is not None
+
+
+@pytest.mark.parametrize(
+    ("path", "refused"),
+    [
+        # Code names skip the substring rule; inside the workspace so do the
+        # non-dot directories above them.
+        (f"{R2_WS}/src/niuu/token_scope.py", False),
+        (f"{R2_WS}/src/token_store/__init__.py", False),
+        (f"{R2_WS}/web/src/secretBox.tsx", False),
+        ("/home/agent/repos/x/forge_session_token.py", False),
+        ("/home/agent/repos/token-tools/a.py", True),  # outside the workspace: dirs judged
+        (f"{R2_WS}/src/token_store/notes.txt", True),  # not code: dirs judged
+        (f"{R2_WS}/.token/a.py", True),  # dot components always
+        (f"{R2_WS}/src/.secret.py", True),  # a dot name never skips
+        # .md and .rst skip only inside the workspace.
+        (f"{R2_WS}/docs/secret-handling.md", False),
+        (f"{R2_WS}/docs/token-flow.rst", False),
+        ("/home/agent/notes/secret-plan.md", True),
+        # Data, config and extensionless names keep it.
+        (f"{R2_WS}/config/tokens.json", True),
+        (f"{R2_WS}/token", True),
+        (f"{R2_WS}/secrets.yaml", True),
+        # Exact, prefix and suffix rules apply to code names too.
+        (f"{R2_WS}/src/id_rsa.py", True),
+        (f"{R2_WS}/src/app.py.pem", True),
+    ],
+)
+def test_r2_the_substring_rule_is_narrowed_for_code(path, refused):
+    assert (_r2(path) is not None) is refused, path
+
+
+def test_r2_a_workspace_at_a_denied_tree_is_not_exempt(tmp_path):
+    """r2 item 5: a workspace of ~/.config (or a symlink to it) serves nothing in it."""
+    home = tmp_path / "home"
+    config = home / ".config"
+    _write(config / "gh" / "hosts.yml", b"synthetic")
+    with pytest.raises(LinkPathError) as err:
+        _resolve("gh/hosts.yml", home, config)
+    assert err.value.status == 403
+    (home / "ws-link").symlink_to(config)
+    with pytest.raises(LinkPathError) as err:
+        _resolve("gh/hosts.yml", home, home / "ws-link")
+    assert err.value.status == 403
+    deeper = config / "ws"
+    _write(deeper / "a.md", b"ok")
+    assert _resolve("a.md", home, deeper).path.name == "a.md"
+    assert not LinkRoots(str(home), str(home), "h", 1).workspace_exempt()
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+async def test_r2_the_descriptor_closes_when_the_client_leaves_before_the_body(roots):
+    """r2 item 6: the client is gone before the first chunk; the fd still closes."""
+    from skuld.broker_api import _DescriptorResponse
+
+    home, workspace = roots
+    _write(home / "a.md", b"x" * 10)
+    link = _resolve("~/a.md", home, workspace)
+    before = _open_fds()
+    fd = open_link(link, _roots(home, workspace))
+    response = _DescriptorResponse(fd, link.size, media_type="text/markdown")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        raise OSError("client went away")
+
+    from starlette.requests import ClientDisconnect
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "GET", "headers": []}
+    with pytest.raises(ClientDisconnect):
+        await response(scope, receive, send)
+    assert _open_fds() == before
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+async def test_r2_the_descriptor_closes_when_the_disconnect_cancels_the_stream(roots):
+    from skuld.broker_api import _DescriptorResponse
+
+    home, workspace = roots
+    _write(home / "a.md", b"x" * 10)
+    link = _resolve("~/a.md", home, workspace)
+    before = _open_fds()
+    fd = open_link(link, _roots(home, workspace))
+    response = _DescriptorResponse(fd, link.size, media_type="text/markdown")
+    sent: list = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message["type"])
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.0"}, "method": "GET", "headers": []}
+    await response(scope, receive, send)
+    assert _open_fds() == before
+
+
+async def test_r2_at_most_link_size_bytes_are_read(tmp_path):
+    """r2 item 7: never more than content-length, and a short file is loud."""
+    from skuld.broker_api import LinkedFileShrankError, _read_descriptor
+
+    path = _write(tmp_path / "f.bin", b"0123456789")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        chunks = [c async for c in _read_descriptor(fd, 4)]
+        assert b"".join(chunks) == b"0123"
+        os.lseek(fd, 0, os.SEEK_SET)
+        with pytest.raises(LinkedFileShrankError):
+            _ = [c async for c in _read_descriptor(fd, 20)]
+    finally:
+        os.close(fd)
+
+
+def test_r2_the_route_still_streams_the_whole_file(client):
+    data = bytes(range(256)) * 1024
+    _write(client.home / "big.bin", data)
+    fid = client.post("/api/files/resolve", json={"path": "~/big.bin"}).json()["file_id"]
+    response = client.get(f"/api/files/presented/{fid}")
+    assert response.content == data
+    assert response.headers["content-length"] == str(len(data))

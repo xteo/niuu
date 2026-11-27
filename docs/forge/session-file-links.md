@@ -32,17 +32,32 @@ role), authenticated like the other session file routes.
   symlink that leaves them included, is **403**.
 - Refused with **403** even inside the roots (`skuld.host_path_links`, constants on
   purpose). Names are compared after Unicode NFKC normalisation and casefolding, on the
-  link, on its target and on the open file's kernel path:
-  - all of `~/.config`, `~/.local/share` and `~/Library` (`ALLOWED_HOME_TREES` lists
-    exceptions; none yet). A workspace inside one of them is exempt from this rule only;
-  - any path component containing `secret`, `token` or `credential`
-    (`~/.lexi/secrets`, `fleet-secrets`, `credentials.json`, `token_scope.py`);
-  - directories `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.gbrain`,
-    `.password-store`, `.mozilla`, `Keychains`, `keyrings` at any depth;
-  - names starting `.env`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`; `.netrc`,
-    `.pgpass`, `.npmrc`, `.pypirc`, `.claude.json`; suffixes `.env`, `.pem`, `.key`,
-    `.p12`, `.pfx`, `.keychain`, `.keychain-db`, `_history`; `.codex/auth.json`.
-- A file with more than one hard link: **403** (it may be a second name for a refused file).
+  link, on its target and on the open file's kernel path. Only the components **below
+  the matched root** are judged, so a worktree called `…-session-token-fix` or a home
+  `/Users/secretary` is not itself refused.
+  - **Home area:** every dot-entry directly under `~`, file or directory
+    (`~/.github-pat`, `~/.codex-*/`, `~/.gstack/`, `~/.config/`, `~/.local/`), and
+    `~/Library`. Open exceptions (`ALLOWED_HOME_DOT_ENTRIES`): `~/.lexi/flow/`,
+    `~/.lexi/config/`, `~/.lexi/notes/`, `~/.claude/CLAUDE.md`, `~/.claude/skills/`,
+    `~/.claude/projects/*/memory/`. Every rule below still applies inside them
+    (`~/.lexi/flow/secrets/…` stays refused). Files in the workspace skip the home-area
+    rule only when every spelling of the workspace sits strictly below the area it is in
+    (`~/.niuu/workspaces/<id>`); a workspace that is `~/.config`, a symlink to it, home,
+    or holds home, skips nothing.
+  - **Substring:** a component containing `secret`, `token` or `credential`. Dot
+    components always fall under it. A final name with a code extension (`.py .pyi .ts
+    .tsx .js .jsx .mjs .swift .go .rs .java .kt .c .h .cpp .m .mm .rb .cs`) skips it,
+    and inside the workspace so do the non-dot directories above it. `.md` and `.rst`
+    skip it only inside the workspace. Data, config and extensionless names keep it.
+  - **Directories** `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.gbrain`,
+    `.password-store`, `.mozilla`, `Keychains`, `keyrings` at any depth.
+  - **Names** (for every file, code included): starting `.env`, `id_rsa`, `id_dsa`,
+    `id_ecdsa`, `id_ed25519`; `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `.claude.json`;
+    ending `.env`, `.pem`, `.key`, `.p8`, `.p12`, `.pfx`, `.keychain`, `.keychain-db`,
+    `_history`; `.codex/auth.json`.
+- A file with **more than one hard link: 403**, since it may be a second name for a
+  refused file. Expect this for hard-linked trees, for example the files in a uv
+  `.venv`'s `site-packages` (uv hard-links them from its cache).
 - Directories, devices and FIFOs: **403**. Over `max_presented_file_bytes`: **413**.
 
 ## Answers
@@ -61,11 +76,17 @@ is **served from its place**, not staged: no conversation turn, no durable uploa
 link never appears in the session's documents, Show Documents or Unread.
 
 Serving a link (`GET …/files/presented/{file_id}`):
-- needs the **owner** role: a viewer, who may open presented files, gets 403;
+- needs the **owner** room role: a viewer, who may open presented files, gets 403.
+  Forge resolves the caller's room role (the session proxy's own resolution, 403 when
+  there is none) and stamps it on its call to the broker, replacing anything the client
+  sent; the Guild facade forwards to that node, which does the same;
 - judges the stored path again literally (never decoded twice), opens it with
   `O_NOFOLLOW`, checks the descriptor is the same inode at the same size and mtime with
   one link, judges the descriptor's kernel path (`/proc/self/fd` on Linux, `F_GETPATH`
-  on macOS) against the same rules, and streams **from that descriptor**;
+  on macOS) against the same rules, and streams **from that descriptor**, at most the
+  recorded size (a file that shrinks mid-send is an error, never a short answer). The
+  descriptor is closed when the response ends, however it ends, including a client
+  that leaves before the first byte;
 - answers **410** when the file changed since it was resolved (the app resolves the
   link again), and 403/413 when it no longer passes. Forge and the facade pass these on.
 
@@ -78,6 +99,7 @@ The session's own broker is the authority: `resolve_path: true` (alias
 `present_by_path`) on its `GET /api/capabilities` and WebSocket `capabilities` frame.
 Forge's `GET /feature-flags` (and the facade, mirrored from the node) says the Forge
 route exists. A session whose broker predates the route answers **501** with
-`x-forge-error-code: resolve_path_unsupported`, never a 404 that reads as a missing file.
+`x-forge-error-code: resolve_path_unsupported` (the facade passes the header on), never
+a 404 that reads as a missing file.
 
 Forge checks the caller may update the session before it forwards the request.

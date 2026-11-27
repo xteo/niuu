@@ -4149,15 +4149,35 @@ def create_router(
                 detail=str(e) or "Session archive service not available",
             ) from None
 
+    async def _caller_room_role(
+        request: Request, session_id: UUID, *, session: Session | None = None
+    ) -> str:
+        """The caller's room role on *session_id* (the session proxy's own resolution).
+
+        403 when the caller has none: no room role means no access to the session."""
+        if session is None:
+            session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session not found: {session_id}")
+        principal = await _optional_principal(request)
+        role = await session_participant_service.effective_room_role(session, principal)
+        if role is None:
+            raise HTTPException(403, f"Access denied to session {session_id}")
+        return role
+
     async def _proxy_session_api(
         request: Request,
         session_id: UUID,
         *path_segments: str,
         timeout: float = 30.0,
         forward_statuses: frozenset[int] = frozenset(),
+        room_role: str | None = None,
     ) -> httpx.Response:
         """Call the session broker's ``/api/<path>``; an error answer becomes 502, except
-        the statuses in *forward_statuses*, which reach the caller with the broker's detail."""
+        the statuses in *forward_statuses*, which reach the caller with the broker's detail.
+
+        *room_role* is the caller's resolved room role, stamped for the broker's own role
+        gate: Forge dials the broker on loopback, where a missing header reads as owner."""
         try:
             _, base_url = await forge.get_session_proxy_target(session_id)
         except LookupError:
@@ -4176,6 +4196,8 @@ def create_router(
             value = request.headers.get(name)
             if value:
                 headers[name] = value
+        if room_role is not None:
+            headers[ROOM_ROLE_HEADER] = room_role
         body = await request.body()
         try:
             proxy_url, routing_headers = _http_proxy_target(
@@ -4285,12 +4307,16 @@ def create_router(
                         **presented_file_safety_headers(record.mime),
                     },
                 )
+        # The live broker serves present-file copies to any room member and resolved
+        # links (LEX-2110) to the owner only: it judges by the role Forge resolves here.
+        room_role = await _caller_room_role(request, session_id)
         response = await _proxy_session_api(
             request,
             session_id,
             *PRESENTED_FILE_ROUTE,
             file_id,
             forward_statuses=PRESENTED_FILE_FORWARD_STATUSES,
+            room_role=room_role,
         )
         # The live broker's staged copy is just as agent-supplied: the same safety policy.
         media_type = response.headers.get("content-type", "application/octet-stream")
@@ -4328,12 +4354,14 @@ def create_router(
             await forge.ensure_access(session, principal, "update")
         except SessionAccessDeniedError as exc:
             raise HTTPException(403, f"Access denied to session {session_id}") from exc
+        room_role = await _caller_room_role(request, session_id, session=session)
         try:
             response = await _proxy_session_api(
                 request,
                 session_id,
                 *SESSION_LINK_RESOLVE_ROUTE,
                 forward_statuses=SESSION_LINK_RESOLVE_STATUSES,
+                room_role=room_role,
             )
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND and exc.detail == ROUTE_NOT_FOUND:

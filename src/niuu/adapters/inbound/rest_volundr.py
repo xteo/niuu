@@ -374,10 +374,20 @@ def _answer_code(response: httpx.Response) -> str | None:
     return code if isinstance(code, str) else None
 
 
+#: A node's machine-readable error code header (e.g. ``resolve_path_unsupported``),
+#: passed through with the error so a client can tell refusals apart.
+FORGE_ERROR_CODE_HEADER = "x-forge-error-code"
+
+
 def _ensure_remote_success(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
-    raise HTTPException(status_code=response.status_code, detail=_upstream_detail(response)[:1000])
+    code = response.headers.get(FORGE_ERROR_CODE_HEADER)
+    raise HTTPException(
+        status_code=response.status_code,
+        detail=_upstream_detail(response)[:1000],
+        headers={FORGE_ERROR_CODE_HEADER: code} if code else None,
+    )
 
 
 #: A node's refusal of a message while a native control is pending (LEX-1936): passed

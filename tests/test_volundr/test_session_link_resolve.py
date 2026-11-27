@@ -264,3 +264,125 @@ def test_the_facade_forwards_the_501_from_an_old_broker():
         f"/api/v1/forge/sessions/{SID}/files/resolve", json={"path": "x"}, headers=HEADERS
     )
     assert resp.status_code == 501
+
+
+# ------------------------------------------------------------------ review round 2
+
+
+def _broker_gate(request: httpx.Request) -> httpx.Response:
+    """The broker's own rule for a link id: owner only, judged by the role Forge stamps."""
+    if request.headers.get("x-niuu-room-role") != "owner":
+        return httpx.Response(403, json={"detail": "linked files open only for the session owner"})
+    return httpx.Response(200, content=b"owner bytes", headers={"content-type": "text/plain"})
+
+
+def _as_role(monkeypatch, role):
+    from volundr.domain.services.session_participants import SessionParticipantService
+
+    async def effective_room_role(self, session, principal):
+        return role
+
+    monkeypatch.setattr(SessionParticipantService, "effective_room_role", effective_room_role)
+
+
+@respx.mock
+async def test_r2_forge_stamps_the_callers_room_role_and_a_viewer_gets_403(tmp_path, monkeypatch):
+    """r2 item 1: Forge dials the broker on loopback; without the stamped role the
+    broker would take every caller for the owner."""
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    route = respx.get(f"http://broker.test:8080/api/files/presented/{FID}").mock(
+        side_effect=_broker_gate
+    )
+    _as_role(monkeypatch, "viewer")
+    refused = client.get(presented_file_path(session.id, FID))
+    assert refused.status_code == 403
+    assert route.calls.last.request.headers["x-niuu-room-role"] == "viewer"
+    _as_role(monkeypatch, "owner")
+    served = client.get(presented_file_path(session.id, FID))
+    assert served.status_code == 200
+    assert served.content == b"owner bytes"
+
+
+@respx.mock
+async def test_r2_a_caller_with_no_room_role_never_reaches_the_broker(tmp_path, monkeypatch):
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    route = respx.get(f"http://broker.test:8080/api/files/presented/{FID}").mock(
+        side_effect=_broker_gate
+    )
+    _as_role(monkeypatch, None)
+    assert client.get(presented_file_path(session.id, FID)).status_code == 403
+    assert not route.called
+
+
+@respx.mock
+async def test_r2_a_client_cannot_forge_the_room_role_header(tmp_path, monkeypatch):
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    route = respx.get(f"http://broker.test:8080/api/files/presented/{FID}").mock(
+        side_effect=_broker_gate
+    )
+    _as_role(monkeypatch, "viewer")
+    resp = client.get(presented_file_path(session.id, FID), headers={"x-niuu-room-role": "owner"})
+    assert resp.status_code == 403
+    assert route.calls.last.request.headers["x-niuu-room-role"] == "viewer"
+
+
+@respx.mock
+async def test_r2_resolve_stamps_the_room_role_too(tmp_path, monkeypatch):
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    route = respx.post("http://broker.test:8080/api/files/resolve").mock(
+        return_value=httpx.Response(200, json=RECORD)
+    )
+    _as_role(monkeypatch, "owner")
+    resp = client.post(f"/api/v1/forge/sessions/{session.id}/files/resolve", json={"path": "x"})
+    assert resp.status_code == 200
+    assert route.calls.last.request.headers["x-niuu-room-role"] == "owner"
+
+
+@respx.mock
+async def test_r2_a_viewer_gets_403_through_the_guild_facade(tmp_path, monkeypatch):
+    """The facade forwards to the session's node, which resolves the role and stamps it."""
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    respx.get(f"http://broker.test:8080/api/files/presented/{FID}").mock(side_effect=_broker_gate)
+    facade = _facade(client.app)
+    _as_role(monkeypatch, "viewer")
+    refused = facade.get(
+        f"/api/v1/forge/sessions/{session.id}/files/presented/{FID}", headers=HEADERS
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == "linked files open only for the session owner"
+    _as_role(monkeypatch, "owner")
+    served = facade.get(
+        f"/api/v1/forge/sessions/{session.id}/files/presented/{FID}", headers=HEADERS
+    )
+    assert served.status_code == 200, served.text
+    assert served.content == b"owner bytes"
+
+
+def test_r2_the_facade_passes_the_error_code_header():
+    """r2 item 8: x-forge-error-code survives the facade for an old broker's 501."""
+    from fastapi.responses import JSONResponse
+
+    node = FastAPI()
+
+    @node.post("/api/v1/forge/sessions/{sid}/files/resolve")
+    async def old_broker(sid: str):
+        return JSONResponse(
+            {"detail": "this session's broker has no files/resolve"},
+            status_code=501,
+            headers={"x-forge-error-code": "resolve_path_unsupported"},
+        )
+
+    @node.get("/api/v1/forge/sessions/{sid}")
+    async def session_row(sid: str):
+        return {"id": sid, "name": "s", "owner_id": "u1", "tenant_id": "t1"}
+
+    resp = _facade(node).post(
+        f"/api/v1/forge/sessions/{SID}/files/resolve", json={"path": "x"}, headers=HEADERS
+    )
+    assert resp.status_code == 501
+    assert resp.headers["x-forge-error-code"] == "resolve_path_unsupported"
