@@ -65,7 +65,17 @@ class _Pane:
 
 
 def _claude(tmp_path, pane: _Pane, model="claude-opus-5-5") -> TmuxInteractiveTransport:
-    claude = TmuxInteractiveTransport(str(tmp_path), model=model, reasoning_effort="xhigh")
+    # Its own tmux session name: the default ("skuld-interactive") is shared by every test on
+    # every xdist worker, so a parallel test's live session of that name could answer here.
+    claude = TmuxInteractiveTransport(
+        str(tmp_path),
+        model=model,
+        reasoning_effort="xhigh",
+        session_id=f"switch-{tmp_path.name}",
+    )
+    # send_control starts a transport that is not alive: here that would launch a real tmux
+    # session running `claude`, left behind after the test. These tests drive a fake pane.
+    claude.start = AsyncMock()
     claude._wait_for_repl_ready = AsyncMock()
     claude._send_slash_command = AsyncMock()
     claude._capture_pane_text = pane.capture
