@@ -331,6 +331,15 @@ async def test_a_server_that_cannot_be_bridged_is_left_out_visibly_and_counted(t
 
     await transport.start()
     try:
+        left_out = [e for e in _of(events, "system") if e.get("subtype") == "agy_mcp_left_out"]
+        assert left_out == []  # at start no browser is a channel yet; it shows with the turn
+        assert transport._counts["mcp_servers_left_out"] == 3
+        transcript = Transcript(tmp_path / "brain" / CONV / "transcript.jsonl")
+        await transport.handle_agy_hook("SessionStart", _hook(transcript))
+        for _ in range(2):
+            await transport.handle_agy_hook(
+                "PreInvocation", _hook(transcript, invocationNum=0, lastUserInput="hi")
+            )
         notices = [e for e in _of(events, "system") if e.get("subtype") == "agy_mcp_left_out"]
         assert len(notices) == 1
         line = notices[0]["content"]

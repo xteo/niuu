@@ -327,7 +327,8 @@ class TmuxAgyTransport(CLITransport):
         self._initial_prompt_sender = initial_prompt_sender
         self._initial_prompt_sent = False
         self._raw_mcp_servers = list(mcp_servers or [])
-        self._left_out_reported = False
+        self._left_out_logged = False
+        self._left_out_shown = False
         self._sdk_port = sdk_port
         self._session_tools = session_tools
         self._mcp_plan = plan_mcp_servers(self._raw_mcp_servers, self._session_environ())
@@ -464,7 +465,7 @@ class TmuxAgyTransport(CLITransport):
             await self._wait_until_ready()
             self._alive = True
             await self._emit_system_init()
-            await self._report_left_out_servers()
+            self._log_left_out_servers()
             if self._poll_task is None or self._poll_task.done():
                 self._poll_task = asyncio.create_task(
                     self._poll_screen(), name=f"agy-poll-{self._session_name}"
@@ -624,24 +625,39 @@ class TmuxAgyTransport(CLITransport):
             env.update(self._session_tools.env)
         return env
 
-    async def _report_left_out_servers(self) -> None:
-        """One visible line, an error log and a count per server agy started without."""
-        if self._left_out_reported or not self._mcp_plan.left_out:
+    def _left_out_line(self) -> str:
+        return (
+            "Gemini started without "
+            + "; ".join(
+                f"the {name} MCP server: {reason}" for name, reason in self._mcp_plan.left_out
+            )
+            + "."
+        )
+
+    def _log_left_out_servers(self) -> None:
+        """At start: an error log and a count per server agy started without."""
+        if self._left_out_logged or not self._mcp_plan.left_out:
             return
-        self._left_out_reported = True
+        self._left_out_logged = True
         for name, _ in self._mcp_plan.left_out:
             self._counts["mcp_servers_left_out"] += 1
             self._counts[f"mcp_left_out:{name}"] += 1
-        message = "Gemini started without " + "; ".join(
-            f"the {name} MCP server: {reason}" for name, reason in self._mcp_plan.left_out
-        )
-        message += "."
-        logger.error("agy session %s: %s", self._session_name, message)
+        logger.error("agy session %s: %s", self._session_name, self._left_out_line())
+
+    async def _show_left_out_servers(self) -> None:
+        """One visible line in the chat, with the first turn.
+
+        Not at start: a browser's connection is what starts agy, before the broker
+        has that browser as a channel, so a line sent then reaches no one.
+        """
+        if self._left_out_shown or not self._mcp_plan.left_out:
+            return
+        self._left_out_shown = True
         await self._emit(
             {
                 "type": "system",
                 "subtype": MCP_LEFT_OUT_SUBTYPE,
-                "content": message,
+                "content": self._left_out_line(),
                 "metadata": {
                     "source": "tmux_agy",
                     "left_out": [
@@ -1047,6 +1063,7 @@ class TmuxAgyTransport(CLITransport):
         if request_id:
             event["request_id"] = request_id
         await self._emit(event)
+        await self._show_left_out_servers()
 
     async def _tool_started(self, payload: dict[str, Any]) -> None:
         call = payload.get("toolCall") or {}
