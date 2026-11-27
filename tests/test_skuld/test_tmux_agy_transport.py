@@ -410,10 +410,46 @@ async def test_start_without_the_hook_endpoint_fails(tmp_path) -> None:
 
 
 async def test_a_signed_out_agy_fails_start_with_the_sign_in_command(tmp_path) -> None:
-    transport = _transport(tmp_path)
-    transport.screen = "Welcome to the Antigravity CLI. You are currently not signed in."
+    transport = _transport(tmp_path, agy={"signed_out_grace_s": 0.1})
+    transport.screen = _frame("signed_out")  # recorded from agy 1.5.16 with an empty home
 
-    with pytest.raises(AgyNotSignedInError, match="HOME=.*home /opt/agy"):
+    with pytest.raises(
+        AgyNotSignedInError, match="stayed for agy.signed_out_grace_s=0.1.*HOME=.*home /opt/agy"
+    ):
+        await transport.start()
+
+
+async def test_the_sign_in_menu_agy_shows_while_it_loads_a_login_is_waited_out(tmp_path) -> None:
+    """agy draws its sign-in menu for a moment while it refreshes a stored login (27 Nov 2026)."""
+    transport = _transport(tmp_path, agy={"signed_out_grace_s": 0.4})
+    transport.screen = _frame("signed_out")
+    seen: list[str] = []
+    real_run = transport._run_tmux
+
+    async def run(*args: str, check: bool = True, env=None):
+        result = await real_run(*args, check=check, env=env)
+        if args[0] == "capture-pane":
+            seen.append(result.stdout)
+            if len(seen) == 5:
+                transport.screen = _frame("ready")
+        return result
+
+    transport._run_tmux = run  # type: ignore[method-assign]
+    await transport.start()
+    try:
+        assert transport.is_alive
+        assert sum(1 for screen in seen if "not signed in" in screen) >= 5
+    finally:
+        await transport.stop()
+
+
+async def test_a_sign_in_menu_still_up_when_start_times_out_is_reported_as_signed_out(
+    tmp_path,
+) -> None:
+    transport = _transport(tmp_path, agy={"signed_out_grace_s": 30, "ready_timeout_s": 0.1})
+    transport.screen = _frame("signed_out")
+
+    with pytest.raises(AgyNotSignedInError, match="not signed in"):
         await transport.start()
 
 

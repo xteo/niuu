@@ -868,6 +868,16 @@ class AgyRuntimeConfig(BaseModel):
         gt=0,
         description="How long a starting agy may take to show its composer before start fails.",
     )
+    signed_out_grace_s: float = Field(
+        default=10,
+        gt=0,
+        description=(
+            "How long agy's sign-in menu may stay on screen at start before Skuld calls the "
+            "home signed out. agy draws it for a moment while it loads or refreshes a stored "
+            "login (seen 27 Nov 2026: ~5 s while it rewrote its credential); still there after "
+            "this long, start fails with the sign-in command."
+        ),
+    )
     version_check_timeout_s: float = Field(
         default=30, gt=0, description="Bound on `agy --version` at start."
     )

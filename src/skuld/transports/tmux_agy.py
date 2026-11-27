@@ -722,13 +722,19 @@ class TmuxAgyTransport(CLITransport):
     async def _wait_until_ready(self) -> None:
         """Answer the launch workspace's trust menu, then wait for the composer."""
         deadline = time.monotonic() + self._config.ready_timeout_s
+        signed_out_since: float | None = None
         while time.monotonic() < deadline:
             screen = await self._capture()
             if agy_screen.signed_out(screen):
-                raise AgyNotSignedInError(
-                    f"agy is not signed in for HOME={self._home}. Sign in once with: "
-                    f"HOME={shlex.quote(str(self._home))} {shlex.quote(self._config.binary)}"
-                )
+                # agy shows its sign-in menu for a moment while it loads or refreshes a
+                # stored login; only a menu that stays is a signed-out home.
+                now = time.monotonic()
+                signed_out_since = signed_out_since if signed_out_since is not None else now
+                if now - signed_out_since >= self._config.signed_out_grace_s:
+                    raise self._signed_out_error()
+                await asyncio.sleep(self._config.poll_interval_s)
+                continue
+            signed_out_since = None
             trust = agy_screen.trust_prompt(screen)
             if trust is not None:
                 await self._answer_trust(trust)
@@ -737,9 +743,18 @@ class TmuxAgyTransport(CLITransport):
             if await self._pane_dead():
                 raise RuntimeError(f"agy exited during start; last screen:\n{screen.strip()}")
             await asyncio.sleep(self._config.poll_interval_s)
+        if signed_out_since is not None:
+            raise self._signed_out_error()
         raise DeliveryNotAcceptedError(
             f"agy did not show its composer within agy.ready_timeout_s="
             f"{self._config.ready_timeout_s}; check the terminal"
+        )
+
+    def _signed_out_error(self) -> AgyNotSignedInError:
+        return AgyNotSignedInError(
+            f"agy is not signed in for HOME={self._home} (its sign-in menu stayed for "
+            f"agy.signed_out_grace_s={self._config.signed_out_grace_s}). Sign in once with: "
+            f"HOME={shlex.quote(str(self._home))} {shlex.quote(self._config.binary)}"
         )
 
     async def _answer_trust(self, trust: agy_screen.TrustPrompt) -> None:
