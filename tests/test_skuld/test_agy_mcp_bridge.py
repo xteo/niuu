@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -81,6 +82,16 @@ def mcp_server() -> Iterator[tuple[str, _Server]]:
         server.server_close()
 
 
+def _closed_port_url() -> str:
+    """A loopback URL nothing listens on: the port was just bound and released, so a
+    connection is refused at once. (Port 9 is not: a hardened CI runner may drop the
+    packets instead, and a request with no timeout then waits for ever.)"""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}/mcp"
+
+
 def _lines(*messages: dict[str, Any]) -> list[bytes]:
     return [json.dumps(m).encode() + b"\n" for m in messages]
 
@@ -137,7 +148,7 @@ def test_a_refused_request_is_answered_with_an_error_agy_can_show(mcp_server, ca
 
 def test_an_unreachable_server_fails_the_request_and_a_notification_only_logs(capsys) -> None:
     out = io.BytesIO()
-    bridge = HttpBridge({"url": "http://127.0.0.1:9/mcp"}, {}, out)
+    bridge = HttpBridge({"url": _closed_port_url()}, {}, out)
 
     bridge.post(json.dumps({"jsonrpc": "2.0", "method": "notifications/x"}))
     assert out.getvalue() == b""
@@ -149,7 +160,7 @@ def test_an_unreachable_server_fails_the_request_and_a_notification_only_logs(ca
 
 def test_a_missing_token_fails_the_request_not_the_bridge(tmp_path) -> None:
     out = io.BytesIO()
-    spec = {"url": "http://127.0.0.1:9/mcp", "credential_file": str(tmp_path / "gone")}
+    spec = {"url": _closed_port_url(), "credential_file": str(tmp_path / "gone")}
 
     HttpBridge(spec, {}, out).post(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
 

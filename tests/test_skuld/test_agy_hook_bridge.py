@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -26,6 +27,14 @@ class _Broker(BaseHTTPRequestHandler):
 
     def log_message(self, *args: object) -> None:
         return
+
+
+def _closed_port_url() -> str:
+    """A loopback URL nothing listens on (refused at once; port 9 may be dropped on CI)."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}/api/agy/hooks"
 
 
 @pytest.fixture
@@ -88,7 +97,7 @@ def test_a_refusing_broker_fails_the_hook_loudly(broker_url, tmp_path, monkeypat
 def test_an_unreachable_broker_fails_the_hook_loudly(tmp_path, monkeypatch, capsys) -> None:
     token = tmp_path / "token"
     token.write_text("s3cret")
-    monkeypatch.setenv(agy_hook_bridge.HOOK_URL_ENV, "http://127.0.0.1:9/api/agy/hooks")
+    monkeypatch.setenv(agy_hook_bridge.HOOK_URL_ENV, _closed_port_url())
     monkeypatch.setenv(agy_hook_bridge.BROKER_TOKEN_FILE_ENV, str(token))
 
     with pytest.raises(SystemExit) as exit_info:
@@ -99,7 +108,7 @@ def test_an_unreachable_broker_fails_the_hook_loudly(tmp_path, monkeypatch, caps
 
 
 def test_a_broker_launch_without_the_token_file_fails(monkeypatch, capsys) -> None:
-    monkeypatch.setenv(agy_hook_bridge.HOOK_URL_ENV, "http://127.0.0.1:9/x")
+    monkeypatch.setenv(agy_hook_bridge.HOOK_URL_ENV, _closed_port_url())
     monkeypatch.delenv(agy_hook_bridge.BROKER_TOKEN_FILE_ENV, raising=False)
 
     with pytest.raises(SystemExit):
