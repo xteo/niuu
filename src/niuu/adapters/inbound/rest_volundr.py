@@ -2536,6 +2536,9 @@ def create_volundr_router(
             # Forwarded reads: true only when the node behind this facade serves them.
             "voice_conversation": node_capabilities.get("voice_conversation") is True,
             "summary_sessions": node_capabilities.get("summary_sessions") is True,
+            # LEX-2110: POST /sessions/{id}/files/resolve, when the node serves it.
+            "resolve_path": node_capabilities.get("resolve_path") is True,
+            "present_by_path": node_capabilities.get("resolve_path") is True,
         }
         return flags
 
@@ -4977,6 +4980,26 @@ def create_volundr_router(
             media_type=response.headers.get("content-type", "application/octet-stream"),
             headers=headers,
         )
+
+    @router.post("/sessions/{session_id}/files/resolve")
+    async def resolve_session_file_link(
+        request: Request,
+        session_id: str = Path(description="Volundr session identifier"),
+        principal: Principal = Depends(extract_principal),
+    ) -> dict[str, Any]:
+        """LEX-2110: resolve a host path the session wrote, on the session's own node."""
+        response = await _proxy_session_file_api(
+            request,
+            principal,
+            session_id,
+            method="POST",
+            path=f"/sessions/{session_id}/files/resolve",
+        )
+        _ensure_remote_success(response)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(502, "session node answered files/resolve with no record")
+        return payload
 
     @router.get("/sessions/{session_id}/files/presented/{file_id}")
     async def download_presented_file(

@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import time
 import uuid
 from collections import deque
@@ -44,6 +45,14 @@ from skuld.conversation_snapshot import ConversationSnapshotTooLargeError, prepa
 from skuld.event_log import FORGE_SESSIONS_PATH
 from skuld.file_routes import register_file_routes
 from skuld.forge_mcp.routes import register_forge_mcp_routes
+from skuld.host_path_links import (
+    LINK_CAPABILITIES,
+    LinkPathError,
+    ResolvedLink,
+    display_path,
+    link_file_id,
+    resolve_link,
+)
 from skuld.native_question_index import NativeTranscriptUnavailableError
 from skuld.path_security import (
     UnsafePathError,
@@ -823,6 +832,7 @@ async def get_capabilities() -> dict:
         raise HTTPException(status_code=503, detail="Transport not initialized")
     payload = asdict(broker._transport.capabilities)
     payload["room_prompt_resend"] = broker._room_bridge is not None
+    payload.update(LINK_CAPABILITIES)
     return payload
 
 
@@ -1238,12 +1248,97 @@ def _build_present_file_turn(
     )
 
 
+# --- Host-path links (LEX-2110) ---
+#
+# A link in a session's text names a host file as written (``~/agent/x.md``, an absolute
+# path, a workspace-relative one). ``POST /api/files/resolve`` decodes it on this host and
+# answers with a presented-file-shaped record. The file is served DIRECTLY from its place
+# by the presented-file route: nothing is staged, no turn is emitted and nothing is
+# uploaded to Forge, so opening a link never adds it to the session's documents.
+
+#: file_id -> the link it was minted for. In memory: after a broker restart the app
+#: resolves the link again (it resolves on every tap) and gets the same id back.
+_linked_registry: dict[str, ResolvedLink] = {}
+
+
+def _link_roots() -> tuple[str, str]:
+    return broker._settings.home_path, broker.workspace_dir
+
+
+def _resolve_session_link(raw: str) -> ResolvedLink:
+    home, workspace = _link_roots()
+    try:
+        return resolve_link(
+            raw,
+            home=home,
+            workspace=workspace,
+            host=socket.gethostname(),
+            max_bytes=broker._settings.max_presented_file_bytes,
+        )
+    except LinkPathError as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+
+
+class _ResolveLinkRequest(BaseModel):
+    """Body of ``POST /api/files/resolve``: the path exactly as the session wrote it."""
+
+    path: str
+
+
+@app.post("/api/files/resolve")
+async def resolve_file_link(body: _ResolveLinkRequest) -> dict:
+    """Resolve a host path a session wrote into a record ``GET /api/files/presented`` serves.
+
+    200 ``{file_id, name, size, mime, path, display_path, host, source: "link"}``; 403 outside
+    the session roots or secret-shaped; 404 no such file; 413 over the size cap; 422 not
+    decodable. Owner-only: ``room_access`` lists it for no lower role.
+    """
+    link = _resolve_session_link(body.path)
+    file_id = link_file_id(str(broker.session_id or ""), link)
+    _linked_registry[file_id] = link
+    name = link.path.name
+    home, _ = _link_roots()
+    return {
+        "file_id": file_id,
+        "name": name,
+        "size": link.size,
+        "mime": mimetypes.guess_type(name)[0] or "application/octet-stream",
+        "path": str(link.path),
+        "display_path": display_path(link.path, home),
+        "host": socket.gethostname(),
+        "source": "link",
+    }
+
+
+def _serve_linked_file(file_id: str, link: ResolvedLink) -> FileResponse:
+    """Serve a resolved link from its place, after checking it again: the roots, the
+    secret rule and the version it was resolved at all still hold."""
+    current = _resolve_session_link(str(link.path))
+    if current != link:
+        _linked_registry.pop(file_id, None)
+        raise HTTPException(410, "file changed since the link was resolved; resolve it again")
+    name = link.path.name
+    media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return FileResponse(
+        path=link.path,
+        filename=name,
+        media_type=media_type,
+        content_disposition_type="inline",
+        headers={
+            "cache-control": PRESENTED_FILE_LIVE_CACHE,
+            **presented_file_safety_headers(media_type),
+        },
+    )
+
+
 @app.get("/api/files/presented/{file_id}")
 async def download_presented_file(file_id: str) -> FileResponse:
     """Serve a staged presented file by OPAQUE id (never a client path → traversal-safe)."""
     if not _PRESENTED_ID_RE.fullmatch(file_id):
         raise HTTPException(400, "invalid file_id")
     path = _presented_registry.get(file_id)
+    if path is None and file_id in _linked_registry:
+        return _serve_linked_file(file_id, _linked_registry[file_id])
     if path is None:
         _rebuild_presented_registry()
         path = _presented_registry.get(file_id)

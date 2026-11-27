@@ -28,6 +28,7 @@ from skuld.conversation_snapshot import (
     prepare_recent_snapshot,
     snapshot_byte_size,
 )
+from skuld.host_path_links import LINK_CAPABILITIES
 from skuld.room_role_port import RoomRoleResolutionError
 from skuld.websocket_auth import (
     _decode_jwt_claims,
@@ -431,6 +432,7 @@ class WebSocketLifecycleMixin:
             if self._transport:
                 caps = {"type": "capabilities", **asdict(self._transport.capabilities)}
                 caps["room_prompt_resend"] = self._room_bridge is not None
+                caps.update(LINK_CAPABILITIES)  # LEX-2110: POST /api/files/resolve
                 caps["history_protocol"] = 2
                 if not await self._safe_send_broker_frame_to(websocket, caps):
                     return

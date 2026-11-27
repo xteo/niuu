@@ -194,7 +194,10 @@ from volundr.domain.services.session_participants import SessionParticipantServi
 from volundr.domain.session_broker import (
     DEFAULT_OPENSHELL_INTERNAL_GATEWAY_URL,
     OPENSHELL_SERVICE_HOST_SUFFIX,
+    PRESENTED_FILE_FORWARD_STATUSES,
     PRESENTED_FILE_ROUTE,
+    SESSION_LINK_RESOLVE_ROUTE,
+    SESSION_LINK_RESOLVE_STATUSES,
     server_side_http_proxy_target,
     session_proxy_url,
 )
@@ -229,6 +232,18 @@ DEFAULT_PREVIEW_CACHE_DIR = FilePath("~/.niuu/preview-cache").expanduser()
 # so previews are safely long-lived cacheable at every layer (incl. URLSession).
 FORGE_READ_MS_HEADER = "X-Forge-Read-Ms"
 """Server time (ms) spent on a read, so a caller can tell Forge time from its own."""
+
+
+def _broker_error_detail(response: httpx.Response) -> str:
+    """The ``detail`` of a broker error answer, or its status text when it has none."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.reason_phrase or f"HTTP {response.status_code}"
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, str) and detail:
+        return detail
+    return response.reason_phrase or f"HTTP {response.status_code}"
 
 
 def _read_ms(started: float) -> str:
@@ -2428,6 +2443,9 @@ def create_router(
                 "voice_conversation": True,
                 # LEX-1677: GET /sessions?fields=summary (and limit)
                 "summary_sessions": True,
+                # LEX-2110: POST /sessions/{id}/files/resolve (alias: present_by_path)
+                "resolve_path": True,
+                "present_by_path": True,
             },
             "notifications_enabled": notifications,
             "projects_enabled": project_service is not None,
@@ -4133,7 +4151,10 @@ def create_router(
         session_id: UUID,
         *path_segments: str,
         timeout: float = 30.0,
+        forward_statuses: frozenset[int] = frozenset(),
     ) -> httpx.Response:
+        """Call the session broker's ``/api/<path>``; an error answer becomes 502, except
+        the statuses in *forward_statuses*, which reach the caller with the broker's detail."""
         try:
             _, base_url = await forge.get_session_proxy_target(session_id)
         except LookupError:
@@ -4169,6 +4190,11 @@ def create_router(
                 response.raise_for_status()
                 return response
         except httpx.HTTPStatusError as e:
+            if e.response.status_code in forward_statuses:
+                raise HTTPException(
+                    status_code=e.response.status_code,
+                    detail=_broker_error_detail(e.response),
+                ) from None
             logger.warning(
                 "Session API proxy failed for session %s path=%s status=%d",
                 _sanitize_log(session_id),
@@ -4256,7 +4282,13 @@ def create_router(
                         **presented_file_safety_headers(record.mime),
                     },
                 )
-        response = await _proxy_session_api(request, session_id, *PRESENTED_FILE_ROUTE, file_id)
+        response = await _proxy_session_api(
+            request,
+            session_id,
+            *PRESENTED_FILE_ROUTE,
+            file_id,
+            forward_statuses=PRESENTED_FILE_FORWARD_STATUSES,
+        )
         # The live broker's staged copy is just as agent-supplied: the same safety policy.
         media_type = response.headers.get("content-type", "application/octet-stream")
         headers = {
@@ -4271,6 +4303,28 @@ def create_router(
             media_type=media_type,
             headers=headers,
         )
+
+    @router.post("/sessions/{session_id}/files/resolve", tags=["Sessions"])
+    async def resolve_session_file_link(
+        request: Request,
+        session_id: UUID = Path(description="Unique session identifier"),
+    ) -> dict:
+        """Resolve a host path the session wrote (LEX-2110) on the session's own host.
+
+        Body ``{"path": "<as written>"}``. The answer's ``file_id`` opens through
+        ``GET /sessions/{id}/files/presented/{file_id}``; the broker's 403, 404, 410, 413
+        and 422 answers reach the caller unchanged.
+        """
+        response = await _proxy_session_api(
+            request,
+            session_id,
+            *SESSION_LINK_RESOLVE_ROUTE,
+            forward_statuses=SESSION_LINK_RESOLVE_STATUSES,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(502, "session broker answered files/resolve with no record")
+        return payload
 
     @router.post("/sessions/{session_id}/files/upload", tags=["Sessions"])
     async def upload_session_files(

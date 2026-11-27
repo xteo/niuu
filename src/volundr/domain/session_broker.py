@@ -16,6 +16,14 @@ OPENSHELL_SERVICE_HOST_SUFFIX = ".openshell.localhost"
 #: The broker's HTTP API root and its presented-file route (``present-file`` staging).
 BROKER_API_SEGMENT = "api"
 PRESENTED_FILE_ROUTE = ("files", "presented")
+#: Broker answers to a presented-file download that reach the caller as they are: an
+#: unknown id (404) and a resolved link whose file changed since (410, LEX-2110).
+PRESENTED_FILE_FORWARD_STATUSES = frozenset({404, 410})
+#: The broker's host-path link resolver (LEX-2110) and the refusals it answers with:
+#: outside the roots or secret-shaped (403), missing (404), over the size cap (413),
+#: not decodable (422).
+SESSION_LINK_RESOLVE_ROUTE = ("files", "resolve")
+SESSION_LINK_RESOLVE_STATUSES = frozenset({403, 404, 413, 422})
 _CHAT_PATH_SUFFIX = "/session"
 
 
