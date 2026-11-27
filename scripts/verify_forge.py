@@ -71,6 +71,12 @@ def inspect_junit(path: Path, *, strict_skips: bool = False) -> dict:
     return result
 
 
+# A test still running after this long is stuck (the whole unit lane takes ~6 min): pytest's
+# faulthandler then prints every thread's stack, so a hang that runs into --timeout names its
+# test in the log. It only reports; the run's own --timeout still decides the failure.
+STALL_REPORT_S = 300
+
+
 def command_for(lane: str, report: Path, *, coverage: bool = False) -> list[str]:
     if lane == "web":
         return [
@@ -84,6 +90,7 @@ def command_for(lane: str, report: Path, *, coverage: bool = False) -> list[str]
             f"--outputFile.junit={report}",
         ]
     command = [sys.executable, "-m", "pytest", "-o", "addopts=", "--strict-markers", "-W", "error"]
+    command += ["-o", f"faulthandler_timeout={STALL_REPORT_S}"]
     for warning in TOLERATED_UPSTREAM_WARNINGS:
         command += ["-W", warning]
     if lane == "unit":

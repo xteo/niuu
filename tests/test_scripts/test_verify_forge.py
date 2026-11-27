@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.verify_forge import command_for, inspect_junit
+from scripts.verify_forge import STALL_REPORT_S, command_for, inspect_junit
 
 
 @pytest.mark.parametrize(
@@ -49,3 +49,9 @@ def test_unit_gate_excludes_live_providers_without_dropping_fake_e2e(tmp_path):
 def test_tmux_gate_selects_actual_tmux_tests(tmp_path):
     command = command_for("tmux", tmp_path / "tmux.xml")
     assert command[command.index("-m", 3) + 1] == "tmux"
+
+
+def test_a_stuck_test_prints_its_stack_before_the_run_times_out(tmp_path):
+    for lane in ("unit", "tmux", "database"):
+        command = command_for(lane, tmp_path / f"{lane}.xml")
+        assert f"faulthandler_timeout={STALL_REPORT_S}" in command
