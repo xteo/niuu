@@ -196,6 +196,9 @@ from volundr.domain.session_broker import (
     OPENSHELL_SERVICE_HOST_SUFFIX,
     PRESENTED_FILE_FORWARD_STATUSES,
     PRESENTED_FILE_ROUTE,
+    RESOLVE_PATH_UNSUPPORTED_CODE,
+    RESOLVE_PATH_UNSUPPORTED_DETAIL,
+    ROUTE_NOT_FOUND,
     SESSION_LINK_RESOLVE_ROUTE,
     SESSION_LINK_RESOLVE_STATUSES,
     server_side_http_proxy_target,
@@ -4312,15 +4315,34 @@ def create_router(
         """Resolve a host path the session wrote (LEX-2110) on the session's own host.
 
         Body ``{"path": "<as written>"}``. The answer's ``file_id`` opens through
-        ``GET /sessions/{id}/files/presented/{file_id}``; the broker's 403, 404, 410, 413
-        and 422 answers reach the caller unchanged.
+        ``GET /sessions/{id}/files/presented/{file_id}``; the broker's 403, 404, 413 and
+        422 answers reach the caller unchanged. A broker that predates the route answers
+        501, never a 404 that would read as "no such file".
         """
-        response = await _proxy_session_api(
-            request,
-            session_id,
-            *SESSION_LINK_RESOLVE_ROUTE,
-            forward_statuses=SESSION_LINK_RESOLVE_STATUSES,
-        )
+        session = await forge.get_session(session_id)
+        if session is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session not found: {session_id}")
+        principal = await _optional_principal(request)
+        try:
+            # A link reads the owner's host: the same authority as changing the session.
+            await forge.ensure_access(session, principal, "update")
+        except SessionAccessDeniedError as exc:
+            raise HTTPException(403, f"Access denied to session {session_id}") from exc
+        try:
+            response = await _proxy_session_api(
+                request,
+                session_id,
+                *SESSION_LINK_RESOLVE_ROUTE,
+                forward_statuses=SESSION_LINK_RESOLVE_STATUSES,
+            )
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND and exc.detail == ROUTE_NOT_FOUND:
+                raise HTTPException(
+                    status.HTTP_501_NOT_IMPLEMENTED,
+                    RESOLVE_PATH_UNSUPPORTED_DETAIL,
+                    headers={"x-forge-error-code": RESOLVE_PATH_UNSUPPORTED_CODE},
+                ) from None
+            raise
         payload = response.json()
         if not isinstance(payload, dict):
             raise HTTPException(502, "session broker answered files/resolve with no record")

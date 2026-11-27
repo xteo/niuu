@@ -12,12 +12,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from skuld import host_path_links
 from skuld.host_path_links import (
     LINK_CAPABILITIES,
     LinkPathError,
+    LinkRoots,
+    check_path,
     decode_link_path,
     display_path,
     link_file_id,
+    open_link,
     resolve_link,
     secret_reason,
 )
@@ -80,7 +84,16 @@ def test_a_plain_path_with_percent_escapes_tries_the_literal_spelling_first():
 
 @pytest.mark.parametrize(
     "raw",
-    ["", "   ", "``", "~other/x.md", "file://otherhost/etc/x", "a\0b", "file:///a%00b"],
+    [
+        "",
+        "   ",
+        "``",
+        "~other/x.md",
+        "file://otherhost/etc/x",
+        "a\0b",
+        "file:///a%00b",
+        "file://[bad",
+    ],
 )
 def test_undecodable_paths_are_422(raw):
     with pytest.raises(LinkPathError) as err:
@@ -144,10 +157,12 @@ def roots(tmp_path):
     return home, workspace
 
 
+def _roots(home, workspace, max_bytes=1 << 20) -> LinkRoots:
+    return LinkRoots(home=str(home), workspace=str(workspace), host="testhost", max_bytes=max_bytes)
+
+
 def _resolve(raw, home, workspace, max_bytes=1 << 20):
-    return resolve_link(
-        raw, home=str(home), workspace=str(workspace), host="testhost", max_bytes=max_bytes
-    )
+    return resolve_link(raw, _roots(home, workspace, max_bytes))
 
 
 def test_resolve_a_home_file_by_tilde(roots):
@@ -262,12 +277,15 @@ def test_file_id_is_stable_for_the_same_version_and_changes_with_it(roots):
     home, workspace = roots
     note = home / "note.md"
     note.write_text("v1")
-    first = link_file_id("s1", _resolve("~/note.md", home, workspace))
-    assert first == link_file_id("s1", _resolve(str(note), home, workspace))
+    key = b"k" * 32
+    first = link_file_id(key, "s1", _resolve("~/note.md", home, workspace))
+    assert first == link_file_id(key, "s1", _resolve(str(note), home, workspace))
     assert first.startswith("pf_") and len(first) == 35
-    assert first != link_file_id("s2", _resolve("~/note.md", home, workspace))
+    assert first != link_file_id(key, "s2", _resolve("~/note.md", home, workspace))
+    # Keyed: another broker (another secret) mints another id, so ids can't be computed.
+    assert first != link_file_id(b"x" * 32, "s1", _resolve("~/note.md", home, workspace))
     note.write_text("v2 longer")
-    assert first != link_file_id("s1", _resolve("~/note.md", home, workspace))
+    assert first != link_file_id(key, "s1", _resolve("~/note.md", home, workspace))
 
 
 def test_display_path_shortens_home():
@@ -301,7 +319,7 @@ def client(tmp_path, monkeypatch, module_broker_runtime):
     monkeypatch.setattr(bmod.broker._channels, "broadcast", _fake_broadcast)
     monkeypatch.setattr(bmod.broker, "_conversation_turns", [])
     api_mod._presented_registry.clear()
-    api_mod._linked_registry.clear()
+    api_mod._clear_link_registry()
     c = TestClient(
         bmod.app,
         headers={
@@ -433,3 +451,203 @@ def test_capabilities_advertise_resolve_path(client, monkeypatch):
     assert payload["resolve_path"] is True
     assert payload["present_by_path"] is True
     assert LINK_CAPABILITIES == {"resolve_path": True, "present_by_path": True}
+
+
+# --- review round 1 (LEX-2110 r1) -------------------------------------------
+
+THOR_HOME = ("/home/agent",)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/agent/.lexi/secrets/openai",
+        "/home/agent/.config/cloudflare-lulla.env",
+        "/home/agent/ws/prod.env",
+        "/home/agent/.config/gh/hosts.yml",
+        "/home/agent/.docker/config.json",
+        "/home/agent/.claude.json",
+        "/home/agent/.gbrain/config.json",
+        "/home/agent/.config/fleet-secrets/a",
+        "/home/agent/.config/codex-accounts/a.json",
+        "/home/agent/.config/claude-nvidia/settings.json",
+        "/home/agent/.local/share/keyrings/login.keyring",
+        "/home/agent/.config/chromium/Default/Cookies",
+        "/home/agent/.config/gcloud/application_default_credentials.json",
+        "/home/agent/.bash_history",
+        "/home/agent/.python_history",
+        "/home/agent/Library/Cookies/Cookies.binarycookies",
+        "/home/agent/Library/Application Support/Google/Chrome/Default/Cookies",
+        "/home/agent/notes/github-token.txt",
+        "/home/agent/notes/my-secret-plan.md",
+        "/home/agent/.mozilla/firefox/x/logins.json",
+        # NFKC + casefold: U+017F LATIN SMALL LETTER LONG S folds to "s".
+        "/home/agent/.ſſh/id_x",
+        "/home/agent/.SSH/known_hosts",
+        "/home/agent/ws/.ENV",
+    ],
+)
+def test_round1_secrets_are_refused(path):
+    assert secret_reason(path, THOR_HOME) is not None, path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/agent/.lexi/flow/reviews/r1.md",
+        "/home/agent/.lexi/flow/state.json",
+        "/home/agent/agents/lexi-flow/brief.md",
+        "/home/agent/repos/niuu/README.md",
+        "/home/agent/tmp/report.pdf",
+        "/home/agent/agent/health/research.md",
+    ],
+)
+def test_round1_working_trees_stay_open(path):
+    assert secret_reason(path, THOR_HOME) is None, path
+
+
+def test_a_workspace_inside_a_denied_tree_still_works(tmp_path):
+    home = tmp_path / "home"
+    workspace = home / ".local" / "share" / "ws"
+    workspace.mkdir(parents=True)
+    _write(workspace / "a.md", b"ws")
+    _write(home / ".local" / "share" / "other.md", b"x")
+    assert _resolve("a.md", home, workspace).path.name == "a.md"
+    with pytest.raises(LinkPathError) as err:
+        _resolve("~/.local/share/other.md", home, workspace)
+    assert err.value.status == 403
+
+
+def test_a_hard_link_is_403(roots):
+    home, workspace = roots
+    secret = _write(home / ".ssh" / "id_ed25519", b"synthetic")
+    os.link(secret, workspace / "notes.txt")
+    with pytest.raises(LinkPathError) as err:
+        _resolve("notes.txt", home, workspace)
+    assert err.value.status == 403
+    assert "hard links" in err.value.detail
+
+
+def test_a_canonical_path_under_a_symlinked_root_opens(tmp_path):
+    """r1 P2a: ~/ws -> /mnt/repo resolves to the canonical path, which must open too."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "mnt" / "repo"
+    _write(repo / "a.md", b"repo file")
+    (home / "ws").symlink_to(repo)
+    roots = _roots(home, home / "ws")
+    link = resolve_link("a.md", roots)
+    assert link.path == (repo / "a.md").resolve()
+    fd = open_link(link, roots)
+    try:
+        assert os.read(fd, 100) == b"repo file"
+    finally:
+        os.close(fd)
+
+
+def test_the_stored_path_is_judged_literally(roots):
+    """r1 P2b: ``report%21`` decodes to ``report!``; serving must not strip the ``!``."""
+    home, workspace = roots
+    _write(home / "report!", b"bang")
+    link = _resolve(f"file://{home}/report%21", home, workspace)
+    assert link.path.name == "report!"
+    fd = open_link(link, _roots(home, workspace))
+    os.close(fd)
+
+
+def test_a_file_swapped_for_a_symlink_between_check_and_open_is_not_served(
+    roots, tmp_path, monkeypatch
+):
+    """r1 P1/M3: the swap lands after the path check, before the open."""
+    home, workspace = roots
+    outside = _write(tmp_path / "outside.txt", b"outside bytes")
+    note = _write(home / "a.md", b"inside")
+    link = _resolve("~/a.md", home, workspace)
+    real_check = host_path_links.check_path
+
+    def check_then_swap(path, roots_):
+        result = real_check(path, roots_)
+        note.unlink()
+        note.symlink_to(outside)
+        return result
+
+    monkeypatch.setattr(host_path_links, "check_path", check_then_swap)
+    with pytest.raises(LinkPathError) as err:
+        open_link(link, _roots(home, workspace))
+    assert err.value.status == 410
+
+
+def test_a_file_replaced_by_another_inode_is_410(roots, tmp_path, monkeypatch):
+    home, workspace = roots
+    note = _write(home / "a.md", b"same")
+    link = _resolve("~/a.md", home, workspace)
+    replacement = _write(home / "b.md", b"same")
+    os.replace(replacement, note)
+    with pytest.raises(LinkPathError) as err:
+        open_link(link, _roots(home, workspace))
+    assert err.value.status == 410
+
+
+def test_the_descriptor_path_is_judged_too(roots, monkeypatch):
+    """Whatever the kernel says the open file is must pass the rules as well."""
+    home, workspace = roots
+    _write(home / "a.md", b"x")
+    link = _resolve("~/a.md", home, workspace)
+    monkeypatch.setattr(host_path_links, "_descriptor_path", lambda fd: "/etc/hostname")
+    with pytest.raises(LinkPathError) as err:
+        open_link(link, _roots(home, workspace))
+    assert err.value.status == 403
+
+
+def test_check_path_does_not_decode(roots):
+    home, workspace = roots
+    _write(home / "a.md", b"x")
+    with pytest.raises(LinkPathError) as err:
+        check_path(f"`{home}/a.md`.", _roots(home, workspace))
+    assert err.value.status in (403, 404)
+
+
+def test_a_viewer_cannot_open_a_linked_file(client, module_broker_runtime):
+    _write(client.home / "a.md", b"owner only")
+    fid = client.post("/api/files/resolve", json={"path": "~/a.md"}).json()["file_id"]
+    viewer = TestClient(
+        client.app,
+        headers={
+            "authorization": module_broker_runtime.authorization,
+            "x-niuu-room-role": "viewer",
+        },
+    )
+    refused = viewer.get(f"/api/files/presented/{fid}")
+    assert refused.status_code == 403
+    assert "owner" in refused.json()["detail"]
+    assert client.get(f"/api/files/presented/{fid}").content == b"owner only"
+
+
+def test_one_id_per_path(client):
+    from skuld import broker_api as api_mod
+
+    note = _write(client.home / "a.md", b"one")
+    first = client.post("/api/files/resolve", json={"path": "~/a.md"}).json()["file_id"]
+    note.write_bytes(b"two, longer")
+    second = client.post("/api/files/resolve", json={"path": "~/a.md"}).json()["file_id"]
+    assert second != first
+    assert first not in api_mod._linked_registry
+    assert list(api_mod._linked_ids_by_path.values()) == [second]
+    assert client.get(f"/api/files/presented/{first}").status_code == 404
+
+
+def test_the_route_serves_a_canonical_path_under_a_symlinked_workspace(
+    client, tmp_path, monkeypatch
+):
+    from skuld import broker as bmod
+
+    repo = tmp_path / "mnt" / "repo"
+    _write(repo / "a.md", b"via symlinked root")
+    (client.home / "link-ws").symlink_to(repo)
+    monkeypatch.setattr(bmod.broker, "workspace_dir", str(client.home / "link-ws"))
+    fid = client.post("/api/files/resolve", json={"path": "a.md"}).json()["file_id"]
+    assert client.get(f"/api/files/presented/{fid}").content == b"via symlinked root"
+
+
+def test_a_malformed_file_url_is_422_at_the_route(client):
+    assert client.post("/api/files/resolve", json={"path": "file://[bad"}).status_code == 422

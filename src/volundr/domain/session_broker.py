@@ -17,13 +17,23 @@ OPENSHELL_SERVICE_HOST_SUFFIX = ".openshell.localhost"
 BROKER_API_SEGMENT = "api"
 PRESENTED_FILE_ROUTE = ("files", "presented")
 #: Broker answers to a presented-file download that reach the caller as they are: an
-#: unknown id (404) and a resolved link whose file changed since (410, LEX-2110).
-PRESENTED_FILE_FORWARD_STATUSES = frozenset({404, 410})
+#: unknown id (404) and, for a resolved link (LEX-2110), a refusal at download time (403:
+#: now outside the roots, secret-shaped, or asked for by a viewer; 413: grown past the
+#: cap) and a file that changed since it was resolved (410).
+PRESENTED_FILE_FORWARD_STATUSES = frozenset({403, 404, 410, 413})
 #: The broker's host-path link resolver (LEX-2110) and the refusals it answers with:
 #: outside the roots or secret-shaped (403), missing (404), over the size cap (413),
 #: not decodable (422).
 SESSION_LINK_RESOLVE_ROUTE = ("files", "resolve")
 SESSION_LINK_RESOLVE_STATUSES = frozenset({403, 404, 413, 422})
+#: What a broker's HTTP framework answers for a route it does not have.
+ROUTE_NOT_FOUND = "Not Found"
+#: A broker older than LEX-2110 has no files/resolve: say so, distinct from a missing file.
+RESOLVE_PATH_UNSUPPORTED_CODE = "resolve_path_unsupported"
+RESOLVE_PATH_UNSUPPORTED_DETAIL = (
+    "this session's broker has no files/resolve (it does not advertise "
+    "capabilities.resolve_path); restart the session on a current Forge"
+)
 _CHAT_PATH_SUFFIX = "/session"
 
 

@@ -178,3 +178,89 @@ def test_the_facade_mirrors_the_nodes_resolve_path_capability():
     )
     assert caps["resolve_path"] is True
     assert caps["present_by_path"] is True
+
+
+# ------------------------------------------------------------------ review round 1
+
+
+@respx.mock
+async def test_a_broker_without_the_route_is_501_not_a_missing_file(tmp_path):
+    """r1 L3: an old broker's framework 404 must not read as "no such file"."""
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    respx.post("http://broker.test:8080/api/files/resolve").mock(
+        return_value=httpx.Response(404, json={"detail": "Not Found"})
+    )
+    resp = client.post(f"/api/v1/forge/sessions/{session.id}/files/resolve", json={"path": "x"})
+    assert resp.status_code == 501
+    assert resp.headers["x-forge-error-code"] == "resolve_path_unsupported"
+    assert "capabilities.resolve_path" in resp.json()["detail"]
+
+
+async def test_resolve_needs_the_session_to_exist(tmp_path):
+    client, _ = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    resp = client.post(f"/api/v1/forge/sessions/{uuid4()}/files/resolve", json={"path": "x"})
+    assert resp.status_code == 404
+
+
+async def test_resolve_checks_access_to_the_session(tmp_path, monkeypatch):
+    """r1 L1: Forge checks the caller may change the session before reading its host."""
+    from volundr.domain.services.session import SessionAccessDeniedError
+
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    seen: list[str] = []
+
+    async def deny(self, session_, principal, action):
+        seen.append(action)
+        raise SessionAccessDeniedError(session_.id, "someone-else")
+
+    from volundr.domain.services import SessionService
+
+    monkeypatch.setattr(SessionService, "_check_access", deny)
+    resp = client.post(f"/api/v1/forge/sessions/{session.id}/files/resolve", json={"path": "x"})
+    assert resp.status_code == 403
+    assert seen == ["update"]
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (403, "/home/agent/a.md is outside the session roots"),
+        (403, "linked files open only for the session owner"),
+        (413, "/home/agent/a.md is 100 bytes, over max_presented_file_bytes=8"),
+    ],
+)
+@respx.mock
+async def test_download_time_refusals_reach_the_caller(tmp_path, status, detail):
+    """r1 P2c: refusals at download time are not turned into 502."""
+    client, repository = _forge_client(LocalPresentedFileStore(root=str(tmp_path)))
+    session = await _live_session(repository)
+    respx.get(f"http://broker.test:8080/api/files/presented/{FID}").mock(
+        return_value=httpx.Response(status, json={"detail": detail})
+    )
+    resp = client.get(presented_file_path(session.id, FID))
+    assert resp.status_code == status
+    assert resp.json()["detail"] == detail
+
+
+def test_the_facade_forwards_download_time_refusals():
+    from fastapi.responses import JSONResponse
+
+    node = _node(200, RECORD)
+
+    @node.get("/api/v1/forge/sessions/{sid}/files/presented/{fid}")
+    async def refused(sid: str, fid: str):
+        return JSONResponse({"detail": "linked files open only for the session owner"}, 403)
+
+    resp = _facade(node).get(f"/api/v1/forge/sessions/{SID}/files/presented/{FID}", headers=HEADERS)
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "linked files open only for the session owner"
+
+
+def test_the_facade_forwards_the_501_from_an_old_broker():
+    node = _node(501, {"detail": "this session's broker has no files/resolve"})
+    resp = _facade(node).post(
+        f"/api/v1/forge/sessions/{SID}/files/resolve", json={"path": "x"}, headers=HEADERS
+    )
+    assert resp.status_code == 501

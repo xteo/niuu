@@ -1,11 +1,13 @@
 """FastAPI composition and HTTP route handlers for the Skuld broker."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import time
@@ -17,11 +19,12 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from niuu.adapters.identity_headers import parse_roles_header
@@ -48,9 +51,11 @@ from skuld.forge_mcp.routes import register_forge_mcp_routes
 from skuld.host_path_links import (
     LINK_CAPABILITIES,
     LinkPathError,
+    LinkRoots,
     ResolvedLink,
     display_path,
     link_file_id,
+    open_link,
     resolve_link,
 )
 from skuld.native_question_index import NativeTranscriptUnavailableError
@@ -1256,27 +1261,35 @@ def _build_present_file_turn(
 # by the presented-file route: nothing is staged, no turn is emitted and nothing is
 # uploaded to Forge, so opening a link never adds it to the session's documents.
 
-#: file_id -> the link it was minted for. In memory: after a broker restart the app
-#: resolves the link again (it resolves on every tap) and gets the same id back.
+#: Keys link file ids, so an id cannot be computed from a path. Per broker process:
+#: ids die with the broker, like the in-memory map below.
+_LINK_ID_KEY = secrets.token_bytes(hashlib.sha256().digest_size)
+#: file_id -> the link it was minted for, and path -> its current id. One entry per
+#: resolved path: a newer version of a file replaces the old id, so the map is bounded
+#: by the files a session's owner opened. After a broker restart the app resolves the
+#: link again (it resolves on every tap).
 _linked_registry: dict[str, ResolvedLink] = {}
+_linked_ids_by_path: dict[str, str] = {}
 
 
-def _link_roots() -> tuple[str, str]:
-    return broker._settings.home_path, broker.workspace_dir
+def _link_roots() -> LinkRoots:
+    return LinkRoots(
+        home=broker._settings.home_path,
+        workspace=broker.workspace_dir,
+        host=socket.gethostname(),
+        max_bytes=broker._settings.max_presented_file_bytes,
+    )
 
 
-def _resolve_session_link(raw: str) -> ResolvedLink:
-    home, workspace = _link_roots()
-    try:
-        return resolve_link(
-            raw,
-            home=home,
-            workspace=workspace,
-            host=socket.gethostname(),
-            max_bytes=broker._settings.max_presented_file_bytes,
-        )
-    except LinkPathError as exc:
-        raise HTTPException(exc.status, exc.detail) from None
+def _clear_link_registry() -> None:
+    _linked_registry.clear()
+    _linked_ids_by_path.clear()
+
+
+def _forget_link(file_id: str) -> None:
+    link = _linked_registry.pop(file_id, None)
+    if link is not None and _linked_ids_by_path.get(str(link.path)) == file_id:
+        _linked_ids_by_path.pop(str(link.path), None)
 
 
 class _ResolveLinkRequest(BaseModel):
@@ -1293,52 +1306,83 @@ async def resolve_file_link(body: _ResolveLinkRequest) -> dict:
     the session roots or secret-shaped; 404 no such file; 413 over the size cap; 422 not
     decodable. Owner-only: ``room_access`` lists it for no lower role.
     """
-    link = _resolve_session_link(body.path)
-    file_id = link_file_id(str(broker.session_id or ""), link)
+    roots = _link_roots()
+    try:
+        link = resolve_link(body.path, roots)
+    except LinkPathError as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+    file_id = link_file_id(_LINK_ID_KEY, str(broker.session_id or ""), link)
+    previous = _linked_ids_by_path.get(str(link.path))
+    if previous is not None and previous != file_id:
+        _linked_registry.pop(previous, None)
     _linked_registry[file_id] = link
+    _linked_ids_by_path[str(link.path)] = file_id
     name = link.path.name
-    home, _ = _link_roots()
     return {
         "file_id": file_id,
         "name": name,
         "size": link.size,
         "mime": mimetypes.guess_type(name)[0] or "application/octet-stream",
         "path": str(link.path),
-        "display_path": display_path(link.path, home),
-        "host": socket.gethostname(),
+        "display_path": display_path(link.path, roots.home),
+        "host": roots.host,
         "source": "link",
     }
 
 
-def _serve_linked_file(file_id: str, link: ResolvedLink) -> FileResponse:
-    """Serve a resolved link from its place, after checking it again: the roots, the
-    secret rule and the version it was resolved at all still hold."""
-    current = _resolve_session_link(str(link.path))
-    if current != link:
-        _linked_registry.pop(file_id, None)
-        raise HTTPException(410, "file changed since the link was resolved; resolve it again")
+def _read_descriptor(fd: int):
+    """Stream an open file's bytes, closing it at the end or on disconnect."""
+    try:
+        while chunk := os.read(fd, shutil.COPY_BUFSIZE):
+            yield chunk
+    finally:
+        os.close(fd)
+
+
+async def _serve_linked_file(request: Request, file_id: str, link: ResolvedLink) -> Response:
+    """Serve a resolved link to the session owner, from the descriptor that was checked.
+
+    Viewers may open presented files but never links: a link reads the owner's host.
+    The file is opened once and judged through that descriptor (``open_link``), so a
+    file swapped after the check is never what is sent."""
+    if await _room_role_from_state(request) != "owner":
+        raise HTTPException(403, "linked files open only for the session owner")
+    try:
+        fd = open_link(link, _link_roots())
+    except LinkPathError as exc:
+        if exc.status == 410:
+            _forget_link(file_id)
+        raise HTTPException(exc.status, exc.detail) from None
     name = link.path.name
     media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-    return FileResponse(
-        path=link.path,
-        filename=name,
+    return StreamingResponse(
+        _read_descriptor(fd),
         media_type=media_type,
-        content_disposition_type="inline",
         headers={
+            "content-length": str(link.size),
+            "content-disposition": _inline_disposition(name),
             "cache-control": PRESENTED_FILE_LIVE_CACHE,
             **presented_file_safety_headers(media_type),
         },
     )
 
 
+def _inline_disposition(name: str) -> str:
+    """``inline`` with the file name, as FileResponse would write it."""
+    quoted = quote(name)
+    if quoted != name:
+        return f"inline; filename*=utf-8''{quoted}"
+    return f'inline; filename="{name}"'
+
+
 @app.get("/api/files/presented/{file_id}")
-async def download_presented_file(file_id: str) -> FileResponse:
+async def download_presented_file(file_id: str, request: Request) -> Response:
     """Serve a staged presented file by OPAQUE id (never a client path → traversal-safe)."""
     if not _PRESENTED_ID_RE.fullmatch(file_id):
         raise HTTPException(400, "invalid file_id")
     path = _presented_registry.get(file_id)
     if path is None and file_id in _linked_registry:
-        return _serve_linked_file(file_id, _linked_registry[file_id])
+        return await _serve_linked_file(request, file_id, _linked_registry[file_id])
     if path is None:
         _rebuild_presented_registry()
         path = _presented_registry.get(file_id)
