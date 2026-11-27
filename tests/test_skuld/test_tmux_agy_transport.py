@@ -209,10 +209,32 @@ def test_launch_names_model_with_effort_mode_and_permissions(tmp_path) -> None:
         "--mode",
         "accept-edits",
         "--dangerously-skip-permissions",
+        "--settings",
+        '{"allowNonWorkspaceAccess": true, "artifactReviewPolicy": "always-proceed"}',
         "--conversation",
         CONV,
     ]
     assert transport.session_id == CONV
+
+
+def test_auto_mode_without_yolo_pre_approves_only_the_sessions_own_mcp_servers(tmp_path) -> None:
+    servers = [
+        {"name": "forge", "command": "fm"},
+        {"name": "old", "type": "sse", "url": "https://s"},
+    ]
+    transport = _transport(tmp_path, agy={"mode": "auto"}, mcp_servers=servers)
+
+    argv = transport._launch_argv()
+
+    assert "--dangerously-skip-permissions" not in argv
+    assert json.loads(argv[argv.index("--settings") + 1]) == {
+        "permissions": {"allow": ["mcp(forge/*)"]}
+    }
+    off = _transport(
+        tmp_path, agy={"mode": "auto", "allow_session_mcp_servers": False}, mcp_servers=servers
+    )
+    assert "--settings" not in off._launch_argv()
+    assert "--settings" not in _transport(tmp_path, mcp_servers=servers)._launch_argv()
 
 
 def test_the_default_effort_is_the_models_own(tmp_path) -> None:
@@ -1005,6 +1027,76 @@ def test_generic_permission_answers_map_onto_agys_rows(chosen, row) -> None:
     menu = agy_screen.permission_menu(_frame("permission"))
 
     assert TmuxAgyTransport._permission_row(chosen, menu) == row
+
+
+@pytest.mark.parametrize(
+    ("chosen", "row"),
+    [
+        ("allow", "Yes, allow tool call"),
+        (
+            "Allow & don't ask again",
+            "Yes, and always allow tool 'forge/get_session' in this conversation",
+        ),
+        ("deny", "No, deny tool call"),
+    ],
+)
+def test_generic_answers_map_onto_the_mcp_menu_rows(chosen, row) -> None:
+    from skuld.transports import agy_screen
+
+    menu = agy_screen.permission_menu(_frame("permission_mcp"))  # recorded live, 27 Nov 2026
+
+    assert TmuxAgyTransport._permission_row(chosen, menu) == row
+
+
+async def test_an_mcp_approval_is_carded_even_in_yolo(tmp_path) -> None:
+    transport = _transport(tmp_path, skip_permissions=True)
+    events = _events(transport)
+    transcript = Transcript(tmp_path / "t.jsonl")
+    await transport.start()
+    try:
+        transport._begin_turn("look up the session")
+        await transport.handle_agy_hook(
+            "PreToolUse",
+            _hook(
+                transcript,
+                stepIdx=32,
+                toolCall={"name": "call_mcp_tool", "args": {"ServerName": "forge"}},
+            ),
+        )
+        transport.screen = _frame("permission_mcp")
+        card = await _wait(lambda: next(iter(_of(events, "ask_user_question")), None))
+    finally:
+        await transport.stop()
+
+    question = card["questions"][0]
+    assert question["header"] == "MCP"
+    assert question["question"] == "forge/get_session Allow calling this tool?"
+    assert len(question["options"]) == 6
+    assert card["tool_use_id"].endswith("-32")
+    assert card["metadata"]["control_kind"] == "permission"
+
+
+async def test_a_menu_forge_cannot_read_gets_one_visible_line(tmp_path) -> None:
+    transport = _transport(tmp_path)
+    events = _events(transport)
+    await transport.start()
+    try:
+        transport.screen = (
+            "Review\n" + "─" * 40 + "\nPick a thing\n  1. A\n  2. B\n  ↑/↓ Navigate\n"
+        )  # no highlighted row: not a menu Skuld can drive
+        line = await _wait(
+            lambda: [
+                e for e in _of(events, "system") if e.get("subtype") == "agy_menu_unanswerable"
+            ]
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        await transport.stop()
+
+    assert len(line) == 1
+    assert "Pick a thing\n1. A\n2. B" in line[0]["content"]
+    assert transport._counts["unread_menus"] == 1
+    assert not _of(events, "ask_user_question")
 
 
 def test_an_answer_agy_does_not_offer_is_refused() -> None:

@@ -175,7 +175,9 @@ def default_session_definitions() -> dict[str, SessionDefinitionConfig]:
                 "broker": {
                     "cliType": "agy",
                     "transportAdapter": "skuld.transports.tmux_agy.TmuxAgyTransport",
-                    "skipPermissions": False,
+                    # YOLO by default (Damien, 27 Nov 2026): agy's --dangerously-skip-permissions.
+                    # Anything agy still asks goes to Forge's permission card.
+                    "skipPermissions": True,
                     "agentTeams": False,
                 },
             },

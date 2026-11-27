@@ -868,6 +868,14 @@ class AgyRuntimeConfig(BaseModel):
         gt=0,
         description="How long a starting agy may take to show its composer before start fails.",
     )
+    allow_session_mcp_servers: bool = Field(
+        default=True,
+        description=(
+            "Without YOLO (skipPermissions false) and in auto mode, let agy call the session's "
+            "own MCP servers without asking, through a per-launch `--settings` rule "
+            "`mcp(<name>/*)` that agy never saves. Off: every MCP call asks through Forge."
+        ),
+    )
     signed_out_grace_s: float = Field(
         default=10,
         gt=0,

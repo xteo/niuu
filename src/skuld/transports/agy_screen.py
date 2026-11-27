@@ -43,6 +43,8 @@ class Menu:
     question_index: int = 0
     question_count: int = 0
     question: str = ""
+    #: The title agy draws above an approval menu's rule: "Command", "MCP", ...
+    kind: str = ""
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -106,14 +108,85 @@ def _build_menu(
     )
 
 
-def permission_menu(screen: str) -> Menu | None:
-    """The live permission menu (``Requesting permission for:`` … rows … footer)."""
-    lines = _lines(screen)
-    header = max((i for i, line in enumerate(lines) if PERMISSION_HEADER in line), default=None)
-    if header is None:
+def _is_rule(line: str) -> bool:
+    text = line.strip()
+    return bool(text) and set(text) == {"─"}
+
+
+def _approval_block(lines: list[str]) -> tuple[str, list[str], list[tuple[bool, int, str]]] | None:
+    """The menu at the bottom of the screen: its title, the text under its rule, its rows.
+
+    agy draws every approval menu the same way, whatever the tool (recorded from 1.5.16:
+    a command, an MCP tool): a title line, a rule, what is asked, numbered rows and the
+    navigation footer. Read from the footer up, so a numbered list higher up in the
+    conversation is never taken for the menu.
+    """
+    footer = max((i for i, line in enumerate(lines) if MENU_FOOTER in line), default=None)
+    if footer is None:
         return None
-    detail, rows = _menu_after(lines, header + 1)
-    return _build_menu(detail, rows) if rows else None
+    index = footer - 1
+    rows: list[tuple[bool, int, str]] = []
+    while index >= 0:
+        line = lines[index]
+        match = _MENU_ROW_RE.match(line)
+        if match:
+            rows.insert(0, (bool(match[1]), int(match[2]), match[3]))
+        elif line.strip():
+            break
+        index -= 1
+    if not rows:
+        return None
+    detail: list[str] = []
+    while index >= 0 and not _is_rule(lines[index]):
+        if lines[index].strip():
+            detail.insert(0, lines[index].strip())
+        index -= 1
+    if index < 0:
+        return None
+    title = next((lines[k].strip() for k in range(index - 1, -1, -1) if lines[k].strip()), "")
+    return title, detail, rows
+
+
+def permission_menu(screen: str) -> Menu | None:
+    """The live tool-approval menu, for any tool agy asks about (command, MCP tool, ...).
+
+    Not a question page (``Question i/n``) and not the workspace trust menu: those have
+    their own readers.
+    """
+    lines = _lines(screen)
+    block = _approval_block(lines)
+    if block is None:
+        return None
+    title, detail, rows = block
+    if any(_QUESTION_HEADER_RE.match(line) for line in detail) or TRUST_QUESTION in detail:
+        return None
+    if any(label in {TRUST_YES, "No, exit"} for _, _, label in rows):
+        return None
+    detail = [line for line in detail if line != PERMISSION_HEADER]
+    return _build_menu(detail, rows, kind=title)
+
+
+def unread_menu(screen: str) -> str:
+    """The text of a menu agy shows that no reader here understands, or "" when none.
+
+    Numbered rows just above the navigation footer that are not an approval, a question
+    or the trust menu: Forge cannot offer them, so the session shows the menu's text,
+    from the rule above it (or the top of the screen) down to the footer.
+    """
+    lines = _lines(screen)
+    footer = max((i for i, line in enumerate(lines) if MENU_FOOTER in line), default=None)
+    if footer is None:
+        return ""
+    index = footer - 1
+    has_rows = False
+    while index >= 0 and (not lines[index].strip() or _MENU_ROW_RE.match(lines[index])):
+        has_rows = has_rows or bool(_MENU_ROW_RE.match(lines[index]))
+        index -= 1
+    if not has_rows or permission_menu(screen) or question_menu(screen) or trust_prompt(screen):
+        return ""
+    while index >= 0 and not _is_rule(lines[index]):
+        index -= 1
+    return "\n".join(line.strip() for line in lines[index + 1 : footer] if line.strip())
 
 
 def question_menu(screen: str) -> Menu | None:

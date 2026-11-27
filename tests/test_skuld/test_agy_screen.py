@@ -32,6 +32,29 @@ def test_the_permission_menu_is_read_with_its_rows_highlight_and_command() -> No
     assert menu.position("Maybe") is None
 
 
+def test_the_mcp_approval_menu_is_read_with_its_title_tool_and_six_rows() -> None:
+    menu = agy_screen.permission_menu(_frame("permission_mcp"))  # recorded live, 27 Nov 2026
+
+    assert menu is not None
+    assert menu.kind == "MCP"
+    assert menu.detail == ("forge/get_session", "Allow calling this tool?")
+    assert menu.labels[0] == "Yes, allow tool call"
+    assert (
+        menu.labels[-1] == "No, and always deny tool 'forge/get_session' (Persist to settings.json)"
+    )
+    assert menu.highlighted_position == 0
+    assert agy_screen.unread_menu(_frame("permission_mcp")) == ""
+
+
+def test_the_command_menu_keeps_its_title() -> None:
+    assert agy_screen.permission_menu(_frame("permission")).kind == "Command"
+
+
+def test_screens_without_a_numbered_menu_have_no_unread_menu() -> None:
+    for name in ("ready", "busy", "question", "trust"):
+        assert agy_screen.unread_menu(_frame(name)) == ""
+
+
 def test_the_question_page_is_read_with_its_number_text_and_options() -> None:
     menu = agy_screen.question_menu(_frame("question"))
 

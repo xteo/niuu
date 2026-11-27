@@ -172,8 +172,21 @@ GENERIC_ALLOW_ALWAYS = "allow & don't ask again"
 GENERIC_DENY = "deny"
 # Generic answers mapped onto agy's permission rows, as 1.5.15 words them.
 _ALLOW_ROW_RE = re.compile(r"^Yes, (run|allow|proceed|apply|write|edit|read)\b", re.IGNORECASE)
-_ALLOW_ALWAYS_ROW_RE = re.compile(r"^Yes, and always allow in this conversation\b", re.IGNORECASE)
-_DENY_ROW_RE = re.compile(r"^No\b", re.IGNORECASE)
+# "Always" for this conversation only, never the row that persists to settings.json:
+# commands ("... in this conversation for commands that start with 'x'") and MCP tools
+# ("... allow tool 'server/tool' in this conversation") both say so.
+_ALLOW_ALWAYS_ROW_RE = re.compile(
+    r"^Yes, and always allow\b.*\bin this conversation\b", re.IGNORECASE
+)
+# The plain refusal ("No, cancel", "No, deny tool call"), not an "always deny" row.
+_DENY_ROW_RE = re.compile(r"^No\b(?!, and always)", re.IGNORECASE)
+#: Session-only settings that make YOLO cover everything (--settings, never saved):
+#: files outside the workspace, and plan or artifact reviews that would otherwise wait.
+YOLO_SETTINGS: dict[str, Any] = {
+    "allowNonWorkspaceAccess": True,
+    "artifactReviewPolicy": "always-proceed",
+}
+UNREAD_MENU_SUBTYPE = "agy_menu_unanswerable"
 _TRANSCRIPT_STAMP_RE = re.compile(r"^(Created|Completed) At: \S+$")
 _QUESTION_ANSWER_RE = re.compile(r"^A(\d+): (.*)$")
 _STEER_NOTICE = """\
@@ -328,6 +341,7 @@ class TmuxAgyTransport(CLITransport):
         self._initial_prompt_sent = False
         self._raw_mcp_servers = list(mcp_servers or [])
         self._left_out_logged = False
+        self._unread_menu_shown = ""
         self._left_out_shown = False
         self._sdk_port = sdk_port
         self._session_tools = session_tools
@@ -381,7 +395,7 @@ class TmuxAgyTransport(CLITransport):
             set_model=True,
             steer=True,
             steering_mode="native",
-            permission_requests=not self._skip_permissions,
+            permission_requests=True,  # YOLO still surfaces whatever agy asks
             terminal_output=True,
             terminal_input=True,
             terminal_keys=True,
@@ -669,11 +683,28 @@ class TmuxAgyTransport(CLITransport):
 
     def _launch_argv(self) -> list[str]:
         argv = [self._config.binary, "--model", self.agy_model_id, "--mode", self._config.mode]
+        settings = self._session_settings()
         if self._skip_permissions:
             argv.append("--dangerously-skip-permissions")
+        if settings:
+            argv.extend(["--settings", json.dumps(settings, sort_keys=True)])
         if self._resume_on_launch and self._conversation_id:
             argv.extend(["--conversation", self._conversation_id])
         return argv
+
+    def _session_settings(self) -> dict[str, Any]:
+        """agy settings for this launch only (``--settings``; agy never saves them).
+
+        YOLO (``--dangerously-skip-permissions``) adds :data:`YOLO_SETTINGS`. Without it, in
+        auto mode the session's own MCP servers run without asking (``mcp(<name>/*)``),
+        when ``agy.allow_session_mcp_servers`` is on; other tools ask, through Forge.
+        """
+        if self._skip_permissions:
+            return dict(YOLO_SETTINGS)
+        if self._config.mode != "auto" or not self._config.allow_session_mcp_servers:
+            return {}
+        names = sorted(self._mcp_plan.servers)
+        return {"permissions": {"allow": [f"mcp({name}/*)" for name in names]}} if names else {}
 
     def _hook_binding(self) -> str:
         authorization = self._session_tools.loopback_authorization if self._session_tools else ""
@@ -1281,7 +1312,7 @@ class TmuxAgyTransport(CLITransport):
         tool_name = tool.name if tool else "agy"
         detail = " ".join(menu.detail) or (_permission_detail(tool_name, tool.args) if tool else "")
         question = {
-            "header": tool_name,
+            "header": menu.kind or tool_name,  # agy's own title: "Command", "MCP", ...
             "question": detail,
             "options": [{"label": label} for label in menu.labels],
             "multiSelect": False,
@@ -1503,8 +1534,8 @@ class TmuxAgyTransport(CLITransport):
             await asyncio.sleep(self._config.poll_interval_s)
 
     async def _watch_permission(self, screen: str) -> None:
-        if self._skip_permissions:
-            return
+        # Also in YOLO: whatever agy still asks must reach Forge, never hang the session.
+        await self._watch_unread_menu(screen)
         open_permission = next((c for c in self._cards.values() if c.kind == "permission"), None)
         menu = agy_screen.permission_menu(screen)
         if menu is None:
@@ -1517,6 +1548,28 @@ class TmuxAgyTransport(CLITransport):
             return
         if open_permission is None:
             await self._open_permission_card(menu)
+
+    async def _watch_unread_menu(self, screen: str) -> None:
+        """A menu Forge cannot offer: one visible line with its text, logged and counted."""
+        text = agy_screen.unread_menu(screen)
+        if not text or text == self._unread_menu_shown:
+            if not text:
+                self._unread_menu_shown = ""
+            return
+        self._unread_menu_shown = text
+        self._counts["unread_menus"] += 1
+        message = (
+            "agy is waiting on a menu Forge cannot answer; answer it in the terminal view:\n" + text
+        )
+        logger.error("agy session %s: %s", self._session_name, message)
+        await self._emit(
+            {
+                "type": "system",
+                "subtype": UNREAD_MENU_SUBTYPE,
+                "content": message,
+                "metadata": {"source": "tmux_agy", "menu": text},
+            }
+        )
 
     async def _watch_turn_cap(self) -> None:
         turn = self._turn

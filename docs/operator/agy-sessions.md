@@ -36,6 +36,8 @@ Transport: `skuld.transports.tmux_agy.TmuxAgyTransport`. Design and recorded beh
    | `agy.home` | The `HOME` above. Required; set it in the platform environment (`SKULD__AGY__HOME`), see step 4. |
    | `agy.expected_version` | The `agy --version` Skuld was tested with. Required: `agy` updates itself, and a new build can redraw the menus Skuld reads, so any other version refuses to start. |
    | `agy.mode` | `auto`, `accept-edits` or `plan`. |
+   | `agy.allow_session_mcp_servers` | Without YOLO, in `auto` mode: the session's own MCP servers run without asking (default `true`). See Permissions. |
+   | `agy.signed_out_grace_s` | How long agy's sign-in menu may show at start before the home counts as signed out (default 10 s). |
    | `agy.human_input_only` | Default `true`. See below. |
    | `agy.turn_max_seconds` | Longest turn without a Stop hook; reaching it ends the turn with an error. |
    | Others | Polling, timeouts and pane size; see `AgyRuntimeConfig` in `src/skuld/config.py`. |
@@ -58,6 +60,28 @@ Transport: `skuld.transports.tmux_agy.TmuxAgyTransport`. Design and recorded beh
 
    Skuld launches `agy` with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (agy ignores `1`). Updates
    started by hand still happen; after one, re-test and raise `agy.expected_version`.
+
+## Permissions: YOLO by default
+
+`skuldGemini` launches agy in YOLO mode (`skipPermissions: true` in the definition, Damien's
+call on 27 Nov 2026): `--dangerously-skip-permissions`, which agy's `/config` shows as
+"Tool Permission: always-proceed (overridden by dangerously-skip-permissions)". It covers
+shell commands, file edits, web requests and every MCP tool. Two settings it does not
+cover are passed for the launch only (`--settings`, which agy never saves to the home):
+`allowNonWorkspaceAccess: true` (files outside the workspace) and
+`artifactReviewPolicy: "always-proceed"` (plans and artifacts do not wait for review). agy's
+status bar shows only the mode and model (`auto · Gemini 4 Neon · xhigh`), not YOLO.
+
+To ask before tools instead, set the definition's `skipPermissions: false`. Then, in `auto`
+mode, the session's own MCP servers still run without asking (a launch-only rule
+`mcp(<name>/*)`; `agy.allow_session_mcp_servers: false` turns that off), and every other menu
+agy draws asks through Forge.
+
+Whatever agy still asks reaches Forge the way a Claude Code or Codex prompt does, as a
+permission card with agy's own rows (command and MCP approval menus, recorded from
+1.5.16); the answer picks the matching row. Questions Gemini asks (`ask_question`) are
+question cards. A numbered menu Skuld cannot read shows one line in the session with its
+text, is logged at error level and counts on `unread_menus`; answer it in the terminal view.
 
 ## Human input only
 
