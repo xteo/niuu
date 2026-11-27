@@ -287,11 +287,100 @@ def test_a_foreign_mcp_server_of_the_same_name_is_never_replaced(tmp_path) -> No
         transport._install_hooks()
 
 
-def test_a_remote_mcp_server_is_refused(tmp_path) -> None:
-    transport = _transport(tmp_path, mcp_servers=[{"name": "web", "url": "https://x"}])
+async def test_an_http_mcp_server_is_bridged_without_its_token_in_the_shared_config(
+    tmp_path,
+) -> None:
+    token = tmp_path / "linear-token"
+    token.write_text("tok-123")
+    linear = {
+        "name": "linear",
+        "type": "http",
+        "url": "https://mcp.linear.app/mcp",
+        "credential_file": str(token),
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+    }
+    transport = _transport(tmp_path, mcp_servers=[linear, {"name": "forge", "command": "fm"}])
+    events = _events(transport)
 
-    with pytest.raises(ValueError, match="only stdio MCP servers"):
-        transport._install_hooks()
+    await transport.start()
+    try:
+        home = Path(transport._config.home)
+        shared = (home / ".gemini" / "config" / "mcp_config.json").read_text()
+        assert "mcp.linear.app" not in shared and "tok-123" not in shared
+        assert json.loads(shared)["mcpServers"]["linear"]["args"][2] == "linear"
+        described = json.loads(transport.launch_env["SKULD_AGY_MCP_SERVERS"])
+        assert described["linear"] == {
+            key: value for key, value in linear.items() if key not in {"name", "type"}
+        }
+        assert "tok-123" not in transport.launch_env["SKULD_AGY_MCP_SERVERS"]
+        assert not [e for e in _of(events, "system") if e.get("subtype") == "agy_mcp_left_out"]
+    finally:
+        await transport.stop()
+
+
+async def test_a_server_that_cannot_be_bridged_is_left_out_visibly_and_counted(tmp_path) -> None:
+    servers = [
+        {"name": "linear", "type": "http", "url": "https://l", "credential_file": "/nope/token"},
+        {"name": "linear", "type": "http", "url": "https://l2"},
+        {"name": "old", "type": "sse", "url": "https://sse"},
+        {"name": "forge", "command": "fm"},
+    ]
+    transport = _transport(tmp_path, mcp_servers=servers)
+    events = _events(transport)
+
+    await transport.start()
+    try:
+        notices = [e for e in _of(events, "system") if e.get("subtype") == "agy_mcp_left_out"]
+        assert len(notices) == 1
+        line = notices[0]["content"]
+        assert line.startswith("Gemini started without the linear MCP server")
+        assert "access token is not on this host" in line
+        assert "already has that name" in line and "legacy SSE" in line
+        assert [item["name"] for item in notices[0]["metadata"]["left_out"]] == [
+            "linear",
+            "linear",
+            "old",
+        ]
+        assert transport._counts["mcp_servers_left_out"] == 3
+        assert transport._counts["mcp_left_out:linear"] == 2
+        described = json.loads(transport.launch_env["SKULD_AGY_MCP_SERVERS"])
+        assert list(described) == ["forge"]
+        note = transport._session_start_answer()["injectSteps"][0]["systemMessage"]
+        assert "not available to you: linear (" in note["systemMessage"]
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.parametrize(
+    ("server", "environ", "reason"),
+    [
+        ({"name": "a"}, {}, "neither a command nor a URL"),
+        ({"name": "a", "url": "https://a", "credential_env": "TOK"}, {}, "TOK is not set"),
+        ({"name": "a", "url": "https://a", "bearer_token_env_var": "B"}, {}, "B is not set"),
+        ({"name": "a", "url": "https://a", "bearer_token_env_var": "B"}, {"B": "x"}, ""),
+        ({"name": "a", "url": "https://a", "credential_env": "TOK"}, {"TOK": "x"}, ""),
+        (
+            {
+                "name": "a",
+                "url": "https://a",
+                "bearer_token_env_var": "B",
+                "headers": {"authorization": "k"},
+            },
+            {},
+            "",
+        ),
+    ],
+)
+def test_the_plan_names_why_a_server_is_left_out(server, environ, reason) -> None:
+    plan = tmux_agy.plan_mcp_servers([server, {"no": "name"}], environ)
+
+    if reason:
+        assert plan.left_out[0][0] == "a" and reason in plan.left_out[0][1]
+        assert plan.servers == {}
+        return
+    assert plan.left_out == ()
+    assert plan.servers["a"]["url"] == "https://a"
 
 
 def test_a_hooks_file_that_is_not_an_object_is_refused(tmp_path) -> None:

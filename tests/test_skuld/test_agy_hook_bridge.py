@@ -128,7 +128,7 @@ def test_the_launcher_resolves_the_sessions_own_server() -> None:
     servers = {"forge": {"command": "python3", "args": ["-m", "x", "--port", 1], "env": {"A": "b"}}}
     environ = {agy_mcp_launcher.SERVERS_ENV: json.dumps(servers), "PATH": "/bin"}
 
-    argv, env = agy_mcp_launcher.resolve("forge", environ)
+    argv, env = agy_mcp_launcher.stdio_command(agy_mcp_launcher.resolve("forge", environ), environ)
 
     assert argv == ["python3", "-m", "x", "--port", "1"]
     assert env["A"] == "b"

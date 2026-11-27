@@ -53,6 +53,7 @@ from skuld.control_errors import ControlRecoveryError, HumanInputOnlyError
 from skuld.delivery_errors import DeliveryNotAcceptedError, NativeControlPendingError
 from skuld.session_runtime import write_private_file
 from skuld.transports import agy_hook_bridge, agy_mcp_launcher, agy_screen
+from skuld.transports.mcp_config import normalize_mcp_servers, url_transport
 from skuld.transports.session_env import session_process_env
 from skuld.transports.session_tools import PRESENT_FILE_INSTRUCTION, SessionTools
 from skuld.transports.tool_shims import ensure_codex_tool_shims
@@ -79,6 +80,92 @@ QUESTION_TOOL = "ask_question"
 AGENT_ENDED_REASON = "no_tool_call"
 INTERRUPTED_REASON = "interrupted"
 TURN_CAP_SUBTYPE = "turn_cap_reached"
+MCP_LEFT_OUT_SUBTYPE = "agy_mcp_left_out"
+#: The keys of a URL server the launcher's HTTP bridge reads. Credential keys name a
+#: file or a variable, never a token, so the description holds no secret but static
+#: headers, which live only in agy's process environment.
+_BRIDGE_KEYS = (
+    "url",
+    "headers",
+    "credential_file",
+    "credential_env",
+    "credential_format",
+    "auth_header",
+    "auth_prefix",
+    "bearer_token_env_var",
+    "tool_timeout_sec",
+)
+
+
+@dataclass(frozen=True)
+class McpPlan:
+    """What agy gets of a session's MCP servers: name -> launcher description, and the rest."""
+
+    servers: dict[str, dict[str, Any]]
+    left_out: tuple[tuple[str, str], ...]
+
+
+def plan_mcp_servers(raw_servers: list[dict[str, Any]], environ: Mapping[str, str]) -> McpPlan:
+    """Split a session's MCP servers into the ones agy can run and the ones it cannot.
+
+    stdio servers run as themselves; streamable-HTTP servers run through the launcher's
+    bridge, which needs its credential at hand. A server that cannot be run is left out
+    with the reason (Damien's call, LEX-2746: a missing integration never stops a Gemini
+    session from starting; the session says which server is missing and why).
+    """
+    servers: dict[str, dict[str, Any]] = {}
+    left_out: list[tuple[str, str]] = []
+    for raw, server in zip(
+        _named(raw_servers), normalize_mcp_servers(_named(raw_servers)), strict=True
+    ):
+        name = server["name"]
+        if name in servers or any(name == gone for gone, _ in left_out):
+            left_out.append((name, "another MCP server of this session already has that name"))
+            continue
+        if server.get("command"):
+            servers[name] = {
+                "command": server["command"],
+                "args": list(server.get("args") or []),
+                "env": dict(raw.get("env") or {}),
+            }
+            continue
+        if not server.get("url"):
+            left_out.append((name, "it has neither a command nor a URL"))
+            continue
+        reason = _unbridgeable(server, environ)
+        if reason:
+            left_out.append((name, reason))
+            continue
+        servers[name] = {key: server[key] for key in _BRIDGE_KEYS if key in server}
+    return McpPlan(servers=servers, left_out=tuple(left_out))
+
+
+def _named(raw_servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        raw for raw in raw_servers if isinstance(raw, dict) and str(raw.get("name") or "").strip()
+    ]
+
+
+def _unbridgeable(server: dict[str, Any], environ: Mapping[str, str]) -> str:
+    if url_transport(server) == "sse":
+        return "it uses the legacy SSE transport, and the agy bridge speaks streamable HTTP only"
+    credential_file = server.get("credential_file")
+    if credential_file and not os.path.isfile(credential_file):
+        return (
+            "its access token is not on this host (no credential file at the path the session "
+            "names), so the bridge cannot sign in to it"
+        )
+    credential_env = server.get("credential_env")
+    if credential_env and not environ.get(credential_env):
+        return f"its access token variable {credential_env} is not set in this session"
+    bearer_env = server.get("bearer_token_env_var")
+    has_authorization = any(k.lower() == "authorization" for k in server.get("headers") or {})
+    if bearer_env and not credential_file and not credential_env and not has_authorization:
+        if not environ.get(bearer_env):
+            return f"its token variable {bearer_env} is not set in this session"
+    return ""
+
+
 #: Generic permission answers any client may send (Telegram buttons, early answers).
 GENERIC_ALLOW = "allow"
 GENERIC_ALLOW_ALWAYS = "allow & don't ask again"
@@ -240,8 +327,10 @@ class TmuxAgyTransport(CLITransport):
         self._initial_prompt_sender = initial_prompt_sender
         self._initial_prompt_sent = False
         self._raw_mcp_servers = list(mcp_servers or [])
+        self._left_out_reported = False
         self._sdk_port = sdk_port
         self._session_tools = session_tools
+        self._mcp_plan = plan_mcp_servers(self._raw_mcp_servers, self._session_environ())
         self._conversation_id: str | None = (resume_session_id or "").strip() or None
         self._resume_on_launch = self._conversation_id is not None
         #: Conversations whose earlier steps an earlier launch already reported.
@@ -366,6 +455,7 @@ class TmuxAgyTransport(CLITransport):
             self._runtime_dir.mkdir(parents=True, exist_ok=True)
             self._socket_path.parent.mkdir(parents=True, exist_ok=True)
             await self._check_version()
+            self._mcp_plan = plan_mcp_servers(self._raw_mcp_servers, self._session_environ())
             self._install_hooks()
             if await self._has_session() and not await self._adoptable_session():
                 await self._run_tmux("kill-session", "-t", self._session_name, check=False)
@@ -374,6 +464,7 @@ class TmuxAgyTransport(CLITransport):
             await self._wait_until_ready()
             self._alive = True
             await self._emit_system_init()
+            await self._report_left_out_servers()
             if self._poll_task is None or self._poll_task.done():
                 self._poll_task = asyncio.create_task(
                     self._poll_screen(), name=f"agy-poll-{self._session_name}"
@@ -406,16 +497,7 @@ class TmuxAgyTransport(CLITransport):
         env[AUTO_UPDATE_OFF_ENV] = "true"
         env[agy_hook_bridge.HOOK_TIMEOUT_ENV] = str(self._config.hook_timeout_s)
         env[agy_hook_bridge.HOOK_URL_ENV] = f"http://127.0.0.1:{self._sdk_port}{HOOK_PATH}"
-        env[agy_mcp_launcher.SERVERS_ENV] = json.dumps(
-            {
-                str(server["name"]): {
-                    "command": server["command"],
-                    "args": list(server.get("args") or []),
-                    "env": dict(server.get("env") or {}),
-                }
-                for server in self._raw_mcp_servers
-            }
-        )
+        env[agy_mcp_launcher.SERVERS_ENV] = json.dumps(self._mcp_plan.servers)
         _, shim_env = ensure_codex_tool_shims(
             self.workspace_dir,
             mcp_servers=self._raw_mcp_servers,
@@ -499,17 +581,15 @@ class TmuxAgyTransport(CLITransport):
         self._install_mcp_servers(python, bridge_dir)
 
     def _install_mcp_servers(self, python: str, bridge_dir: Path) -> None:
-        """List this session's stdio MCP servers in the home's shared mcp_config.json.
+        """List this session's MCP servers in the home's shared mcp_config.json.
 
-        Each entry runs ``agy_mcp_launcher``, which starts the server described in the
-        session's own environment, so sessions sharing the home never see each other's
-        broker or token. An entry of the same name that is not Skuld's is never replaced.
+        Each entry runs ``agy_mcp_launcher``, which starts (stdio) or bridges (HTTP) the
+        server described in the session's own environment, so sessions sharing the home
+        never see each other's broker, URL or token. An entry of the same name that is not
+        Skuld's is never replaced.
         """
-        if not self._raw_mcp_servers:
+        if not self._mcp_plan.servers:
             return
-        remote = [s.get("name") for s in self._raw_mcp_servers if not s.get("command")]
-        if remote:
-            raise ValueError(f"agy sessions run only stdio MCP servers; remove or replace {remote}")
         launcher = bridge_dir / "agy-mcp.py"
         source = Path(agy_mcp_launcher.__file__).read_text(encoding="utf-8")
         if not launcher.exists() or launcher.read_text(encoding="utf-8") != source:
@@ -522,8 +602,7 @@ class TmuxAgyTransport(CLITransport):
                 raise RuntimeError(f"{path} is not a JSON object; fix or remove it")
         servers = current.setdefault("mcpServers", {})
         changed = False
-        for server in self._raw_mcp_servers:
-            name = str(server["name"])
+        for name in self._mcp_plan.servers:
             wanted = {"command": python, "args": ["-I", str(launcher), name]}
             existing = servers.get(name)
             if existing == wanted:
@@ -537,6 +616,40 @@ class TmuxAgyTransport(CLITransport):
             changed = True
         if changed:
             write_private_file(path, json.dumps(current, indent=2) + "\n")
+
+    def _session_environ(self) -> dict[str, str]:
+        """The variables agy and its MCP servers will see (credential variables live here)."""
+        env = session_process_env()
+        if self._session_tools is not None:
+            env.update(self._session_tools.env)
+        return env
+
+    async def _report_left_out_servers(self) -> None:
+        """One visible line, an error log and a count per server agy started without."""
+        if self._left_out_reported or not self._mcp_plan.left_out:
+            return
+        self._left_out_reported = True
+        for name, _ in self._mcp_plan.left_out:
+            self._counts["mcp_servers_left_out"] += 1
+            self._counts[f"mcp_left_out:{name}"] += 1
+        message = "Gemini started without " + "; ".join(
+            f"the {name} MCP server: {reason}" for name, reason in self._mcp_plan.left_out
+        )
+        message += "."
+        logger.error("agy session %s: %s", self._session_name, message)
+        await self._emit(
+            {
+                "type": "system",
+                "subtype": MCP_LEFT_OUT_SUBTYPE,
+                "content": message,
+                "metadata": {
+                    "source": "tmux_agy",
+                    "left_out": [
+                        {"name": name, "reason": reason} for name, reason in self._mcp_plan.left_out
+                    ],
+                },
+            }
+        )
 
     def _launch_argv(self) -> list[str]:
         argv = [self._config.binary, "--model", self.agy_model_id, "--mode", self._config.mode]
@@ -898,6 +1011,12 @@ class TmuxAgyTransport(CLITransport):
         parts.append(
             self._session_tools.instructions if self._session_tools else PRESENT_FILE_INSTRUCTION
         )
+        if self._mcp_plan.left_out:
+            parts.append(
+                "These MCP servers of the session are not available to you: "
+                + "; ".join(f"{name} ({reason})" for name, reason in self._mcp_plan.left_out)
+                + ". If the user asks for one, say so."
+            )
         if self._system_prompt:
             parts.append(self._system_prompt)
         text = "\n\n".join(part for part in parts if part)

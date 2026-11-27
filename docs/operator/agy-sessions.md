@@ -33,16 +33,28 @@ Transport: `skuld.transports.tmux_agy.TmuxAgyTransport`. Design and recorded beh
    | Key | Meaning |
    |---|---|
    | `agy.binary` | Path to the `agy` executable. |
-   | `agy.home` | The `HOME` above. Required. |
+   | `agy.home` | The `HOME` above. Required; set it in the platform environment (`SKULD__AGY__HOME`), see step 4. |
    | `agy.expected_version` | The `agy --version` Skuld was tested with. Required: `agy` updates itself, and a new build can redraw the menus Skuld reads, so any other version refuses to start. |
    | `agy.mode` | `auto`, `accept-edits` or `plan`. |
    | `agy.human_input_only` | Default `true`. See below. |
    | `agy.turn_max_seconds` | Longest turn without a Stop hook; reaching it ends the turn with an error. |
    | Others | Polling, timeouts and pane size; see `AgyRuntimeConfig` in `src/skuld/config.py`. |
 
-4. In Forge, connect **Google Antigravity (host sign-in)** under AI providers and give the
-   `agy` home from step 1. It stores only that path (no token) and hands it to the
-   person's sessions as `SKULD__AGY__HOME`; the launcher offers Gemini once it is connected.
+4. Give the Forge platform the agy settings in its environment, so every session broker
+   it starts inherits them. On a systemd Forge, put them on the `ExecStart` line of the
+   release drop-in, so a rollback removes them with the release:
+
+   ```
+   SKULD__AGY__HOME=<the home from step 1>  SKULD__AGY__BINARY=<home>/bin/agy
+   SKULD__AGY__EXPECTED_VERSION=1.5.16      SKULD__AGY__HUMAN_INPUT_ONLY=true
+   ```
+
+5. In Forge, connect **Google Antigravity (host sign-in)** under AI providers, naming the
+   same home. The launcher offers Gemini only to people who have connected it. The
+   connection does not deliver the home to the session on a mini-mode Forge: that Forge
+   has no secret injector, so provider credentials never become session variables, and a
+   session without `SKULD__AGY__HOME` in the platform environment fails with
+   `agy.home is not set`.
 
    Skuld launches `agy` with `AGY_CLI_DISABLE_AUTO_UPDATE=true` (agy ignores `1`). Updates
    started by hand still happen; after one, re-test and raise `agy.expected_version`.
@@ -63,12 +75,28 @@ Forge's REST API still accepts `"sender": "user"` from any caller holding the ow
 credential, so a script using a personal access token can pass as the user. Do not point
 such scripts at these sessions. Set `human_input_only: false` only for an API-key login.
 
+## MCP servers
+
+agy gets the session's MCP servers through one launcher script per server name in
+`agy.home/.gemini/config/mcp_config.json`. The real description stays in the session's own
+`agy` environment, so the shared file holds no URL, token or broker address.
+
+- stdio servers (the Forge MCP among them) run as themselves.
+- Streamable-HTTP servers (Linear, for example) run through the launcher's bridge, which
+  reads the auth header from the session's credential file or variable on every request.
+- A server that cannot run is left out, and the session still starts. The chat shows one
+  line naming each such server and why, the broker logs it at error level, and it counts on
+  `mcp_servers_left_out` and `mcp_left_out:<name>`. Reasons: a legacy SSE server; a
+  credential file or variable that is not there (on a mini-mode Forge, integration tokens
+  are not projected to `/run/secrets/mcp/...`, so an OAuth-connected Linear is left out
+  there); two servers with the same name; or an entry with neither command nor URL.
+
 ## What runs where
 
 - `agy` runs with `HOME=agy.home`, so commands the agent runs see that home too. Link the
   files the agent needs there (for example `~/.gitconfig`).
 - Skuld writes one entry, `skuld-forge-bridge`, into `agy.home/.gemini/config/hooks.json`,
-  and one per stdio MCP server into `mcp_config.json`. Each runs a small script copied to
+  and one per MCP server into `mcp_config.json`. Each runs a small script copied to
   `agy.home/.gemini/skuld/`, which reaches the session's own broker through variables
   that only that session's `agy` has. An `agy` you start by hand in the same home runs
   the hooks as no-ops and cannot start the Forge MCP server.
@@ -76,7 +104,8 @@ such scripts at these sessions. Set `human_input_only: false` only for an API-ke
 ## Known limits
 
 - Multi-select questions are answered in the terminal; Forge refuses to drive them.
-- Only stdio MCP servers are offered to `agy`.
+- The HTTP bridge does not open the optional standalone GET stream, so a server message sent
+  outside any request is not relayed. Replies and messages streamed on a request are.
 - An interrupted turn reports no tokens: `agy` writes no transcript row for it.
 - Subagents run in their own conversations; Skuld counts their hooks but does not show them.
 - Live text streams to the terminal view only; the chat view gets each finished step.
