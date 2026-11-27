@@ -209,6 +209,7 @@ class HttpBridge:
             for item in parsed if isinstance(parsed, list) else [parsed]:
                 self._relay(json.dumps(item), initialize=initialize)
         except urllib.error.HTTPError as exc:
+            exc.close()  # the error carries the open response
             self._fail(request_id, f"{self._spec['url']} answered HTTP {exc.code} {exc.reason}")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self._fail(request_id, f"could not reach {self._spec['url']}: {exc}")

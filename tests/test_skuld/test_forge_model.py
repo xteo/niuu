@@ -114,7 +114,8 @@ async def test_model_picked_in_the_app_is_typed_and_acknowledged() -> None:
 
         await h.transport.send_control("set_model", model="claude-opus-5-5")
         sent = [f for f in frames if f.get("type") == "slash_command_sent"]
-        assert sent[-1]["input"] == "/model claude-opus-5-5"
+        # The picker's "s" switches for this session only (LEX-2022), not a typed /model <id>.
+        assert sent[-1]["input"] == "/model"
         assert (await h.transport.get_runtime_options())["current"]["model"] == "claude-opus-5-5"
 
         await _reply(h, frames, "second", "claude-opus-5-5")

@@ -37,6 +37,7 @@ def broker_url():
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}/api/agy/hooks"
     server.shutdown()
+    server.server_close()
 
 
 def _run(monkeypatch, capsys, event: str, payload: dict) -> str:

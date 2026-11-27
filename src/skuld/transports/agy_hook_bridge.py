@@ -74,7 +74,9 @@ def main(argv: list[str] | None = None) -> None:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode()
     except urllib.error.HTTPError as exc:
-        _fail(f"broker refused {event}: {exc.code} {exc.read().decode()}", EXIT_BROKER_UNREACHABLE)
+        with exc:  # the error carries the open response; close it
+            detail = exc.read().decode()
+        _fail(f"broker refused {event}: {exc.code} {detail}", EXIT_BROKER_UNREACHABLE)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         _fail(f"broker unreachable for {event}: {exc}", EXIT_BROKER_UNREACHABLE)
     sys.stdout.write(body)

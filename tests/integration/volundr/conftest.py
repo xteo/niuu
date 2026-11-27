@@ -101,6 +101,7 @@ class SyncSessionService(SessionService):
         resource_config: dict | None = None,
         system_prompt: str = "",
         initial_prompt: str = "",
+        initial_prompt_sender: dict | None = None,
         workload_type: str = "session",
         workload_config: dict | None = None,
     ) -> Session:

@@ -73,6 +73,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import re
 import select
 import signal
 import sys
@@ -283,6 +284,64 @@ def _do_model(model: str) -> None:
             },
         }
     )
+
+
+# The /model picker of a claude.ai login (screens/claude-model-picker-subscription.txt):
+# model id -> its row label. "s" selects for this session only (LEX-2022).
+_PICKER_MODELS = (
+    ("claude-opus-5-5", "Opus 5.5", "For complex work and everyday tasks"),
+    ("claude-fable-5-2", "Fable 5.2", "For your toughest challenges"),
+    ("claude-fable-5-1", "Fable 5.1", "The previous Fable"),
+    ("claude-sonnet-5-5", "Sonnet 5.5", "Most efficient for simpler tasks"),
+)
+
+
+def _do_model_picker() -> None:
+    """A bare ``/model``: the native picker, driven by arrows, ``s`` and Esc."""
+    global _model
+    labels = [label for _, label, _ in _PICKER_MODELS]
+    focus = next((i for i, (mid, _, _) in enumerate(_PICKER_MODELS) if mid == _model), 0)
+
+    def render(*, tail: str = "") -> None:
+        lines = ["❯ /model"]
+        if tail:
+            lines.append(f"  ⎿  {tail}")
+        else:
+            lines += ["─" * 80, "  Select model", "  Switch between Claude models."]
+            lines.append(
+                "    1.  Default (recommended)  Opus 5.5 · Best for everyday, complex tasks"
+            )
+            for index, (_, label, description) in enumerate(_PICKER_MODELS):
+                cursor = "❯" if index == focus else " "
+                lines.append(f"  {cursor} {index + 2}.  {label:<22} {description}")
+            lines += [
+                "  ● High effort ←/→ to adjust",
+                "  Enter to set as default · s to use this session only · Esc to cancel",
+            ]
+        sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(lines) + "\n" + ("❯ " if tail else ""))
+        sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        render()
+        while True:
+            key = _read_widget_key()
+            if key is None or key == "\x1b":
+                render(tail=f"Kept model as {labels[focus]}")
+                return
+            if key == "\x1b[A":
+                focus = max(0, focus - 1)
+            elif key == "\x1b[B":
+                focus = min(len(labels) - 1, focus + 1)
+            elif key == "s":
+                _model = _PICKER_MODELS[focus][0]
+                render(tail=f"Set model to {labels[focus]} for this session only")
+                return
+            render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
 
 
 def _parse_settings_path(argv: list[str]) -> str | None:
@@ -821,6 +880,9 @@ def _dispatch(directive: str, hooks: _Hooks, menu_delay: float = 0.0) -> None:
     if directive.startswith("exit:"):
         sys.stdout.flush()
         sys.exit(int(directive[len("exit:") :].strip() or "0"))
+    if directive == "/model":
+        _do_model_picker()
+        return
     if directive.startswith("/model "):
         _do_model(directive[len("/model ") :].strip())
         return
@@ -936,10 +998,31 @@ def run(argv: list[str] | None = None) -> int:
         line = sys.stdin.readline()
         if line == "":
             return 0
+        prompt, line = _read_headed_message(line)
         # A local command such as /model is no prompt: Claude fires no hook for it.
-        if line.strip() and not line.startswith("/model "):
-            hooks.user_prompt_submit(line.rstrip("\n"))
+        if line.strip() and not line.startswith("/model ") and line.strip() != "/model":
+            hooks.user_prompt_submit(prompt)
         handle_line(line.rstrip("\n"), hooks)
+
+
+# Forge heads a message that was not typed by the user (LEX-1910,
+# niuu.domain.message_sender.text_for_model): "[Message from …]", a blank line, the
+# text. Claude takes that paste as ONE prompt, so the fake does too.
+_SENDER_HEADER = re.compile(r"^\[(Message from|From the user by voice:) .+\]$")
+
+
+def _read_headed_message(line: str) -> tuple[str, str]:
+    """(the whole prompt, the line holding the directive) for one submitted message."""
+    if not _SENDER_HEADER.match(line.strip()):
+        return line.rstrip("\n"), line
+    lines = [line.rstrip("\n")]
+    while True:
+        following = sys.stdin.readline()
+        if following == "":
+            return "\n".join(lines), ""
+        lines.append(following.rstrip("\n"))
+        if following.strip():
+            return "\n".join(lines), following
 
 
 if __name__ == "__main__":
