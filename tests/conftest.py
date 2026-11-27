@@ -1103,3 +1103,56 @@ class MockEventBroadcaster(EventBroadcaster):
 def broadcaster() -> MockEventBroadcaster:
     """Create a mock event broadcaster."""
     return MockEventBroadcaster()
+
+
+# --------------------------------------------------------------------------- stall report
+# The Forge gate sets faulthandler_timeout (scripts/verify_forge.py STALL_REPORT_S). faulthandler
+# prints thread stacks but not which test, nor the asyncio task a loop teardown waits on (a task
+# that does not end when cancelled hangs pytest-asyncio's runner). This adds both, once, for a
+# test still running after that long. It only reports.
+
+
+def _report_stall(nodeid: str, fd: int) -> None:
+    import asyncio
+    import gc
+    import os
+
+    # pytest captures stderr down to fd 2; write where faulthandler writes (its dup of the
+    # real stderr), so the report reaches the job log.
+    out = os.fdopen(os.dup(fd), "w")
+    out.write(f"\n=== STALLED TEST: {nodeid}\n")
+    loops = [o for o in gc.get_objects() if isinstance(o, asyncio.AbstractEventLoop)]
+    for loop in loops:
+        if loop.is_closed():
+            continue
+        try:
+            tasks = asyncio.all_tasks(loop)
+        except RuntimeError:
+            continue
+        for task in tasks:
+            out.write(f"--- pending task {task!r}\n")
+            task.print_stack(file=out)
+    out.close()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    import threading
+
+    timeout = float(item.config.getini("faulthandler_timeout") or 0)
+    if timeout <= 0:
+        yield
+        return
+    from _pytest.faulthandler import fault_handler_stderr_fd_key
+
+    fd = item.config.stash.get(fault_handler_stderr_fd_key, None)
+    if fd is None:
+        yield
+        return
+    timer = threading.Timer(timeout, _report_stall, args=(item.nodeid, fd))
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
